@@ -1135,6 +1135,64 @@ class DualViewModel(
     // production builds.
     internal var beforePolicyClearPhaseAssignSeamForTests: (() -> Unit)? = null
 
+    // D03b PART 2 (PR #74 round 3): JVM-testable seam for the VM-side consent
+    // fence. Production NEVER sets it (null in production builds); when null,
+    // runPolicyWriteConsentFence() below calls the SAME four-gate implementation
+    // as the Activity final-confirm fence (revalidatePolicyWriteConsent).
+    // Tests inject a deterministic outcome so no real IPC / SU probe runs.
+    // Framework-free signature: PolicyWriteConsent + PreClearContinueOutcome are
+    // both plain Kotlin types (the latter is `internal` in MainActivity.kt,
+    // visible here because both live in the same module).
+    internal var policyWriteConsentFenceForTests: (suspend (PolicyWriteConsent) -> PreClearContinueOutcome)? = null
+
+    // D03b PART 2: production implementation of the VM-side, independent
+    // fail-closed consent fence. This is defense in depth over R3-6's Activity
+    // fence: a miswired/bypassed UI path that skips the Activity check still
+    // cannot commit against a stale warning.
+    //
+    // Wiring (all four gates are the SAME ones revalidatePolicyWriteConsent /
+    // revalidatePreClearContinue use in R3-6 — this is NOT a weaker check):
+    //   (0) captured (id,serial) + installed snapshot come from the consent.
+    //   (1) resolveLiveTarget = { resolvePreClearDualTarget(state.value) }:
+    //       re-resolves from the live VM state exactly like the Activity fence.
+    //       NOTE: state.inventory is NOT used as the freshness AUTHORITY here;
+    //       it is only gate (1)'s live comparison. Gate (2) below is the
+    //       authoritative freshness evidence (a genuine new IPC read).
+    //   (2) fetchFreshVerifiedTarget(): repo.fetchFreshVerifiedTarget() is a
+    //       genuinely fresh gateway triple read (never state-cached), so a
+    //       remap / delete+recreate (same id, new serial) fails closed.
+    //   (3) reprobe = probeDualApps(consent.delta, consent.capturedUserId, suGateway):
+    //       a genuinely fresh gateway round-trip re-probing the SAME delta with
+    //       the SAME verified uid, compared against consent.capturedInstalled.
+    //
+    // Equivalence / deviation vs R3-6's `probeDualApps(consent.delta, uid)`:
+    // the Activity helper defaults its gateway to a fresh `SuCmdGateway()`;
+    // here the VM passes its injectable `suGateway` instead, which is the same
+    // ROOT command transport the Activity uses and keeps the probe testable.
+    // Both build the same buildDualProbeCommand + decideDualProbeResult and both
+    // fail closed on Failed/timeout/invalid input. On SHIZUKU-only devices the
+    // ROOT gateway may be unavailable -> probe Failed -> fail-closed abort; that
+    // is intentional (never a "ProceedOk" shortcut).
+    //
+    // COST (documented): in the normal UI flow R3-6 already spent 2 gateway
+    // round-trips at the Activity final-confirm; this VM fence adds 2 more
+    // (fresh-target fetch + same-delta re-probe). Each is bounded by the caller
+    // with withTimeout(minOf(policyIoTimeoutMs, 1_000L)). No optional optimization
+    // (passing the Activity outcome in) was taken, so the VM fence stays fully
+    // independent and fails closed on the consent token alone.
+    private suspend fun runPolicyWriteConsentFence(
+        consent: PolicyWriteConsent,
+    ): PreClearContinueOutcome {
+        val injected = policyWriteConsentFenceForTests
+        if (injected != null) return injected(consent)
+        return revalidatePolicyWriteConsent(
+            consent = consent,
+            resolveLiveTarget = { resolvePreClearDualTarget(state.value) },
+            fetchFreshVerifiedTarget = { this@DualViewModel.fetchFreshVerifiedTarget() },
+            reprobe = { probeDualApps(consent.delta, consent.capturedUserId, suGateway) },
+        )
+    }
+
     private fun sampledCurrentRevision(): Long = try {
         val sampler = revisionSamplerForTests
         if (sampler != null) {
@@ -9409,33 +9467,34 @@ class DualViewModel(
                     // 中止，避免整包覆寫使用者未曾被告知的刪除。
                     // 僅警告綁定路徑執行（baseFreshGen != -1L）；legacy 直接注入
                     // （baseFreshGen==-1L）跳過，保既有測試綠（新 UI 一律攜綁定）。
+                    // R04 pre-read 與 D03b consent fence 共用同一 fail-closed 清理路徑：
+                    // 清 in-flight、mark unknown、清 pending、回 IDLE、
+                    // UNKNOWN_REFRESH/CHANNEL，零 store save、零 Tx claim。
+                    // 提到 run{} 外以便 consent fence 也能重用（同一 opMutex scope）。
+                    fun abortUnknownRefresh(preCorrupt: Boolean) {
+                        synchronized(policySettleLock) {
+                            inFlightWrites.remove(key)
+                            policyWriteSaving.remove(key)
+                            markPolicyUnknownLocked()
+                            _state.update { curWrite ->
+                                if (curWrite.pendingPolicyWrite != pendingAtCall) return@update curWrite
+                                curWrite.copy(
+                                    pendingPolicyWrite = null,
+                                    policyWritePhase = PolicyWritePhase.IDLE,
+                                    policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                    policyDraftKnown = false,
+                                    policyDraftCorrupt = preCorrupt,
+                                    msg = policyText(
+                                        if (preCorrupt) PolicyText(PolicyTextKind.CORRUPT_DETECTED)
+                                        else PolicyText(PolicyTextKind.UNKNOWN_REFRESH),
+                                    ),
+                                    msgKind = MsgKind.CHANNEL,
+                                )
+                            }
+                        }
+                    }
                     if (pendingAtCall.baseFreshGen != -1L) {
                         run {
-                            // Unknown 與 Known 漂移共用同一清理路徑：清
-                            // in-flight、mark unknown、清 pending、回 IDLE、
-                            // UNKNOWN_REFRESH/CHANNEL，零 store save。
-                            fun abortUnknownRefresh(preCorrupt: Boolean) {
-                                synchronized(policySettleLock) {
-                                    inFlightWrites.remove(key)
-                                    policyWriteSaving.remove(key)
-                                    markPolicyUnknownLocked()
-                                    _state.update { curWrite ->
-                                        if (curWrite.pendingPolicyWrite != pendingAtCall) return@update curWrite
-                                        curWrite.copy(
-                                            pendingPolicyWrite = null,
-                                            policyWritePhase = PolicyWritePhase.IDLE,
-                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                            policyDraftKnown = false,
-                                            policyDraftCorrupt = preCorrupt,
-                                            msg = policyText(
-                                                if (preCorrupt) PolicyText(PolicyTextKind.CORRUPT_DETECTED)
-                                                else PolicyText(PolicyTextKind.UNKNOWN_REFRESH),
-                                            ),
-                                            msgKind = MsgKind.CHANNEL,
-                                        )
-                                    }
-                                }
-                            }
                             val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
                             val preRead: LoadResult = try {
                                 withTimeout(minOf(policyIoTimeoutMs, 1_000L)) { preJob.await() }
@@ -9463,6 +9522,38 @@ class DualViewModel(
                                     return@withLock
                                 }
                             }
+                        }
+                    }
+                    // D03b PART 2 — VM-side independent consent fence (defense in depth).
+                    // Runs the SAME four gates as the R3-6 Activity final-confirm fence.
+                    // Placed AFTER the R04 pre-read and BEFORE any Tx/Mutex claim or
+                    // store.save, so a bypass/miswired UI path still cannot commit with
+                    // a stale warning: every non-ProceedOk / timeout / exception =>
+                    // abortUnknownRefresh(false) (zero save, pending cleared, no Tx).
+                    // consent==null is the legacy carve-out, skipped exactly like
+                    // baseFreshGen==-1L (direct test injection / no warning capture).
+                    val consentAtCall = pendingAtCall.consent
+                    if (consentAtCall != null) {
+                        // Cheap BINDING guard only (requirement 5) — generation is NOT
+                        // the freshness authority; the four gates below remain that.
+                        if (consentAtCall.generation != pendingAtCall.generation) {
+                            abortUnknownRefresh(false)
+                            return@withLock
+                        }
+                        val consentOutcome: PreClearContinueOutcome = try {
+                            withTimeout(minOf(policyIoTimeoutMs, 1_000L)) {
+                                runPolicyWriteConsentFence(consentAtCall)
+                            }
+                        } catch (_: CancellationException) {
+                            abortUnknownRefresh(false)
+                            return@withLock
+                        } catch (_: Exception) {
+                            abortUnknownRefresh(false)
+                            return@withLock
+                        }
+                        if (consentOutcome !is PreClearContinueOutcome.ProceedOk) {
+                            abortUnknownRefresh(false)
+                            return@withLock
                         }
                     }
                     var h1Deferred: Deferred<Boolean>? = null
@@ -10603,6 +10694,31 @@ class DualViewModel(
                             warningBinding?.warnedOld != null &&
                             preRead.packages != warningBinding.warnedOld
                         ) {
+                            abortPrecommit(false, PolicyTextKind.UNKNOWN_REFRESH)
+                            return@withLock
+                        }
+                    }
+                    // D03b PART 2 — same independent VM-side consent fence for the
+                    // clear path, after its R04-equivalent pre-read and BEFORE
+                    // store.clear() (or any Tx claim). consent==null = legacy skip.
+                    // No pending exists on the clear path, so the cheap
+                    // generation-vs-pending binding guard of confirmPolicyWrite is
+                    // not applicable here (the Activity builder leaves generation
+                    // at the -1 sentinel for clear); the four gates remain the
+                    // freshness authority, bounded and fail-closed.
+                    if (consent != null) {
+                        val consentOutcome: PreClearContinueOutcome = try {
+                            withTimeout(minOf(policyIoTimeoutMs, 1_000L)) {
+                                runPolicyWriteConsentFence(consent)
+                            }
+                        } catch (_: CancellationException) {
+                            abortPrecommit(false, PolicyTextKind.UNKNOWN_REFRESH)
+                            return@withLock
+                        } catch (_: Exception) {
+                            abortPrecommit(false, PolicyTextKind.UNKNOWN_REFRESH)
+                            return@withLock
+                        }
+                        if (consentOutcome !is PreClearContinueOutcome.ProceedOk) {
                             abortPrecommit(false, PolicyTextKind.UNKNOWN_REFRESH)
                             return@withLock
                         }

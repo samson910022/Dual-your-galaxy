@@ -1050,4 +1050,265 @@ class PolicyPhaseCRequiredTest {
         assertFalse(nulA == nulB)
         assertTrue(nulA.contains("3:a"))
     }
+
+    // =====================================================================
+    // D03b PART 2 (PR #74 round 3): VM pre-IO defense-in-depth consent fence.
+    //
+    // These tests exercise the SECOND, independent fence inside DualViewModel,
+    // after the R04 store pre-read and BEFORE any store.save/clear or Tx claim.
+    // No Robolectric / real IPC: the VM seam `policyWriteConsentFenceForTests`
+    // injects the four-gate outcome deterministically. The backend is an
+    // AtomicReference so "backend unchanged" is asserted exactly, and pending
+    // is injected by reflection (legacy pattern used throughout this file).
+    // =====================================================================
+
+    private fun atomicBackendStore(
+        backend: AtomicReference<Set<String>?>,
+        saveCalls: AtomicInteger,
+        clearCalls: AtomicInteger,
+    ): HookPolicyStore = HookPolicyStore(
+        loadRaw = { backend.get() },
+        saveRaw = { raw ->
+            if (raw == null) {
+                clearCalls.incrementAndGet()
+                backend.set(emptySet())
+            } else {
+                saveCalls.incrementAndGet()
+                backend.set(raw)
+            }
+            true
+        },
+    )
+
+    // Inject a pending carrying a real consent directly (bypasses the request
+    // seams on purpose — that is the bypass this fence must survive).
+    // baseFreshGen=1L keeps the R04 pre-read active; baseWarnedOld=null skips
+    // the content-drift abort so the CONSENT FENCE is the gate under test.
+    private fun injectConsentPending(
+        vm: DualViewModel,
+        consent: PolicyWriteConsent?,
+        packages: Set<String> = setOf("com.b.app"),
+    ): PendingPolicyWrite {
+        val base = PendingPolicyWrite(
+            packages = packages,
+            requestedAtMs = System.currentTimeMillis(),
+            baseDraftVersion = -1L,
+            baseCoordinatorRevision = -1L,
+            // Bind to the VM's REAL freshness generation so the no-coordinator
+            // baseMismatch gate stays green — otherwise an unrelated abort would
+            // mask whether the consent fence itself made the decision.
+            baseFreshGen = vm.policyFreshGenForTests(),
+            baseWarnedOld = null,
+        )
+        val pending = if (consent == null) base else base.copy(consent = consent.copy(generation = base.generation))
+        val f = DualViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val flow = f.get(vm) as MutableStateFlow<UiState>
+        flow.value = flow.value.copy(
+            pendingPolicyWrite = pending,
+            policyWritePhase = PolicyWritePhase.QUEUED,
+        )
+        return pending
+    }
+
+    private fun consentTemplate(): PolicyWriteConsent = buildPolicyWriteConsent(
+        delta = setOf("com.b.app"),
+        verifiedTarget = PreClearDualTarget(95, 7),
+        installed = listOf("com.b.app"),
+    )
+
+    private fun assertConfirmAborted(
+        saveCalls: AtomicInteger,
+        backend: AtomicReference<Set<String>?>,
+        initial: Set<String>,
+        vm: DualViewModel,
+    ) {
+        assertEquals("save count must be 0", 0, saveCalls.get())
+        assertEquals("backend must be unchanged", initial, backend.get())
+        assertNull("pending must be cleared", vm.state.value.pendingPolicyWrite)
+        assertEquals("phase must be IDLE", PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+        assertEquals(
+            PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+            vm.state.value.msg,
+        )
+    }
+
+    @Test
+    fun confirmPolicyWrite_consentMembershipChanged_abortsZeroSave() {
+        val initial = setOf("com.a.app", "com.b.app")
+        val backend = AtomicReference<Set<String>?>(initial)
+        val saveCalls = AtomicInteger(0)
+        val clearCalls = AtomicInteger(0)
+        val store = atomicBackendStore(backend, saveCalls, clearCalls)
+        val vm = makeVm(store, initialDraft = initial)
+        val fenceCalls = AtomicInteger(0)
+        vm.policyWriteConsentFenceForTests = { _ ->
+            fenceCalls.incrementAndGet()
+            PreClearContinueOutcome.CloneMembershipChanged
+        }
+        val pending = injectConsentPending(vm, consentTemplate())
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertEquals(1, fenceCalls.get())
+        assertConfirmAborted(saveCalls, backend, initial, vm)
+    }
+
+    @Test
+    fun confirmPolicyWrite_consentProbeFailed_abortsZeroSave() {
+        val initial = setOf("com.a.app", "com.b.app")
+        val backend = AtomicReference<Set<String>?>(initial)
+        val saveCalls = AtomicInteger(0)
+        val clearCalls = AtomicInteger(0)
+        val store = atomicBackendStore(backend, saveCalls, clearCalls)
+        val vm = makeVm(store, initialDraft = initial)
+        vm.policyWriteConsentFenceForTests = { _ -> PreClearContinueOutcome.CannotDetermine }
+        val pending = injectConsentPending(vm, consentTemplate())
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertConfirmAborted(saveCalls, backend, initial, vm)
+    }
+
+    @Test
+    fun confirmPolicyWrite_consentTargetChanged_abortsZeroSave() {
+        val initial = setOf("com.a.app", "com.b.app")
+        val backend = AtomicReference<Set<String>?>(initial)
+        val saveCalls = AtomicInteger(0)
+        val clearCalls = AtomicInteger(0)
+        val store = atomicBackendStore(backend, saveCalls, clearCalls)
+        val vm = makeVm(store, initialDraft = initial)
+        vm.policyWriteConsentFenceForTests = { _ -> PreClearContinueOutcome.TargetChanged }
+        val pending = injectConsentPending(vm, consentTemplate())
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertConfirmAborted(saveCalls, backend, initial, vm)
+    }
+
+    @Test
+    fun confirmPolicyWrite_consentProceedOk_savesCandidate() {
+        val initial = setOf("com.a.app", "com.b.app")
+        val candidate = setOf("com.b.app")
+        val backend = AtomicReference<Set<String>?>(initial)
+        val saveCalls = AtomicInteger(0)
+        val clearCalls = AtomicInteger(0)
+        val store = atomicBackendStore(backend, saveCalls, clearCalls)
+        val vm = makeVm(store, initialDraft = initial)
+        val seenGeneration = AtomicReference(-1L)
+        vm.policyWriteConsentFenceForTests = { consent ->
+            seenGeneration.set(consent.generation)
+            PreClearContinueOutcome.ProceedOk
+        }
+        val pending = injectConsentPending(vm, consentTemplate(), packages = candidate)
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null && saveCalls.get() == 1 }
+        await { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertEquals(pending.generation, seenGeneration.get())
+        assertEquals("save count must be 1", 1, saveCalls.get())
+        assertEquals("candidate must be saved", candidate, backend.get())
+        assertEquals(0, clearCalls.get())
+        assertNull(vm.state.value.pendingPolicyWrite)
+    }
+
+    @Test
+    fun confirmPolicyWrite_legacyNullConsent_skipsFence() {
+        val initial = setOf("com.a.app", "com.b.app")
+        val backend = AtomicReference<Set<String>?>(initial)
+        val saveCalls = AtomicInteger(0)
+        val clearCalls = AtomicInteger(0)
+        val store = atomicBackendStore(backend, saveCalls, clearCalls)
+        val vm = makeVm(store, initialDraft = initial)
+        val fenceCalls = AtomicInteger(0)
+        vm.policyWriteConsentFenceForTests = { _ ->
+            fenceCalls.incrementAndGet()
+            PreClearContinueOutcome.CannotDetermine
+        }
+        // Legacy carve-out: no consent AND baseFreshGen == -1L — fence must be skipped.
+        val base = PendingPolicyWrite(
+            packages = setOf("com.b.app"),
+            requestedAtMs = System.currentTimeMillis(),
+            baseDraftVersion = -1L,
+            baseCoordinatorRevision = -1L,
+            baseFreshGen = -1L,
+            baseWarnedOld = null,
+            consent = null,
+        )
+        val f = DualViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val flow = f.get(vm) as MutableStateFlow<UiState>
+        flow.value = flow.value.copy(pendingPolicyWrite = base, policyWritePhase = PolicyWritePhase.QUEUED)
+        vm.confirmPolicyWrite(base, base.generation)
+        await { vm.state.value.pendingPolicyWrite == null && saveCalls.get() == 1 }
+        assertEquals("fence must be skipped for legacy null consent", 0, fenceCalls.get())
+        assertEquals(1, saveCalls.get())
+        assertEquals(setOf("com.b.app"), backend.get())
+        await { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+    }
+
+    @Test
+    fun confirmPolicyWrite_consentGenerationMismatch_abortsZeroSave() {
+        val initial = setOf("com.a.app", "com.b.app")
+        val backend = AtomicReference<Set<String>?>(initial)
+        val saveCalls = AtomicInteger(0)
+        val clearCalls = AtomicInteger(0)
+        val store = atomicBackendStore(backend, saveCalls, clearCalls)
+        val vm = makeVm(store, initialDraft = initial)
+        val fenceCalls = AtomicInteger(0)
+        vm.policyWriteConsentFenceForTests = { _ ->
+            fenceCalls.incrementAndGet()
+            PreClearContinueOutcome.ProceedOk
+        }
+        // Bind to a DIFFERENT generation than the pending's — cheap guard aborts
+        // before the fence (generation is binding-only, never the freshness authority).
+        val base = PendingPolicyWrite(
+            packages = setOf("com.b.app"),
+            requestedAtMs = System.currentTimeMillis(),
+            baseDraftVersion = -1L,
+            baseCoordinatorRevision = -1L,
+            baseFreshGen = vm.policyFreshGenForTests(),
+            baseWarnedOld = null,
+        )
+        val mismatched = base.copy(consent = consentTemplate().copy(generation = base.generation + 100L))
+        val f = DualViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val flow = f.get(vm) as MutableStateFlow<UiState>
+        flow.value = flow.value.copy(pendingPolicyWrite = mismatched, policyWritePhase = PolicyWritePhase.QUEUED)
+        vm.confirmPolicyWrite(mismatched, mismatched.generation)
+        await { vm.state.value.pendingPolicyWrite == null }
+        assertEquals("fence must not run on generation mismatch", 0, fenceCalls.get())
+        assertConfirmAborted(saveCalls, backend, initial, vm)
+    }
+
+    @Test
+    fun clearPolicyDraft_consentMembershipChanged_abortsZeroClear() {
+        val initial = setOf("com.a.app", "com.b.app")
+        val backend = AtomicReference<Set<String>?>(initial)
+        val saveCalls = AtomicInteger(0)
+        val clearCalls = AtomicInteger(0)
+        val store = atomicBackendStore(backend, saveCalls, clearCalls)
+        val vm = makeVm(store, initialDraft = initial)
+        vm.policyWriteConsentFenceForTests = { _ -> PreClearContinueOutcome.CloneMembershipChanged }
+        vm.clearPolicyDraft(consent = consentTemplate())
+        await { vm.state.value.msg == PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText() }
+        assertEquals("clear count must be 0", 0, clearCalls.get())
+        assertEquals("save count must be 0", 0, saveCalls.get())
+        assertEquals("backend must be unchanged", initial, backend.get())
+        assertNull(vm.state.value.pendingPolicyWrite)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+    }
+
+    @Test
+    fun clearPolicyDraft_consentProceedOk_clears() {
+        val initial = setOf("com.a.app", "com.b.app")
+        val backend = AtomicReference<Set<String>?>(initial)
+        val saveCalls = AtomicInteger(0)
+        val clearCalls = AtomicInteger(0)
+        val store = atomicBackendStore(backend, saveCalls, clearCalls)
+        val vm = makeVm(store, initialDraft = initial)
+        vm.policyWriteConsentFenceForTests = { _ -> PreClearContinueOutcome.ProceedOk }
+        vm.clearPolicyDraft(consent = consentTemplate())
+        await { clearCalls.get() == 1 }
+        await { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertEquals("clear count must be 1", 1, clearCalls.get())
+        assertEquals("backend must be empty", emptySet<String>(), backend.get())
+        assertNull(vm.state.value.pendingPolicyWrite)
+    }
 }
