@@ -36,6 +36,9 @@ package com.galaxydual.plus
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import com.galaxydual.hook.PolicySource
+import com.galaxydual.hook.VersionPrefsView
+import com.galaxydual.hook.VersionProbeResult
+import com.galaxydual.hook.probeVersion
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -138,6 +141,25 @@ internal class WeakPrefKey(referent: SharedPreferences) : WeakReference<SharedPr
 }
 
 internal val remotePoison = AtomicReference(PoisonState(emptyMap(), 0))
+
+// NEW-2 (P2): process-wide lock serializing the version
+// read->increment->putLong->commit in remoteHookPolicyStore.saveRaw. Without
+// it two concurrent save() calls can read the same current version and commit
+// duplicate versions; a duplicate later presented as Cleared is then rejected
+// by the hook's monotonic gate. Top-level (not per-store) because multiple
+// store instances share the same prefs/version key in one process.
+//
+// SINGLE-WRITER INVARIANT (Phase 3 review F4): in-process, saveRaw is the ONLY
+// writer of the version key, and it always does so under this lock — no other
+// code path in this tree writes that key. Cross-process, two writers can in
+// principle commit the same version, but duplicate/out-of-order versions are
+// bounded on the reader side by R06's monotonic version gate (rejects 0 /
+// duplicate / replay / downgrade, content-aware at equal version) plus R07's
+// seqlock (version-before == version-after around the defensive package-set
+// copy), so a torn or duplicate commit cannot replay a revoked package. A
+// duplicate writer is therefore not reachable as a correctness bug in this
+// tree; if a future writer of the version key is added, it MUST take this lock.
+internal val versionCommitLock = Any()
 
 // A3-8: overflow 閂每行程 log-once（永久 fail-closed 狀態必須可診斷；逐次讀
 // log 會污染 log buffer，故 once-per-process）。resetRemotePoisonForTests 重置。
@@ -640,7 +662,39 @@ class HookPolicyStore(
     // 直接注入後端預設 null → loadForRepair() 即 loadResult())。VM 修復 pre/final
     // 讀一律經 loadForRepair()，正常 refresh/save/clear 仍經 loadResult()。
     private val repairProbe: (() -> LoadResult)? = null,
+    // PR #74 G1: BBC injection opt-out (dual_policy/bbc_injection_enabled).
+    // SEPARATE from the packages/version single-commit and the poison/seqlock
+    // machinery: a boolean preference cannot corrupt the policy draft snapshot.
+    // Direct-injected test backends default to "absent" (read => default true,
+    // write => false unless a backend is supplied).
+    private val loadBbcEnabledRaw: () -> Boolean? = { null },
+    private val saveBbcEnabledRaw: (Boolean) -> Boolean = { false },
 ) {
+
+    // PR #74 G1: persisted, owner-controlled BBC injection preference.
+    // Default TRUE when the key is absent or the read fails (preserve shipped
+    // behavior; "off" is not a safety guarantee — Samsung's cold-start deletion
+    // happens before the BBC callback, issue #75). CancellationException is
+    // propagated; all other throwables are swallowed (store never throws).
+    fun isBbcInjectionEnabled(): Boolean = try {
+        loadBbcEnabledRaw() ?: true
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        true
+    }
+
+    // PR #74 G1: atomic single-key commit of the BBC preference. Best-effort:
+    // returns false on failure (provider absent / IPC failure), never throws
+    // except CancellationException. Does NOT touch packages/version or poison.
+    fun setBbcInjectionEnabled(enabled: Boolean): Boolean = try {
+        saveBbcEnabledRaw(enabled)
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        false
+    }
+
     // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
     // fail-closed. Direct backends (repairProbe null) delegate to loadResult()
     // (no poison → already authoritative). Remote probe bypasses the poison
@@ -1010,11 +1064,74 @@ fun remoteHookPolicyStore(
                 // 關 commit-vs-publish 窗:先 CAS 加毒再 commit,重疊讀必見 gen 變化。
                 val ownToken = prePoison(prefs)
                 try {
-                    val ok: Boolean = if (raw == null) {
-                        prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES).commit()
-                    } else {
-                        prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
-                            .commit()
+                    // NEW-2 (P2): serialize the whole version
+                    // read->increment->putLong->commit under ONE process-wide
+                    // lock so two concurrent save() calls can never read the
+                    // same current version and commit duplicates (a duplicate
+                    // later presented as Cleared would be rejected by the hook's
+                    // monotonic gate). The lock includes the commit so packages
+                    // + version stay in the same atomic commit; poison bookkeeping
+                    // below stays outside the lock (minimal scope).
+                    val ok: Boolean = synchronized(versionCommitLock) {
+                        // Phase A P0 policy_version 同步寫入（與包集合同一 commit
+                        // 原子落盤）：每次 save/clear 單調 +1。舊草稿遷移：版本鍵
+                        // 缺席視為 0（下次寫入即 1）；非空舊草稿無版本仍被 hook
+                        // 視為 Good（向後相容），空+無版本永不視為故意清除。
+                        // 版本鍵型別錯亂（CCE）視為 0 並以 putLong 覆寫修復。
+                        //
+                        // N04/N07 fail-closed version proof: probe via the shared
+                        // hook/app vocabulary (BbcVersionProbe.probeVersion). An
+                        // Unavailable result — `contains` threw, or `getLong`
+                        // failed for a non-CCE reason — means the probe itself
+                        // failed: ABORT THE WHOLE WRITE (no editor, no commit,
+                        // old store byte-identical). Absent/Invalid (CCE or
+                        // value < 1) still map to curVer=0 so the legacy
+                        // migration and the CCE-corrupt->v1 repair are preserved.
+                        val probe = probeVersion(object : VersionPrefsView {
+                            override fun containsVersion(): Boolean =
+                                prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+                            override fun readVersion(defValue: Long): Long =
+                                prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, defValue)
+                        })
+                        if (probe is VersionProbeResult.Unavailable) {
+                            return@synchronized false
+                        }
+                        val curVer: Long = when (probe) {
+                            is VersionProbeResult.Present -> probe.value
+                            VersionProbeResult.Absent, VersionProbeResult.Invalid -> 0L
+                            VersionProbeResult.Unavailable -> 0L // unreachable: aborted above
+                        }
+                        val newVer: Long = if (curVer >= Long.MAX_VALUE - 1L) 1L else curVer + 1L
+                        // N04/N07: 版本寫入改為 fail-closed（不再是 best-effort）。
+                        // putLong 若因非取消原因失敗，整筆寫入中止、不 commit，
+                        // 避免包集合落盤但版本缺席被 hook 讀成 Unknown。取消仍透傳。
+                        val ed = try {
+                            if (raw == null) {
+                                prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
+                            } else {
+                                prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
+                            }
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Throwable) {
+                            throw e
+                        }
+                        try {
+                            ed.putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, newVer)
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (_: Throwable) {
+                            // putLong 失敗（含測試 stub 的 UnsupportedOperationException）：
+                            // 整筆中止、不 commit、不留部分狀態。取消仍透傳。
+                            return@synchronized false
+                        }
+                        try {
+                            ed.commit()
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Throwable) {
+                            throw e
+                        }
                     }
                     if (ok) {
                         val cleared = clearPoison(prefs, ownToken)
@@ -1186,6 +1303,49 @@ fun remoteHookPolicyStore(
                         }
                         LoadResult.Unavailable
                     }
+                }
+            }
+        },
+        // PR #74 G1: BBC opt-out lives in the SAME dual_policy group but is a
+        // standalone boolean key — it never enters the packages/version atomic
+        // commit nor the poison/seqlock fence (those protect the draft snapshot
+        // only). service absent => read default true / write false. CE propagates.
+        loadBbcEnabledRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    prefs.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        saveBbcEnabledRaw = { enabled ->
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                false
+            } else {
+                try {
+                    // Single-key atomic commit (never apply(): immediate
+                    // cross-process visibility of a user preference).
+                    // Defense in depth: serialize against the policy writer's
+                    // packages/version commit with the SAME process-wide lock.
+                    // A whole-map-commit libxposed implementation could
+                    // otherwise let a concurrent toggle commit drop the draft
+                    // (or vice versa). The policy writer itself is unchanged.
+                    synchronized(versionCommitLock) {
+                        prefs.edit()
+                            .putBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, enabled)
+                            .commit()
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
                 }
             }
         },

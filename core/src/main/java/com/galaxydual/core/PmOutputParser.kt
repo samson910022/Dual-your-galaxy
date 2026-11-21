@@ -51,6 +51,13 @@ sealed interface TrustedList {
 }
 
 // Tolerant parser and command builder for pm-style outputs; pure Kotlin, no Android deps.
+//
+// Phase E 效能聲明（獨立有界預算）：PM 解析（parsePackagesTrusted 等）跑在 App 側
+// Dispatchers.IO＋上層有界預算（SU_EXEC_TIMEOUT／probe 重試上限／verify 三重掃描上限），
+// 不在 hook 熱路徑 50ms 端到端 stall 預算內（PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
+// 僅治理 hook 側 effectivePolicy() 的 capability＋prefs 讀取＋follower grace；PM 解析
+// 為 App 側線性掃描，複雜度 O(行數)，N=512 行仍為微秒級，見 hook 側 BbcMergeTimingTest
+// 的 N=50/200/512 合併耗時基準同級量級，但兩者預算獨立、不得混用）。
 object PmOutputParser {
     // Matches lines like "UserInfo{0:Owner:13} running" or "UserInfo{95:DUAL_APP:400}".
     // Group 3 (flag/type field) is retained, never dropped (C1 safety audit, issue #2).

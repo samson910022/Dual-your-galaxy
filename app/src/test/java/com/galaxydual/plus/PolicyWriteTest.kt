@@ -580,7 +580,7 @@ class PolicyWriteTest {
 
         vm.requestPolicyWrite()
 
-        assertTrue(vm.state.value.msg.contains("已捨去 1 項不在來源清單的勾選"))
+        assertTrue(vm.state.value.msg.contains("已捨去 1 項不符合寫入條件的項目"))
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         assertEquals(
             setOf("com.example.a"),
@@ -2396,8 +2396,14 @@ class PolicyWriteTest {
             }
             override fun putInt(key: String?, value: Int): SharedPreferences.Editor =
                 throw UnsupportedOperationException()
-            override fun putLong(key: String?, value: Long): SharedPreferences.Editor =
-                throw UnsupportedOperationException()
+            // N04/N07: writer now requires putLong to succeed (fail-closed on
+            // failure). Stage into pending like putStringSet so real-store-chain
+            // tests that rely on successful saves keep passing.
+            override fun putLong(key: String?, value: Long): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
             override fun putFloat(key: String?, value: Float): SharedPreferences.Editor =
                 throw UnsupportedOperationException()
             override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor =

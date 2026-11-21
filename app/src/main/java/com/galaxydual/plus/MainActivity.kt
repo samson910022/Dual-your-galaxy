@@ -39,6 +39,7 @@ package com.galaxydual.plus
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -86,7 +87,13 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.galaxydual.core.CloneOutcome
+import com.galaxydual.core.CmdGateway
+import com.galaxydual.core.CmdResult
 import com.galaxydual.core.DualRepository
+// Alias: core TRUNCATION_MARKER ("[truncated]") is distinct from the local UI
+// TRUNCATION_MARKER (" [truncated]") used for remove-label shortening below.
+import com.galaxydual.core.TRUNCATION_MARKER as CORE_TRUNCATION_MARKER
+import com.galaxydual.core.VerifiedTarget
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
@@ -171,21 +178,39 @@ class MainActivity : ComponentActivity() {
     private lateinit var refreshPolicyBtn: Button
     private var policyWriteDialog: AlertDialog? = null
     private var serviceBindListener: (() -> Unit)? = null
-    private var shownPolicyWrite: PendingPolicyWrite? = null
+    // Phase D shared confirm-dialog state machine (Main/Editor共用同一 holder 類型
+    // PolicyConfirmDialogState；既有欄位名保留為委派屬性，行為不變，rotation/onDestroy
+    // 語義與 Editor 單一來源）。
+    private val policyConfirmState = PolicyConfirmDialogState()
+    private var shownPolicyWrite: PendingPolicyWrite?
+        get() = policyConfirmState.shownPending
+        set(v) { policyConfirmState.shownPending = v }
     // Phase 5：已顯示 dialog 的 saving 相位快照（early-return 偵測 QUEUED→SAVING
     // 翻轉，翻轉沿播報一次；僅 UI 播報用，不參與門控）。
-    private var shownPolicyWriteSaving: Boolean = false
-    private var policyAcknowledged = false
-    private var policyAckGeneration: Long? = null
+    private var shownPolicyWriteSaving: Boolean
+        get() = policyConfirmState.shownSaving
+        set(v) { policyConfirmState.shownSaving = v }
+    private var policyAcknowledged: Boolean
+        get() = policyConfirmState.acknowledged
+        set(v) { policyConfirmState.acknowledged = v }
+    private var policyAckGeneration: Long?
+        get() = policyConfirmState.ackGeneration
+        set(v) { policyConfirmState.ackGeneration = v }
     // Stage J4 (dialog trap)：RECONCILING 期使用者 Back/觸外/取消導致的本地 dismiss
     // 世代（僅 UI 層抑制重建，不調 vm.cancelPolicyWrite、不清 VM fence；pending 仍在，
     // reconciler／late-join 照常結清；該世代終態 IDLE 或新世代即清除）。
-    private var policyWriteDismissedForReconcilingGen: Long? = null
+    private var policyWriteDismissedForReconcilingGen: Long?
+        get() = policyConfirmState.dismissedForReconcilingGen
+        set(v) { policyConfirmState.dismissedForReconcilingGen = v }
     // Stage B P2 dialog 完整清單（方案 A Toggle）：展開/收合純 UI 開關。
     // rest>0 才顯示 Toggle；in-place 切換保 ack；世代重置同步重置 expanded；
-    // 旋轉經 KEY_POLICY_EXPANDED(/GEN) 保留，同世代保留、跨世代重置。
-    private var policyWriteExpanded = false
-    private var policyWriteExpandedGeneration: Long? = null
+    // 旋轉經 holder saveToBundle/restoreFromBundle 保留，同世代保留、跨世代重置。
+    private var policyWriteExpanded: Boolean
+        get() = policyConfirmState.expanded
+        set(v) { policyConfirmState.expanded = v }
+    private var policyWriteExpandedGeneration: Long?
+        get() = policyConfirmState.expandedGeneration
+        set(v) { policyConfirmState.expandedGeneration = v }
     private lateinit var sourceContainer: LinearLayout
     private lateinit var catalogErrorView: TextView
     private lateinit var batchBtn: Button
@@ -279,6 +304,12 @@ class MainActivity : ComponentActivity() {
     // dismiss，否則舊 Activity 的 window 洩漏。
     private var exportDialog: AlertDialog? = null
     private var settingsDialog: AlertDialog? = null
+    // PR #74 R2 N05：BBC 開關的單一 latest-intent actor。對話框重建時先 dispose
+    // 舊實例，Activity.onDestroy 再 dispose 最後一個，避免孤兒 consumer 持有舊 View。
+    private var bbcToggleController: BbcInjectionToggleController? = null
+    // PR-74 A3：pre-clear 警告／ROOT 二次確認／卸載驗證對話框 handle（onDestroy 釋放，
+    // 避免舊 Activity 的 window 洩漏；與既有 export/settings dialog 同一生命周期語義）。
+    private val destructiveDialogHandles = DestructiveDialogHandles()
 
     // Main-thread delivery for binder/permission callbacks; the ViewModel
     // entry points are thread-safe anyway (viewModelScope), this only keeps
@@ -469,28 +500,11 @@ class MainActivity : ComponentActivity() {
                     }
             }
         }
-        // Stage2：政策寫入確認勾選綁定世代保留（同 remove ack 模式）→ 不再保留。
-        // Consent 是 session-scoped：Bundle 還原的 ack 與 per-process 世代計數器
-        // 撞代（process 死後計數器重置，舊 Bundle 的 gen 會誤配新世代）。dialog
-        // 首個 render 本來就會清掉它，此處直接移除這個脆弱的還原窗口。
-        policyAcknowledged = false
-        policyAckGeneration = null
-        // Stage B P2：完整清單展開開關保留（同世代旋轉保留，跨世代重置見 sync）。
-        policyWriteExpanded = savedInstanceState?.getBoolean(KEY_POLICY_EXPANDED) ?: false
-        policyWriteExpandedGeneration =
-            if (savedInstanceState?.containsKey(KEY_POLICY_EXPANDED_GEN) == true) {
-                savedInstanceState.getLong(KEY_POLICY_EXPANDED_GEN)
-            } else {
-                null
-            }
-        // Stage J4：RECONCILING 期本地抑制世代保留（旋轉重建不丟抑制；跨世代/
-        // 終態清除仍由 syncPolicyWriteDialog 負責，此處僅恢復原始值）。
-        policyWriteDismissedForReconcilingGen =
-            if (savedInstanceState?.containsKey(KEY_POLICY_WRITE_DISMISSED_GEN) == true) {
-                savedInstanceState.getLong(KEY_POLICY_WRITE_DISMISSED_GEN)
-            } else {
-                null
-            }
+        // Stage2：政策寫入確認 consent 為 session-scoped，永不經 Bundle 持久化
+        // (holder 明確拆分：ack 不存、shown 不還原；見 PolicyConfirmDialogState 檔頭).
+        // 兩屏統一走 holder saveToBundle/restoreFromBundle (舊手寫 KEY 已刪)：
+        // 還原後 ack 強制清除，expanded/dismissed 世代保留由 holder 處理.
+        policyConfirmState.restoreFromBundle(savedInstanceState)
         currentTab = savedInstanceState?.getInt(KEY_CURRENT_TAB) ?: TAB_DUAL_APPS
         buildUi()
         // Phase C: no announcement for the initial restore (avoids speaking on
@@ -581,14 +595,14 @@ class MainActivity : ComponentActivity() {
         }
         outState.putBoolean(KEY_BATCH_ACK, batchAcknowledged)
         if (batchAcknowledgedGeneration != null) outState.putLong(KEY_BATCH_ACK_GEN, batchAcknowledgedGeneration!!)
-        // Stage2：政策寫入確認勾選綁定世代保留 → 不再寫入 Bundle（consent 為
-        // session-scoped；見 onCreate 還原處說明）。
-        // Stage B P2：完整清單展開開關保留（同世代保留，跨世代重置）。
-        outState.putBoolean(KEY_POLICY_EXPANDED, policyWriteExpanded)
-        if (policyWriteExpandedGeneration != null) outState.putLong(KEY_POLICY_EXPANDED_GEN, policyWriteExpandedGeneration!!)
-        // Stage J4：RECONCILING 期本地抑制世代保留（同世代旋轉保留；跨世代/終態
-        // 清除見 syncPolicyWriteDialog：pending 清除、世代不匹配不抑制、非 RECONCILING 清除）。
-        if (policyWriteDismissedForReconcilingGen != null) outState.putLong(KEY_POLICY_WRITE_DISMISSED_GEN, policyWriteDismissedForReconcilingGen!!)
+        // Stage2：政策寫入確認 consent 為 session-scoped，永不寫入 Bundle
+        // (ack 不存；見 PolicyConfirmDialogState 檔頭)；兩屏統一走 holder
+        // saveToBundle (expanded/dismissed 世代保留；shown 不存；舊手寫 KEY 已刪).
+        try {
+            policyConfirmState.saveToBundle(outState)
+        } catch (_: Exception) {
+            // Best effort.
+        }
     }
 
     override fun onDestroy() {
@@ -616,8 +630,9 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         policyWriteDialog = null
-        shownPolicyWrite = null
-        shownPolicyWriteSaving = false
+        // Phase D：onDestroy 經 holder 結清 (shown/ack/expanded/dismissed；VM fence
+        // 不受影響；與 Editor 同源).
+        policyConfirmState.onPendingCleared()
         try {
             exportDialog?.dismiss()
         } catch (_: Exception) {
@@ -630,6 +645,18 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         settingsDialog = null
+        // PR #74 R2 N05：終止 BBC 開關係統的單一 consumer，避免它在 Activity
+        // 銷毀後仍回呼 onRestored/onFailed（舊 CheckBox / Toast 已無效）。
+        bbcToggleController?.dispose()
+        bbcToggleController = null
+        // PR-74 A3：破壞性路徑的三個對話框 handle 逐一 best-effort dismiss + null
+        // （單一 handle 失敗不阻斷後續；dismissDialogHandle 為 JVM 可測純函式）。
+        destructiveDialogHandles.preClearWarning =
+            dismissDialogHandle(destructiveDialogHandles.preClearWarning) { it.dismiss() }
+        destructiveDialogHandles.rootConfirm =
+            dismissDialogHandle(destructiveDialogHandles.rootConfirm) { it.dismiss() }
+        destructiveDialogHandles.uninstallVerify =
+            dismissDialogHandle(destructiveDialogHandles.uninstallVerify) { it.dismiss() }
         try {
             catalogJob?.cancel()
         } catch (_: Exception) {
@@ -1014,7 +1041,14 @@ class MainActivity : ComponentActivity() {
             textSize = 12f
             minimumHeight = dp(48)
             contentDescription = getString(R.string.write_policy_cd)
-            setOnClickListener { vm.requestPolicyWrite() }
+            // Phase C：寫入前先算 old-minus-candidate delta，對 installed user95 彈警告；
+            // R03：proceed 攜「綁定＋警告前凍結候選」進 VM，寫入凍結集合而非
+            // 從當下勾選重導；候選漂移／綁定失配皆作廢。
+            setOnClickListener {
+                requestPreWriteWarning(
+                    proceed = { binding, frozen -> vm.requestPolicyWriteForWarning(frozen, binding) },
+                )
+            }
         }
         clearPolicyBtn = Button(this).apply {
             text = getString(R.string.action_clear_policy_draft)
@@ -1023,11 +1057,18 @@ class MainActivity : ComponentActivity() {
             textSize = 12f
             minimumHeight = dp(48)
             contentDescription = getString(R.string.clear_policy_draft_cd)
-            // Stage L4 fix(a) 統一入口：按鈕僅為 thin wrapper，直調 VM
+            // Stage L4 fix(a) 統一入口：按鈕僅為 thin wrapper；先經 issue #73
+            // 雙開提醒攔截（user-95 探測＋警告對話框），通過後才直調 VM
             // onClearPolicyButtonTap（single source；路由謂詞與 TTL/世代雙檢皆在
             // VM 內經 clearPolicyButtonRoute(known,corrupt,armed) 判定，純函數僅作
             // VM 內部決策 helper／JVM 可測，不在此重複分發，避免雙路由器漂移）。
-            setOnClickListener { vm.onClearPolicyButtonTap() }
+            // Phase C：清除候選為空集，delta=old 全量；proceed 攜綁定進 VM
+            // （第二參數為凍結候選，clear 路徑固定空集，VM 清除入口忽略它）。
+            setOnClickListener {
+                requestPreClearWarning(
+                    proceed = { binding, _ -> vm.onClearPolicyButtonTap(binding) },
+                )
+            }
         }
         // Phase 2：手動重新整理草稿（唯讀，不觸發寫入；Unknown 時計數行保留
         // 未知提示，不改 dialog 主流程）。
@@ -1686,6 +1727,28 @@ class MainActivity : ComponentActivity() {
             addView(refreshPolicyBtn, rowParams())
         }
         techCard.addView(policyRow)
+        // BBC 注入政策（Dual Messenger 可用應用程式清單）編輯入口：右側
+        // outlined 按鈕，啟動 PolicyActivity（Not exported；寫入仍走 VM
+        // pending → 確認對話框 → confirmPolicyWrite 流程，見 DualViewModel）。
+        val editPolicyRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = dp(6)
+            }
+        }
+        val editPolicyBtn = Button(this).apply {
+            text = getString(R.string.action_edit_policy)
+            background = getDrawable(R.drawable.bg_pill_button_secondary)
+            setTextColor(getColor(R.color.oneui_text_primary))
+            textSize = 12f
+            minimumHeight = dp(48)
+            val hp = dp(14)
+            setPadding(hp, 0, hp, 0)
+            setOnClickListener { startActivity(Intent(this@MainActivity, PolicyActivity::class.java)) }
+        }
+        editPolicyRow.addView(editPolicyBtn)
+        techCard.addView(editPolicyRow)
         tabEngineLayout.addView(techCard)
 
         // Engine Action Buttons
@@ -2296,6 +2359,77 @@ class MainActivity : ComponentActivity() {
             label
         }
 
+    // PR #74 G1: the store handed to DualViewModel is created inline in
+    // DualViewModelFactory (no Activity-side field). A fresh binding over the
+    // SAME provider/group is equivalent — libxposed caches one SharedPreferences
+    // instance per group — and leaves the VM/policy write path untouched.
+    private fun bbcPolicyStore(): HookPolicyStore =
+        remoteHookPolicyStore { GalaxyApp.remotePreferences(PolicySource.POLICY_PREFS_NAME) }
+
+    // PR #74 G1: BBC injection opt-out UI. Programmatic views (same pattern as
+    // the rest of this Activity, no new layout resource). The summary states
+    // honestly that this may need a hook-process restart or a reboot and is NOT
+    // a guard against Samsung's cold-start deletion (issue #75).
+    private fun buildBbcInjectionToggle(): View {
+        // A fresh dialog rebuild replaces (and disposes) the previous actor.
+        bbcToggleController?.dispose()
+        val toggle = CheckBox(this).apply {
+            text = getString(R.string.settings_bbc_injection_label)
+            // Read at dialog open; best-effort (store defaults true on any failure).
+            isChecked = bbcPolicyStore().isBbcInjectionEnabled()
+            minimumHeight = dp(48)
+            setCompoundDrawablePadding(dp(8))
+        }
+        val initialChecked = toggle.isChecked
+        val summary = TextView(this).apply {
+            text = getString(R.string.settings_bbc_injection_summary)
+        }
+        // PR #74 R2 N05：單一 actor 接管 lastGood 與 generation；連點不再各起
+        // 一條 IO coroutine。restoring 守衛仍必要：controller 的 onRestored 會在
+        // Main 設定 isChecked，不可再觸發一次 onToggle。
+        var restoring = false
+        bbcToggleController = BbcInjectionToggleController(
+            scope = lifecycleScope,
+            store = { enabled ->
+                withContext(Dispatchers.IO) {
+                    bbcPolicyStore().setBbcInjectionEnabled(enabled)
+                }
+            },
+            initialValue = initialChecked,
+            onRestored = { lastGood ->
+                restoring = true
+                toggle.isChecked = lastGood
+                restoring = false
+            },
+            onFailed = {
+                if (!isFinishing && !isDestroyed) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        R.string.settings_bbc_injection_write_failed,
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            },
+        )
+        toggle.setOnCheckedChangeListener { _, checked ->
+            if (restoring) return@setOnCheckedChangeListener
+            bbcToggleController?.onToggle(checked)
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val side = dp(20)
+            setPadding(side, dp(8), side, dp(4))
+            addView(toggle, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+            addView(summary, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }
+    }
+
     private fun showSettingsDialog() {
         // Phase B B3：比照 syncRemoveDialog 的 isFinishing/isDestroyed 守衛，
         // 避免後台/銷毀時 show() 拋 WindowManager.BadTokenException。
@@ -2332,6 +2466,9 @@ class MainActivity : ComponentActivity() {
                 .setNegativeButton(getString(R.string.action_export_diagnosis)) { _, _ ->
                     showDiagnosticExport()
                 }
+                // PR #74 G1: runtime BBC injection opt-out (default on). The
+                // about message above stays unchanged; the toggle is appended.
+                .setView(buildBbcInjectionToggle())
                 .show()
         } catch (e: Exception) {
             Log.w(TAG, "showSettingsDialog failed", e)
@@ -3004,8 +3141,10 @@ class MainActivity : ComponentActivity() {
             // Best effort: the state render must never depend on Shizuku.
         }
         // Phase B B1：寫入門控單一來源（busy 時 null＝不可寫語意由 enabled 式承載）。
+        // R03：probe／警告對話框在途（pendingClearConfirm）時亦視為 busy，
+        // 勾選／選取控制項全數凍結，避免已警告候選與實際寫入集合漂移。
         // renderClonedApps 的移除鈕與稍後按鈕/dialog 共用此 blockKey，不重算。
-        val busy = s.loading
+        val busy = s.loading || pendingClearConfirm
         // 保留 BlockReason 原鍵以計算穩定去重鍵（writeBlockDedupKey）；
         // 可見文字為完整 blockReason（含時間）：顯示比完整文字，播報比去重鍵。
         val blockKey = if (busy) null else writeBlockReason(s)
@@ -3457,10 +3596,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
             if (::writePolicyBtn.isInitialized) {
-                writePolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE
+                // R03：probe／警告對話框在途時連入口也鎖住（除了 phaseIsIdle）。
+                writePolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE && !pendingClearConfirm
             }
             if (::clearPolicyBtn.isInitialized) {
-                clearPolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE
+                clearPolicyBtn.isEnabled = s.policyWritePhase == PolicyWritePhase.IDLE && !pendingClearConfirm
                 // Stage L4 fix(a) 修復模式標籤：Corrupt 下重貼 repair 文案＋CD，
                 // 使 TalkBack 可感知「修復（兩步確認）」而非「清除」；msg 播報仍走
                 // VM 的 CORRUPT_DETECTED / REPAIR_FIRST 資源文案。非 Corrupt 回原
@@ -4209,7 +4349,8 @@ class MainActivity : ComponentActivity() {
         }
         // Stage J4：confirm 門控沿用舊 policySaving 語義（SAVING||RECONCILING 即禁確認）；
         // cancelable 拆分（SAVING 不可取消，RECONCILING 可取消僅 dismiss）。
-        val confirmSaving = policySaving || policyReconciling
+        // Phase D single source：confirmSaving 一律經 policyConfirmSaving 映射.
+        val confirmSaving = policyConfirmSaving(policySaving, policyReconciling)
         // Nit：直接以 (policySaving, policyReconciling) 調雙參真相
         // (!saving || reconciling)；舊 savingOnly 中介與此等價（真值表一致），故省去。
         val cancelable = policyDialogShouldBeCancelable(policySaving, policyReconciling)
@@ -4436,9 +4577,10 @@ class MainActivity : ComponentActivity() {
             // RECONCILING 才禁用（QUEUED 可確認，避免 request 即 QUEUED 導致恆
             // 禁用死鎖；核對中請勿重試）；世代守衛在 VM。
             // Stage L4: 點擊亦經可檢視上界（display≡inspectability，超限禁寫）。
+            // Phase D single source：live phase→confirmSaving 經 policyConfirmSaving.
             val curPolicySaving = try {
                 val ph = vm.state.value.policyWritePhase
-                ph == PolicyWritePhase.SAVING || ph == PolicyWritePhase.RECONCILING
+                policyConfirmSaving(ph == PolicyWritePhase.SAVING, ph == PolicyWritePhase.RECONCILING)
             } catch (_: Exception) {
                 confirmSaving
             }
@@ -4693,7 +4835,7 @@ class MainActivity : ComponentActivity() {
                     pending.droppedCount,
                 )
             } catch (_: Exception) {
-                "已捨去 ${pending.droppedCount} 項不在來源清單的勾選" // JVM-test seam (keys exist in all 3 locales); production reads resources
+                "已捨去 ${pending.droppedCount} 項不符合寫入條件的項目（不在來源清單或格式無效）" // JVM-test seam (keys exist in all 3 locales); production reads resources
             }
             message += "\n$droppedSuffix"
         }
@@ -5133,7 +5275,8 @@ class MainActivity : ComponentActivity() {
     // 按鈕文字/勾選啟用狀態每輪都更新（busy 時勾選區不可改，見 render）。
     private fun renderSourceList(s: UiState) {
         val visible = sortSourceApps(filterSourceApps(s.sourceCatalog, s.sourceQuery, s.includeSystemApps))
-        val busy = s.loading
+        // R03：probe／警告對話框在途時勾選不可改（指紋未變分支亦每輪同步 enabled）。
+        val busy = s.loading || pendingClearConfirm
         // PR-37 Phase C #6 a11y：文字與 contentDescription 每輪隨 state 同步
         //（按鈕類型不變，最小改動；開關語義靠文案「顯示中/已隱藏＋點兩下切換」傳達）。
         systemToggleBtn.text = if (s.includeSystemApps) {
@@ -5866,6 +6009,243 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Issue #73：清除草稿前先探測 verified target 分身安裝狀態並顯示警告對話框
+    // （BBC6：清除／空政策曾於 11-18 伴隨 Samsung 自動系統刪分身，觸發機制未證實，分身資料不可復原）。
+    // Phase C：
+    // - old-minus-candidate delta：清除候選為空集，delta=old 全量；僅對 delta 探測。
+    // - Unknown stale 非空不得當授權依據：!known 一律走 cannot-determine 對話框
+    //  （probe-failed 警告），不走空 fast-path。
+    // - Activity probe 只告知不授權：VM 提交前另做權威重讀（clear pre-IO 重讀）。
+    // - proceed 攜警告綁定（rev/version/freshGen）進 VM，提交前比對失配作廢要求重探。
+    // pendingClearConfirm：probe／警告對話框期間忽略再次點擊，避免重複彈窗
+    // （警告對話框本身為 modal；此旗標覆蓋 probe 在途窗口與對話框存活期）。
+    // 跨屏仍各私有（Main/Editor 各自持有），但警告綁修訂後作廢機制覆蓋競態。
+    private var pendingClearConfirm = false
+
+    // R03：旗標翻轉時立即重渲染，讓勾選／選取控制項在 probe 啟動前就禁用；
+    // 取消／完成／例外路徑同樣立刻恢復。render 在測試路徑（未 buildUi）可能
+    // 失敗，best-effort 不影響警告流程本身。
+    private fun setPendingClearConfirm(value: Boolean) {
+        pendingClearConfirm = value
+        try {
+            render(vm.state.value)
+        } catch (_: Exception) {
+            // Best effort.
+        }
+    }
+
+    // R03 (PR #74) Phase 2：Main proceed 的候選新鮮度防禦檢查。
+    // pendingClearConfirm（probe／對話框存活期凍結操作）是主要守衛；此檢查是
+    // defense-in-depth——在真正持有 Main live 候選處重算 writeCandidateForWarning()
+    // 並與警告時凍結的指紋比對。VM 的 isWarningBindingFresh 刻意不解指紋來源，
+    // 故不可在那裡重算（Editor 的 ticks 永遠不等於 Main 的 selectedKeys）。
+    // 失配即走 VM 單一訊息出口 emit UNKNOWN_REFRESH，回 false → 零 store 寫入。
+    private fun mainWarningCandidateFresh(binding: PolicyWarningBinding): Boolean {
+        if (isWarningCandidateFresh(binding, vm.writeCandidateForWarning())) return true
+        vm.rejectStaleWarningBinding()
+        return false
+    }
+
+    private fun requestPreClearWarning(
+        proceed: (PolicyWarningBinding, Set<String>) -> Unit,
+        onCancel: () -> Unit = {},
+    ) {
+        // Phase C：快照 old＋Known＋綁定（單一來源，避免 TOCTOU 借用）。
+        val snap: PolicyWarningSnapshot = try {
+            vm.snapshotPolicyForWarning()
+        } catch (_: Exception) {
+            PolicyWarningSnapshot(emptySet(), false, false, PolicyWarningBinding(-1L, -1L, -1L))
+        }
+        // R03：清除路徑沒有候選漂移問題（候選固定空集），只把 warnedOld 凍結
+        // 進綁定供 VM 使用；candidateFingerprint 保持 null（無候選檢查）。
+        val warnedBinding = snap.binding.withWarning(snap.draft, null)
+        // Phase C：Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
+        // stale 非空不得當授權依據；即使 stale 為空亦不可信（重讀前不得放行）。
+        if (!snap.known) {
+            if (pendingClearConfirm) return
+            setPendingClearConfirm(true)
+            showPreClearProbeFailedWarning(
+                this@MainActivity,
+                onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
+                onCancel = { setPendingClearConfirm(false); onCancel() },
+            )
+            return
+        }
+        val old = snap.draft
+        // Known 空草稿：無刪可警，直接進 VM（VM 仍掌握 blind-clear 語義）。
+        if (old.isEmpty()) {
+            proceed(warnedBinding, emptySet())
+            return
+        }
+        // Phase C：清除 delta=old 全量（候選空集）。
+        val delta = policyRemovalDelta(old, emptySet())
+        if (delta.isEmpty()) {
+            proceed(warnedBinding, emptySet())
+            return
+        }
+        if (pendingClearConfirm) return
+        setPendingClearConfirm(true)
+        lifecycleScope.launch {
+            // Phase B：probe 回傳 DualProbeResult（Ok/Failed），不再以空清單吞失敗。
+            // 僅 Ok(empty) 直接放行；Ok(non-empty) 走雙開提醒；Failed 一律走
+            // 探測失敗警告（此前 probeFailed 僅 exception 才置位，exit/stderr/
+            // Failure/截斷皆靜默當空，失敗警告為死碼；現皆歸 Failed 使其變活）。
+            // Phase C：僅探 delta（old-minus-candidate），非全量 old。
+            // R05/NEW-1：uid 必須來自 verified target；unverified => Failed 警告。
+            val verifiedTarget = resolvePreClearDualTarget(vm.state.value)
+            val probe = try {
+                probeDualApps(delta, verifiedTarget?.userId)
+            } catch (e: CancellationException) {
+                setPendingClearConfirm(false)
+                throw e
+            } catch (e: Exception) {
+                preClearLog("pre-clear dual-profile probe failed", e)
+                DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
+            }
+            if (isFinishing || isDestroyed) {
+                setPendingClearConfirm(false)
+                return@launch
+            }
+            when (probe) {
+                is DualProbeResult.Failed -> {
+                    showPreClearProbeFailedWarning(
+                        this@MainActivity,
+                        onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
+                    )
+                    return@launch
+                }
+                is DualProbeResult.Ok -> {
+                    if (!shouldWarnForDelta(probe.installed)) {
+                        setPendingClearConfirm(false)
+                        proceed(warnedBinding, emptySet())
+                        return@launch
+                    }
+                    showPreClearWarning(
+                        this@MainActivity,
+                        probe.installed,
+                        onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
+                        resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
+                        fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
+                        dialogHandles = destructiveDialogHandles,
+                        capturedTarget = verifiedTarget,
+                        capturedInstalled = probe.installed.toSet(),
+                        // R2-5 (N10)：同一 verified uid／同一 delta 的重探；身分已由
+                        // revalidatePreClearContinue 先與 live/fresh 比對過。
+                        reprobe = { probeDualApps(delta, verifiedTarget?.userId) },
+                        rootUninstallAllowed = verifiedTarget != null,
+                    )
+                }
+            }
+        }
+    }
+
+    // Phase C：Main 寫入入口 delta 警告（N→M 覆寫）。
+    // old=已保存草稿（Known 才權威），candidate=當下勾選映射；delta=old-candidate
+    // 為被移除包；僅對 delta 探測 verified target installed，installed 非空即警告。
+    // Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
+    // R03：proceed 攜「綁定＋probe 前凍結候選」進 VM（vm.requestPolicyWriteForWarning），
+    // 不再於 proceed 時重導當下勾選；候選漂移／綁定失配皆作廢要求重探。
+    private fun requestPreWriteWarning(
+        proceed: (PolicyWarningBinding, Set<String>) -> Unit,
+        onCancel: () -> Unit = {},
+    ) {
+        val snap: PolicyWarningSnapshot = try {
+            vm.snapshotPolicyForWarning()
+        } catch (_: Exception) {
+            PolicyWarningSnapshot(emptySet(), false, false, PolicyWarningBinding(-1L, -1L, -1L))
+        }
+        val old = snap.draft
+        // R03：警告前凍結候選（probe／對話框期間不得再變）。
+        val candidate: Set<String> = try {
+            vm.writeCandidateForWarning()
+        } catch (_: Exception) {
+            emptySet()
+        }
+        val warnedBinding = snap.binding.withWarning(old, candidate)
+        if (!snap.known) {
+            if (pendingClearConfirm) return
+            setPendingClearConfirm(true)
+            showPreClearProbeFailedWarning(
+                this@MainActivity,
+                onProceed = {
+                    setPendingClearConfirm(false)
+                    if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                },
+                onCancel = { setPendingClearConfirm(false); onCancel() },
+            )
+            return
+        }
+        // 空候選（空勾選／空 catalog／映射全捨）交由 VM 門控（EMPTY_SELECTION／
+        // CATALOG_LOADING／CATALOG_MISSING），此處不警告直接進 VM。
+        if (candidate.isEmpty()) {
+            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+            return
+        }
+        val delta = policyRemovalDelta(old, candidate)
+        if (delta.isEmpty()) {
+            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+            return
+        }
+        if (pendingClearConfirm) return
+        setPendingClearConfirm(true)
+        lifecycleScope.launch {
+            // R05/NEW-1：同 requestPreClearWarning，uid 來自 verified target。
+            val verifiedTarget = resolvePreClearDualTarget(vm.state.value)
+            val probe = try {
+                probeDualApps(delta, verifiedTarget?.userId)
+            } catch (e: CancellationException) {
+                setPendingClearConfirm(false)
+                throw e
+            } catch (e: Exception) {
+                preClearLog("pre-clear dual-profile probe failed", e)
+                DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
+            }
+            if (isFinishing || isDestroyed) {
+                setPendingClearConfirm(false)
+                return@launch
+            }
+            when (probe) {
+                is DualProbeResult.Failed -> {
+                    showPreClearProbeFailedWarning(
+                        this@MainActivity,
+                        onProceed = {
+                            setPendingClearConfirm(false)
+                            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                        },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
+                    )
+                    return@launch
+                }
+                is DualProbeResult.Ok -> {
+                    if (!shouldWarnForDelta(probe.installed)) {
+                        setPendingClearConfirm(false)
+                        if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                        return@launch
+                    }
+                    showPreClearWarning(
+                        this@MainActivity,
+                        probe.installed,
+                        onProceed = {
+                            setPendingClearConfirm(false)
+                            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                        },
+                        onCancel = { setPendingClearConfirm(false); onCancel() },
+                        resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
+                        fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
+                        dialogHandles = destructiveDialogHandles,
+                        capturedTarget = verifiedTarget,
+                        capturedInstalled = probe.installed.toSet(),
+                        // R2-5 (N10)：同 requestPreClearWarning，重探同一 delta。
+                        reprobe = { probeDualApps(delta, verifiedTarget?.userId) },
+                        rootUninstallAllowed = verifiedTarget != null,
+                    )
+                }
+            }
+        }
+    }
+
     companion object {
         // Test seam: allow instrumentation to inject a fake-backed ViewModel
         // (zero device writes) without changing production defaults. Null in
@@ -5902,13 +6282,9 @@ class MainActivity : ComponentActivity() {
         private const val KEY_BATCH_REQ_WAS_FRESH = "batchReqWasFresh"
         private const val KEY_BATCH_ACK = "batchAck"
         private const val KEY_BATCH_ACK_GEN = "batchAckGen"
-        // Stage2：政策寫入確認勾選綁定世代 → 不再經 Bundle 持久化（consent 為
-        // session-scoped；舊 key policyAck/policyAckGen 已廢棄）。
-        // Stage B P2：完整清單展開開關（同世代旋轉保留，跨世代重置）。
-        private const val KEY_POLICY_EXPANDED = "policyExpanded"
-        private const val KEY_POLICY_EXPANDED_GEN = "policyExpandedGen"
-        // Stage J4：RECONCILING 期本地抑制世代（同世代旋轉保留，跨世代/終態清除見 sync）。
-        private const val KEY_POLICY_WRITE_DISMISSED_GEN = "policyWriteDismissedGen"
+        // Stage2/Phase D：政策寫入確認改走 PolicyConfirmDialogState holder
+        // saveToBundle/restoreFromBundle (兩屏 Bundle 格式統一；ack 不存、shown 不還原、
+        // session-scoped 見 holder 檔頭；舊手寫 policyExpanded*/policyWriteDismissedGen 已刪).
         // PR-7 P2 (#26):單次渲染列數上限 (效能護欄,超出請用搜尋縮小範圍)。
         private const val MAX_SOURCE_ROWS = 200
 
@@ -6074,6 +6450,62 @@ internal fun shouldShowBlankInputReason(isBlank: Boolean, busy: Boolean, writeBl
 // UI 層即時門控（fail-closed 對齊，不取代 VM 守衛）。
 internal fun verifiedTargetAvailable(s: UiState): Boolean =
     s.inventory.targetId > 0 && s.inventory.targetSerial != null
+
+// PR-74 A2：pre-clear 破壞性路徑捕獲的目標身份＝(id, serial) 配對（不可變值）。
+// 只帶 app 側需要的兩欄（對應 core.VerifiedTarget 的 userId/serial），避免破壞性
+// 路徑的公開簽名依賴 core 的完整 target；serial 可空是因 legacy/SerialUnavailable
+// 快照存在，但 resolvePreClearDualTarget 永不產出 serial=null 的捕獲值。
+internal data class PreClearDualTarget(val userId: Int, val serial: Int?)
+
+// R05/NEW-1 / Phase1 review(HIGH) / PR-74 A2：pre-clear 破壞性路徑（probe／uninstall／
+// ROOT 代關按鈕）唯一的身份來源，現在回傳 (id, serial) 而非裸 id。
+//
+// 授權不變數（invariant）：只有「新鮮且已驗證」的 target 才授權破壞性動作——
+// targetId>0、targetSerial 已知，且 inventory.freshness == FRESH。STALE／UNKNOWN
+// 明確保留 targetId/targetSerial（見 InventorySnapshot），若只看 id/serial 仍會在
+// profile remap（95→96）後拿到陳舊 id 而誤授權 pm uninstall／probe 到錯誤 profile，
+// 故一律回 null = fail-closed。
+//
+// PR-74 A2 (P2)：id 單獨不足以辨識 profile 實例——delete+recreate 可重用同一 id
+// 但換發新 serial；因此捕獲值必須帶 serial，且點擊當下要再比較 serial（見
+// preClearTargetStillValid）並做新鮮 verified-target fetch（見
+// rootUninstallIfTargetStillValid），對齊 core.continuityBreach 的 fail-closed 語意。
+// 字面 95 只是 device hypothesis（profile 可被 remap），永不授權破壞性動作。
+internal fun resolvePreClearDualTarget(s: UiState): PreClearDualTarget? =
+    if (verifiedTargetAvailable(s) && s.inventory.freshness == InventoryFreshness.FRESH) {
+        PreClearDualTarget(s.inventory.targetId, s.inventory.targetSerial)
+    } else {
+        null
+    }
+
+// 既有 int-only 呼叫端/測試的薄別名（只取 id）；ROOT 代關 uninstall 嚴禁只靠它
+// 授權——必須走 resolvePreClearDualTarget + preClearTargetStillValid（serial 綁定）。
+internal fun resolvePreClearDualUserId(s: UiState): Int? = resolvePreClearDualTarget(s)?.userId
+
+// PR-74 A2 (P2)：serial-bound TOCTOU fence（純函數、JVM 可測）。
+// captured=警告顯示時捕獲的 (id,serial)；live=點擊瞬間從 vm.state.value 重解析的
+// (id,serial)（或新鮮 fetch 的 (id,serial)，見 rootUninstallIfTargetStillValid）。
+// 放行條件：兩者皆非 null、id>0、serial 非 null，且 id 與 serial 皆相等。
+// 同 id 換 serial（delete+recreate）、known serial→null（continuity lost）、
+// remap 95→96、任一 null/<=0 一律 false，對齊 core.continuityBreach。
+internal fun preClearTargetStillValid(
+    captured: PreClearDualTarget?,
+    live: PreClearDualTarget?,
+): Boolean =
+    captured != null && live != null &&
+        captured.userId > 0 && live.userId > 0 &&
+        captured.serial != null && live.serial != null &&
+        captured.userId == live.userId && captured.serial == live.serial
+
+// 舊 int-only fence：保留供既有測試（95/96 remap）與非破壞性推導使用；
+// 破壞性 ROOT 路徑不得只靠它授權（無 serial 綁定，無法攔截同 id 重建）。
+internal fun preClearUidStillValid(captured: Int?, live: Int?): Boolean =
+    captured != null && live != null && captured > 0 && live > 0 && captured == live
+
+// showPreClearWarning 的 ROOT 代關 Neutral 顯示條件（純函數、JVM 可測）：
+// 只有 resolved verified id（>0）才准顯示；null/<=0 一律 false。
+internal fun preClearRootUninstallAllowed(userId: Int?): Boolean =
+    userId != null && userId > 0
 
 // P2-2 clone/remove enablement（純函數，JVM 可測；render + TextWatcher 共用）。
 // 三條件：非 busy、可寫（writeBlockReason == null）、手動輸入可用。
@@ -6661,6 +7093,12 @@ internal fun policyDialogShouldBeCancelable(policySaving: Boolean): Boolean = !p
 internal fun policyDialogShouldBeCancelable(saving: Boolean, reconciling: Boolean): Boolean =
     !saving || reconciling
 
+// Phase D confirm-saving 映射 single source：SAVING || RECONCILING 即禁確認
+// (QUEUED 才可確認). Main / Editor 兩屏 sync / showConfirmDialog 一律經此，
+// 真值表 (F,F)->F、(T,F)->T、(F,T)->T、(T,T)->T 由 JVM 鎖定.
+internal fun policyConfirmSaving(saving: Boolean, reconciling: Boolean): Boolean =
+    saving || reconciling
+
 internal fun policyAckShouldReset(storedGeneration: Long?, pendingGeneration: Long): Boolean =
     storedGeneration != pendingGeneration
 
@@ -6845,7 +7283,10 @@ internal fun userIdFromUid(uid: Int): Int = if (uid < 0) -1 else uid / 100_000
 // remains a NoOp placeholder.
 // DEVICE-UNVERIFIED: marker read + LSPosed placeholder behavior never ran
 // on a device (staleness/SELinux limits documented in HookMarker).
-private class DualViewModelFactory(
+// internal (was file-private): PolicyActivity acquires the same factory so its
+// ViewModel wiring is identical to MainActivity's (same dual_policy store,
+// same owner-user gates, same policyText/plural resource resolution).
+internal class DualViewModelFactory(
     private val appContext: Context,
     private val appPackageName: String,
 ) : ViewModelProvider.Factory {
@@ -7023,5 +7464,832 @@ private class DualViewModelFactory(
             } catch (_: Exception) {
                 false
             }
+    }
+}
+
+// ===== Issue #73：清除政策前雙開提醒（BBC6；verified-user 分身探測／ROOT 代關）=====
+// MainActivity「清除草稿」與 PolicyActivity「寫入政策草稿（清空）」兩處共用的
+// 實作（頂層 internal；spec 原稿為 private 成員＋PolicyActivity 端重複實作，但
+// STRICT 範圍禁止新檔案、且重複兩份探測／對話框邏輯易漂移，故收斂為單份共用）。
+//
+// 盡力而為語義（Phase B 修訂）：探測以 DualProbeResult 回傳，不再以空清單
+// 吞失敗。exit!=0／stderr 非空／Failure 行／截斷（truncated 旗標、
+// [truncated] 標記、輸入超上限箝制）／gateway 拋例外皆歸 Failed，呼叫端
+// 一律走探測失敗警告（fail-closed，不靜默放行）；僅 Ok(empty) 直接放行，
+// Ok(non-empty) 走雙開提醒。卸載失敗仍只記 log 並 proceed（使用者意圖優先，
+// BBC6 風險由警告文案與「二次確認」承載，不由靜默攔截承載）。
+//
+// R02：shell probe 不再以 pm path 的 ROM 特定錯誤文字判定「未安裝」。改以
+// 單一 `pm list packages --user <uid>` 的 stdout 作為 deterministic source of
+// truth：先抓 rc 成 PROBE_RC=<n>，再對每個 requested pkg 輸出三選一 marker
+// INST/CLEAN/FAIL。任何 FAIL、marker 缺失、PROBE_RC!=0、gateway 失敗訊號皆
+// Failed；Ok(empty) 僅在每個 requested pkg 都有 CLEAN marker 時成立。
+//
+// R05/NEW-1：uid 由 verified target pipeline 顯式傳入（resolvePreClearDualUserId），
+// 不再硬編碼 95；unverified => probe Failed / uninstall 不執行 / ROOT 按鈕不顯示。
+//
+// F4：所有進入 shell 的包名 token 改用 PolicySource.isValidShellPackage（嚴格
+// Android grammar），不再用 equality-only 的 isValidPackage。
+//
+// shell 備註：pkg tokens 全部來自 caller 端已驗證的包名集合；以空格 join 後
+// 直接內插進 for 清單是安全的；整個指令字串作為單一 su -c 參數傳入（argv form，
+// 不經第二層 shell 引捨／Runtime.exec）。uid 為 Int，內插至 --user 亦安全。
+// 512 == PolicySource.MAX_POLICY_ENTRIES; raising from 200 so every legitimate
+// draft fits argv limits (512 × ~40 B ≈ 20 KB) and disclosure stays complete.
+internal const val MAX_DUAL_PROBE_PKGS = 512
+
+// 警告對話框中套件清單的顯示上限（超出以省略號標示截斷；不截斷 ROOT 代關對象）。
+internal const val PRE_CLEAR_LIST_MAX = 20
+private const val PRE_CLEAR_TAG = "PreClear"
+
+// R02 markers: one explicit, unambiguous outcome per requested package.
+internal const val DUAL_PROBE_INST = "INST"
+internal const val DUAL_PROBE_CLEAN = "CLEAN"
+internal const val DUAL_PROBE_FAIL = "FAIL"
+internal const val DUAL_PROBE_RC = "PROBE_RC"
+
+private fun shellProbePkgs(pkgs: List<String>): List<String> =
+    pkgs.map { it.trim() }.filter { it.isNotEmpty() }
+        .filter { PolicySource.isValidShellPackage(it) }
+        .distinct().sorted().take(MAX_DUAL_PROBE_PKGS)
+
+// uid 為 verified dual id（>0），由 caller 顯式傳入，永不硬編碼 95。
+internal fun buildDualProbeCommand(pkgs: List<String>, userId: Int): String {
+    val capped = shellProbePkgs(pkgs)
+    // `pm list packages --user <uid>` 是 deterministic truth source（僅在 rc==0
+    // 時採信其 package: 行）；不視 ROM 特定 error text 為判斷依據。
+    // 每個 requested pkg 恰 emit 一個 marker；rc!=0 => FAIL（不因 stdout 含
+    // package: 行而誤判 installed，fake pm exit 1 + package: 行必須 Failed）。
+    // _BAD: ROM 可能把 error text 寫進 stdout 且仍 exit 0；任何非 package: 行
+    // 都視為不可信輸出（全數 FAIL），不因「找不到 package:<pkg>」而假裝 CLEAN。
+    // Phase1 review(MEDIUM)：ROM/pty 可能在每行尾補 \r（CRLF）；先將整段輸出
+    // 正規化為 _PN（strip CR），_BAD 檢查與 grep 比對一律用 _PN，避免
+    // "package:com.a.app\r" 通過 _BAD 卻讓精確 grep 落空而誤判 CLEAN（fail-open）。
+    // 同樣地，_BAD 用 `for _l in $_PN` 做 word-split（去掉行前/後空白/tab），故 INST
+    // 比對也必須消耗【同一份 word-split token 集】：保留原本對正規化副本的精確
+    // grep，另加一個未引號 $_PN 展開的 grep（與 _BAD 相同的 token 集），讓
+    // "package:com.a.app " 這類周圍帶空白的行亦被 token 化為精確的
+    // package:com.a.app，避免「_BAD 通過但精確 grep 落空」而對已安裝雙開誤發
+    // CLEAN（fail-open）。兩者皆為正面比對（任一命中即 INST），不引入 fail-open。
+    // A1 (PR #74 review): allowlist — only `package:` + [A-Za-z0-9_.]+ is trusted.
+    // Empty payloads or any other char (e.g. canonical -f form
+    // package:/data/app/.../base.apk=com.a.app, or a :uid suffix) pass a mere
+    // prefix check but miss the exact grep -> false CLEAN -> silent clear
+    // (fail-open). Reject them via _BAD so the existing FAIL path is taken.
+    // A1 (PR #74 review): 白名單——僅 `package:` + [A-Za-z0-9_.]+ 視為可信。
+    // 空 payload 或含其他字元（如 -f 形式
+    // package:/data/app/.../base.apk=com.a.app、:uid 後綴）雖過前綴檢查，
+    // 精確 grep 落空 → 誤判 CLEAN → 靜默清除（fail-open）。故設 _BAD 走 FAIL。
+    return "_PL=\$(pm list packages --user $userId); _RC=\$?; " +
+        "_PN=\$(printf '%s\\n' \"\$_PL\" | tr -d '\\r'); " +
+        "_BAD=0; for _l in \$_PN; do case \"\$_l\" in package:|package:*[!A-Za-z0-9_.]*) _BAD=1;; package:*) ;; *) _BAD=1;; esac; done; " +
+        "echo \"$DUAL_PROBE_RC=\$_RC\"; " +
+        "for pkg in ${capped.joinToString(" ")}; do " +
+        "if [ \$_RC -ne 0 ] || [ \$_BAD -ne 0 ]; then echo \"$DUAL_PROBE_FAIL \$pkg\"; " +
+        "elif printf '%s\\n' \"\$_PN\" | grep -Fxq \"package:\$pkg\" || " +
+        "printf '%s\\n' \$_PN | grep -Fxq \"package:\$pkg\"; then echo \"$DUAL_PROBE_INST \$pkg\"; " +
+        "else echo \"$DUAL_PROBE_CLEAN \$pkg\"; fi; done"
+}
+
+// R02 parser：回傳完整 marker 集合（ LinkedHashSet 保留首次出現順序）。
+internal data class DualProbeMarkers(
+    val installed: Set<String>,
+    val clean: Set<String>,
+    val failed: Set<String>,
+    val probeRc: Int?,
+) {
+    val allMarked: Set<String> get() = installed + clean + failed
+}
+
+internal fun parseDualProbeMarkers(out: String): DualProbeMarkers {
+    val inst = LinkedHashSet<String>()
+    val clean = LinkedHashSet<String>()
+    val failed = LinkedHashSet<String>()
+    var rc: Int? = null
+    out.lineSequence().map { it.trim() }.forEach { line ->
+        when {
+            line.startsWith("$DUAL_PROBE_RC=") -> {
+                rc = line.removePrefix("$DUAL_PROBE_RC=").trim().toIntOrNull()
+            }
+            line.startsWith("$DUAL_PROBE_INST ") ->
+                line.removePrefix("$DUAL_PROBE_INST ").trim().takeIf { it.isNotEmpty() }?.let(inst::add)
+            line.startsWith("$DUAL_PROBE_CLEAN ") ->
+                line.removePrefix("$DUAL_PROBE_CLEAN ").trim().takeIf { it.isNotEmpty() }?.let(clean::add)
+            line.startsWith("$DUAL_PROBE_FAIL ") ->
+                line.removePrefix("$DUAL_PROBE_FAIL ").trim().takeIf { it.isNotEmpty() }?.let(failed::add)
+        }
+    }
+    return DualProbeMarkers(inst, clean, failed, rc)
+}
+
+// 向後相容的 pure seam：只解 INST 行（順序去重），新的完整判定見 decideDualProbeResult。
+internal fun parseDualProbeOutput(out: String): List<String> =
+    out.lineSequence()
+        .map { it.trim() }
+        .filter { it.startsWith("$DUAL_PROBE_INST ") }
+        .map { it.removePrefix("$DUAL_PROBE_INST ").trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .toList()
+
+internal fun buildDualUninstallCommand(pkgs: List<String>, userId: Int): String {
+    val capped = shellProbePkgs(pkgs)
+    return "for pkg in ${capped.joinToString(" ")}; do pm uninstall --user $userId \"\$pkg\"; done"
+}
+
+// Phase B（P1 #2）：探測結果以 Ok/Failed 明確區分，不再以空清單吞失敗。
+// Ok(installed)：探測成功完成，installed 為已安裝分身（可為空）；
+// Failed(reason)：探測不可信，reason 為穩定短字串（有界 take(200)），呼叫端
+// 一律走探測失敗警告。JVM 可測（seam 注入 gateway；純判定另見 decideDualProbeResult）。
+internal sealed interface DualProbeResult {
+    data class Ok(val installed: List<String>) : DualProbeResult
+    data class Failed(val reason: String) : DualProbeResult
+}
+
+// 純判定（JVM 可測，無 Android 依賴）：CmdResult → DualProbeResult。
+// fail-closed 口徑：timedOut／transportUnknown／truncated 旗標、
+// [truncated] 標記、exit!=0、stderr 非空、Failure 行任一命中即 Failed；
+// PROBE_RC!=0 或任何 FAIL marker 亦 Failed。R02：Ok(empty) 僅在每個 requested
+// pkg 都有 CLEAN marker 時成立；缺任何 marker 一律 Failed。
+// requested 省略時保留舊 pure-seam 行為（只解 INST 行），供既有純判定測試使用。
+internal fun decideDualProbeResult(
+    result: CmdResult,
+    requested: Set<String> = emptySet(),
+): DualProbeResult {
+    if (result.timedOut) {
+        val detail = result.err.ifBlank { "unknown" }.take(200)
+        return DualProbeResult.Failed("timeout: $detail")
+    }
+    if (result.transportUnknown) {
+        return DualProbeResult.Failed("transport-unknown: ${result.err.take(200)}")
+    }
+    if (result.truncated ||
+        result.out.contains(CORE_TRUNCATION_MARKER) ||
+        result.err.contains(CORE_TRUNCATION_MARKER)
+    ) {
+        return DualProbeResult.Failed("truncated: output capped")
+    }
+    if (result.exit != 0) {
+        return DualProbeResult.Failed("exit=${result.exit} err=${result.err.take(200)}")
+    }
+    if (result.err.isNotBlank()) {
+        return DualProbeResult.Failed("stderr: ${result.err.take(200)}")
+    }
+    val failureLine = result.out.lineSequence().firstOrNull {
+        val line = it.trim()
+        line.startsWith("Failure", ignoreCase = true) ||
+            line.startsWith("DELETE_FAILED", ignoreCase = true)
+    }
+    if (failureLine != null) {
+        return DualProbeResult.Failed("failure-line: ${failureLine.trim().take(200)}")
+    }
+    val markers = parseDualProbeMarkers(result.out)
+    if (markers.probeRc != null && markers.probeRc != 0) {
+        return DualProbeResult.Failed("probe-rc: ${markers.probeRc}")
+    }
+    // Phase1 review(P2)：有 requested 集合時 PROBE_RC 為必要證據——缺行代表指令
+    // 未如預期執行（例如 gateway 吞掉 echo），即便所有 marker 齊全也不得 Ok。
+    if (requested.isNotEmpty() && markers.probeRc == null) {
+        return DualProbeResult.Failed("probe-rc: missing")
+    }
+    if (markers.failed.isNotEmpty()) {
+        return DualProbeResult.Failed("probe-failed: ${markers.failed.take(3).joinToString(",")}")
+    }
+    if (requested.isEmpty()) {
+        // Legacy pure seam: no requested set to cross-check.
+        return DualProbeResult.Ok(parseDualProbeOutput(result.out))
+    }
+    // R02：每個 requested pkg 必須恰有一個 marker；缺 marker / 矛盾 marker == FAIL。
+    val ambiguous = requested.filter { pkg ->
+        (if (pkg in markers.installed) 1 else 0) +
+            (if (pkg in markers.clean) 1 else 0) +
+            (if (pkg in markers.failed) 1 else 0) > 1
+    }
+    if (ambiguous.isNotEmpty()) {
+        return DualProbeResult.Failed("ambiguous-marker: ${ambiguous.take(3).joinToString(",")}")
+    }
+    val unmarked = requested - markers.allMarked
+    if (unmarked.isNotEmpty()) {
+        return DualProbeResult.Failed("missing-marker: ${unmarked.take(3).joinToString(",")}")
+    }
+    // F4 cross-check：INST 必須是 requested 的子集，且通過嚴格 shell grammar；
+    // 注入的 INST evil.pkg 直接丟棄，不得進入 installed。
+    val installed = markers.installed.toList()
+        .filter { it in requested && PolicySource.isValidShellPackage(it) }
+    if (installed.isEmpty() && !markers.clean.containsAll(requested)) {
+        return DualProbeResult.Failed("probe-incomplete: no CLEAN for ${requested.take(3).joinToString(",")}")
+    }
+    return DualProbeResult.Ok(installed)
+}
+
+// R05/NEW-1：uid 為 verified target id（resolvePreClearDualUserId 的結果）。
+// null = target unverified => fail-closed Failed，且不呼叫 gateway。
+internal suspend fun probeDualApps(
+    pkgs: Collection<String>,
+    userId: Int?,
+    gateway: CmdGateway = SuCmdGateway(),
+): DualProbeResult {
+    if (userId == null) {
+        return DualProbeResult.Failed("target-unverified: no verified dual user id")
+    }
+    val distinct = pkgs.map { it.trim() }.filter { it.isNotEmpty() }
+        .distinct().sorted()
+    if (distinct.isEmpty()) return DualProbeResult.Ok(emptyList())
+    // Probe entry does not trust persisted/lastSynced content: re-validate
+    // strict shell grammar here before building the shell command.
+    val valid = distinct.filter { PolicySource.isValidShellPackage(it) }
+    if (valid.size != distinct.size) {
+        preClearLog("dual-profile probe dropped invalid: ${distinct.size - valid.size}")
+    }
+    if (valid.isEmpty()) {
+        return DualProbeResult.Failed("failure-line: invalid packages")
+    }
+    // 輸入超上限即截斷（buildDualProbeCommand 僅取前 N）：部分探測不可信，
+    // 直接歸 Failed（fail-closed），不呼叫 gateway。
+    if (valid.size > MAX_DUAL_PROBE_PKGS) {
+        preClearLog("dual-profile probe capped: ${valid.size} > $MAX_DUAL_PROBE_PKGS")
+        return DualProbeResult.Failed("truncated: capped ${valid.size} > $MAX_DUAL_PROBE_PKGS")
+    }
+    val cmd = buildDualProbeCommand(valid, userId)
+    val result = try {
+        gateway.run(cmd)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        preClearLog("dual-profile probe exec failed", e)
+        return DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
+    }
+    val decided = decideDualProbeResult(result, valid.toSet())
+    if (decided is DualProbeResult.Failed) {
+        // Phase1 review(LOW)：log 合約為「counts/status only」——reason 可能內嵌包名原文
+        // （probe-failed/missing-marker/ambiguous-marker/probe-incomplete），僅供 UI 顯示；
+        // 此處只記計數，不把包名寫入 log。
+        val markers = parseDualProbeMarkers(result.out)
+        preClearLog(
+            "dual-profile probe failed: status=failed requested=${valid.size} " +
+                "failed=${markers.failed.size} missing=${(valid.toSet() - markers.allMarked).size}",
+        )
+    }
+    return decided
+}
+
+// Phase1 review(P2)：probeDualAppsInUser95 / uninstallDualAppsInUser95 測試的包裝
+// 已移出生產源碼，僅存在於 src/test（PreClearTestHelpers.kt）。生產路徑一律用
+// probeDualApps / uninstallDualApps + resolvePreClearDualUserId，源碼中不含任何
+// 可呼叫的硬編碼 95 路徑。
+
+// JVM 單元測試相容：android.util.Log 在 JVM 單元測試為 stub（拋
+// "not mocked" RuntimeException），此處吞掉以保純邏輯可測；生產仍經 Logcat。
+internal fun preClearLog(msg: String, e: Throwable? = null) {
+    try {
+        if (e != null) Log.w(PRE_CLEAR_TAG, msg, e) else Log.w(PRE_CLEAR_TAG, msg)
+    } catch (_: RuntimeException) {
+        // JVM unit-test stub: ignore.
+    }
+}
+
+// Phase E：gateway 可注入（JVM 測試經 FakeGateway 覆蓋 error/partial/Unknown/cancel/race；
+// 生產預設仍走 SuCmdGateway）。隱私：log 只記計數／狀態旗標，不記包名原文（log 包名改計數）。
+// R05/NEW-1：uid 必須是 verified id；null（unverified）=> 绝不執行 pm uninstall。
+internal suspend fun uninstallDualApps(
+    pkgs: Collection<String>,
+    userId: Int?,
+    gateway: CmdGateway = SuCmdGateway(),
+): Boolean {
+    if (userId == null) {
+        preClearLog("dual-profile uninstall refused: target unverified")
+        return false
+    }
+    if (pkgs.isEmpty()) return true
+    val cmd = buildDualUninstallCommand(pkgs.toList(), userId)
+    return try {
+        val result = gateway.run(cmd)
+        // Reuse decideDualProbeResult fail-closed signals: truncated output,
+        // timeout, or transport loss is never a success, even with exit 0.
+        if (result.timedOut || result.transportUnknown || result.truncated ||
+            result.out.contains(CORE_TRUNCATION_MARKER) ||
+            result.err.contains(CORE_TRUNCATION_MARKER)
+        ) {
+            preClearLog("dual-profile uninstall truncated/unknown: timedOut=${result.timedOut} transportUnknown=${result.transportUnknown} truncated=${result.truncated}")
+            return false
+        }
+        // 每個 pm uninstall 的失敗通常以 stdout 的 "Failure [DELETE_FAILED_*]" 行呈現，
+        // stderr 非空或整體 exit 非零亦視為失敗——回 false；呼叫端只記 log，仍 proceed。
+        val noFailureLine = result.out.lineSequence().none {
+            val line = it.trim()
+            line.startsWith("Failure", ignoreCase = true) ||
+                line.startsWith("DELETE_FAILED", ignoreCase = true)
+        }
+        result.exit == 0 && result.err.isBlank() && noFailureLine
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        preClearLog("dual-profile uninstall exec failed", e)
+        false
+    }
+}
+
+// PR-74 A2 (P2)：ROOT 代關二次確認 OK 點擊當下的 serial-bound fence（suspend seam，
+// JVM 可測）。三道關卡全過才執行 uninstall：
+//  (1) 捕獲 (id,serial) 與當下 vm.state.value 重解析值一致（STALE／remap 攔截）；
+//  (2) 真正新鮮的 verified-target fetch 成功（非 state／inventory 快取）；
+//  (3) 新鮮值的 (id,serial) 仍與捕獲一致（delete+recreate 同 id 換 serial、
+//      known serial→null 皆攔截，對齊 core.continuityBreach）。
+// uninstall 以 lambda 注入：JVM 測試用 FakeGateway call log 證明 abort 路徑零呼叫；
+// 生產傳 { pkgs, uid -> uninstallDualApps(pkgs, uid) }。回傳有效 uid 表示 uninstall
+// 已執行（其失敗仍不阻擋後續驗證，沿用既有「失敗只記 log」語意）；任一關失敗回
+// null（呼叫端 Toast + onCancel，不 uninstall、不 re-probe、不 proceed）。
+internal suspend fun rootUninstallIfTargetStillValid(
+    installed: List<String>,
+    captured: PreClearDualTarget?,
+    resolveLiveTarget: () -> PreClearDualTarget?,
+    fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
+    uninstall: suspend (List<String>, Int) -> Boolean,
+): Int? {
+    val live: PreClearDualTarget? = try {
+        resolveLiveTarget()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        preClearLog("root-uninstall live re-resolve failed", e)
+        null
+    }
+    if (!preClearTargetStillValid(captured, live)) {
+        preClearLog("root-uninstall aborted: live target lost or changed (id+serial)")
+        return null
+    }
+    val fresh: VerifiedTarget? = try {
+        fetchFreshVerifiedTarget()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        preClearLog("root-uninstall fresh verified-target fetch failed", e)
+        null
+    }
+    val freshTarget: PreClearDualTarget? = fresh?.let { PreClearDualTarget(it.userId, it.serial) }
+    if (!preClearTargetStillValid(captured, freshTarget)) {
+        preClearLog("root-uninstall aborted: fresh target lost/recreated (id+serial)")
+        return null
+    }
+    // 兩道 fence 已確認三者 (id,serial) 相同；用捕獲 id 執行（與 live/fresh 相等）。
+    // uninstall 本身的失敗沿用既有「只記 log、仍讓後續驗證決定」語意（成敗回傳值
+    // 不影響 fence 結論），只有 cancellation 透傳。
+    val effectiveUid = captured!!.userId
+    try {
+        uninstall(installed, effectiveUid)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        preClearLog("dual-profile uninstall failed", e)
+    }
+    return effectiveUid
+}
+
+// R2-5 (N10)：非 ROOT「繼續清除」按鈕的 fail-closed 重驗結果（純型別、JVM 可測）。
+// 只有 ProceedOk 才准呼叫 onProceed()；其餘三種一律不放行、不寫政策。
+internal sealed interface PreClearContinueOutcome {
+    data object ProceedOk : PreClearContinueOutcome
+    // 身份（id/serial）或新鮮度在對話框期間改變（remap／同 id 重建／轉 STALE）。
+    data object TargetChanged : PreClearContinueOutcome
+    // 同一 delta 重探後 installed 集合增減／改變（新裝分身等）。
+    data object CloneMembershipChanged : PreClearContinueOutcome
+    // 捕獲值缺失、探測失敗或任何例外／取消 ⇒ 無法判定，fail closed。
+    data object CannotDetermine : PreClearContinueOutcome
+}
+
+// R2-5 (N10)：警告對話框「繼續清除」（非 ROOT）點擊當下的 serial-bound + membership
+// fence（suspend seam，對稱 rootUninstallIfTargetStillValid）。四道關卡全過才回 ProceedOk：
+//  (0) 警告顯示時必須已捕獲 verified target；沒有捕獲值即無法判定（fail closed）；
+//  (1) 捕獲 (id,serial) 與當下 vm.state.value 重解析值一致（STALE／remap 攔截）；
+//  (2) 真正新鮮的 verified-target fetch 成功且 (id,serial) 仍與捕獲一致
+//      （delete+recreate 同 id 換 serial／known serial→null 攔截，對齊 continuityBreach）；
+//  (3) 以同一 verified uid 重探同一 delta，installed 集合必須與警告時凍結的快照完全相同
+//      （對話框期間新裝分身／清單變化攔截）。
+// 任一 re-resolve／fetch／re-probe 例外或取消（含 CancellationException）以及
+// re-probe 回 Failed ⇒ CannotDetermine；不同於 uninstall fence 的取消透傳，這裡
+// 沒有與之耦合的破壞性動作，改以四態結果明確收斂為 fail-closed（零 proceed／零寫入）。
+// log 只記狀態／計數，不記包名原文。
+internal suspend fun revalidatePreClearContinue(
+    captured: PreClearDualTarget?,
+    capturedInstalled: Set<String>,
+    resolveLiveTarget: () -> PreClearDualTarget?,
+    fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
+    reprobe: suspend () -> DualProbeResult,
+): PreClearContinueOutcome {
+    if (captured == null) {
+        preClearLog("pre-clear continue aborted: no captured verified target")
+        return PreClearContinueOutcome.CannotDetermine
+    }
+    val live: PreClearDualTarget? = try {
+        resolveLiveTarget()
+    } catch (_: Exception) {
+        // 只記狀態：例外訊息可能摻入包名／技術細節。
+        preClearLog("pre-clear continue aborted: live re-resolve failed status=exception")
+        return PreClearContinueOutcome.CannotDetermine
+    }
+    if (!preClearTargetStillValid(captured, live)) {
+        preClearLog("pre-clear continue aborted: live target lost or changed (id+serial)")
+        return PreClearContinueOutcome.TargetChanged
+    }
+    val fresh: VerifiedTarget? = try {
+        fetchFreshVerifiedTarget()
+    } catch (_: Exception) {
+        preClearLog("pre-clear continue aborted: fresh fetch failed status=exception")
+        return PreClearContinueOutcome.CannotDetermine
+    }
+    val freshTarget: PreClearDualTarget? = fresh?.let { PreClearDualTarget(it.userId, it.serial) }
+    if (!preClearTargetStillValid(captured, freshTarget)) {
+        preClearLog("pre-clear continue aborted: fresh target lost/recreated (id+serial)")
+        return PreClearContinueOutcome.TargetChanged
+    }
+    val reprobeResult: DualProbeResult = try {
+        reprobe()
+    } catch (_: Exception) {
+        preClearLog("pre-clear continue aborted: re-probe failed status=exception")
+        return PreClearContinueOutcome.CannotDetermine
+    }
+    val currentInstalled: Set<String> = when (reprobeResult) {
+        is DualProbeResult.Failed -> {
+            // reason 可能內嵌包名，log 只記狀態。
+            preClearLog("pre-clear continue aborted: re-probe failed status=failed")
+            return PreClearContinueOutcome.CannotDetermine
+        }
+        is DualProbeResult.Ok -> reprobeResult.installed.toSet()
+    }
+    if (currentInstalled != capturedInstalled) {
+        preClearLog(
+            "pre-clear continue aborted: installed set changed " +
+                "captured=${capturedInstalled.size} current=${currentInstalled.size}",
+        )
+        return PreClearContinueOutcome.CloneMembershipChanged
+    }
+    return PreClearContinueOutcome.ProceedOk
+}
+
+// PR-74 A3 (P3)：破壞性路徑對話框 handle 收集器（Activity 欄位持有，onDestroy 一次結清）。
+// showPreClearWarning 的警告／ROOT 二次確認與 showUninstallVerifyDialog 的驗證對話框
+// 先前 show() 後即丟棄 handle，銷毀時無法 dismiss → 舊 Activity window 洩漏；改由此
+// holder 統一持有，onDestroy 逐個 best-effort dismiss + null（不影響按鈕行為）。
+internal class DestructiveDialogHandles {
+    var preClearWarning: AlertDialog? = null
+    var rootConfirm: AlertDialog? = null
+    var uninstallVerify: AlertDialog? = null
+}
+
+// PR-74 A3：best-effort 關閉單一 handle 並回 null（純函式、JVM 可測：dismiss lambda
+// 可注入假物件）。即使 dismiss 拋出仍吞掉並照樣清空，避免第一個 handle 失敗阻斷
+// 後續 handle 的釋放（與既有 onDestroy 的 try/catch 風格一致）。
+internal fun <T> dismissDialogHandle(handle: T?, dismiss: (T) -> Unit): T? {
+    if (handle != null) {
+        try {
+            dismiss(handle)
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+    }
+    return null
+}
+
+// 清除政策前雙開提醒對話框。
+// Phase B：僅接受 Ok(non-empty)的 installed 清單。Ok(empty) 由呼叫端直接放行
+// （requestPreClearWarning 的 Ok(empty) 分支），Failed 一律走探測失敗警告；
+// 此處空清單視為程式錯誤，fail-closed 走 onCancel（不再靜默 onProceed），
+// 避免空警告誤放行。
+// onProceed＝繼續清除（Positive，不二次確認；對話框文字已明示「同意卸載分身」）。
+// onCancel＝取消清除（Negative／返回鍵／點擊外部／ROOT 代關二次確認中取消；呼叫端負責還原勾選等）。
+// Neutral（ROOT 代關）先補一道不可復原的二次確認；確認後對 installed 全部套用
+// pm uninstall --user <verified uid>，失敗仍 proceed（只記 log；使用者意圖優先）。
+// R05/NEW-1：只有 verified target 存在（rootUninstallAllowed && capturedTarget != null
+// && serial 已知）才顯示 ROOT 代關 Neutral；unverified 時該按鈕完全不出現，杜絕
+// unresolved uid 的破壞性 pm uninstall。兩參數預設皆為 fail-closed（false / null）。
+//
+// Phase1 review(HIGH/TOCTOU) + PR-74 A2 (P2)：capturedTarget 是警告顯示時捕獲的
+// (id,serial) 候選值，可能被 remap／轉 STALE／同 id 重建（新 serial）。
+// resolveLiveTarget 由呼叫端綁定 vm.state.value（{ resolvePreClearDualTarget(...) }），
+// fetchFreshVerifiedTarget 綁定 VM→repo 的真正新 gateway triple（非 state 快取）。
+// 兩者在二次確認 OK 點擊當下經 rootUninstallIfTargetStillValid 做 serial-bound fence；
+// 只有 preClearTargetStillValid 對 live 與 fresh 皆成立才執行 uninstall／re-probe，
+// 否則完全不執行、發出 fail-closed 訊息並 onCancel 還原 UI 狀態。
+// 三個新參數皆無預設值：任何新呼叫端都必須明確提供 fence 來源與 dialog holder
+// （fail-closed 編譯期約束）。
+// R2-5 (N10)：非 ROOT Positive「繼續清除」也必須通過 revalidatePreClearContinue 的
+// serial-bound + membership fence；capturedInstalled（警告時凍結的 installed 快照）與
+// reprobe（同一 verified uid／同一 delta 的重探 seam）皆無預設值，缺少任一即編譯失敗。
+// PR-74 A3：dialogHandles 收集本對話框與其巢狀 confirm／verify handle，供 onDestroy 釋放。
+internal fun showPreClearWarning(
+    host: ComponentActivity,
+    installed: List<String>,
+    onProceed: () -> Unit,
+    onCancel: () -> Unit,
+    resolveLiveTarget: () -> PreClearDualTarget?,
+    fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
+    dialogHandles: DestructiveDialogHandles,
+    capturedInstalled: Set<String>,
+    reprobe: suspend () -> DualProbeResult,
+    proceedLabelRes: Int = R.string.pre_clear_confirm_proceed,
+    capturedTarget: PreClearDualTarget? = null,
+    rootUninstallAllowed: Boolean = false,
+) {
+    if (installed.isEmpty()) {
+        preClearLog("pre-clear warning called with empty list; treating as cancelled")
+        onCancel()
+        return
+    }
+    if (host.isFinishing || host.isDestroyed) { onCancel(); return }
+    val canRootUninstall = rootUninstallAllowed && capturedTarget != null &&
+        capturedTarget.serial != null && preClearRootUninstallAllowed(capturedTarget.userId)
+    val sorted = installed.sorted()
+    val shown = sorted.take(PRE_CLEAR_LIST_MAX)
+    val list = shown.joinToString("\n") + if (sorted.size > PRE_CLEAR_LIST_MAX) "\n…" else ""
+    val message = try {
+        host.getString(R.string.pre_clear_message, list)
+    } catch (e: RuntimeException) {
+        preClearLog("pre-clear message build failed", e)
+        onCancel()
+        return
+    }
+    try {
+        val builder = AlertDialog.Builder(host)
+            .setTitle(R.string.pre_clear_title)
+            .setMessage(message)
+            .setCancelable(true)
+            .setPositiveButton(proceedLabelRes) { _, _ ->
+                // R2-5 (N10)：非 ROOT Continue 不再直接用對話框顯示時凍結的 installed/
+                // 身份放行。fresh fetch + re-probe 是 suspend/IPC，故在既有 lifecycleScope
+                // launch 內執行，Main 不阻塞；只有 ProceedOk 才 onProceed（寫政策）。
+                host.lifecycleScope.launch {
+                    val outcome: PreClearContinueOutcome = try {
+                        revalidatePreClearContinue(
+                            captured = capturedTarget,
+                            capturedInstalled = capturedInstalled,
+                            resolveLiveTarget = resolveLiveTarget,
+                            fetchFreshVerifiedTarget = fetchFreshVerifiedTarget,
+                            reprobe = reprobe,
+                        )
+                    } catch (_: Exception) {
+                        // 防禦：helper 已把取消／例外收斂為 CannotDetermine；此處僅處理
+                        // 未預期失敗，維持零 proceed 的 fail-closed 語意（不記例外文字）。
+                        preClearLog("pre-clear continue aborted: revalidation status=exception")
+                        PreClearContinueOutcome.CannotDetermine
+                    }
+                    if (host.isFinishing || host.isDestroyed) {
+                        preClearLog("pre-clear continue aborted: host gone status=finishing-or-destroyed")
+                        try { onCancel() } catch (_: Exception) { }
+                        return@launch
+                    }
+                    when (outcome) {
+                        is PreClearContinueOutcome.ProceedOk -> {
+                            try {
+                                onProceed()
+                            } catch (_: Exception) {
+                                preClearLog("pre-clear continue onProceed failed status=exception")
+                                try { onCancel() } catch (_: Exception) { }
+                            }
+                        }
+                        else -> {
+                            // log 只記結果狀態，絕不記包名或其他對話框內容。
+                            preClearLog(
+                                "pre-clear continue aborted status=" + when (outcome) {
+                                    is PreClearContinueOutcome.TargetChanged -> "target-changed"
+                                    is PreClearContinueOutcome.CloneMembershipChanged -> "membership-changed"
+                                    is PreClearContinueOutcome.CannotDetermine -> "cannot-determine"
+                                    is PreClearContinueOutcome.ProceedOk -> "proceed-ok"
+                                },
+                            )
+                            try {
+                                Toast.makeText(
+                                    host,
+                                    R.string.pre_clear_continue_recheck_failed,
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            } catch (_: Exception) { }
+                            try { onCancel() } catch (_: Exception) { }
+                        }
+                    }
+                }
+            }
+            .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
+        // R05/NEW-1：unverified target 完全不顯示 ROOT 代關 Neutral。
+        if (canRootUninstall) {
+            builder.setNeutralButton(R.string.pre_clear_root_uninstall) { _, _ ->
+                // ROOT 代關＝清除分身資料，不可復原 → 二次確認（ONE confirm only）。
+                // 取消（含返回鍵）= 完整取消語義：不放行、不執行卸載，旗標重置；
+                // 呼叫端 onCancel 生效（PolicyActivity 勾選還原＝安全側，MA/寫入路徑為 no-op）。
+                // Phase D：二次確認通過後先執行卸載，再重跑 probeDualApps 驗證：
+                // 殘留非空即失敗；驗證結果經三選一對話框明確選擇（驗證成功→清除／
+                // 仍要清除自擔／取消），失敗 never 默認 proceed。
+                // PR-74 A3：保存 handle 供 onDestroy 釋放（先前直接丟棄 → window 洩漏）。
+                dialogHandles.rootConfirm = try {
+                    AlertDialog.Builder(host)
+                        .setTitle(R.string.pre_clear_root_uninstall)
+                        .setMessage(
+                            host.getString(R.string.pre_clear_root_uninstall_confirm) +
+                                "\n\n" + shown.joinToString("\n") +
+                                if (sorted.size > PRE_CLEAR_LIST_MAX) {
+                                    try {
+                                        host.getString(
+                                            R.string.pre_clear_list_truncated_format,
+                                            sorted.size,
+                                            PRE_CLEAR_LIST_MAX,
+                                        )
+                                    } catch (_: Exception) {
+                                        "\n…（共 ${sorted.size} 個，僅顯示前 $PRE_CLEAR_LIST_MAX 筆）"
+                                    }
+                                } else "",
+                        )
+                        .setCancelable(true)
+                        .setPositiveButton(android.R.string.ok) { _, _ ->
+                            // PR-74 A2 (P2)：執行前兩道 serial-bound fence——
+                            //  (1) 當下 vm.state.value 重解析 (id,serial) 與捕獲一致；
+                            //  (2) 真正新鮮 verified-target fetch 的 (id,serial) 仍一致。
+                            // fresh fetch 是 suspend，故整道 fence 放進既有 launch；
+                            // delete+recreate 同 id 換 serial（continuityBreach）與
+                            // known→null 皆攔截；任一失敗不 uninstall／re-probe／proceed。
+                            host.lifecycleScope.launch {
+                                val effectiveUid: Int? = try {
+                                    rootUninstallIfTargetStillValid(
+                                        installed = installed,
+                                        captured = capturedTarget,
+                                        resolveLiveTarget = resolveLiveTarget,
+                                        fetchFreshVerifiedTarget = fetchFreshVerifiedTarget,
+                                        uninstall = { pkgs, uid -> uninstallDualApps(pkgs, uid) },
+                                    )
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    preClearLog("root-uninstall fresh target check failed", e)
+                                    null
+                                }
+                                if (effectiveUid == null) {
+                                    // fail-closed：uninstall／re-probe／proceed 全不做。
+                                    preClearLog("root-uninstall aborted: verified target no longer valid")
+                                    try {
+                                        Toast.makeText(host, R.string.pre_clear_target_changed, Toast.LENGTH_LONG).show()
+                                    } catch (_: Exception) { }
+                                    try { onCancel() } catch (_: Exception) { }
+                                    return@launch
+                                }
+                                // Phase D post-verify: re-probe the same warned set.
+                                // Residual non-empty (or probe failure) = verification
+                                // failure; never auto-proceed — explicit 3-choice below.
+                                val postProbe: DualProbeResult = try {
+                                    probeDualApps(installed, effectiveUid)
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    preClearLog("post-uninstall re-probe failed", e)
+                                    DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
+                                }
+                                if (host.isFinishing || host.isDestroyed) {
+                                    try { onCancel() } catch (_: Exception) { }
+                                    return@launch
+                                }
+                                val outcome = decideUninstallVerifyResult(postProbe)
+                                when (outcome) {
+                                    is UninstallVerifyOutcome.VerifiedEmpty ->
+                                        preClearLog("post-uninstall re-probe verified empty")
+                                    is UninstallVerifyOutcome.Residual ->
+                                        preClearLog("post-uninstall re-probe residual: ${outcome.remaining.size}")
+                                    is UninstallVerifyOutcome.ProbeFailed ->
+                                        // log 只記狀態，不記 reason（可能內嵌包名原文）。
+                                        preClearLog("post-uninstall re-probe failed: status=failed expected=${installed.size}")
+                                }
+                                try {
+                                    showUninstallVerifyDialog(
+                                        host = host,
+                                        outcome = outcome,
+                                        onClearVerified = { onProceed() },
+                                        onForceClear = { onProceed() },
+                                        onCancel = { onCancel() },
+                                        dialogHandles = dialogHandles,
+                                    )
+                                } catch (e: CancellationException) {
+                                    throw e
+                                } catch (e: Exception) {
+                                    preClearLog("uninstall verify dialog failed", e)
+                                    try { onCancel() } catch (_: Exception) { }
+                                }
+                            }
+                        }
+                        .setNegativeButton(R.string.dialog_cancel) { _, _ -> onCancel() }
+                        .setOnCancelListener { onCancel() }
+                        .show()
+                } catch (e: RuntimeException) {
+                    preClearLog("pre-clear root-uninstall confirm failed to show", e)
+                    onCancel()
+                    null
+                }
+            }
+        }
+        builder.setOnCancelListener { onCancel() }
+        // PR-74 A3：保存警告對話框 handle 供 onDestroy 釋放。
+        dialogHandles.preClearWarning = builder.show()
+    } catch (e: RuntimeException) {
+        // BadToken / OOM 等 → 視同取消（不默默放行，由呼叫端重置旗標）。
+        preClearLog("pre-clear warning failed to show", e)
+        onCancel()
+    }
+}
+
+// Phase D：ROOT 卸載後驗證三選一對話框（重跑 probe；殘留非空即失敗）。
+// - Positive「驗證成功，繼續清除」僅 VerifiedEmpty 啟用；Residual/ProbeFailed 一律禁用
+//   (isEnabled=false＋click guard no-op 雙層強制，見 uninstallVerifyPositiveClickShouldProceed).
+// - Neutral「仍要清除（自擔風險）」全 outcome 可點（明確自擔）；Negative／Back／觸外＝取消。
+// - 失敗 never 默認 proceed：本函數不自動呼叫任何 proceed，須使用者明確點按。
+// - DEVICE-UNVERIFIED (dialog widget／isFinishing／neutral-negative 路徑)：JVM 僅鎖定
+//   純謂詞 (decide／positiveEnabled／click guard／截斷)，widget 行為見 PhaseD 手測矩陣.
+internal fun showUninstallVerifyDialog(
+    host: ComponentActivity,
+    outcome: UninstallVerifyOutcome,
+    onClearVerified: () -> Unit,
+    onForceClear: () -> Unit,
+    onCancel: () -> Unit,
+    dialogHandles: DestructiveDialogHandles,
+) {
+    if (host.isFinishing || host.isDestroyed) { onCancel(); return }
+    val message: String = try {
+        when (outcome) {
+            is UninstallVerifyOutcome.VerifiedEmpty ->
+                host.getString(R.string.pre_clear_uninstall_verify_success)
+            is UninstallVerifyOutcome.Residual -> {
+                // 截斷與 JVM seam 同源 (uninstallVerifyResidualDisplay；上界見
+                // UNINSTALL_VERIFY_LIST_MAX，與 PRE_CLEAR_LIST_MAX 同值 20).
+                val (shown, rest) = uninstallVerifyResidualDisplay(outcome.remaining, PRE_CLEAR_LIST_MAX)
+                val list = shown.joinToString("\n") +
+                    if (rest > 0) "\n…" else ""
+                host.getString(R.string.pre_clear_uninstall_verify_residual, list)
+            }
+            is UninstallVerifyOutcome.ProbeFailed ->
+                host.getString(R.string.pre_clear_uninstall_verify_failed, outcome.reason)
+        }
+    } catch (e: RuntimeException) {
+        preClearLog("uninstall verify message build failed", e)
+        onCancel()
+        return
+    }
+    try {
+        val dialog = AlertDialog.Builder(host)
+            .setTitle(R.string.pre_clear_uninstall_verify_title)
+            .setMessage(message)
+            .setCancelable(true)
+            .setPositiveButton(R.string.pre_clear_verify_proceed, null)
+            .setNeutralButton(R.string.pre_clear_force_proceed, null)
+            .setNegativeButton(R.string.pre_clear_cancel, null)
+            .setOnCancelListener { onCancel() }
+            .show()
+        // PR-74 A3：保存 handle 供 onDestroy 釋放（按鈕自身 dismiss 後仍留在 holder，
+        // onDestroy 再 best-effort dismiss 一次無副作用）。
+        dialogHandles.uninstallVerify = dialog
+        val positiveEnabled = uninstallVerifyPositiveEnabled(outcome)
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
+            isEnabled = positiveEnabled
+            setOnClickListener {
+                // 禁用強制：Residual/Failed 下 click 一律 no-op (不 dismiss、不 proceed).
+                if (!uninstallVerifyPositiveClickShouldProceed(outcome)) return@setOnClickListener
+                try { dialog.dismiss() } catch (_: Exception) { }
+                onClearVerified()
+            }
+        }
+        dialog.getButton(AlertDialog.BUTTON_NEUTRAL)?.apply {
+            isEnabled = true
+            setOnClickListener {
+                try { dialog.dismiss() } catch (_: Exception) { }
+                onForceClear()
+            }
+        }
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE)?.apply {
+            isEnabled = true
+            setOnClickListener {
+                try { dialog.dismiss() } catch (_: Exception) { }
+                onCancel()
+            }
+        }
+    } catch (e: RuntimeException) {
+        preClearLog("uninstall verify dialog failed to show", e)
+        onCancel()
+    }
+}
+
+// 無 Root 或環境不支援時的探測失敗警告——告知使用者「無法判斷哪些分身會被刪除」，
+// 為防止靜默放行，只提供「仍然清除」（繼承 PolicyActivity 的「同意卸載分身」語義）與取消。
+internal fun showPreClearProbeFailedWarning(
+    host: ComponentActivity,
+    onProceed: () -> Unit,
+    onCancel: () -> Unit,
+    proceedLabelRes: Int = R.string.pre_clear_probe_failed_proceed,
+) {
+    if (host.isFinishing || host.isDestroyed) { onCancel(); return }
+    try {
+        AlertDialog.Builder(host)
+            .setTitle(R.string.pre_clear_probe_failed_title)
+            .setMessage(R.string.pre_clear_probe_failed_message)
+            .setCancelable(true)
+            .setPositiveButton(proceedLabelRes) { _, _ -> onProceed() }
+            .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
+            .setOnCancelListener { onCancel() }
+            .show()
+    } catch (e: RuntimeException) {
+        preClearLog("pre-clear probe-failed warning failed to show", e)
+        onCancel()
     }
 }

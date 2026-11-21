@@ -19,6 +19,8 @@
 - `RikkaApps/Shizuku` — Apache-2.0 — Shizuku shell fallback integration pattern
   (also linked as a binary dependency; see below).
 - `salvogiangri/KnoxPatch` — GPL-3.0 — Mentioned only to explicitly exclude; no Knox bypass is implemented.
+- `fei-ke/DualAppMod` — Apache-2.0 — Idea-level reference only: shared anchor class + method choice idea for the BBC injector (`PmWrapper#getPossibleDualAppPackages`-style 「可用的應用程式」擴充點；注構 `installed ∩ enabled ∩ whitelist` 交集方向). No code copied — our merge (`BbcInjector.mergeAvailableList`) and policy pipeline are written independently from the facts in this repo (ROM dumps, log evidence).
+- `SoClear/OneUIX` — AGPL-3.0 — Mentioned only to explicitly exclude; never used, no code referenced, integration not considered viable. Documented here to satisfy the "what we did not use" ledger.
 
 ## Binary dependencies (Apache-2.0)
 

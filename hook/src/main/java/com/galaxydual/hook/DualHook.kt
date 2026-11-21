@@ -9,6 +9,179 @@ import io.github.libxposed.api.XposedModuleInterface
 import java.lang.reflect.Executable
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+
+// --- R07 (P1): torn {packages, version} prefs read guard (framework-free seam) ---
+// Minimal view of the SharedPreferences calls the BBC versioned read needs.
+// Production adapts the real SharedPreferences exactly once (in
+// readRemotePrefsVersioned); JVM tests supply a fake that can swap values
+// BETWEEN the two version reads to prove the seqlock double read fails closed.
+internal interface BbcVersionedPrefsView {
+    fun contains(key: String): Boolean
+    fun getLong(key: String, defValue: Long): Long
+    fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String>?
+}
+
+// --- PR #74 G1: runtime BBC injection opt-out (framework-free seam) ---
+// Minimal view of the ONE boolean the BBC gate needs, so JVM tests can inject
+// a fake (absent key / read throws) without an Android runtime. Production
+// adapts the real SharedPreferences once in bbcInjectionEnabledNow().
+internal interface BbcInjectionPrefsView {
+    fun getBoolean(key: String, defValue: Boolean): Boolean
+}
+
+// Returns null on any read failure (key absent is handled by defValue=true in
+// the adapter). null is fed to the hybrid rule in bbcInjectionGateOpen: the
+// FIRST failure still defaults to TRUE ("off" is NOT a safety guarantee —
+// cold-start deletion happens before the BBC callback, issue #75), but once
+// OFF has been confirmed a failure keeps it CLOSED for BBC_STICKY_MAX_AGE_MS.
+// This reader itself is unchanged and never throws.
+internal fun readBbcInjectionEnabled(view: BbcInjectionPrefsView): Boolean? = try {
+    view.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true)
+} catch (_: Throwable) {
+    null
+}
+
+// N06(a): process-local confirmed-OFF timestamp (millis on the injected clock;
+// null = no confirmed OFF in this process). compareAndSet in the gate makes the
+// get -> decide -> write transition atomic/visibility-safe under concurrent BBC
+// queries (no lock is held around the prefs read). It is deliberately NOT
+// device-verified and NOT cross-process: a daemon restart clears it, so a
+// stale OFF cannot outlive the process that observed it.
+internal val bbcConfirmedOffAtMs = AtomicReference<Long?>(null)
+
+// Pure, Android-free statement of the hybrid rule. `runtime` is the already
+// observed boolean read: false = confirmed OFF, true = confirmed ON,
+// null = read failure/absence. Returns the gate decision plus the state to
+// store (null = no confirmed OFF). No I/O, no shared state — JVM tests pin the
+// full decision table through this helper.
+internal data class BbcGateDecision(val open: Boolean, val confirmedOffAtMs: Long?)
+
+internal fun bbcInjectionGateOpenWithSticky(
+    compileTimeGate: Boolean,
+    runtime: Boolean?,
+    confirmedOffAtMs: Long?,
+    nowMs: Long,
+    ttlMs: Long = EffectivePolicyCache.BBC_STICKY_MAX_AGE_MS,
+): BbcGateDecision {
+    // Compile-time gate stays authoritative and never mutates sticky state.
+    if (!compileTimeGate) return BbcGateDecision(false, confirmedOffAtMs)
+    val (open, nextOffAtMs) = when (runtime) {
+        false -> false to nowMs // confirmed OFF: stamp it and keep the gate closed
+        true -> true to null // confirmed ON: clear any prior OFF
+        null -> {
+            val off = confirmedOffAtMs
+            if (off != null && nowMs >= off && nowMs - off < ttlMs) {
+                false to off // sticky OFF within TTL (bounded, process-local)
+            } else {
+                true to null // first failure / expired TTL => shipped default ON
+            }
+        }
+    }
+    return BbcGateDecision(open, nextOffAtMs)
+}
+
+// Compile-time default AND the hybrid runtime rule. The runtime read is LAZY
+// so a compile-time-closed gate keeps its historic zero-pref-read / zero-IPC
+// path. nowMs/ttlMs/stickyState are injectable for JVM tests; production uses
+// the process-local AtomicReference above and wall-clock millis. Never throws
+// into the hook caller: every failure degrades to the fail-open default.
+internal inline fun bbcInjectionGateOpen(
+    compileTimeGate: Boolean,
+    nowMs: () -> Long = { System.currentTimeMillis() },
+    ttlMs: Long = EffectivePolicyCache.BBC_STICKY_MAX_AGE_MS,
+    stickyState: AtomicReference<Long?> = bbcConfirmedOffAtMs,
+    // Kept last so the historic trailing-lambda call sites still bind here.
+    runtimeEnabled: () -> Boolean?,
+): Boolean {
+    if (!compileTimeGate) return false // ZERO runtime read (existing pin)
+    val runtime = try {
+        runtimeEnabled()
+    } catch (_: Throwable) {
+        null
+    }
+    while (true) {
+        val committedOpen: Boolean? = try {
+            val cur = stickyState.get()
+            val d = bbcInjectionGateOpenWithSticky(
+                compileTimeGate = true,
+                runtime = runtime,
+                confirmedOffAtMs = cur,
+                nowMs = nowMs(),
+                ttlMs = ttlMs,
+            )
+            // Atomic CAS keeps the transition linearizable: if another query
+            // changed the state after our get(), retry from the fresh value.
+            // NO lock is held here (the prefs read above is lock-free).
+            if (stickyState.compareAndSet(cur, d.confirmedOffAtMs)) d.open else null
+        } catch (_: Throwable) {
+            return true // fail open to the shipped default, never throw into the hook
+        }
+        if (committedOpen != null) return committedOpen
+    }
+}
+
+// Outcome of the self-consistent read. `failed` is true on a torn snapshot
+// (version-before != version-after) or any read failure; the caller maps that
+// to the Unknown signal (null packages, null version) with throttled logging.
+internal data class BbcVersionedRead(
+    val packages: Set<String>?,
+    val version: Long?,
+    val failed: Boolean,
+    // F4 (optional diagnostic): the two seqlock reads, retained only to restore
+    // mismatch detail in the torn-snapshot log. Defaults keep existing callers
+    // (and tests) source-compatible; values are package/version numbers only.
+    val versionBefore: Long? = null,
+    val versionAfter: Long? = null,
+)
+
+// Seqlock-style snapshot: version-before -> defensive COPY of the package set
+// (never trust a live cross-process collection) -> version-after. The pair is
+// accepted ONLY when both probes agree AND neither is Invalid/Unavailable
+// (both-Absent == confirmed legacy absence). Empty+version remains a Cleared
+// candidate, empty+null stays Unknown, non-empty is Good (version may be null
+// for the legacy no-version draft). Never throws.
+internal fun readBbcVersionedPrefs(view: BbcVersionedPrefsView): BbcVersionedRead {
+    // N03: adapt the view ONCE per probe to the shared framework-free model.
+    // A read failure / corrupt value is now a distinct outcome instead of
+    // collapsing to "absent" (which used to allow a legacy replay).
+    fun probe(): VersionProbeResult = probeVersion(object : VersionPrefsView {
+        override fun containsVersion(): Boolean =
+            view.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+
+        override fun readVersion(defValue: Long): Long =
+            view.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, defValue)
+    })
+    var before: VersionProbeResult = VersionProbeResult.Unavailable
+    var after: VersionProbeResult = VersionProbeResult.Unavailable
+    return try {
+        before = probe()
+        val live = view.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, LinkedHashSet())
+        // Defensive snapshot: a concurrent commit may mutate the live set while
+        // we iterate; a CTE/CME here fails closed via the outer catch.
+        val pkgs: Set<String> = if (live == null) emptySet() else LinkedHashSet(live)
+        after = probe()
+        val failed = before is VersionProbeResult.Unavailable ||
+            before is VersionProbeResult.Invalid ||
+            after is VersionProbeResult.Unavailable ||
+            after is VersionProbeResult.Invalid ||
+            before != after
+        if (failed) {
+            BbcVersionedRead(
+                null, null, failed = true,
+                versionBefore = (before as? VersionProbeResult.Present)?.value,
+                versionAfter = (after as? VersionProbeResult.Present)?.value,
+            )
+        } else {
+            // Both probes equal and neither failed => both Absent (version=null,
+            // confirmed legacy absence) or both Present(v).
+            BbcVersionedRead(pkgs, (before as? VersionProbeResult.Present)?.value, failed = false)
+        }
+    } catch (_: Throwable) {
+        BbcVersionedRead(null, null, failed = true)
+    }
+}
 
 // LSPosed entry point (Modern Xposed API, API 102, interceptor-chain model).
 //
@@ -78,7 +251,8 @@ class DualHook : XposedModule() {
             // this scope is honored regardless of the peer's write.
             // Marker semantics: install evidence only (at least one daagent
             // hook installed: WhiteListApps <clinit> and/or a query-method
-            // hook below), not proof policy took effect. Empty policy =>
+            // hook below and/or the BBC getPossibleDualAppPackages hook), not
+            // proof policy took effect. Empty policy =>
             // no-op today (early return, semantically skipped; no Outcome
             // emitted, returns before reflection; WhitelistPolicy.apply
             // returns the original result unchanged); even with non-empty
@@ -92,6 +266,9 @@ class DualHook : XposedModule() {
             // only, never the on-device install/callback.
             var installed = hookWhiteListApps(param.defaultClassLoader)
             installed += hookDaagentQueryMethods(param.defaultClassLoader)
+            // BBC (com.samsung.bbc) injector: install count feeds the same
+            // active-marker write condition as the two hook paths above.
+            installed += installBbcHooks(param.defaultClassLoader)
             if (installed > 0) {
                 try {
                     HookMarker.markActive(HookMarker.SCOPE_DAAGENT, onLog = ::logi)
@@ -625,16 +802,11 @@ class DualHook : XposedModule() {
         // nanoTime is explicit (clockOk=false), never a fresh full budget.
         // Budget segments and the follower grace degrade the SAME way:
         // clockOk=false -> no budget spend (reader never runs) and grace 0.
+        // The reader body itself lives in policyRead() (shared with the BBC
+        // injector path); this function keeps the cache-call shape.
         val t0Sample = DeadlineBudget.sampleClock()
         val t0 = t0Sample.nanos
         val clockOk = t0Sample.clockOk
-        fun remainingMs(): Long = if (!clockOk) {
-            0L
-        } else try {
-            DeadlineBudget.remainingMs(t0, DeadlineBudget.nowNanos())
-        } catch (_: Throwable) {
-            0L
-        }
         val graceAtEntry: Long = if (!clockOk) {
             0L
         } else try {
@@ -672,34 +844,128 @@ class DualHook : XposedModule() {
             followerGraceMs = graceAtEntry,
             deadlineMs = deadlineMs,
         ) {
-            var rem = remainingMs()
-            if (rem <= 0) {
-                try {
-                    deadlineExhaustedCount.incrementAndGet()
-                } catch (_: Throwable) {
-                }
-                return@get null
-            }
-            val capTimeout = minOf(PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS, rem)
-            val capable = isRemoteCapable(capTimeout) ?: return@get null
-            if (!capable) return@get emptySet()
-            rem = remainingMs()
-            if (rem <= 0) {
-                try {
-                    deadlineExhaustedCount.incrementAndGet()
-                } catch (_: Throwable) {
-                }
-                return@get null
-            }
-            policyRefreshGate.readBoundedOrThrow(
-                reader = { readRemotePrefs() },
-                timeoutMs = rem,
-            )
+            policyRead()
         }
         // H4: one throttled best-effort line when policy truncation advanced
         // (unsealed path only — the gate-closed arm returned above).
         maybeLogPolicyTruncationDrops()
         return policy
+    }
+
+    // BBC 路徑專屬：以獨立 EffectivePolicyCache(bbcCache, sticky)讀取政策，
+    // 以 BBC_AVAILABLE_APPS_INJECTION AND 執行期 dual_policy 偏好作為自己的
+    // 效應開關（Stage-1 封緘不受影響；白名單 effectiveCache 維持 fail-closed，
+    // 零影響）。偏好關閉時 getBbc 的 gate-closed 仍不碰 reader；偏好讀取本身
+    // 是快取 prefs 的布林查表（無新增 binder IPC，見 bbcInjectionEnabledNow）。
+    // Phase A P0 sticky last-good：null/拋/contention/deadline/clock 失敗回
+    // 上次成功非空快照；僅成功讀到空（帶版本證明 Cleared）方可收縮；TTL 過期
+    // /invalidate 不丟 BBC last-good（僅 sticky cap 到期才過期，計數+節流日誌）。
+    // TTL 60s／failureCooldown 5s／single-flight／50ms budget 語義與白名單
+    // 一致，grace/deadline 取樣方式比照 effectivePolicy，不漂移。
+    //
+    // PR #74 G1：compile-time 開關 AND 執行期偏好（dual_policy/
+    // bbc_injection_enabled，預設 true）。偏好讀取走既有 remote prefs accessor
+    // （getRemotePreferences 在同一行程對同一 group 為快取查表，非新增 binder
+    // IPC），只有布林讀；null/拋出交給 bbcInjectionGateOpen 的混合規則：
+    // 首次失敗仍回 true，但已確認 OFF 後 30 分鐘內的失敗維持關閉（process-local，
+    // 非裝置驗證）。此讀取在所有其他 bbcPolicy 邏輯之外另有 try/catch，任何
+    // Throwable 都不會逸出到 system_server/daagent。
+    private fun bbcInjectionEnabledNow(): Boolean? = try {
+        val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
+        if (prefs == null) {
+            null
+        } else {
+            readBbcInjectionEnabled(object : BbcInjectionPrefsView {
+                override fun getBoolean(key: String, defValue: Boolean): Boolean =
+                    prefs.getBoolean(key, defValue)
+            })
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun bbcPolicy(): EffectivePolicyCache.BbcPolicy = try {
+        val t0Sample = DeadlineBudget.sampleClock()
+        val clockOk = t0Sample.clockOk
+        val t0 = t0Sample.nanos
+        val graceAtEntry: Long = if (!clockOk) {
+            0L
+        } else try {
+            DeadlineBudget.graceAtEntry(t0, DeadlineBudget.nowNanos())
+        } catch (_: Throwable) {
+            0L
+        }
+        val deadlineMs: Long = if (!clockOk) {
+            -1L
+        } else try {
+            val n = DeadlineBudget.nowNanos()
+            if (n == DeadlineBudget.NO_START_NANOS) -1L else (n / 1_000_000L) + PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS
+        } catch (_: Throwable) {
+            -1L
+        }
+        bbcCache.getBbc(
+            EXTRA_WHITELIST_PACKAGES,
+            // N06(b): LAZY provider — getBbc samples now0 first, then calls this
+            // inside the guarded section, so a slow pref read is charged to the
+            // same 50ms deadline budget instead of running outside it.
+            bbcGateOpen = {
+                bbcInjectionGateOpen(
+                    PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+                ) { bbcInjectionEnabledNow() }
+            },
+            followerGraceMs = graceAtEntry,
+            deadlineMs = deadlineMs,
+        ) { policyReadBbcVersioned() }
+    } catch (_: Throwable) {
+        EffectivePolicyCache.BbcPolicy.Unknown(emptySet())
+    }
+
+    // Policy read shared by effectivePolicy() (whitelist query path, reached
+    // only with the Stage-1 gate open) and bbcPolicy() (BBC injector path):
+    // ONE implementation — capability probe + single 50ms end-to-end deadline
+    // budget + readRemotePrefs(). The t0/clockOk/remainingMs arithmetic is
+    // identical to what effectivePolicy() sampled inline before the
+    // extraction, but sampled at this reader's entry (microseconds after the
+    // caller's t0 on the leader path; followers never run the reader).
+    // deadlineExhaustedCount is incremented on the fail-closed skip arms.
+    private fun policyRead(): Set<String>? {
+        // t0 sampled at entry with true System.nanoTime (never mocked);
+        // arithmetic via pure DeadlineBudget (same function JVM tests use).
+        // H8 (sentinel discipline): sample via sampleClock() so a broken
+        // nanoTime is explicit (clockOk=false), never a fresh full budget.
+        val t0Sample = DeadlineBudget.sampleClock()
+        val t0 = t0Sample.nanos
+        val clockOk = t0Sample.clockOk
+        fun remainingMs(): Long = if (!clockOk) {
+            0L
+        } else try {
+            DeadlineBudget.remainingMs(t0, DeadlineBudget.nowNanos())
+        } catch (_: Throwable) {
+            0L
+        }
+        var rem = remainingMs()
+        if (rem <= 0) {
+            try {
+                deadlineExhaustedCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            return null
+        }
+        val capTimeout = minOf(PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS, rem)
+        val capable = isRemoteCapable(capTimeout) ?: return null
+        if (!capable) return emptySet()
+        rem = remainingMs()
+        if (rem <= 0) {
+            try {
+                deadlineExhaustedCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            return null
+        }
+        return policyRefreshGate.readBoundedOrThrow(
+            reader = { readRemotePrefs() },
+            timeoutMs = rem,
+        )
     }
 
     // H4: PolicySource.truncationDrops is a process-lifetime monotonic
@@ -790,6 +1056,111 @@ class DualHook : XposedModule() {
             }
             null
         }
+    }
+
+    // Phase A P0 BBC versioned prefs read: returns Pair(packages, version)
+    // where packages==null signals a failed read (framework absent / IPC
+    // failure, throttled log via bbcCache.shouldLogFailure) and version==null
+    // signals "no version proof" (key absent or unreadable). Never throws.
+    // Empty + version!=null is the ONLY intentional-clear signal the BBC
+    // cache may shrink on; empty + version==null is Unknown (sticky).
+    private fun readRemotePrefsVersioned(): Pair<Set<String>?, Long?> {
+        return try {
+            val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
+            if (prefs == null) return Pair(null, null)
+            registerPolicyChangeListener(prefs)
+            // R07 (P1): the writer commits packages+version in one atomic commit,
+            // but a reader-side snapshot must be self-consistent. Adapt the real
+            // SharedPreferences to the framework-free view ONCE here; the seam
+            // does version-before / defensive set copy / version-after and fails
+            // closed on any mismatch or read failure.
+            val read = readBbcVersionedPrefs(object : BbcVersionedPrefsView {
+                override fun contains(key: String): Boolean = prefs.contains(key)
+                override fun getLong(key: String, defValue: Long): Long = prefs.getLong(key, defValue)
+                override fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String>? =
+                    prefs.getStringSet(key, defValue)
+            })
+            if (read.failed && bbcCache.shouldLogFailure()) {
+                try {
+                    // F4: restore the before/after mismatch detail (numbers
+                    // only, no package strings); throttling is unchanged —
+                    // still gated by shouldLogFailure() above.
+                    logi(
+                        "BBC remote policy read failed: torn/inconsistent snapshot " +
+                            "versionBefore=${read.versionBefore} versionAfter=${read.versionAfter}",
+                    )
+                } catch (_: Throwable) {
+                }
+            }
+            Pair(read.packages, read.version)
+        } catch (t: Throwable) {
+            if (bbcCache.shouldLogFailure()) {
+                try {
+                    logi("BBC remote policy read failed: ${shortEx(t)}: ${shortMsg(t)}")
+                } catch (_: Throwable) {
+                }
+            }
+            Pair(null, null)
+        }
+    }
+
+    // Phase A P0 BBC versioned policy read (shared 50ms end-to-end budget):
+    // capability probe + single 50ms total + versioned prefs read. Maps
+    // capability-false to Unknown (null,null) — a missing capability is a
+    // failure for BBC (keep last-good), never an intentional clear (whitelist
+    // maps it to emptySet/cached; BBC must not shrink on it). Deadline
+    // exhaustion maps to Unknown as well (failed read => 5s cooldown +
+    // sticky). Contention propagates as PolicyRefreshContentionException so
+    // the BBC cache serves sticky WITHOUT renewing its cooldown (herd fix).
+    private fun policyReadBbcVersioned(): Pair<Set<String>?, Long?> {
+        val t0Sample = DeadlineBudget.sampleClock()
+        val t0 = t0Sample.nanos
+        val clockOk = t0Sample.clockOk
+        fun remainingMs(): Long = if (!clockOk) {
+            0L
+        } else try {
+            DeadlineBudget.remainingMs(t0, DeadlineBudget.nowNanos())
+        } catch (_: Throwable) {
+            0L
+        }
+        var rem = remainingMs()
+        if (rem <= 0) {
+            try {
+                deadlineExhaustedCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            return Pair(null, null)
+        }
+        val capTimeout = minOf(PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS, rem)
+        val capable = isRemoteCapable(capTimeout) ?: return Pair(null, null)
+        if (!capable) return Pair(null, null)
+        rem = remainingMs()
+        if (rem <= 0) {
+            try {
+                deadlineExhaustedCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            return Pair(null, null)
+        }
+        // Gate-bounded versioned read: the gate only supports Set<String>?,
+        // so the version travels via an AtomicReference set inside the
+        // worker lambda (happens-before via Future.get).
+        val versionHolder = AtomicReference<Long?>(null)
+        val versionPresent = AtomicBoolean(false)
+        val pkgs: Set<String>? = policyRefreshGate.readBoundedOrThrow(
+            reader = {
+                val (p, v) = readRemotePrefsVersioned()
+                if (v != null) {
+                    versionHolder.set(v)
+                    versionPresent.set(true)
+                }
+                p
+            },
+            timeoutMs = rem,
+        )
+        if (pkgs == null) return Pair(null, null)
+        val ver = if (versionPresent.get()) versionHolder.get() else null
+        return Pair(pkgs, ver)
     }
 
     // PROP_CAP_REMOTE probe via RemoteCapabilityLatch (P2-1). A framework
@@ -996,6 +1367,356 @@ class DualHook : XposedModule() {
             .intercept { chain -> interceptWhitelistCall(chain) }
     }
 
+    // --- BBC (com.samsung.bbc) injector: Dual Messenger available-apps list ---
+    // UNION-only, fail-closed. With an empty BBC injection policy (the common
+    // case: user has not ticked anything in the policy editor) bbcPolicy()
+    // returns emptySet() and the hook is a no-op returning Samsung's original
+    // result object, identical to not hooking at all. Any unexpected ROM shape,
+    // null, exception, or non-String element also returns the ORIGINAL result
+    // object. Device-verified evidence lives in docs/TAB7_BBC_INJECTION_PLAN.md.
+
+    // Per-process one-line rate limits for the BBC entry/merge evidence logs.
+    private val bbcHitLog = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
+    private val bbcMergedLog = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
+
+    // Caller-identification entry ledger (once per process, pid-keyed like
+    // bbcMergedLog): the BBC-ENTRY read-only diagnosis fires at most once per
+    // process so the open-page hot path never spams logcat.
+    private val bbcEntryLog = java.util.Collections.synchronizedSet(java.util.HashSet<String>())
+
+    // R10 (P2): the caller stack snippet is captured LAZILY through this seam —
+    // only after the once-per-pid ledger claim succeeds. Same ledger + log sink
+    // as before; format/desensitization unchanged.
+    private val bbcEntryLogger = BbcInjector.BbcEntryLogger(bbcEntryLog, ::logi)
+
+    // BBC install path: probe (BBC shared library resolvable on this ROM,
+    // method present), resolve the callee reflectively, resolve the caller
+    // Executables (best-effort, may be empty), then installWithCallers
+    // (caller deopt best-effort, callee deopt + hook). Returns 1 when the
+    // callee hook installed, else 0; BOTH outcomes emit an `BBC-HOOK
+    // installed=N` ledger line (pid included, per runbook/spec §12.2).
+    // Any unexpected failure stays fail-closed (log + 0, zero behavior
+    // change, zero hooks installed).
+    private fun installBbcHooks(classLoader: ClassLoader): Int {
+        // android.os.Process.myPid() is expected not to throw, but keep the
+        // install ledger line total anyway.
+        val pid = try {
+            android.os.Process.myPid()
+        } catch (_: Throwable) {
+            -1
+        }
+        return try {
+            if (!BbcInjector.probeBbcAvailable(classLoader, ::logi)) {
+                logi("BBC-HOOK installed=0 (probe failed, pid=$pid)")
+                return 0
+            }
+            val wrapperClass = classLoader.loadClass(BbcInjector.BBC_PM_WRAPPER_CLASS)
+            val method = wrapperClass.getDeclaredMethod(
+                BbcInjector.BBC_PM_GET_POSSIBLE_METHOD,
+                android.content.Context::class.java,
+            )
+            val callers = BbcInjector.resolveCallers(classLoader, ::logi)
+            if (HookInstaller.installWithCallers(
+                    method,
+                    BbcInjector.BBC_HOOK_ID,
+                    callers,
+                    ::deoptimize,
+                    ::installBbcInterceptHook,
+                    ::logi,
+                )
+            ) {
+                logi("BBC-HOOK installed=1 (daagent, pid=$pid)")
+                1
+            } else {
+                logi("BBC-HOOK installed=0 (hook install returned false, pid=$pid)")
+                0
+            }
+        } catch (t: Throwable) {
+            // Fail-closed: BBC absent/unexpected shape/hook failure => no hook,
+            // no behavior change; the daagent keeps Samsung's original list.
+            try {
+                logi("BBC-HOOK install failed: ${t.message}")
+            } catch (_: Throwable) {
+                // Logging must never break the hook path.
+            }
+            try {
+                logi("BBC-HOOK installed=0 (install exception, pid=$pid)")
+            } catch (_: Throwable) {
+                // Logging must never break the hook path.
+            }
+            0
+        }
+    }
+
+    // BBC interceptor builder: identical protective setup to
+    // installInterceptHook (framework protection + stable id).
+    private fun installBbcInterceptHook(target: Method, id: String) {
+        hook(target)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId(id)
+            .intercept { chain -> interceptBbcCall(chain) }
+    }
+
+    // BBC interceptor: run the original first (never skipped, never replaced),
+    // then — only with a non-empty BBC injection policy — UNION-append the
+    // policy packages that this device reports installed+enabled to the END of
+    // Samsung's own list (order of the original list preserved, entries never
+    // removed/reordered). Fail-closed at every step: policy lookup error,
+    // unexpected result type, or any non-String element => the ORIGINAL
+    // result object is returned unchanged.
+    private fun interceptBbcCall(chain: XposedInterface.Chain): Any? {
+        // Read-only entry timestamp FIRST (cheap, no semantics). R10 (P2): the
+        // caller STACK capture is deferred behind a lazy supplier — it is only
+        // materialized by the entry logger AFTER the once-per-pid ledger claim
+        // succeeds, so fast-path exits and repeated calls never pay for it.
+        val entryTsMs: Long = try {
+            System.currentTimeMillis()
+        } catch (_: Throwable) {
+            0L
+        }
+        fun entryCaller(): String = try {
+            BbcInjector.callerSnippet(Thread.currentThread().stackTrace)
+        } catch (_: Throwable) {
+            ""
+        }
+        val result = chain.proceed()
+        val pid = try {
+            android.os.Process.myPid()
+        } catch (_: Throwable) {
+            -1
+        }
+        // Fail-fast on unexpected ROM shapes before paying for the policy
+        // lookup (type-check is cheaper than a binder read).
+        if (result !is List<*>) {
+            // Read-only entry diagnosis for the bad-type shape (size unknown).
+            logBbcEntryOnce(pid, entryTsMs, ::entryCaller, -1, false)
+            if (logBbcBadTypeOnce(pid)) {
+                logi("BBC-HOOK unexpected result type; returning original (pid=$pid)")
+            }
+            return result
+        }
+        val bbcResult = try {
+            bbcPolicy()
+        } catch (_: Throwable) {
+            return result
+        }
+        // Phase A P0 explicit-empty token: Good(non-empty) merges; Cleared
+        // (empty+version) is an intentional clear (no merge, no Unknown log);
+        // Unknown (null/version-absent/contention/deadline/clock) keeps
+        // last-good with a once-per-process keep-last-good log.
+        val extra: Set<String> = when (bbcResult) {
+            is EffectivePolicyCache.BbcPolicy.Cleared -> {
+                // Read-only entry: intentional-clear path (empty policy).
+                val entrySize = try {
+                    result.size
+                } catch (_: Throwable) {
+                    -1
+                }
+                logBbcEntryOnce(pid, entryTsMs, ::entryCaller, entrySize, false)
+                logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
+                return result
+            }
+            is EffectivePolicyCache.BbcPolicy.Good -> bbcResult.packages
+            is EffectivePolicyCache.BbcPolicy.Unknown -> {
+                if (logBbcUnknownOnce(pid)) {
+                    val kept = try {
+                        bbcResult.lastGood.size
+                    } catch (_: Throwable) {
+                        -1
+                    }
+                    logi("BBC-HOOK unknown-policy keep-last-good (kept=$kept, pid=$pid)")
+                }
+                if (bbcResult.lastGood.isEmpty()) {
+                    // Read-only entry: unknown-policy with nothing kept.
+                    val entrySize = try {
+                        result.size
+                    } catch (_: Throwable) {
+                        -1
+                    }
+                    logBbcEntryOnce(pid, entryTsMs, ::entryCaller, entrySize, false)
+                    logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (pid=$pid)")
+                    return result
+                }
+                bbcResult.lastGood
+            }
+        }
+        // Good is non-empty by contract (empty-with-proof is Cleared, empty
+        // without proof is Unknown-empty and returned above), so no empty
+        // guard is needed here: BbcInjector returns the original for empty.
+        // Read-only entry diagnosis (once per process, never branches merge):
+        // result size + whether Samsung's list already contains a policy
+        // entry (boolean only, no package literals). Any failure skips the
+        // line; merge/gate/write/return semantics below are untouched.
+        val entrySize = try {
+            result.size
+        } catch (_: Throwable) {
+            -1
+        }
+        val entryContains = try {
+            BbcInjector.originalContainsPolicy(result, extra)
+        } catch (_: Throwable) {
+            false
+        }
+        logBbcEntryOnce(pid, entryTsMs, ::entryCaller, entrySize, entryContains)
+        logBbcHitOnce("BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=$pid)")
+        return try {
+            // result is already known to be a List<*> (checked above).
+            @Suppress("UNCHECKED_CAST")
+            val raw = result as List<*>
+            val original = ArrayList<String>(raw.size)
+            for (e in raw) {
+                original.add(e as? String ?: return result)
+            }
+            // F-06: the BBC callee's first argument IS the Context (the
+            // daagent passes its own); prefer it for the PackageManager. The
+            // reflective ActivityThread path is kept ONLY as the fallback for
+            // a missing/non-Context argument.
+            val pm: android.content.pm.PackageManager? = try {
+                val ctx = chain.args.getOrNull(0) as? android.content.Context
+                if (ctx != null) {
+                    try {
+                        ctx.packageManager
+                    } catch (_: Throwable) {
+                        null // arg present but PM unavailable: probes stay false, fail-closed
+                    }
+                } else {
+                    bbcCurrentPackageManager()
+                }
+            } catch (_: Throwable) {
+                null
+            }
+            // Resolve ApplicationInfo ONCE per package per merge (one binder
+            // round-trip instead of one per predicate); the memo is local to
+            // this call and never cached beyond it. Hits and misses (incl.
+            // exceptions, mapped to null) are both memoized.
+            val applicationInfoMemo = LinkedHashMap<String, android.content.pm.ApplicationInfo?>()
+            fun applicationInfo(pkg: String): android.content.pm.ApplicationInfo? {
+                if (applicationInfoMemo.containsKey(pkg)) return applicationInfoMemo[pkg]
+                val info = try {
+                    pm?.getApplicationInfo(pkg, 0)
+                } catch (_: Throwable) {
+                    null
+                }
+                applicationInfoMemo[pkg] = info
+                return info
+            }
+            val merged = BbcInjector.mergeAvailableList(
+                original,
+                extra,
+                { pkg -> try { applicationInfo(pkg) != null } catch (_: Throwable) { false } },
+                { pkg -> try { applicationInfo(pkg)?.enabled == true } catch (_: Throwable) { false } },
+            )
+            // Identity-preserving fast path: nothing merged => original object.
+            if (merged === original) {
+                if (logBbcNoMergeOnce(pid)) {
+                    val preds = extra.take(4).joinToString(", ") { pkg ->
+                        "$pkg: installed=${applicationInfo(pkg) != null}, enabled=${applicationInfo(pkg)?.enabled == true}"
+                    } + if (extra.size > 4) ", …(+${extra.size - 4} more)" else ""
+                    logi("BBC-HOOK merge added 0 packages (policy=${extra.size}: $preds) (pid=$pid)")
+                }
+                return result
+            }
+            if (logBbcMergedOnce(pid)) {
+                logi("BBC-HOOK merged +${merged.size - original.size} packages (total ${merged.size}, pid=$pid)")
+            }
+            // mergeAvailableList already returns a fresh ArrayList on merge;
+            // do not wrap it in a second copy.
+            merged
+        } catch (t: Throwable) {
+            // Fail-closed: merge errors never surface to the caller.
+            if (logBbcMergeFailOnce(pid)) {
+                logi("BBC-HOOK merge failed (${t.javaClass.name}); returning original (pid=$pid)")
+            }
+            result
+        }
+    }
+
+    // android.app.ActivityThread is @hide-excluded from the compile-time SDK
+    // stub (compileSdk 34), so the current Application is reached through a
+    // cached reflective method; the framework class is present at runtime in
+    // every app process. Memoized Method only — currentApplication() is
+    // re-invoked per probe so an early null never sticks. Kept ONLY as the
+    // fallback for a missing/non-Context BBC callee argument (F-06).
+    private val activityThreadCurrentApplication: java.lang.reflect.Method? by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        try {
+            Class.forName("android.app.ActivityThread").getMethod("currentApplication")
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun bbcCurrentPackageManager(): android.content.pm.PackageManager? = try {
+        val app = activityThreadCurrentApplication?.invoke(null) as? android.app.Application
+        app?.packageManager
+    } catch (_: Throwable) {
+        null
+    }
+
+    // One line per process for the empty-policy entry evidence. Fully total:
+    // a broken log store drops the line instead of breaking the hook path.
+    private fun logBbcHitOnce(msg: String) {
+        val added = try {
+            bbcHitLog.add(msg)
+        } catch (_: Throwable) {
+            false
+        }
+        if (added) {
+            logi(msg)
+        }
+    }
+
+    // Caller-identification entry diagnosis (once per process, pid-keyed).
+    // Read-only: formats one BBC-ENTRY line (ts/pid/size/containsPolicy
+    // boolean/caller snippet) and never affects merge/gate/write/return
+    // semantics. R10 (P2): the caller stack snippet is now supplied LAZILY and
+    // captured only after the once-per-pid ledger claim succeeds (delegated to
+    // BbcEntryLogger). An empty caller snippet or any failure skips the line.
+    private fun logBbcEntryOnce(
+        pid: Int,
+        tsMs: Long,
+        callerSupplier: () -> String,
+        resultSize: Int,
+        containsPolicy: Boolean,
+    ) {
+        bbcEntryLogger.logOnce(pid, tsMs, resultSize, containsPolicy, callerSupplier)
+    }
+
+    // First merge per process logs; subsequent merges stay silent.
+    private fun logBbcMergedOnce(pid: Int): Boolean = try {
+        bbcMergedLog.add("pid:$pid")
+    } catch (_: Throwable) {
+        false
+    }
+
+    private fun logBbcNoMergeOnce(pid: Int): Boolean = try {
+        bbcMergedLog.add("nomerge:$pid")
+    } catch (_: Throwable) {
+        false
+    }
+
+    // Merge-path failure ledger (logged once per process, never swallowed).
+    private fun logBbcMergeFailOnce(pid: Int): Boolean = try {
+        bbcMergedLog.add("mergefail:$pid")
+    } catch (_: Throwable) {
+        false
+    }
+
+    // Bad-result-type ledger (logged once per process, never swallowed).
+    private fun logBbcBadTypeOnce(pid: Int): Boolean = try {
+        bbcMergedLog.add("badtype:$pid")
+    } catch (_: Throwable) {
+        false
+    }
+
+    // Phase A P0: Unknown-policy keep-last-good ledger (once per process).
+    // Fires when bbcPolicy() is Unknown (null/version-absent/contention/
+    // deadline/clock) and the interceptor keeps serving the sticky snapshot.
+    private fun logBbcUnknownOnce(pid: Int): Boolean = try {
+        bbcMergedLog.add("unknown:$pid")
+    } catch (_: Throwable) {
+        false
+    }
+
     // Merges policy entries into the WhiteListApps static whitelists after
     // class init. Thin shell over WhitelistPatch.patchFields (unit-tested):
     // BOTH candidate fields are attempted (the ROM may read the _FOR_CHINA
@@ -1099,6 +1820,23 @@ class DualHook : XposedModule() {
             },
         )
 
+        // Phase A P0 BBC independent cache (sticky last-good). Separate
+        // instance from the whitelist effectiveCache so the whitelist path
+        // (NON_EMPTY_POLICY_EFFECTIVE_GATE=false, fail-closed) sees zero
+        // behavior change; BBC TTL/invalidate never discard last-good here
+        // (only the sticky cap does). Same 60s TTL / 5s cooldown /
+        // single-flight shape, independent counters + throttled BBC log.
+        private val bbcCache = EffectivePolicyCache(
+            onLog = { msg ->
+                try {
+                    Log.i(TAG, msg)
+                } catch (_: Throwable) {
+                    // Diagnostics only.
+                }
+            },
+            stickyLastGood = true,
+        )
+
         // Bounded refresh executor (P1-2, hardened K4 P2#6): zero-queue single
         // daemon thread shared by all policy refreshes so a slow binder read
         // never pins the hooked query thread beyond
@@ -1198,6 +1936,13 @@ class DualHook : XposedModule() {
                 remoteCapableFalseCached = null
                 remoteCapabilityProbeFailureLogged = false
                 effectiveCache.invalidate()
+                // Phase A P0: BBC cache has its own generation/single-flight;
+                // invalidate it too so the next BBC query re-reads, but its
+                // sticky last-good survives (unlike the whitelist seed-only).
+                try {
+                    bbcCache.invalidate()
+                } catch (_: Throwable) {
+                }
                 try {
                     policyRefreshGate.invalidate()
                 } catch (_: Throwable) {

@@ -23,6 +23,12 @@ import java.util.concurrent.atomic.AtomicLong
 class EffectivePolicyCache(
     private val nowMs: () -> Long = { System.nanoTime() / 1_000_000L },
     private val onLog: (String) -> Unit = {},
+    // Phase A P0 (BBC sticky last-good): when true, failed reads keep the
+    // last successful snapshot across TTL expiry / invalidate / cooldown /
+    // contention / clock / deadline instead of falling back to seed.
+    // Whitelist path uses false (fail-closed, zero behavior change); BBC path
+    // uses a separate instance with true (see DualHook.bbcCache).
+    private val stickyLastGood: Boolean = false,
 ) {
     // lock is a plain monitor guard for synchronized(lock); wait/notify need
     // the java.lang.Object surface, which kotlin.Any does not expose.
@@ -96,6 +102,26 @@ class EffectivePolicyCache(
     // for observability.
     companion object {
         const val DEFAULT_FOLLOWER_GRACE_MS = 50L
+        // Phase A P0 sticky cap: last-good is retained at most this long.
+        // Past the cap the sticky snapshot expires to empty (fail-closed) so a
+        // dead daemon cannot hide a policy clear indefinitely. 30 min >> 60s
+        // TTL so normal polls never hit it; only a sustained failure storm
+        // (no successful read for 30 min) expires. Retunable without breaking
+        // the contract as long as it stays >> TTL + cooldown.
+        const val BBC_STICKY_MAX_AGE_MS = 30L * 60L * 1000L
+    }
+
+    // Phase A P0 BBC explicit-empty token. Good = successful non-empty read
+    // (mergeable); Cleared = successful empty read WITH version proof
+    // (intentional clear, shrink allowed); Unknown = failed read (null /
+    // throw / contention / deadline / clock) OR successful empty WITHOUT
+    // version proof (indistinguishable from "never written", never shrink).
+    // Unknown carries the sticky last-good (possibly empty) for the caller to
+    // merge (non-empty) or no-op (empty) + one-time keep-last-good logging.
+    sealed interface BbcPolicy {
+        data class Good(val packages: Set<String>) : BbcPolicy
+        data class Cleared(val version: Long) : BbcPolicy
+        data class Unknown(val lastGood: Set<String>) : BbcPolicy
     }
 
     // Phase7 observability: follower grace waits taken. Counted inside the
@@ -127,6 +153,28 @@ class EffectivePolicyCache(
     val failedReadSeedOnly = AtomicLong(0L)
     private val lastFallbackLogMs = AtomicLong(Long.MIN_VALUE)
     private val FALLBACK_LOG_THROTTLE_MS = 5_000L
+
+    // Phase A P0 BBC sticky state (independent lastGoodBbc; whitelist path
+    // with stickyLastGood=false never touches these). Guarded by [lock] like
+    // [cached]/[valid]; counters are process-lifetime observability only.
+    // lastGoodSticky holds the last SUCCESSFUL BBC snapshot (Good non-empty
+    // or Cleared empty-with-version); Unknown never updates it. It survives
+    // TTL expiry + invalidate (unlike [cached]/[valid]/[invalidated]) until
+    // the sticky cap expires it.
+    private var lastGoodSticky: Set<String>? = null
+    private var lastGoodStickyAtMs: Long = 0L
+    private var lastBbcClearedVersion: Long = -1L
+    // Phase A P0 Security MEDIUM: monotonic version gate. Tracks the highest
+    // accepted BBC version (Good-with-version or Cleared) to reject replays:
+    // Cleared requires strictly increasing (reject 0/negative, reject
+    // duplicate/replay), with a wraparound exception (writer wraps to 1 after
+    // Long.MAX_VALUE-1/MAX). Updated only on accepted Good/Cleared, never on
+    // Unknown/rejected-Cleared, under [lock].
+    private var lastBbcSeenVersion: Long = -1L
+    val bbcStickyFallbackCount = AtomicLong(0L)
+    val bbcStickyExpiredCount = AtomicLong(0L)
+    val bbcUnknownCount = AtomicLong(0L)
+    private val lastBbcLogMs = AtomicLong(Long.MIN_VALUE)
 
     private fun waitGrace(timeoutMs: Long) {
         if (timeoutMs <= 0L) return
@@ -170,6 +218,152 @@ class EffectivePolicyCache(
         }
     }
 
+    // Phase A P0: throttled BBC sticky-fallback log (same 5s throttle shape as
+    // noteSeedOnlyFallback, separate gate so BBC + whitelist storms do not
+    // starve each other). Every getBbc() fallback arm calls this; a broken
+    // clock skips the log (no throttle bypass) like the seed-only sibling.
+    private fun noteBbcFallback(cause: String) {
+        val now = try {
+            nowMs()
+        } catch (_: Throwable) {
+            Long.MIN_VALUE
+        }
+        if (now == Long.MIN_VALUE) return
+        val last = lastBbcLogMs.get()
+        if (last != Long.MIN_VALUE && now - last < FALLBACK_LOG_THROTTLE_MS) return
+        if (!lastBbcLogMs.compareAndSet(last, now)) return
+        try {
+            onLog(
+                "BBC sticky fallback ($cause): " +
+                    "stickyFallback=${bbcStickyFallbackCount.get()} " +
+                    "stickyExpired=${bbcStickyExpiredCount.get()} " +
+                    "unknown=${bbcUnknownCount.get()}",
+            )
+        } catch (_: Throwable) {
+            // Diagnostics only.
+        }
+    }
+
+    // Phase A P0: sticky helpers. Must be called under [lock].
+    // Returns the sticky snapshot if present and within the cap; expires it
+    // (fail-closed to null) past BBC_STICKY_MAX_AGE_MS with a counted +
+    // throttled log so a clear can never hide indefinitely.
+    private fun stickyIfValidLocked(now: Long): Set<String>? {
+        val g = lastGoodSticky ?: return null
+        if (now >= lastGoodStickyAtMs && now - lastGoodStickyAtMs >= BBC_STICKY_MAX_AGE_MS) {
+            lastGoodSticky = null
+            try {
+                bbcStickyExpiredCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            // Throttled expiry log (called under lock; noteBbcFallback reads
+            // the clock again — never throws, never deadlocks).
+            try {
+                noteBbcFallback("sticky-expired")
+            } catch (_: Throwable) {
+            }
+            return null
+        }
+        return g
+    }
+
+    private fun updateStickyLocked(snapshot: Set<String>, now: Long) {
+        lastGoodSticky = snapshot
+        lastGoodStickyAtMs = now
+    }
+
+    // Phase A P0 Security MEDIUM: version monotonicity helpers. Must be called
+    // under [lock].
+    //
+    // F3 (documented limitation — option (b)): the writer's version counter is
+    // a bare Long with no on-disk epoch (the key format is fixed and shared
+    // cross-process, so an epoch/floor cannot be persisted here without a
+    // writer-side format change). When the counter wraps from MAX-1/MAX to 1,
+    // [observeBbcVersionLocked] resets the high-water to 1 to admit the new
+    // 1,2,3... sequence. From that point a replayed mid-range value (e.g. 500)
+    // is greater than the new high-water and therefore ACCEPTED — wraparound
+    // reopens the replay window until the new sequence itself passes that
+    // value. This is practically unreachable in production (it needs ~9.22e18
+    // committed writes on one install); see the pinning test
+    // `bbcVersionWraparoundReopensReplayWindowDocumentedBbc`. Do not "fix" this
+    // by storing an epoch in the version key — that changes the key format.
+    private fun isBbcVersionWraparound(last: Long, v: Long): Boolean =
+        last >= Long.MAX_VALUE - 1L && v == 1L
+
+    private fun isClearedVersionAcceptableLocked(v: Long): Boolean {
+        if (v < 1L) return false
+        val last = lastBbcSeenVersion
+        if (last < 0L) return true
+        if (v > last) return true
+        if (v == last) return false
+        return isBbcVersionWraparound(last, v)
+    }
+
+    // R06 (P1) / F2: version gate for Good(non-empty). Deliberate rule choice:
+    // reject NON-INCREASING versions (v <= last high-water) with two narrow
+    // exceptions so existing fail-open-for-Good semantics are preserved:
+    //   1. writer wraparound (v==1 after MAX-1/MAX) — identical to the Cleared
+    //      path;
+    //   2. a same-version Good when the high-water was set by a GOOD (lastBbc-
+    //      ClearedVersion != last) — preserves the existing same-version Good
+    //      re-acceptance after an intervening failed read. F2: this branch is
+    //      now CONTENT-AWARE (see below). A same-version Cleared->Good replay
+    //      IS still rejected (lastBbcClearedVersion == last), which is the
+    //      revoke-then-re-attach case this gate must stop.
+    // Strictly older versions (except wraparound) are always rejected.
+    //
+    // F2 (same-version content): when v == last and the high-water came from a
+    // Good, accept ONLY an identical-content re-acceptance — the candidate set
+    // must equal the last accepted good snapshot (cached, or sticky last-good
+    // after invalidate/TTL), compared as the merged effective set (post
+    // STATIC_SEED / 512-cap sanitize). At an equal version ANY content change —
+    // including a shrink — is a stale replay and is REJECTED as Unknown: the
+    // writer bumps extra_whitelist_version on every successful save/clear, so
+    // a genuine policy change must carry a strictly newer version. Comparing
+    // against BOTH cached and sticky keeps the legacy
+    // successEmptyWithoutVersionKeepsLastGoodBbc (same-version same-content
+    // re-acceptance after a failed read) working, as long as a genuine
+    // snapshot exists. If BOTH are absent (e.g. the sticky cap expired after a
+    // sustained failure storm), content equality cannot be proven and the
+    // same-version Good is REJECTED (fail-closed) instead of being accepted
+    // unconditionally. The wraparound and no-canonical fail-closed branches
+    // are unchanged.
+    private fun isGoodVersionAcceptableLocked(v: Long, candidate: Set<String>): Boolean {
+        if (v < 1L) return false
+        val last = lastBbcSeenVersion
+        if (last < 0L) return true
+        if (v > last) return true
+        if (isBbcVersionWraparound(last, v)) return true
+        if (v == last && lastBbcClearedVersion != last) {
+            val canonical = cached.takeIf { it.isNotEmpty() }
+                ?: lastGoodSticky?.takeIf { it.isNotEmpty() }
+                ?: return false // FAIL-CLOSED: no canonical snapshot to compare against.
+            // Byte-for-byte equal merged content (a re-read of the current
+            // state) is the ONLY acceptable same-version case. Any content
+            // change — including a shrink — needs a strictly newer version;
+            // at an equal version it is a stale replay.
+            return canonical == candidate
+        }
+        return false
+    }
+
+    private fun observeBbcVersionLocked(v: Long?) {
+        if (v == null || v < 1L) return
+        val last = lastBbcSeenVersion
+        // On wraparound this intentionally lowers the high-water to 1 (see F3
+        // note on isBbcVersionWraparound: the replay window reopens, documented
+        // and pinned by test rather than fixed with a key-format change).
+        if (last < 0L || v > last || isBbcVersionWraparound(last, v)) {
+            lastBbcSeenVersion = v
+        }
+    }
+
+    // NOTE (code-reviewer Major, kept by design): the stickyLastGood arms
+    // inside get() below are currently unreachable in production (whitelist
+    // instance constructs with false; the sticky BBC instance only calls
+    // getBbc()). They are kept — not deleted — as defensive parity: a future
+    // sticky caller of get() stays fail-sticky instead of silently regressing
+    // to fail-closed, at zero runtime cost (one boolean check per arm).
     fun get(
         seed: Set<String>,
         nonEmptyPolicyGateOpen: Boolean = PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE,
@@ -194,6 +388,24 @@ class EffectivePolicyCache(
         } catch (_: Throwable) {
             // H9: seed-only fallback, routed like the sibling broken-clock
             // degrades (a no-op log when the clock is dead).
+            // Phase A P0: sticky instances keep last-good on clock failure
+            // (no TTL/expiry check possible without a clock — serve sticky
+            // as-is, never unbounded seed-only churn).
+            if (stickyLastGood) {
+                val sticky: Set<String>? = synchronized(lock) { lastGoodSticky }
+                if (sticky != null) {
+                    try {
+                        bbcStickyFallbackCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        bbcUnknownCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    noteBbcFallback("clock")
+                    return sticky
+                }
+            }
             noteSeedOnlyFallback("clock")
             return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
         }
@@ -216,6 +428,33 @@ class EffectivePolicyCache(
             // never toward serving a stale cache).
             val lf = lastFailureMs
             if (lf != null && now0 - lf < failureCooldownMs && now0 - lf >= 0L) {
+                // Phase A P0: sticky instances ignore [invalidated] here —
+                // TTL expiry / invalidate never discard BBC last-good; the
+                // cooldown path serves sticky when present (even after an
+                // explicit invalidation), expiring only via the sticky cap.
+                if (stickyLastGood) {
+                    val sticky = stickyIfValidLocked(now0)
+                    if (sticky != null) {
+                        try {
+                            bbcStickyFallbackCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            bbcUnknownCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        noteBbcFallback("cooldown")
+                        return sticky
+                    }
+                    // Sticky absent/expired: fail-closed to seed (counted as
+                    // BBC sticky fallback for observability, throttled log).
+                    try {
+                        bbcStickyFallbackCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    noteBbcFallback("cooldown-no-sticky")
+                    return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
+                }
                 // After an explicit invalidation, never resurrect a stale
                 // pre-invalidation cached value: fall back to the seed alone.
                 if (hadGoodValue && !invalidated) return cached
@@ -281,6 +520,33 @@ class EffectivePolicyCache(
             if (remainingGrace <= 0L) {
                 synchronized(lock) {
                     if (valid) return cached
+                    // Phase A P0: sticky followers keep last-good on
+                    // grace-exhausted short-circuit (deadline already spent).
+                    if (stickyLastGood) {
+                        val nowG = try {
+                            nowMs()
+                        } catch (_: Throwable) {
+                            now1
+                        }
+                        val sticky = stickyIfValidLocked(nowG)
+                        if (sticky != null) {
+                            try {
+                                bbcStickyFallbackCount.incrementAndGet()
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                bbcUnknownCount.incrementAndGet()
+                            } catch (_: Throwable) {
+                            }
+                            noteBbcFallback("grace-expired")
+                            return sticky
+                        }
+                        try {
+                            bbcStickyFallbackCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        noteBbcFallback("grace-expired-no-sticky")
+                    }
                     // H9: grace-expired follower fell back to seed-only.
                     graceExpiredSeedOnly.incrementAndGet()
                     noteSeedOnlyFallback("grace-expired")
@@ -341,6 +607,27 @@ class EffectivePolicyCache(
                 // released before this follower re-acquired the lock) with no
                 // committed value. graceExpiredSeedOnly counts this arm, not
                 // proof of parking.
+                // Phase A P0: sticky followers keep last-good here as well.
+                if (stickyLastGood) {
+                    val sticky = stickyIfValidLocked(now2)
+                    if (sticky != null) {
+                        try {
+                            bbcStickyFallbackCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            bbcUnknownCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        noteBbcFallback("grace-expired")
+                        return sticky
+                    }
+                    try {
+                        bbcStickyFallbackCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    noteBbcFallback("grace-expired-no-sticky")
+                }
                 graceExpiredSeedOnly.incrementAndGet()
                 noteSeedOnlyFallback("grace-expired")
                 return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
@@ -373,6 +660,55 @@ class EffectivePolicyCache(
                 try {
                     // A peer may have committed while we were in IO; prefer it.
                     if (valid) return cached
+                    // Phase A P0: sticky keeps last-good across invalidate-
+                    // during-IO and contention (TTL/invalidate never discard
+                    // BBC last-good; only the sticky cap expires it).
+                    if (stickyLastGood) {
+                        // Loser-drop still releases the claim, but serves
+                        // sticky instead of seed-only.
+                        if (gen0 != generation) {
+                            val sticky = stickyIfValidLocked(now0)
+                            if (sticky != null) {
+                                try {
+                                    bbcStickyFallbackCount.incrementAndGet()
+                                } catch (_: Throwable) {
+                                }
+                                try {
+                                    bbcUnknownCount.incrementAndGet()
+                                } catch (_: Throwable) {
+                                }
+                                noteBbcFallback("invalidated-discard")
+                                return sticky
+                            }
+                            try {
+                                bbcStickyFallbackCount.incrementAndGet()
+                            } catch (_: Throwable) {
+                            }
+                            noteBbcFallback("invalidated-discard-no-sticky")
+                            // Fall through to seed-only counting below.
+                        } else {
+                            val sticky2 = stickyIfValidLocked(now0)
+                            if (sticky2 != null) {
+                                try {
+                                    bbcStickyFallbackCount.incrementAndGet()
+                                } catch (_: Throwable) {
+                                }
+                                try {
+                                    bbcUnknownCount.incrementAndGet()
+                                } catch (_: Throwable) {
+                                }
+                                noteBbcFallback("contention")
+                                return sticky2
+                            }
+                            try {
+                                bbcStickyFallbackCount.incrementAndGet()
+                            } catch (_: Throwable) {
+                            }
+                            noteBbcFallback("contention-no-sticky")
+                            // Fall through to seed-only counting below for
+                            // H9 parity when no sticky exists.
+                        }
+                    }
                     // Loser-drop still applies: an invalidate during IO means
                     // seed-only (never resurrect stale).
                     if (gen0 != generation) {
@@ -416,6 +752,27 @@ class EffectivePolicyCache(
                 // already committed a good value.
                 if (gen0 != generation) {
                     if (valid) return cached
+                    // Phase A P0: sticky survives invalidate-during-IO.
+                    if (stickyLastGood) {
+                        val stickyL = stickyIfValidLocked(now1)
+                        if (stickyL != null) {
+                            try {
+                                bbcStickyFallbackCount.incrementAndGet()
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                bbcUnknownCount.incrementAndGet()
+                            } catch (_: Throwable) {
+                            }
+                            noteBbcFallback("invalidated-discard")
+                            return stickyL
+                        }
+                        try {
+                            bbcStickyFallbackCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        noteBbcFallback("invalidated-discard-no-sticky")
+                    }
                     // H9: invalidate-during-IO discard -> seed-only.
                     invalidatedDiscardSeedOnly.incrementAndGet()
                     noteSeedOnlyFallback("invalidated-discard")
@@ -437,6 +794,24 @@ class EffectivePolicyCache(
                     lastFailureMs = null
                     failureLogged = false
                     lastRefreshMs = now1
+                    // Phase A P0: sticky tracks every success (including
+                    // empty) so a later transient keeps last-good; TTL /
+                    // invalidate never clear it (only the sticky cap does).
+                    if (stickyLastGood) {
+                        try {
+                            updateStickyLocked(
+                                java.util.Collections.unmodifiableSet(
+                                    LinkedHashSet(merged),
+                                ),
+                                now1,
+                            )
+                        } catch (_: Throwable) {
+                            try {
+                                updateStickyLocked(merged, now1)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
                     return cached
                 } else {
                     // Sliding cooldown: refresh lastFailureMs on every failure
@@ -444,6 +819,28 @@ class EffectivePolicyCache(
                     // cooldownThrottlesConsecutiveFailures). Success/invalidate clears
                     // it (branch above). Phase 5: unified to English.
                     lastFailureMs = now1
+                    // Phase A P0: sticky failure keeps last-good (even after
+                    // invalidate/TTL); only the sticky cap expires it.
+                    if (stickyLastGood) {
+                        val stickyF = stickyIfValidLocked(now1)
+                        if (stickyF != null) {
+                            try {
+                                bbcStickyFallbackCount.incrementAndGet()
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                bbcUnknownCount.incrementAndGet()
+                            } catch (_: Throwable) {
+                            }
+                            noteBbcFallback("failed-read")
+                            return stickyF
+                        }
+                        try {
+                            bbcStickyFallbackCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        noteBbcFallback("failed-read-no-sticky")
+                    }
                     if (hadGoodValue && !invalidated) return cached
                     // CR-O4: H9 — failed read with nothing good to resurrect:
                     // seed-only fallback, counted like the sibling arms.
@@ -456,6 +853,518 @@ class EffectivePolicyCache(
                 // still ours -- an invalidate() (which clears inFlightGen) or
                 // a successor leader must never be cleared by a stale leader.
                 // Wake all waiting followers immediately via notifyAll().
+                if (inFlightGen == gen0) {
+                    inFlightGen = null
+                    notifyFollowers()
+                }
+            }
+        }
+    }
+
+    // Phase A P0 BBC version-aware sticky read.
+    //
+    // Reader contract: Pair(packages, version) where packages==null means a
+    // failed read (null / throw / contention / deadline / clock upstream);
+    // packages non-empty means Good — a null version is the UNGATED legacy
+    // old-draft path (trusted only before any versioned state exists), while a
+    // PRESENT version is monotonic-gated against downgrade/replay (R06 + F1/F2
+    // — see isGoodVersionAcceptableLocked; equal version requires identical
+    // merged content, any content change needs a strictly newer version);
+    // packages empty + version!=null means Cleared (intentional clear, shrink
+    // allowed and cached); packages empty + version==null means Unknown
+    // (indistinguishable from "never written", never cached, sticky served).
+    // Only Good(non-empty) and Cleared(empty+version) update the sticky
+    // snapshot; Unknown never shrinks. TTL expiry / invalidate never discard
+    // sticky (only BBC_STICKY_MAX_AGE_MS expires it, counted + throttled).
+    // Gate-closed short-circuits to Cleared(-1) with zero IPC/state (BBC
+    // injection disabled => empty, no Unknown log). N06(b): the gate is a LAZY
+    // provider evaluated after now0 so a slow read is charged to the same
+    // bounded 50ms deadline budget.
+    fun getBbc(
+        seed: Set<String>,
+        bbcGateOpen: () -> Boolean = { PolicySource.BBC_AVAILABLE_APPS_INJECTION },
+        followerGraceMs: Long = DEFAULT_FOLLOWER_GRACE_MS,
+        deadlineMs: Long = -1L,
+        reader: () -> Pair<Set<String>?, Long?>,
+    ): BbcPolicy {
+        val now0: Long = try {
+            nowMs()
+        } catch (_: Throwable) {
+            // Preserve the gate-closed invariant even when the clock sample
+            // fails: re-evaluate the opt-out provider (wrapped, never throws)
+            // and still short-circuit to Cleared(-1) with zero reader calls.
+            // A broken provider cannot mask the existing clock fallback.
+            val gateClosed = try {
+                !bbcGateOpen()
+            } catch (_: Throwable) {
+                false
+            }
+            if (gateClosed) return BbcPolicy.Cleared(-1L)
+            val sticky: Set<String>? = synchronized(lock) { lastGoodSticky }
+            if (sticky != null) {
+                try {
+                    bbcStickyFallbackCount.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                try {
+                    bbcUnknownCount.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                noteBbcFallback("clock")
+                return BbcPolicy.Unknown(sticky)
+            }
+            try {
+                bbcStickyFallbackCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            try {
+                bbcUnknownCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+            noteBbcFallback("clock-no-sticky")
+            return BbcPolicy.Unknown(emptySet())
+        }
+        // N06(b): gate read happens AFTER now0/deadline sampling, inside the
+        // guarded section, so a slow pref read consumes the same deadline
+        // budget (visible to the follower elapsed clamp below). Gate-closed
+        // still returns the exact Cleared(-1) sentinel with ZERO reader calls.
+        if (!bbcGateOpen()) return BbcPolicy.Cleared(-1L)
+        val gen0: Long
+        var isFollower = false
+        synchronized(lock) {
+            if (valid && (now0 - lastRefreshMs >= maxCacheAgeMs || now0 - lastRefreshMs < 0L)) {
+                valid = false
+                // NOTE: sticky intentionally NOT cleared here (unlike the
+                // whitelist fail-closed path which sets invalidated=true to
+                // suppress resurrection). invalidated is still set for the
+                // shared cooldown bookkeeping, but getBbc() fallback arms
+                // prefer sticky regardless of it.
+                invalidated = true
+            }
+            if (valid) {
+                return if (cached.isEmpty()) {
+                    BbcPolicy.Cleared(lastBbcClearedVersion)
+                } else {
+                    BbcPolicy.Good(cached)
+                }
+            }
+            val lf = lastFailureMs
+            if (lf != null && now0 - lf < failureCooldownMs && now0 - lf >= 0L) {
+                val sticky = stickyIfValidLocked(now0)
+                if (sticky != null) {
+                    try {
+                        bbcStickyFallbackCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        bbcUnknownCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    noteBbcFallback("cooldown")
+                    return BbcPolicy.Unknown(sticky)
+                }
+                try {
+                    bbcStickyFallbackCount.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                try {
+                    bbcUnknownCount.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                noteBbcFallback("cooldown-no-sticky")
+                return BbcPolicy.Unknown(emptySet())
+            }
+            if (inFlightGen != null) {
+                if (valid) {
+                    return if (cached.isEmpty()) {
+                        BbcPolicy.Cleared(lastBbcClearedVersion)
+                    } else {
+                        BbcPolicy.Good(cached)
+                    }
+                }
+                isFollower = true
+                gen0 = -1L
+            } else {
+                inFlightGen = generation
+                gen0 = generation
+            }
+        }
+        if (isFollower) {
+            val now1 = try {
+                nowMs()
+            } catch (_: Throwable) {
+                now0
+            }
+            val elapsed = try {
+                (now1 - now0).coerceAtLeast(0L)
+            } catch (_: Throwable) {
+                0L
+            }
+            val remainingGrace = if (deadlineMs > 0L) {
+                try {
+                    minOf(followerGraceMs - elapsed, deadlineMs - now1).coerceAtLeast(0L)
+                } catch (_: Throwable) {
+                    0L
+                }
+            } else {
+                try {
+                    (followerGraceMs - elapsed).coerceAtLeast(0L)
+                } catch (_: Throwable) {
+                    0L
+                }
+            }
+            if (remainingGrace <= 0L) {
+                synchronized(lock) {
+                    if (valid) {
+                        return if (cached.isEmpty()) {
+                            BbcPolicy.Cleared(lastBbcClearedVersion)
+                        } else {
+                            BbcPolicy.Good(cached)
+                        }
+                    }
+                    val sticky = try {
+                        stickyIfValidLocked(now1)
+                    } catch (_: Throwable) {
+                        lastGoodSticky
+                    }
+                    try {
+                        bbcStickyFallbackCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        bbcUnknownCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    noteBbcFallback("grace-expired")
+                    return BbcPolicy.Unknown(sticky ?: emptySet())
+                }
+            }
+            synchronized(lock) {
+                val now2: Long = try {
+                    nowMs()
+                } catch (_: Throwable) {
+                    now1
+                }
+                val elapsed2: Long = try {
+                    (now2 - now0).coerceAtLeast(0L)
+                } catch (_: Throwable) {
+                    0L
+                }
+                val budget2: Long = try {
+                    if (deadlineMs > 0L) {
+                        minOf(remainingGrace, followerGraceMs - elapsed2, deadlineMs - now2)
+                    } else {
+                        minOf(remainingGrace, followerGraceMs - elapsed2)
+                    }
+                } catch (_: Throwable) {
+                    0L
+                }
+                if (budget2 > 0L && !valid && inFlightGen != null) {
+                    try {
+                        followerGraceHits.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        waitGrace(budget2)
+                    } catch (t: Throwable) {
+                        if (t is InterruptedException) {
+                            try {
+                                Thread.currentThread().interrupt()
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+                if (valid) {
+                    return if (cached.isEmpty()) {
+                        BbcPolicy.Cleared(lastBbcClearedVersion)
+                    } else {
+                        BbcPolicy.Good(cached)
+                    }
+                }
+                val sticky = try {
+                    stickyIfValidLocked(now2)
+                } catch (_: Throwable) {
+                    lastGoodSticky
+                }
+                try {
+                    bbcStickyFallbackCount.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                try {
+                    bbcUnknownCount.incrementAndGet()
+                } catch (_: Throwable) {
+                }
+                noteBbcFallback("grace-expired")
+                return BbcPolicy.Unknown(sticky ?: emptySet())
+            }
+        }
+        var wasContention = false
+        var readPair: Pair<Set<String>?, Long?>? = null
+        var readFailed = false
+        try {
+            readPair = reader()
+        } catch (e: PolicyRefreshContentionException) {
+            wasContention = true
+        } catch (t: Throwable) {
+            if (t is InterruptedException) try {
+                Thread.currentThread().interrupt()
+            } catch (_: Throwable) {
+            }
+            readFailed = true
+        }
+        if (wasContention) {
+            synchronized(lock) {
+                try {
+                    if (valid) {
+                        return if (cached.isEmpty()) {
+                            BbcPolicy.Cleared(lastBbcClearedVersion)
+                        } else {
+                            BbcPolicy.Good(cached)
+                        }
+                    }
+                    // Sticky survives contention + invalidate-during-IO.
+                    val sticky = try {
+                        stickyIfValidLocked(now0)
+                    } catch (_: Throwable) {
+                        lastGoodSticky
+                    }
+                    try {
+                        bbcStickyFallbackCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        bbcUnknownCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    noteBbcFallback(if (gen0 != generation) "invalidated-discard" else "contention")
+                    return BbcPolicy.Unknown(sticky ?: emptySet())
+                } finally {
+                    if (inFlightGen == gen0) {
+                        inFlightGen = null
+                        notifyFollowers()
+                    }
+                }
+            }
+        }
+        // Classify the versioned read: null pair / null packages / throw =>
+        // Unknown (failed); empty + null version => Unknown (no proof, never
+        // shrink); empty + version => Cleared candidate (monotonicity checked
+        // under lock: reject 0/duplicate/replay except writer wraparound to 1);
+        // non-empty => Good. Only version == null is the ungated legacy draft;
+        // a PRESENT version is monotonic-gated under lock (reject 0/downgrade/
+        // replay; at equal version only identical merged content is accepted —
+        // any content change, including shrink, needs a newer version; see
+        // isGoodVersionAcceptableLocked) and, when accepted, advances the gate.
+        var unknownRead = readFailed || readPair == null
+        var remoteForMerge: Set<String>? = null
+        var clearedVersion: Long? = null
+        var goodVersion: Long? = null
+        if (!unknownRead) {
+            val pkgs = readPair!!.first
+            val ver = readPair!!.second
+            if (pkgs == null) {
+                unknownRead = true
+            } else if (pkgs.isEmpty() && ver == null) {
+                unknownRead = true
+            } else if (pkgs.isEmpty()) {
+                remoteForMerge = emptySet()
+                clearedVersion = ver
+            } else {
+                remoteForMerge = pkgs
+                goodVersion = ver
+            }
+        }
+        var merged: Set<String>? = null
+        var mergeOk = false
+        if (!unknownRead && remoteForMerge != null) {
+            try {
+                merged = PolicySource.effective(seed, remoteForMerge, true)
+                mergeOk = true
+            } catch (_: Throwable) {
+                mergeOk = false
+                unknownRead = true
+            }
+        }
+        val now1: Long = try {
+            nowMs()
+        } catch (_: Throwable) {
+            now0
+        }
+        synchronized(lock) {
+            try {
+                if (gen0 != generation) {
+                    if (valid) {
+                        return if (cached.isEmpty()) {
+                            BbcPolicy.Cleared(lastBbcClearedVersion)
+                        } else {
+                            BbcPolicy.Good(cached)
+                        }
+                    }
+                    val sticky = try {
+                        stickyIfValidLocked(now1)
+                    } catch (_: Throwable) {
+                        lastGoodSticky
+                    }
+                    try {
+                        bbcStickyFallbackCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        bbcUnknownCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    noteBbcFallback("invalidated-discard")
+                    return BbcPolicy.Unknown(sticky ?: emptySet())
+                }
+                if (valid) {
+                    return if (cached.isEmpty()) {
+                        BbcPolicy.Cleared(lastBbcClearedVersion)
+                    } else {
+                        BbcPolicy.Good(cached)
+                    }
+                }
+                if (!unknownRead && mergeOk && merged != null) {
+                    // Security MEDIUM: Cleared monotonicity gate (strictly
+                    // increasing; reject 0/duplicate/replay, wraparound to 1
+                    // after MAX-1/MAX only). Rejected Cleared is Unknown
+                    // (sticky, never cached/shrunk), counted like failed-read.
+                    if (clearedVersion != null && !isClearedVersionAcceptableLocked(clearedVersion)) {
+                        lastFailureMs = now1
+                        val sticky = try {
+                            stickyIfValidLocked(now1)
+                        } catch (_: Throwable) {
+                            lastGoodSticky
+                        }
+                        try {
+                            bbcStickyFallbackCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            bbcUnknownCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        noteBbcFallback("cleared-rejected")
+                        return BbcPolicy.Unknown(sticky ?: emptySet())
+                    }
+                    // R06 (P1): BBC Good(non-empty) with a version must pass the
+                    // monotonic + content gate (isGoodVersionAcceptableLocked) —
+                    // previously only Cleared(empty) did, so a stale/replayed
+                    // versioned Good (e.g. Good({A},v5) -> Cleared(v6) -> stale
+                    // Good({A},v5)) was accepted and re-attached revoked A,
+                    // persisting via sticky.
+                    //
+                    // F1: a non-empty read with NO version (goodVersion == null)
+                    // is only trusted BEFORE any versioned state exists
+                    // (lastBbcSeenVersion < 0 — the legacy old-draft path, kept
+                    // working exactly as today). Once a versioned Good/Cleared
+                    // has been accepted — including every versioned Cleared
+                    // (lastBbcClearedVersion >= 1) — an unversioned non-empty
+                    // read may be a stale pre-version draft or a corrupt/CCE
+                    // version key replayed from the cached RemotePreferences
+                    // map, so it MUST be rejected as Unknown(sticky) just like a
+                    // bad version. Checked before any cached/sticky/high-water
+                    // mutation, so rejection overwrites nothing.
+                    val noVersionGoodRejected =
+                        goodVersion == null && clearedVersion == null && // unversioned non-empty Good only (not a Cleared candidate)
+                            (lastBbcSeenVersion >= 0L || lastBbcClearedVersion >= 1L)
+                    if ((goodVersion != null && !isGoodVersionAcceptableLocked(goodVersion, merged)) ||
+                        noVersionGoodRejected
+                    ) {
+                        lastFailureMs = now1
+                        val sticky = try {
+                            stickyIfValidLocked(now1)
+                        } catch (_: Throwable) {
+                            lastGoodSticky
+                        }
+                        try {
+                            bbcStickyFallbackCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            bbcUnknownCount.incrementAndGet()
+                        } catch (_: Throwable) {
+                        }
+                        noteBbcFallback(
+                            if (goodVersion == null) "good-rejected-no-version" else "good-rejected",
+                        )
+                        return BbcPolicy.Unknown(sticky ?: emptySet())
+                    }
+                    val unmod = try {
+                        java.util.Collections.unmodifiableSet(merged)
+                    } catch (_: Throwable) {
+                        merged
+                    }
+                    cached = unmod
+                    valid = true
+                    hadGoodValue = true
+                    invalidated = false
+                    lastFailureMs = null
+                    failureLogged = false
+                    lastRefreshMs = now1
+                    if (clearedVersion != null) {
+                        lastBbcClearedVersion = clearedVersion
+                        lastBbcSeenVersion = clearedVersion
+                        try {
+                            updateStickyLocked(
+                                try {
+                                    java.util.Collections.unmodifiableSet(LinkedHashSet(merged))
+                                } catch (_: Throwable) {
+                                    merged
+                                },
+                                now1,
+                            )
+                        } catch (_: Throwable) {
+                        }
+                        return BbcPolicy.Cleared(clearedVersion)
+                    } else {
+                        // A higher-version Good takes over the high-water from
+                        // any earlier Cleared. Drop the stale Cleared marker so
+                        // the same-version Good gate classifies this version as
+                        // Good-owned (content-aware against this Good's own
+                        // snapshot) instead of comparing a replay against a
+                        // canonical from the earlier Cleared version. This does
+                        // NOT lower lastBbcSeenVersion: observeBbcVersionLocked
+                        // only advances it (except the documented wraparound).
+                        if (goodVersion != null && goodVersion > lastBbcSeenVersion) {
+                            lastBbcClearedVersion = -1L
+                        }
+                        try {
+                            observeBbcVersionLocked(goodVersion)
+                        } catch (_: Throwable) {
+                        }
+                        try {
+                            updateStickyLocked(
+                                try {
+                                    java.util.Collections.unmodifiableSet(LinkedHashSet(merged))
+                                } catch (_: Throwable) {
+                                    merged
+                                },
+                                now1,
+                            )
+                        } catch (_: Throwable) {
+                        }
+                        return BbcPolicy.Good(unmod)
+                    }
+                } else {
+                    lastFailureMs = now1
+                    val sticky = try {
+                        stickyIfValidLocked(now1)
+                    } catch (_: Throwable) {
+                        lastGoodSticky
+                    }
+                    try {
+                        bbcStickyFallbackCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    try {
+                        bbcUnknownCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
+                    noteBbcFallback("failed-read")
+                    return BbcPolicy.Unknown(sticky ?: emptySet())
+                }
+            } finally {
                 if (inFlightGen == gen0) {
                     inFlightGen = null
                     notifyFollowers()
