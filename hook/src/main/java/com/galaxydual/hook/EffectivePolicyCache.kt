@@ -313,19 +313,21 @@ class EffectivePolicyCache(
     // Strictly older versions (except wraparound) are always rejected.
     //
     // F2 (same-version content): when v == last and the high-water came from a
-    // Good, accept ONLY a content-compatible re-acceptance — the candidate set
-    // must be content-equivalent to, or a strict shrink of, the last accepted
-    // good snapshot (cached, or sticky last-good after invalidate/TTL). A
-    // candidate that re-introduces a package removed at this version (i.e. is
-    // NOT a subset of that snapshot) is a stale replay and is rejected as
-    // Unknown, so it can no longer re-attach a revoked package. Comparing
+    // Good, accept ONLY an identical-content re-acceptance — the candidate set
+    // must equal the last accepted good snapshot (cached, or sticky last-good
+    // after invalidate/TTL), compared as the merged effective set (post
+    // STATIC_SEED / 512-cap sanitize). At an equal version ANY content change —
+    // including a shrink — is a stale replay and is REJECTED as Unknown: the
+    // writer bumps extra_whitelist_version on every successful save/clear, so
+    // a genuine policy change must carry a strictly newer version. Comparing
     // against BOTH cached and sticky keeps the legacy
     // successEmptyWithoutVersionKeepsLastGoodBbc (same-version same-content
     // re-acceptance after a failed read) working, as long as a genuine
     // snapshot exists. If BOTH are absent (e.g. the sticky cap expired after a
-    // sustained failure storm), content compatibility cannot be proven and the
+    // sustained failure storm), content equality cannot be proven and the
     // same-version Good is REJECTED (fail-closed) instead of being accepted
-    // unconditionally.
+    // unconditionally. The wraparound and no-canonical fail-closed branches
+    // are unchanged.
     private fun isGoodVersionAcceptableLocked(v: Long, candidate: Set<String>): Boolean {
         if (v < 1L) return false
         val last = lastBbcSeenVersion
@@ -336,10 +338,11 @@ class EffectivePolicyCache(
             val canonical = cached.takeIf { it.isNotEmpty() }
                 ?: lastGoodSticky?.takeIf { it.isNotEmpty() }
                 ?: return false // FAIL-CLOSED: no canonical snapshot to compare against.
-            // Equal (a re-read of the current state) or a strict subset (a
-            // legitimate same-version shrink) is safe: no previously removed
-            // package can come back. Any other set is a stale replay.
-            return canonical.containsAll(candidate)
+            // Byte-for-byte equal merged content (a re-read of the current
+            // state) is the ONLY acceptable same-version case. Any content
+            // change — including a shrink — needs a strictly newer version;
+            // at an equal version it is a stale replay.
+            return canonical == candidate
         }
         return false
     }
@@ -865,7 +868,8 @@ class EffectivePolicyCache(
     // packages non-empty means Good — a null version is the UNGATED legacy
     // old-draft path (trusted only before any versioned state exists), while a
     // PRESENT version is monotonic-gated against downgrade/replay (R06 + F1/F2
-    // — see isGoodVersionAcceptableLocked);
+    // — see isGoodVersionAcceptableLocked; equal version requires identical
+    // merged content, any content change needs a strictly newer version);
     // packages empty + version!=null means Cleared (intentional clear, shrink
     // allowed and cached); packages empty + version==null means Unknown
     // (indistinguishable from "never written", never cached, sticky served).
@@ -1133,8 +1137,9 @@ class EffectivePolicyCache(
         // under lock: reject 0/duplicate/replay except writer wraparound to 1);
         // non-empty => Good. Only version == null is the ungated legacy draft;
         // a PRESENT version is monotonic-gated under lock (reject 0/downgrade/
-        // replay, content-aware at equal version; see isGoodVersionAcceptableLocked)
-        // and, when accepted, advances the seen gate.
+        // replay; at equal version only identical merged content is accepted —
+        // any content change, including shrink, needs a newer version; see
+        // isGoodVersionAcceptableLocked) and, when accepted, advances the gate.
         var unknownRead = readFailed || readPair == null
         var remoteForMerge: Set<String>? = null
         var clearedVersion: Long? = null

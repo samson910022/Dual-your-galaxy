@@ -581,23 +581,80 @@ class BbcStickyPolicyTest {
     }
 
     @Test
-    fun goodSameVersionShrinkThenOldContentReplayRejectedBbc() {
-        // Exact replay sequence: Good({A,B},5) -> Good({B},5) (a legitimate
-        // same-version shrink) -> replay Good({A,B},5). The final replay must
-        // be Unknown and retain {B}; A is never re-attached.
+    fun goodSameVersionShrinkRejectedBbc() {
+        // N02: a same-version shrink is a content change and MUST be rejected
+        // as a stale replay (no version proof); the writer bumps
+        // extra_whitelist_version on every successful save/clear. Good({A,B},5)
+        // -> Good({B},5) must stay Unknown with lastGood/cached still {A,B},
+        // and the unknown counter must increment.
         val (cache, _) = bbcCacheAt(1_000L)
         assertTrue(
             cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
                 is EffectivePolicyCache.BbcPolicy.Good,
         )
         cache.invalidate()
+        val unknownBefore = cache.bbcUnknownCount.get()
         val shrunk = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 5L) })
-        assertTrue(shrunk is EffectivePolicyCache.BbcPolicy.Good)
-        assertEquals(setOf("B"), (shrunk as EffectivePolicyCache.BbcPolicy.Good).packages)
+        assertTrue(shrunk is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(setOf("A", "B"), (shrunk as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertTrue(cache.bbcUnknownCount.get() >= unknownBefore + 1)
+        // The final old-content replay {A,B}@5 is now an identical re-read of
+        // the unchanged canonical, so it is accepted — proving the rejected
+        // shrink never shrank cached/sticky to {B} (which would reject it).
         cache.invalidate()
         val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
-        assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
-        assertEquals(setOf("B"), (replay as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertTrue(replay is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A", "B"), (replay as EffectivePolicyCache.BbcPolicy.Good).packages)
+    }
+
+    @Test
+    fun goodSameVersionNewerVersionShrinkAcceptedBbc() {
+        // N02: a genuine shrink is accepted when it carries a strictly newer
+        // version — the writer bumps extra_whitelist_version on every save.
+        val (cache, _) = bbcCacheAt(1_000L)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        val shrunk = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 6L) })
+        assertTrue(shrunk is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("B"), (shrunk as EffectivePolicyCache.BbcPolicy.Good).packages)
+    }
+
+    @Test
+    fun goodSameVersionConcurrentReaderCannotShrinkBbc() {
+        // N02: a second same-version reader cannot shrink the canonical
+        // snapshot; {B}@5 against {A,B}@5 is a stale partial replay.
+        val (cache, _) = bbcCacheAt(1_000L)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        val concurrent = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 5L) })
+        assertTrue(concurrent is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(setOf("A", "B"), (concurrent as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        // Canonical unchanged: an identical re-read at v5 is still accepted.
+        cache.invalidate()
+        val still = cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
+        assertTrue(still is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A", "B"), (still as EffectivePolicyCache.BbcPolicy.Good).packages)
+    }
+
+    @Test
+    fun goodReAddAtHigherVersionAcceptedBbc() {
+        // N02: re-adding a previously removed package is legitimate when it
+        // carries a strictly newer version (writer bumps on every save).
+        val (cache, _) = bbcCacheAt(1_000L)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 6L) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        val readded = cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 7L) })
+        assertTrue(readded is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A", "B"), (readded as EffectivePolicyCache.BbcPolicy.Good).packages)
     }
 
     @Test
