@@ -239,4 +239,30 @@ class BbcToggleConcurrencyTest {
         assertEquals(0, sink.failures)
         assertEquals(false, sink.persisted)
     }
+
+    @Test
+    fun staleSuccessThenNewerFailure_restoresActualPersistedValue() = runTest {
+        val sink = Sink(initial = false) // persisted starts OFF
+        val gate0 = CompletableDeferred<Unit>()
+        sink.gates[0] = gate0
+        sink.resultAt = { idx -> idx != 1 } // call 0 (ON) succeeds, call 1 (OFF) fails
+        val c = controller(initial = false, sink = sink)
+
+        c.onToggle(true) // gen 1: ON commit starts, gated in IO
+        testScheduler.runCurrent()
+        assertEquals(listOf(true), sink.commits)
+
+        c.onToggle(false) // gen 2: OFF supersedes while the ON commit is in flight
+        gate0.complete(Unit)
+        testScheduler.advanceUntilIdle()
+
+        // ON really landed on disk (persisted=true) but its gen-1 result was
+        // stale, so lastGood stayed false. The newer OFF commit fails; rollback
+        // must restore ON (disk truth), NOT OFF (the stale lastGood).
+        assertEquals(listOf(true), sink.restored)
+        assertEquals(1, sink.failures)
+        assertEquals(false, c.currentLastGood())
+        assertEquals(true, sink.persisted)
+        c.dispose()
+    }
 }

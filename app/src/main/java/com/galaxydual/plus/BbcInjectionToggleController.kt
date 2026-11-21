@@ -44,12 +44,19 @@ internal class BbcInjectionToggleController(
     /** Best-effort UI toast on a rejected/throwing commit; never on cancellation. */
     private val onFailed: (() -> Unit)? = null,
 ) {
-    // lastGood = last value the store actually confirmed (or the initial read).
-    // A failed commit must never advance it, so a rollback has a truthful target.
+    // lastGood = last value the store confirmed for a NON-stale intent (or the
+    // initial read); a failed commit must never advance it. persistedValue = the
+    // ACTUAL disk truth after ANY successful commit, including stale ones — a
+    // stale commit still landed in storage even though its UI result is dropped.
+    // A failure rollback must use persistedValue, not lastGood, or the CheckBox
+    // would be restored to a value that disagrees with storage.
     // @Volatile only to keep the JVM test accessors honest; production writes are
-    // serialised on main (the consumer applies results there, taps come from main).
+    // serialised on the single actor (results applied on main, taps from main).
     @Volatile
     private var lastGood: Boolean = initialValue
+
+    @Volatile
+    private var persistedValue: Boolean = initialValue
 
     // Monotonically increasing, bumped ONLY by user intents (never by commits).
     @Volatile
@@ -76,6 +83,12 @@ internal class BbcInjectionToggleController(
                 false
             }
 
+            // Disk truth advances on EVERY successful commit, BEFORE the
+            // generation fence below. A stale commit was dropped for the UI,
+            // but it really did write to storage; a later failure rollback
+            // must reflect that value.
+            if (ok) persistedValue = intent
+
             withContext(main) {
                 // Stale result: a newer tap arrived while this commit ran.
                 // Dropping it is what stops an older write from winning the UI.
@@ -84,9 +97,10 @@ internal class BbcInjectionToggleController(
                 if (ok) {
                     lastGood = intent
                 } else {
-                    // Return the LATEST confirmed value, not the value that just
-                    // failed and not some older cached snapshot.
-                    onRestored(lastGood)
+                    // Restore the ACTUAL persisted value (which may come from a
+                    // stale-but-successful commit), not lastGood and not the
+                    // value that just failed.
+                    onRestored(persistedValue)
                     onFailed?.invoke()
                 }
             }

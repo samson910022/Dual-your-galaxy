@@ -146,7 +146,7 @@
 
 ### 推論
 - BBC6 仍然是**破壞性指令**（系統會刪除分身及其資料，這次是 Samsung 自己做的）；不可恢復的是兩個可持久化的資料——分身內 app 的本地 session／資料、以及任何 Samsung 拒絕在**非白名單分身包**授予的 `Ssaid settings not accessible` 程式碼路徑
-- 恢復路徑是：**重啟 + Samsung 原生 toggle-on**；不是從 SettingsProvider 補丁注入改寫 SSAID 表（那個修復方式是可能發生的「很好」目標，但實測沒有成功——單純的 ABX 修補在 live-load 下仍被 Samsung Knox 拒絕服務）
+- 恢復路徑是：**重啟 + Samsung 原生 toggle-on**；不是從 SettingsProvider 補丁注入改寫 SSAID 表（該 ABX 修補僅為 root-cause 分析＋時序 crash 推論，A2 結果無 log／exit-info 擷錄可復核，不再主張其實測失敗；見本文件「修復可能性與已驗證結果」第 3 點與「寫作守則」第 2 點）
 - 我作為修補維護者必須把這份簡單工作流寫清楚——這是 Samsung 官方流程，乾淨、安全
 
 ### 本機修復作業書寫守則（依據本次 Samsung 原生流程）
