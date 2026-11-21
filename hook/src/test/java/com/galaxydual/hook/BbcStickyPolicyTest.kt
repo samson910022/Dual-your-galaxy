@@ -1051,6 +1051,12 @@ class BbcStickyPolicyTest {
         assertEquals(null, state.get())
     }
 
+    // D06 (PR#74 r3): these two gateReadInsideGuardedBudget_* tests are
+    // ACCOUNTING PINS only — they drive a fake clock (time.addAndGet(60L)) to
+    // prove the gate is evaluated AFTER now0 so its cost is charged to the
+    // deadline/grace arithmetic. They do NOT assert wall time and are NOT a
+    // stall bound. The real wall-time ceiling is pinned separately by the
+    // System.nanoTime-based BbcGateBoundedWaitTest.
     @Test
     fun gateReadInsideGuardedBudget_seesElapsedAfterSlowProvider() {
         val (cache, time) = bbcCacheAt(1_000L)
@@ -1271,5 +1277,37 @@ class BbcStickyPolicyTest {
         val result = cache.getBbc(emptySet(), reader = { Pair(read.packages, read.version) })
         assertTrue(result is EffectivePolicyCache.BbcPolicy.Good)
         assertEquals(setOf("A"), (result as EffectivePolicyCache.BbcPolicy.Good).packages)
+    }
+
+    // --- D07 (PR#74 r3): KNOWN LIMITATION — not a pass ---
+    // App-side HookPolicyStore repairs a corrupt (Invalid) version key to v1
+    // on the next save. That repair is NOT guaranteed to take effect in an
+    // ALREADY-RUNNING hook whose lastBbcSeenVersion > 1: the v1 Good is a
+    // decreasing version, so the hook's monotonic high-water rejects it and
+    // keeps the previous sticky snapshot. A successful App save does NOT prove
+    // BBC applied in that process — a HOOK RESTART (fresh cache, high-water
+    // reset) is required for reliable application. Documents the limitation;
+    // it does not claim the in-process behavior is correct.
+    @Test
+    fun versionTypeCorruptRepairV1NeedsHookRestartDocumentedBbc() {
+        val (cache, _) = bbcCacheAt(1_000L)
+        // Running hook: a high-water version is established.
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 50L) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        cache.invalidate()
+        // App repairs the corrupt key and writes v1. The running hook sees
+        // Good({B},1) as a stale decreasing version -> Unknown, sticky {A}.
+        val rejected = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 1L) })
+        assertTrue(rejected is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(setOf("A"), (rejected as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+
+        // FRESH cache models a hook RESTART: high-water reset, so the very
+        // same Good({B},1) is accepted. This is why a restart is required.
+        val (freshCache, _) = bbcCacheAt(1_000L)
+        val applied = freshCache.getBbc(emptySet(), reader = { Pair(setOf("B"), 1L) })
+        assertTrue(applied is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("B"), (applied as EffectivePolicyCache.BbcPolicy.Good).packages)
     }
 }

@@ -1131,6 +1131,19 @@ fun remoteHookPolicyStore(
                         // old store byte-identical). Absent/Invalid (CCE or
                         // value < 1) still map to curVer=0 so the legacy
                         // migration and the CCE-corrupt->v1 repair are preserved.
+                        //
+                        // D07 (PR#74 r3) KNOWN LIMITATION (cross-reference:
+                        // hook BbcStickyPolicyTest
+                        // .versionTypeCorruptRepairV1NeedsHookRestartDocumentedBbc):
+                        // repairing Invalid -> v1 is NOT guaranteed to take
+                        // effect in an already-running hook whose
+                        // lastBbcSeenVersion > 1 — the v1 Good is a decreasing
+                        // version and the hook's monotonic high-water rejects
+                        // it, keeping its previous sticky snapshot. A
+                        // successful App save does NOT prove BBC applied in
+                        // that process; a HOOK RESTART is required for reliable
+                        // application. This is a documented limitation, not a
+                        // pass. Behavior below is intentionally unchanged.
                         val probe = probeVersion(object : VersionPrefsView {
                             override fun containsVersion(): Boolean =
                                 prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)

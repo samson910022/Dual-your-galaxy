@@ -43,6 +43,38 @@ internal fun readBbcInjectionEnabled(view: BbcInjectionPrefsView): Boolean? = tr
     null
 }
 
+// --- D06 (PR#74 r3): bounded BBC gate pref read ---
+// The raw adapter above is a synchronous SharedPreferences boolean lookup. On
+// the hooked caller thread an IPC/Binder stall could pin the thread for the
+// FULL duration of the stall (the later 50ms deadline only clamped the policy
+// reader, not this gate read). Wrap it in a REAL wall-time ceiling via
+// PolicyRefreshBudget.readBoundedValue (submit + future.get(timeout)), so a
+// stalled gate read can never block the caller beyond timeoutMs.
+//
+// All failure modes map to null (failed read) and the helper NEVER throws:
+//   - timeoutMs <= 0            -> null (no submit; spent/zero budget)
+//   - timeout / reader throw    -> null
+//   - submit rejection / gate contention -> null (Contention mapped here)
+// Boolean? keeps false (confirmed OFF) distinct from null (failed read); the
+// EXISTING hybrid rule in bbcInjectionGateOpen consumes that distinction:
+// first failure -> OPEN(true) ("off" is NOT a safety guarantee), but a
+// confirmed OFF inside BBC_STICKY_MAX_AGE_MS keeps the gate CLOSED.
+// Framework-free and executor/reader injected so JVM tests exercise the real
+// wall-time path (see BbcGateBoundedWaitTest).
+internal fun readBbcInjectionEnabledBounded(
+    executor: java.util.concurrent.ExecutorService,
+    timeoutMs: Long,
+    read: () -> Boolean?,
+): Boolean? = try {
+    PolicyRefreshBudget.readBoundedValue(
+        reader = read,
+        timeoutMs = timeoutMs,
+        executor = executor,
+    )
+} catch (_: Throwable) {
+    null
+}
+
 // N06(a): process-local confirmed-OFF timestamp (millis on the injected clock;
 // null = no confirmed OFF in this process). compareAndSet in the gate makes the
 // get -> decide -> write transition atomic/visibility-safe under concurrent BBC
@@ -856,7 +888,9 @@ class DualHook : XposedModule() {
     // 以 BBC_AVAILABLE_APPS_INJECTION AND 執行期 dual_policy 偏好作為自己的
     // 效應開關（Stage-1 封緘不受影響；白名單 effectiveCache 維持 fail-closed，
     // 零影響）。偏好關閉時 getBbc 的 gate-closed 仍不碰 reader；偏好讀取本身
-    // 是快取 prefs 的布林查表（無新增 binder IPC，見 bbcInjectionEnabledNow）。
+    // 是快取 prefs 的布林查表（見 bbcInjectionEnabledNow），但 D06 起此讀取
+    // 另走專屬零佇列 executor + 真實牆鐘上限（BBC_GATE_MAX_MS），避免 IPC
+    // 停頓直接釘住呼叫執行緒（原 50ms deadline 只管到後面的政策 reader）。
     // Phase A P0 sticky last-good：null/拋/contention/deadline/clock 失敗回
     // 上次成功非空快照；僅成功讀到空（帶版本證明 Cleared）方可收縮；TTL 過期
     // /invalidate 不丟 BBC last-good（僅 sticky cap 到期才過期，計數+節流日誌）。
@@ -908,10 +942,26 @@ class DualHook : XposedModule() {
             // N06(b): LAZY provider — getBbc samples now0 first, then calls this
             // inside the guarded section, so a slow pref read is charged to the
             // same 50ms deadline budget instead of running outside it.
+            // D06: the pref read itself is now BOUNDED by a real wall-time
+            // ceiling on a dedicated zero-queue executor. min(ceiling, remaining)
+            // keeps a Binder stall from pinning the caller for its full
+            // duration; null feeds the EXISTING hybrid rule (first failure OPEN,
+            // confirmed OFF within TTL stays CLOSED). A compile-time-closed
+            // gate still returns before any submit (zero-runtime-read pin).
             bbcGateOpen = {
+                val remainingBudget = try {
+                    DeadlineBudget.remainingMs(t0, DeadlineBudget.nowNanos())
+                } catch (_: Throwable) {
+                    0L
+                }
                 bbcInjectionGateOpen(
                     PolicySource.BBC_AVAILABLE_APPS_INJECTION,
-                ) { bbcInjectionEnabledNow() }
+                ) {
+                    readBbcInjectionEnabledBounded(
+                        bbcGateExecutor,
+                        minOf(BBC_GATE_MAX_MS, remainingBudget),
+                    ) { bbcInjectionEnabledNow() }
+                }
             },
             followerGraceMs = graceAtEntry,
             deadlineMs = deadlineMs,
@@ -1799,6 +1849,17 @@ class DualHook : XposedModule() {
     companion object {
         private const val TAG = "GalaxyDualHook"
 
+        // D06 (PR#74 r3): real wall-time ceiling for the BBC opt-out gate pref
+        // read. A small slice of the 50ms end-to-end stall budget so the policy
+        // reader still has room; the call site uses
+        // min(BBC_GATE_MAX_MS, remaining-of-50ms). TUNABLE: real device Binder
+        // latency is UNMEASURED — this is a safety bound, NOT a device go/no-go
+        // claim. The caller is pinned to this ceiling by BbcGateBoundedWaitTest.
+        // A 15ms timeout on a NOT-yet-confirmed opt-out yields fail-OPEN (BBC
+        // injects): the intended fail-open default, NOT a device SLA; real
+        // Binder latency and DAAgent UI/ANR are UNMEASURED (docs/ACCEPTANCE N08).
+        internal const val BBC_GATE_MAX_MS = 15L
+
         // Stage H2-P2: effective-policy cache + same-process prefs listener
         // (listener is local-only hygiene on API 102.0.0, never cross-process).
         // Companion (static) so a hot-reload instance replacement cannot leak
@@ -1891,6 +1952,26 @@ class DualHook : XposedModule() {
                 }
             },
         )
+
+        // D06 (PR#74 r3): DEDICATED zero-queue daemon executor for the BBC
+        // opt-out gate pref read ONLY. Kept separate from policyRefreshExecutor
+        // and capabilityRefreshExecutor so a stuck BBC gate reader cannot
+        // self-contend with the policy reader it guards, nor starve it. The
+        // SynchronousQueue + AbortPolicy factory means a second concurrent
+        // gate read is REJECTED (mapped to null by
+        // readBbcInjectionEnabledBounded -> hybrid rule) rather than queued
+        // behind a stuck worker, so at most one worker can ever be resident.
+        // Bounded to BBC_GATE_MAX_MS per call. Never shut down (process
+        // lifetime); a stuck daemon worker is confined to this one executor.
+        // Reliability limitation (NOT a safety guarantee): a stuck
+        // uninterruptible gate read leaves this single zero-queue worker
+        // permanently busy, so every later gate read is REJECTED -> null ->
+        // the hybrid rule FAILS OPEN (BBC injects), keeping a confirmed OFF
+        // only for BBC_STICKY_MAX_AGE_MS (30 min). Mirroring
+        // policyRefreshExecutor's process-lifetime residency, recovery from a
+        // stuck worker is process-restart-bound (daemon exits with the process).
+        private val bbcGateExecutor: java.util.concurrent.ThreadPoolExecutor =
+            PolicyRefreshBudget.newPolicyRefreshExecutor("GalaxyDual-bbc-optout-read")
 
         // Remote-capability latch (P2-1): only true is latched forever; false
         // is cooldown-gated and re-probed (see RemoteCapabilityLatch). The
