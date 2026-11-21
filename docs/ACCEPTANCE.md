@@ -116,6 +116,8 @@ BBC6 注意事項（unified build）：
 | daagent 冷啟動（force-stop 後開 DualAppActivity） | BBC 回調應先於任何 deletion 判定 | 11-18/11-20/11-21 皆出現 deletion；11-20/11-21 於**非空政策**（`nonempty` + `merged +1 total 7`）下 DELETE 早於回調 116/144ms；觸發機制未證實，見 incident §2/§8。 |
 | LSPosed daemon／root daemon 失去同步（底層 `mMap` 陳舊） | 60s TTL 到期重讀應見新值 | API 102 無跨行程推送；到期重讀的是同一永久快取 `RemotePreferences` 實例，`mMap` 可能仍陳舊，不保證下一次 poll 看到新集合；重啟 hook 行程後才保證。見 `docs/HOOK.md` §1.1、`docs/USAGE.md` 政策 TTL 對照表。 |
 | 政策清空／非空冷 deletion 造成 user-95 資料全清 | 清除前 Root probe 列出分身並警示 | 11-18/11-20/11-21 皆發生 deletion 且資料清除；toggle-ON 可重裝但資料無法復原；非可回滾操作。 |
+| BBC hot path 於政策規模 1/50/200/512（hook on/off）的量測 | 合併應為有界、線性、不阻塞 DAAgent UI | **UNMEASURED／需裝置 trace**：從未在裝置上量測 `pm.getApplicationInfo` 等 Binder IPC 次數或 DAAgent UI 延遲。`BbcMergeTimingTest` 僅鎖「純內存合併」工作量與 2s 寬鬆上界；once-per-PID stack-trace 捕獲修正僅 JVM 測試覆蓋，真實 IPC 成本未量測。**不得**據此宣稱「50ms 內完成／1/50/200/512 無 ANR」；本列不是通過項。 |
+| BBC 版本號 wraparound 重播視窗（~9.22e18 次寫入；`bbcVersionWraparoundReopensReplayWindowDocumentedBbc`） | 版本鍵固定格式、無 epoch；`Good(MAX)`→`Good(1)` 後 high-water 降到 1，中間範圍重播 `Good(500)` 被接受 | **已文件化限制／接受（非通過項）**：需約 9.22e18 次提交寫入才可能達成，實務不可及；未來若加入 epoch 方案，該測試應改為預期 Unknown。見 hook `BbcStickyPolicyTest.bbcVersionWraparoundReopensReplayWindowDocumentedBbc` 與 `EffectivePolicyCache.isBbcVersionWraparound`。本列為已知限制，不是驗收通過。 |
 
 擷錄指引：
 - S23 Ultra：BBC-HOOK 行只出現在 LSPosed verbose mirror：`adb shell su -c 'grep -E "BBC-HOOK|BBC-SPIKE|RemotePreferences" /data/adb/lspd/log/verbose_*.log'`；logcat 僅見 `adb logcat -d -s GalaxyDualHook`（unified build 不再印 `RemotePreferences initial load/updated`，pool/TTL 模式無此行）。

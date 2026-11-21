@@ -534,6 +534,10 @@ class PolicyPhaseCRequiredTest {
     // 所有新 UI 路徑都攜帶 warning binding（baseFreshGen != -1），其 fail-closed
     // 重讀保證由 5c (freshBinding_withBackendUnknown_abortsZeroSave) 釘住；此 legacy
     // seam 不適用該 fail-closed 保證。本測試刻意鎖住放行行為，勿「修正」為作廢。
+    // D7：新 UI 路徑「一律 baseFreshGen != -1」由下方
+    // normalWarningPaths_alwaysInstallPendingWithBaseFreshGen 從公開寫入 seam 運行時釘住；
+    // 本測的 legacy pending 只能靠反射直接注入（繞過所有公開 request seam）取得，
+    // MainActivity／PolicyActivity 不可達。
     @Test
     fun legacy_baseFreshGenMinusOne_skipsReread() {
         val fake = FakePolicyStore(initialDraft = setOf("com.a.app"))
@@ -577,6 +581,52 @@ class PolicyPhaseCRequiredTest {
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(savesBefore, fake.saveCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
+    }
+
+    // 5c-guard (D7). 運行時守護 5b 的文件化前提：所有新 UI 寫入路徑都經由公開
+    // request seam 並攜帶非 null warning binding，故安裝出的 pending【一律】
+    // baseFreshGen != -1。5b 的 legacy carve-out（baseFreshGen == -1）只能靠反射
+    // 直接注入 pending 取得（繞過全部公開 seam），MainActivity／PolicyActivity 不可達。
+    // 三個 seam 逐一對應生產呼叫點：
+    //   Main   : MainActivity proceed → requestPolicyWriteForWarning(frozen, binding)
+    //   Editor : PolicyActivity.performWritePolicy → replacePolicyDraft(candidate, binding)
+    //   Main列表: requestPolicyWrite(binding)（catalog→勾選映射；與前兩者共用 requestPolicyWriteFor）
+    // 若未來有人讓任一公開 seam 在未綁 binding 時仍建 pending，本測即失敗。
+    @Test
+    fun normalWarningPaths_alwaysInstallPendingWithBaseFreshGen() {
+        fun makeSeamVm(): DualViewModel {
+            val fake = FakePolicyStore(initialDraft = setOf("com.a.app", "com.b.app"))
+            val vm = makeVm(fake.store)
+            // 兩個需要 catalog／勾選的 seam（requestPolicyWriteForWarning、requestPolicyWrite）
+            // 必須先有清單與勾選；replacePolicyDraft 不受此影響但一併種入以保持一致。
+            seedSelection(vm, listOf("com.a.app", "com.b.app"), setOf("com.a.app", "com.b.app"))
+            return vm
+        }
+        fun assertFreshGen(vm: DualViewModel, label: String) {
+            val pending = vm.state.value.pendingPolicyWrite
+            assertNotNull("$label must install a pending", pending)
+            assertTrue(
+                "$label must carry baseFreshGen != -1 (legacy carve-out is not reachable from UI)",
+                pending!!.baseFreshGen != -1L,
+            )
+            vm.cancelPolicyWrite()
+        }
+
+        run {
+            val vm = makeSeamVm()
+            vm.requestPolicyWriteForWarning(setOf("com.a.app"), vm.currentWarningBinding())
+            assertFreshGen(vm, "requestPolicyWriteForWarning(binding)")
+        }
+        run {
+            val vm = makeSeamVm()
+            vm.replacePolicyDraft(setOf("com.a.app"), vm.currentWarningBinding())
+            assertFreshGen(vm, "replacePolicyDraft(binding)")
+        }
+        run {
+            val vm = makeSeamVm()
+            vm.requestPolicyWrite(vm.currentWarningBinding())
+            assertFreshGen(vm, "requestPolicyWrite(binding)")
+        }
     }
 
     // 6a. delta接線：空集跳過probe直接proceed（純函數層）。

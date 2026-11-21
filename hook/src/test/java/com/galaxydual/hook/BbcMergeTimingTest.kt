@@ -11,6 +11,13 @@ import java.util.concurrent.atomic.AtomicInteger
 // 見 PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS）；PM 解析（PmOutputParser）同樣不在
 // 50ms 內，兩者預算獨立。此測試鎖定三檔規模皆在有界時間內完成（CI 寬鬆上界 2s，實測微秒級），
 // 避免未來回歸為二次方或阻塞行為。
+//
+// 量測範圍侷限（誠實揭露）：本測試【僅】量測純內存合併——installed/enabled 是恆真 stub
+// 謂詞，完全沒有 `pm.getApplicationInfo` 的 Binder IPC，也沒有真實 hook 攔截延遲、
+// DAAgent UI 渲染或 Samsung 系統端 deletion 判定。因此它【不能】用來證成任何
+// 「50ms 內完成／1/50/200/512 皆無 ANR」之類的裝置端效能把關；那些主張需要裝置 trace
+// 量測 Binder IPC 次數與 DAAgent UI 延遲（見 docs/ACCEPTANCE.md 的 11-20/11-21 fault matrix，
+// 該列標為 UNMEASURED）。本測試只能擔保合併演算法本身不退化為二次方或阻塞。
 class BbcMergeTimingTest {
 
     private val allInstalled: (String) -> Boolean = { true }
