@@ -187,7 +187,7 @@ class PolicyActivity : ComponentActivity() {
         candidate: Set<String>,
         proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
-        // D03b fixer M2：ROOT 卸載驗證成功回呼（只跳 membership 比對）。
+        // D03b fixer M2：ROOT 驗證對話框兩個繼續回呼（只跳 membership 比對）。
         onRootVerified: () -> Unit = {},
     ) {
         // D03b carry-forward #2：re-entrant 要求不得清空活躍警告捕獲的 consent。
@@ -675,7 +675,8 @@ class PolicyActivity : ComponentActivity() {
         }
     }
 
-    // D03b fixer M2：ONLY ROOT 卸載驗證成功回呼標記 rootVerifiedEmpty。
+    // D03b fixer M2：ONLY ROOT 驗證對話框兩個繼續回呼標記 rootVerifiedEmpty
+    // （onClearVerified 已驗證空／onForceClear 自擔風險覆寫，非驗證成功）。
     private val markRootVerifiedEmpty: () -> Unit = {
         pendingWarningConsent = pendingWarningConsent?.copy(rootVerifiedEmpty = true)
     }

@@ -6140,8 +6140,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // D03b fixer M2：只有 ROOT 卸載驗證成功回呼才會把 rootVerifiedEmpty 蓋到 consent；
-    // 非 ROOT Positive 按鈕完全不經過此回呼（fence 照樣做 membership 比對）。
+    // D03b fixer M2：ROOT 驗證對話框的兩個「繼續」回呼才會把 rootVerifiedEmpty
+    // 蓋到 consent — onClearVerified（已驗證空）與 onForceClear（使用者在 Residual/
+    // ProbeFailed 後明確自擔風險覆寫，NOT 驗證成功）。非 ROOT Positive 不經此回呼。
     private val markRootVerifiedEmpty: () -> Unit = {
         pendingWarningConsent = pendingWarningConsent?.copy(rootVerifiedEmpty = true)
     }
@@ -6291,8 +6292,8 @@ class MainActivity : ComponentActivity() {
     private fun requestPreClearWarning(
         proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
-        // D03b fixer M2：ROOT 卸載驗證成功時由 showPreClearWarning 回呼，
-        // 把 rootVerifiedEmpty 旗標蓋到當下 consent（只跳 membership 比對）。
+        // D03b fixer M2：ROOT 驗證對話框的兩個繼續回呼（已驗證空／自擔風險覆寫）
+        // 由 showPreClearWarning 回呼，把 rootVerifiedEmpty 蓋到 consent（只跳 membership）。
         onRootVerified: () -> Unit = {},
     ) {
         // D03b carry-forward #2：re-entrant 要求（probe／警告對話框存活期）直接返回，
@@ -6419,7 +6420,7 @@ class MainActivity : ComponentActivity() {
     private fun requestPreWriteWarning(
         proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
-        // D03b fixer M2：ROOT 卸載驗證成功回呼（只跳 membership 比對）。
+        // D03b fixer M2：ROOT 驗證對話框兩個繼續回呼（只跳 membership 比對）。
         onRootVerified: () -> Unit = {},
     ) {
         // D03b carry-forward #2：同上——re-entrant 要求不得清空活躍警告的 consent。
@@ -8171,7 +8172,7 @@ internal suspend fun revalidatePreClearContinue(
     resolveLiveTarget: () -> PreClearDualTarget?,
     fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
     reprobe: suspend () -> DualProbeResult,
-    // D03b fixer M2：ROOT 卸載驗證成功後，expected installed 集合已合法變空；
+    // D03b fixer M2：ROOT 驗證對話框繼續後（已驗證空，或使用者自擔風險覆寫），
     // 只跳過 (3) membership 比對，關卡 (0)(1)(2) 身分／新鮮度照樣強制。
     //  default false = 既有非 ROOT 路徑完全不變。
     skipMembershipCheck: Boolean = false,
@@ -8202,8 +8203,8 @@ internal suspend fun revalidatePreClearContinue(
         preClearLog("pre-clear continue aborted: fresh target lost/recreated (id+serial)")
         return PreClearContinueOutcome.TargetChanged
     }
-    // D03b fixer M2：關卡 (0)(1)(2) 已全數通過才到這裡。ROOT 卸載驗證成功旗標只
-    // 跳過 (3) installed membership 比對（預期集合已合法變空）；沒有任何
+    // D03b fixer M2：關卡 (0)(1)(2) 已全數通過才到這裡。ROOT 繼續旗標（已驗證空
+    // 或自擔風險覆寫）只跳過 (3) installed membership 比對；沒有任何
     // 「ROOT ⇒ ProceedOk」捷徑，identity／fresh 失配早在上方 fail closed。
     if (skipMembershipCheck) {
         preClearLog("pre-clear continue: root verified-empty, membership comparison skipped")
@@ -8338,8 +8339,8 @@ internal suspend fun buildFastPathConsent(
 // 注意（carry-forward 釘住）：
 //  * generation 僅作 pending 身份比對（binding-only），不是新鮮度依據；
 //    四道關卡完全由 revalidatePolicyWriteConsent / revalidatePreClearContinue 判定。
-//  * ROOT/卸載成功後由 consent.rootVerifiedEmpty 在 fence 內「只」跳 membership 比對
-//    （identity 仍強制）；非 ROOT 路徑不得比照鬆綁。
+//  * ROOT 驗證對話框繼續後（已驗證空／自擔風險覆寫）由 consent.rootVerifiedEmpty
+//    在 fence 內「只」跳 membership 比對（identity 仍強制）；非 ROOT 不得比照鬆綁。
 //  * M6：警告 probe 失敗（force-proceed）的 consent 由 revalidatePolicyWriteConsent
 //    直接回 CannotDetermine；重探失敗也收斂 CannotDetermine。兩者皆 revoke+notify，
 //    沒有「確認失敗仍強制放行」的靜默路徑。
@@ -8466,7 +8467,7 @@ internal fun showPreClearWarning(
     proceedLabelRes: Int = R.string.pre_clear_confirm_proceed,
     capturedTarget: PreClearDualTarget? = null,
     rootUninstallAllowed: Boolean = false,
-    // D03b fixer M2：ONLY 由 ROOT 卸載驗證成功回呼觸發（非 ROOT Positive 不帶此 callback）。
+    // D03b fixer M2：ONLY 由 ROOT 驗證對話框兩個繼續回呼觸發（非 ROOT Positive 不帶此 callback）。
     onRootVerified: () -> Unit = {},
 ) {
     if (installed.isEmpty()) {
@@ -8557,10 +8558,10 @@ internal fun showPreClearWarning(
                 // Phase D：二次確認通過後先執行卸載，再重跑 probeDualApps 驗證：
                 // 殘留非空即失敗；驗證結果經三選一對話框明確選擇（驗證成功→清除／
                 // 仍要清除自擔／取消），失敗 never 默認 proceed。
-                // D03b fixer M2：不再有「ROOT 已跳過 fence」的假設。ROOT 成功後由
-                // onRootVerified 把 rootVerifiedEmpty 蓋到 consent，fence 內「只」跳
-                // installed membership 比對（預期集合已合法變空）；live+fresh (id,serial)
-                // 身分檢查照樣強制，非 ROOT 路徑不受影響。
+                // D03b fixer M2：不再有「ROOT 已跳過 fence」的假設。ROOT 對話框繼續後
+                // （VerifiedEmpty 或 Residual/ProbeFailed 的自擔風險覆寫），onRootVerified
+                // 把 rootVerifiedEmpty 蓋到 consent，fence 內「只」跳 installed membership
+                // 比對；live+fresh (id,serial) 身分檢查照樣強制，非 ROOT 不受影響。
                 // PR-74 A3：保存 handle 供 onDestroy 釋放（先前直接丟棄 → window 洩漏）。
                 dialogHandles.rootConfirm = try {
                     AlertDialog.Builder(host)
@@ -8641,8 +8642,8 @@ internal fun showPreClearWarning(
                                     showUninstallVerifyDialog(
                                         host = host,
                                         outcome = outcome,
-                                        // D03b fixer M2：ONLY 這兩個 ROOT 驗證成功回呼標記
-                                        // rootVerifiedEmpty；非 ROOT Positive 不走此處。
+                                        // D03b fixer M2：ONLY 這兩個 ROOT 對話框繼續回呼
+                                        // 標記 rootVerifiedEmpty（後者非驗證成功）；非 ROOT Positive 不走此處。
                                         onClearVerified = { onRootVerified(); onProceed() },
                                         onForceClear = { onRootVerified(); onProceed() },
                                         onCancel = { onCancel() },

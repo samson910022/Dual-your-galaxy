@@ -747,15 +747,19 @@ class PreClearGatewayInjectTest {
     }
 
     @Test
-    fun confirmDispatch_hostGoneAfterAwait_noConfirm() = runBlocking {
-        // await 前算出 ProceedOk 且 host 仍活；await 期間 host 消失（flip），
-        // dispatch 當下重新求值 hostAlive ⇒ 失效，零 confirm（stale host 不得放行）。
+    fun confirmDispatch_hostGoneBeforeDispatch_noConfirm() = runBlocking {
+        // Outcome computed while host alive, host gone at dispatch time.
+        // dispatchConsentGatedConfirm has NO suspension point, so the flip below
+        // happens BEFORE dispatch: hostAlive() is re-evaluated as false and the
+        // ProceedOk outcome is refused (a stale host must not be allowed through).
+        // 結果在 host 仍活時算出，host 已於 dispatch 前消失（helper 無 suspension
+        // point）⇒ dispatch 當下重新求值 hostAlive 為 false，零 confirm。
         val p = DispatchProbe(hostAlive = true)
-        val outcomeBeforeAwait = PreClearContinueOutcome.ProceedOk
+        val outcomeBeforeDispatch = PreClearContinueOutcome.ProceedOk
         assertTrue(p.alive.get())
-        p.alive.set(false) // host 在 await 後消失
+        p.alive.set(false) // host 在 dispatch 前消失
         assertFalse(p.alive.get())
-        p.run(outcomeBeforeAwait)
+        p.run(outcomeBeforeDispatch)
         assertEquals(0, p.confirms)
         assertEquals(1, p.revokes)
         assertEquals(1, p.notifies)

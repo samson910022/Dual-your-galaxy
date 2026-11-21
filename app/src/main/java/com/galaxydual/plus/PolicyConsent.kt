@@ -39,12 +39,16 @@ package com.galaxydual.plus
  *   Such a consent can never authorize a write: the fence returns
  *   `CannotDetermine` regardless of what any later reprobe reports. Default
  *   false keeps legacy/device-unverified seams compiling.
- * - [rootVerifiedEmpty] (D03b fixer M2): true ONLY after the ROOT uninstall
- *   verification's success callbacks (`onClearVerified` / `onForceClear`).
- *   It skips ONLY the `capturedInstalled` membership comparison (the expected
- *   set is legitimately empty after uninstall); live + fresh (id,serial)
- *   identity checks are STILL enforced. Never a "ROOT => ProceedOk" shortcut.
- *   Default false; the non-ROOT Positive button never sets it.
+ * - [rootVerifiedEmpty] (D03b fixer M2, name is historical): set by BOTH ROOT
+ *   post-uninstall verification outcomes that continue to the policy write —
+ *   `onClearVerified` (verification found the clone set empty) AND `onForceClear`
+ *   (the user EXPLICITLY chose "still clear at own risk" after verification
+ *   returned Residual / ProbeFailed). The latter is an informed override, NOT a
+ *   successful verification: the flag does not assert the store was verified
+ *   empty. In either case it skips ONLY the `capturedInstalled` membership
+ *   comparison; live + fresh (id,serial) identity checks are STILL enforced,
+ *   and it is never a "ROOT => ProceedOk" shortcut. Default false; the non-ROOT
+ *   Positive button never sets it.
  */
 data class PolicyWriteConsent(
     val generation: Long,

@@ -435,7 +435,7 @@ class BbcToggleConcurrencyTest {
                 scope = appScope, state = state, commit = { sink.commit(it) }, io = io,
             )
             val aLog = UiLog()
-            val a = uiController(coordinator, initial = true, log = aLog)
+            val a = uiController(coordinator, initial = false, log = aLog)
 
             a.onToggle(true) // seq 1: enters a genuinely blocking commit
             sink.awaitFirstStarted()
@@ -461,6 +461,18 @@ class BbcToggleConcurrencyTest {
                 sink.snapshot()) // A's commit completed before B's even started
             assertEquals(2L, coordinator.latestSequence())
             assertEquals(false, state.confirmedOrUnknown)
+            // Confirmed commits fire NO UI callback (onRestored is dead and the
+            // Confirmed branch only writes lastGood), so the UiLog.isEmpty()
+            // pins below cannot see them. currentLastGood() is the real
+            // observation: it advances only for a LIVE controller whose own
+            // intent is still current (the alive + sequence guards).
+            assertEquals("B committed false while alive -> lastGood must follow",
+                false, b.currentLastGood())
+            // A was disposed before its Confirmed(true) landed; its stale result
+            // must never advance A's lastGood off its initial false. (The app-scoped
+            // state, not the disposed controller, carries the provisional seed.)
+            assertEquals("disposed A must not absorb its own Confirmed(true) result",
+                false, a.currentLastGood())
             assertTrue("disposed A's UI must be cut", aLog.isEmpty())
             assertTrue("A's stale result must never be routed to B", bLog.isEmpty())
             a.dispose()
@@ -496,7 +508,15 @@ class BbcToggleConcurrencyTest {
             assertTrue(sink.persisted)
             assertEquals(true, state.confirmedOrUnknown)
             assertTrue(coordinator.isConsumerActive())
-            // ...but the disposed controller got no UI callback at all.
+            // ...but the DISPOSED controller must NOT absorb the Confirmed(true)
+            // result: c started at false and stayed disposed through the commit.
+            // currentLastGood() is the real observation (Confirmed fires no UI
+            // callback, so UiLog.isEmpty() below is only secondary): a LIVE
+            // controller would have advanced lastGood to the confirmed true,
+            // while the disposed one must stay at false. This pins the
+            // alive/sequence-guard contract that protects UI state on dispose.
+            assertFalse("disposed controller lastGood must stay at initial false",
+                c.currentLastGood())
             assertTrue(log.isEmpty())
             assertFalse(c.isAlive())
         } finally {
