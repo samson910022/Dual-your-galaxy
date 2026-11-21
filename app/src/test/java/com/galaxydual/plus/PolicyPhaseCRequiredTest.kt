@@ -289,6 +289,43 @@ class PolicyPhaseCRequiredTest {
         assertEquals(PolicyWritePhase.IDLE, vmA.state.value.policyWritePhase)
     }
 
+    // 2b-3. R04 clear-path parity：clear 比 write 更具破壞性（清除整份已存草稿，
+    // Samsung 可能據此刪除雙開），故警告與清除 confirm 之間若有外部 Known 漂移
+    //（直接 store.save，不推進任何 VM 世代／fence），precommit 重讀必須 fail-closed
+    // 中止：零 clear、後端仍是外部值、UNKNOWN_REFRESH/CHANNEL、草稿保留。
+    // pre-fix 只擋 Unknown，會直接清除，故此測在 pre-fix 必失敗。
+    @Test
+    fun clearReread_knownDrift_abortsWithoutClear() {
+        val warnedOld = setOf("com.a.app", "com.b.app")
+        val backend = AtomicReference<Set<String>?>(warnedOld)
+        val clearCalls = AtomicInteger(0)
+        val store = HookPolicyStore(
+            loadRaw = { backend.get() },
+            saveRaw = { raw ->
+                if (raw == null) clearCalls.incrementAndGet()
+                backend.set(raw ?: emptySet())
+                true
+            },
+        )
+        // 單一 VM、無 coordinator：警告→confirm 之間所有 VM 世代（fence）不變。
+        val vm = makeVm(store, initialDraft = warnedOld, coordinator = null, policyIoTimeoutMs = 500L)
+        val binding = vm.currentWarningBinding().withWarning(warnedOld, null)
+        // 外部寫入（跨流程等價）：不經任何 VM，fence 完全看不到。
+        store.save(setOf("com.z.app"))
+        assertEquals(setOf("com.z.app"), backend.get())
+        val clearsBefore = clearCalls.get()
+
+        vm.clearPolicyDraft(binding)
+        await { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+
+        assertEquals("clear must not proceed after external known drift", clearsBefore, clearCalls.get())
+        assertEquals(setOf("com.z.app"), backend.get())
+        assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(warnedOld, vm.state.value.policyDraft)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+    }
+
     // 3. 跨屏雙VM：共用FakePolicyStore+PolicyTxCoordinator，A綁定後B寫入推進，A舊綁定replace/request/clear皆作廢。
     @Test
     fun crossVm_sharedStoreCoordinator_oldBindingVoidsReplaceRequestClear() {
@@ -469,6 +506,10 @@ class PolicyPhaseCRequiredTest {
         // armedRev==-1旁路：不得因rev失配而重arm為FIRST；應落到正常清除路徑
         // （Unknown＋lastKnownNull經典語義：pre-IO重讀仍Unknown→REFRESH_FAILED，中止零clear）。
         // 關鍵釘住：msg不是BLIND_CLEAR_FIRST（證明rev未觸發重arm）。
+        // msg 由 pre-IO 重讀的非同步 coroutine 寫入；等待其收斂再判定，
+        // 避免與測試執行緒競爭造成假失敗（若 rev 確實誤觸發 re-arm，
+        // msg 會永久停留在 BLIND_CLEAR_FIRST，此 await 仍會超時失敗）。
+        await { vm.state.value.msg != PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText() }
         assertEquals(0, fake.clearCalls.get())
         assertTrue(vm.state.value.msg != PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText())
     }

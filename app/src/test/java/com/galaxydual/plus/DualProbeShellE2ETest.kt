@@ -123,6 +123,38 @@ class DualProbeShellE2ETest {
         assertTrue("emitted marker must reflect normalized data", raw.out.contains("INST com.a.app"))
     }
 
+    // Phase1 review(LOW): _BAD 用 word-split（去掉行尾空白/tab）判 package:*，
+    // 但引號版精確 grep 會因行尾空白落空 → 對已安裝雙開誤發 CLEAN（fail-open）。
+    // 未引號 $_PN 展開的 grep 必須消耗同一份 token 集，仍判定 INST。
+    @Test
+    fun e2e_whitespacePaddedPackageLine_stillDetectedInstalled() {
+        val (res, raw) = probeViaShell(
+            listOf("com.a.app"),
+            95,
+            "printf 'package:com.a.app \\n'; exit 0",
+        )
+        assertTrue("whitespace-padded package line must be INST, got: $res / raw=$raw", res is DualProbeResult.Ok)
+        assertEquals(listOf("com.a.app"), (res as DualProbeResult.Ok).installed)
+        assertTrue("emitted marker must be INST, not CLEAN", raw.out.contains("INST com.a.app"))
+        assertFalse("must not emit CLEAN for an installed dual", raw.out.contains("CLEAN com.a.app"))
+    }
+
+    // Same fail-open, mixed case: a whitespace-padded installed line plus an
+    // absent package. Only the absent package may be CLEAN.
+    @Test
+    fun e2e_whitespacePaddedInstalledAndAbsent_mixedStillOk() {
+        val (res, raw) = probeViaShell(
+            listOf("com.a.app", "com.b.app"),
+            95,
+            "printf 'package:com.a.app \\n'; exit 0",
+        )
+        assertTrue("mixed must be Ok, got: $res / raw=$raw", res is DualProbeResult.Ok)
+        assertEquals(listOf("com.a.app"), (res as DualProbeResult.Ok).installed)
+        assertTrue(raw.out.contains("INST com.a.app"))
+        assertFalse(raw.out.contains("CLEAN com.a.app"))
+        assertTrue(raw.out.contains("CLEAN com.b.app"))
+    }
+
     // ROM error text on stdout with exit 0 must not be read as "not installed".
     @Test
     fun e2e_romErrorTextOnStdout_failsClosed() {

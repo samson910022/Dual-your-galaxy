@@ -7397,13 +7397,20 @@ internal fun buildDualProbeCommand(pkgs: List<String>, userId: Int): String {
     // Phase1 review(MEDIUM)：ROM/pty 可能在每行尾補 \r（CRLF）；先將整段輸出
     // 正規化為 _PN（strip CR），_BAD 檢查與 grep 比對一律用 _PN，避免
     // "package:com.a.app\r" 通過 _BAD 卻讓精確 grep 落空而誤判 CLEAN（fail-open）。
+    // 同樣地，_BAD 用 `for _l in $_PN` 做 word-split（去掉行前/後空白/tab），故 INST
+    // 比對也必須消耗【同一份 word-split token 集】：保留原本對正規化副本的精確
+    // grep，另加一個未引號 $_PN 展開的 grep（與 _BAD 相同的 token 集），讓
+    // "package:com.a.app " 這類周圍帶空白的行亦被 token 化為精確的
+    // package:com.a.app，避免「_BAD 通過但精確 grep 落空」而對已安裝雙開誤發
+    // CLEAN（fail-open）。兩者皆為正面比對（任一命中即 INST），不引入 fail-open。
     return "_PL=\$(pm list packages --user $userId); _RC=\$?; " +
         "_PN=\$(printf '%s\\n' \"\$_PL\" | tr -d '\\r'); " +
         "_BAD=0; for _l in \$_PN; do case \"\$_l\" in package:*) ;; *) _BAD=1;; esac; done; " +
         "echo \"$DUAL_PROBE_RC=\$_RC\"; " +
         "for pkg in ${capped.joinToString(" ")}; do " +
         "if [ \$_RC -ne 0 ] || [ \$_BAD -ne 0 ]; then echo \"$DUAL_PROBE_FAIL \$pkg\"; " +
-        "elif printf '%s\\n' \"\$_PN\" | grep -Fxq \"package:\$pkg\"; then echo \"$DUAL_PROBE_INST \$pkg\"; " +
+        "elif printf '%s\\n' \"\$_PN\" | grep -Fxq \"package:\$pkg\" || " +
+        "printf '%s\\n' \$_PN | grep -Fxq \"package:\$pkg\"; then echo \"$DUAL_PROBE_INST \$pkg\"; " +
         "else echo \"$DUAL_PROBE_CLEAN \$pkg\"; fi; done"
 }
 

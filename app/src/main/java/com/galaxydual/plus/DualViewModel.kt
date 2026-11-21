@@ -10501,6 +10501,41 @@ class DualViewModel(
                         }
                         return@withLock
                     }
+                    // R04 clear-path parity：pre-IO 重讀的 fail-closed 清理共用同一
+                    // helper——Unknown（既有 REFRESH_FAILED／CORRUPT_DETECTED）與
+                    // Known 內容漂移（UNKNOWN_REFRESH，與 write 路徑 baseWarnedOld
+                    // 比對同義）皆清 in-flight／flags／phase／state，零 store.clear。
+                    // 既有 Unknown 行為／訊息與 legacy 無綁定路徑完全不變。
+                    fun abortPrecommit(preCorrupt: Boolean, msgKind: PolicyTextKind) {
+                        synchronized(policySettleLock) {
+                            inFlightWrites.remove(key)
+                            markPolicyUnknownLocked()
+                            _state.update { cur ->
+                                val preMsg = policyText(PolicyText(msgKind))
+                                // R5-1：phase 僅在無 request 擁有之（無 pending）時才重置——
+                                // request 已安裝 pending 時由 request 擁有 QUEUED/SAVING。
+                                if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
+                                    cur.copy(
+                                        loading = false,
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = preCorrupt,
+                                        policyWritePhase = PolicyWritePhase.IDLE,
+                                        policyEpoch = policyPhaseEpoch.incrementAndGet(),
+                                        msg = preMsg,
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                } else {
+                                    cur.copy(
+                                        loading = false,
+                                        policyDraftKnown = false,
+                                        policyDraftCorrupt = preCorrupt,
+                                        msg = preMsg,
+                                        msgKind = MsgKind.CHANNEL,
+                                    )
+                                }
+                            }
+                        }
+                    }
                     run {
                         val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
                         val preRead: LoadResult = try {
@@ -10517,37 +10552,22 @@ class DualViewModel(
                         }
                         if (preRead is LoadResult.Unknown) {
                             val preCorrupt = preRead is LoadResult.Corrupt
-                            synchronized(policySettleLock) {
-                                inFlightWrites.remove(key)
-                                markPolicyUnknownLocked()
-                                _state.update { cur ->
-                                    val preMsg = policyText(
-                                        if (preCorrupt) PolicyText(PolicyTextKind.CORRUPT_DETECTED)
-                                        else PolicyText(PolicyTextKind.REFRESH_FAILED),
-                                    )
-                                    // R5-1：phase 僅在無 request 擁有之（無 pending）時才重置——
-                                    // request 已安裝 pending 時由 request 擁有 QUEUED/SAVING。
-                                    if (cur.pendingPolicyWrite == null && cur.policyWritePhase == PolicyWritePhase.QUEUED) {
-                                        cur.copy(
-                                            loading = false,
-                                            policyDraftKnown = false,
-                                            policyDraftCorrupt = preCorrupt,
-                                            policyWritePhase = PolicyWritePhase.IDLE,
-                                            policyEpoch = policyPhaseEpoch.incrementAndGet(),
-                                            msg = preMsg,
-                                            msgKind = MsgKind.CHANNEL,
-                                        )
-                                    } else {
-                                        cur.copy(
-                                            loading = false,
-                                            policyDraftKnown = false,
-                                            policyDraftCorrupt = preCorrupt,
-                                            msg = preMsg,
-                                            msgKind = MsgKind.CHANNEL,
-                                        )
-                                    }
-                                }
-                            }
+                            abortPrecommit(
+                                preCorrupt,
+                                if (preCorrupt) PolicyTextKind.CORRUPT_DETECTED else PolicyTextKind.REFRESH_FAILED,
+                            )
+                            return@withLock
+                        }
+                        // R04 clear-path parity（write 路徑 confirmPolicyWrite 的
+                        // baseWarnedOld 內容比對同義）：警告綁定路徑（warnedOld != null）
+                        // 在警告與清除之間被外部寫成另一個 Known 時，內容與使用者
+                        // 所見不符 → fail-closed 中止，避免清除掉未曾被告知的雙開。
+                        // 無綁定／legacy（warnedOld==null）維持既有盲清語意（不再比對）。
+                        if (preRead is LoadResult.Known &&
+                            warningBinding?.warnedOld != null &&
+                            preRead.packages != warningBinding.warnedOld
+                        ) {
+                            abortPrecommit(false, PolicyTextKind.UNKNOWN_REFRESH)
                             return@withLock
                         }
                     }

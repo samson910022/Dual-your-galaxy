@@ -71,7 +71,7 @@
   save/clear＋1，與 packages 同一 atomic commit）；hook 側 BBC 讀取以 seqlock 自洽快照
   （version-before → 防禦性 copy → version-after，不一致 fail-closed 回 Unknown）搭配
   **Good（非空）／Cleared（空＋版本證明）**單調版本閘，拒絕重放／陳舊值（含內容感知的
-  同版本再接受規則）；App 側 reconciler／refresh 以版本判定是否需重讀。版本本身仍經同一
+  同版本再接受規則）；App 側 reconciler／refresh 以本地世代（policyDraftVersion／freshGen／rev）判定是否需重讀；持久化版本鍵僅供 hook 側新鮮度證據。版本本身仍經同一
   永久快取實例，底層 mMap 可能仍陳舊，故仍受 TTL＋重啟語義約束（daemon 重建前版本亦可能
   過期），僅為「可觀測的新鮮度證據」，**非推送替代**；不保證 60s 內或下一次 poll 看到新集合，
   重啟 hook 行程後才保證讀到新值。DevOps 端無須額外操作，但端到端 read-after-write 仍待實機證明。
