@@ -17,9 +17,13 @@ package com.galaxydual.hook
 /** Minimal view of the two prefs calls the version probe needs.
  *
  * Framework-free on purpose: production adapts the real SharedPreferences once
- * in the reader; JVM tests supply fakes that can throw or swap values between
- * the two probe calls. */
-internal interface VersionPrefsView {
+ * in the reader (hook) or the writer (app); JVM tests supply fakes that can
+ * throw or swap values between the two probe calls.
+ *
+ * PUBLIC: shared hook/app version-probe contract — the app writer
+ * (HookPolicyStore) adapts its prefs to this same view so both sides classify
+ * version-key state with one source of truth. */
+interface VersionPrefsView {
     fun containsVersion(): Boolean
     fun readVersion(defValue: Long): Long
 }
@@ -39,8 +43,10 @@ internal interface VersionPrefsView {
  *
  * Reader rule: only [Absent] on BOTH seqlock reads yields `version = null` with
  * `failed = false`; [Invalid] or [Unavailable] on either read (or a mismatch)
- * fails closed. High-water is never lowered. */
-internal sealed interface VersionProbeResult {
+ * fails closed. High-water is never lowered.
+ *
+ * PUBLIC: shared hook/app version-probe contract (see [VersionPrefsView]). */
+sealed interface VersionProbeResult {
     /** Key confirmed absent — legacy migration allowed. */
     data object Absent : VersionProbeResult
 
@@ -58,8 +64,11 @@ internal sealed interface VersionProbeResult {
  *
  * Never throws: a [ClassCastException] means a corrupt value ([Invalid]), any
  * other [Throwable] means the probe itself failed ([Unavailable]). The caller
- * compares two such probes (before/after the package snapshot) via seqlock. */
-internal fun probeVersion(view: VersionPrefsView): VersionProbeResult = try {
+ * compares two such probes (before/after the package snapshot) via seqlock.
+ *
+ * PUBLIC: shared hook/app version-probe contract — used by both the hook reader
+ * and the app writer (HookPolicyStore). */
+fun probeVersion(view: VersionPrefsView): VersionProbeResult = try {
     if (!view.containsVersion()) {
         VersionProbeResult.Absent
     } else {

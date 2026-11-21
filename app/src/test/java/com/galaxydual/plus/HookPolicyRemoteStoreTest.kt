@@ -66,8 +66,15 @@ class HookPolicyRemoteStoreTest {
         var corruptType = false
         var cancelOnAll = false
         // Phase A P0:模擬不支援 putLong 的 MinimalPrefs（舊 stub）：putLong 擲出，
-        // 驗證 save 仍落盤包集合（版本缺席由 hook 視為 Unknown sticky）。
+        // 驗證 save fail-closed（不 commit、不留部分狀態；N04/N07）。
         var putLongThrows = false
+        // N04/N07: version-key probe failure fixtures. Each is version-key
+        // specific so other store reads (poison bookkeeping, backup, ...) are
+        // unaffected. versionContainsFailure -> Unavailable; versionGetLongFailure
+        // -> Unavailable; versionTypeCorrupt -> ClassCastException -> Invalid.
+        var versionContainsThrows = false
+        var versionGetLongThrows = false
+        var versionTypeCorrupt = false
         // PR #74 G1: simulate a transient boolean read failure (binder/prefs
         // unavailable) to pin the default-true behavior on read errors.
         var booleanReadThrows = false
@@ -98,13 +105,24 @@ class HookPolicyRemoteStoreTest {
             return stored ?: defValues
         }
         override fun getInt(key: String?, defValue: Int): Int = (data[key] as? Int) ?: defValue
-        override fun getLong(key: String?, defValue: Long): Long = (data[key] as? Long) ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long {
+            if (key == PolicySource.POLICY_KEY_EXTRA_VERSION) {
+                if (versionTypeCorrupt) throw ClassCastException("version key wrong type")
+                if (versionGetLongThrows) throw RuntimeException("version getLong failed")
+            }
+            return (data[key] as? Long) ?: defValue
+        }
         override fun getFloat(key: String?, defValue: Float): Float = (data[key] as? Float) ?: defValue
         override fun getBoolean(key: String?, defValue: Boolean): Boolean {
             if (booleanReadThrows) throw RuntimeException("boolean read failed")
             return (data[key] as? Boolean) ?: defValue
         }
-        override fun contains(key: String?): Boolean = data.containsKey(key)
+        override fun contains(key: String?): Boolean {
+            if (versionContainsThrows && key == PolicySource.POLICY_KEY_EXTRA_VERSION) {
+                throw RuntimeException("version contains failed")
+            }
+            return data.containsKey(key)
+        }
         override fun edit(): SharedPreferences.Editor = RecordingEditor()
         override fun registerOnSharedPreferenceChangeListener(
             listener: SharedPreferences.OnSharedPreferenceChangeListener?,
@@ -711,14 +729,18 @@ class HookPolicyRemoteStoreTest {
             override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
                 private var pending: MutableSet<String>? = null
                 private var removed = false
+                private var pendingVersion: Long? = null
                 override fun putString(key: String?, value: String?): SharedPreferences.Editor =
                     throw UnsupportedOperationException()
                 override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor =
                     apply { pending = values?.toMutableSet(); removed = false }
                 override fun putInt(key: String?, value: Int): SharedPreferences.Editor =
                     throw UnsupportedOperationException()
+                // N04/N07: writer requires putLong to succeed (fail-closed on
+                // failure); stage the version so this test still reaches commit
+                // and exercises CancellationException propagation there.
                 override fun putLong(key: String?, value: Long): SharedPreferences.Editor =
-                    throw UnsupportedOperationException()
+                    apply { pendingVersion = value }
                 override fun putFloat(key: String?, value: Float): SharedPreferences.Editor =
                     throw UnsupportedOperationException()
                 override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor =
@@ -732,6 +754,9 @@ class HookPolicyRemoteStoreTest {
                     if (removed) data.remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
                     if (pending != null) {
                         data[PolicySource.POLICY_KEY_EXTRA_PACKAGES] = pending!!
+                    }
+                    if (pendingVersion != null) {
+                        data[PolicySource.POLICY_KEY_EXTRA_VERSION] = pendingVersion!!
                     }
                     return true
                 }
@@ -1786,32 +1811,138 @@ class HookPolicyRemoteStoreTest {
         }
     }
 
-    // Phase A P0 MinimalPrefs 相容：Editor.putLong 擲出（不支援版本鍵）時仍須
-    // 落盤包集合（版本缺席）；hook 側 empty+無版本視為 Unknown sticky（永不收縮）。
+    // N04/N07 MinimalPrefs 相容（改為 fail-closed）：Editor.putLong 擲出時
+    // 整筆寫入中止、不 commit、不留部分狀態（包集合/版本皆不變）。
     @Test
-    fun versionPutLongThrows_stillPersistsPackage_hookSeesUnknown() {
+    fun versionPutLongThrows_failsWriteWithoutCommitBbc() {
         resetRemotePoisonForTests()
         try {
             val prefs = RecordingPrefs()
             prefs.putLongThrows = true
             val store = remoteHookPolicyStore { prefs }
-            // 非空包仍落盤（向後相容：hook 側非空+無版本為 Good）。
-            assertTrue(store.save(setOf("com.example.a")))
-            assertEquals(setOf("com.example.a"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+            // 非空包：putLong 失敗 → save=false，commit=0，鍵皆不存在。
+            assertFalse(store.save(setOf("com.example.a")))
+            assertEquals(0, prefs.commitCalls)
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
             assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION))
-            // 空包 + 無版本：hook 側必須視為 Unknown（sticky，永不收縮為 Cleared）。
-            assertTrue(store.save(emptySet()))
-            assertEquals(emptySet<String>(), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+            // 空包：同樣 fail-closed，不落盤空集合、不寫版本。
+            assertFalse(store.save(emptySet()))
+            assertEquals(0, prefs.commitCalls)
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
             assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION))
-            val cache = com.galaxydual.hook.EffectivePolicyCache(
-                nowMs = { 1_000L },
-                stickyLastGood = true,
-            )
-            val unk = cache.getBbc(emptySet(), reader = {
-                val pkgs: Set<String>? = prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf())?.toSet()
-                Pair<Set<String>?, Long?>(pkgs, null)
-            })
-            assertTrue(unk is com.galaxydual.hook.EffectivePolicyCache.BbcPolicy.Unknown)
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: version probe 的 contains 失敗 (Unavailable) → 整筆 save 中止，
+    // 舊 v50 + 包集合保持 byte-identical，commit 次數不變。
+    @Test
+    fun versionContainsFailureAbortsWriteKeepsPersistedV50Bbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+            prefs.versionContainsThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            assertEquals(commitsBefore, prefs.commitCalls)
+            // contains 開關只擋 version 鍵，getLong 仍可讀回見證值。
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: version probe 的 getLong 失敗 (非 CCE → Unavailable) → 整筆 save 中止。
+    @Test
+    fun versionGetLongFailureAbortsWriteKeepsPersistedV50Bbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+            prefs.versionGetLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            assertEquals(commitsBefore, prefs.commitCalls)
+            prefs.versionGetLongThrows = false
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: version probe 讀失敗時 clear 亦須中止，不誤刪既有草稿。
+    @Test
+    fun versionReadFailureAbortsClearKeepsPersistedV50Bbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+            prefs.versionContainsThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.clear())
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: CCE-corrupt 版本鍵仍視為 Invalid → curVer=0 → 修復寫入 v1
+    // （保留舊版 CCE-corrupt 修復語意，不因 fail-closed 而遺失）。
+    @Test
+    fun versionTypeCorruptStillMigratesToV1Bbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            prefs.versionTypeCorrupt = true // getLong(version) 擲 CCE → Invalid
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.save(setOf("new")))
+            prefs.versionTypeCorrupt = false
+            assertEquals(1L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("new"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: clear 的 putLong 失敗時不得 commit，版本/包集合保持原樣。
+    @Test
+    fun clearWithExistingVersionAndPutLongThrowsFailsWithoutChangingStoreBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+            prefs.putLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.clear())
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
         } finally {
             resetRemotePoisonForTests()
         }

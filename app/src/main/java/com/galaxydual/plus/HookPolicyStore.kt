@@ -36,6 +36,9 @@ package com.galaxydual.plus
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import com.galaxydual.hook.PolicySource
+import com.galaxydual.hook.VersionPrefsView
+import com.galaxydual.hook.VersionProbeResult
+import com.galaxydual.hook.probeVersion
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -1075,29 +1078,33 @@ fun remoteHookPolicyStore(
                         // 缺席視為 0（下次寫入即 1）；非空舊草稿無版本仍被 hook
                         // 視為 Good（向後相容），空+無版本永不視為故意清除。
                         // 版本鍵型別錯亂（CCE）視為 0 並以 putLong 覆寫修復。
-                        val curVer: Long = try {
-                            val has = try {
+                        //
+                        // N04/N07 fail-closed version proof: probe via the shared
+                        // hook/app vocabulary (BbcVersionProbe.probeVersion). An
+                        // Unavailable result — `contains` threw, or `getLong`
+                        // failed for a non-CCE reason — means the probe itself
+                        // failed: ABORT THE WHOLE WRITE (no editor, no commit,
+                        // old store byte-identical). Absent/Invalid (CCE or
+                        // value < 1) still map to curVer=0 so the legacy
+                        // migration and the CCE-corrupt->v1 repair are preserved.
+                        val probe = probeVersion(object : VersionPrefsView {
+                            override fun containsVersion(): Boolean =
                                 prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
-                            } catch (_: Throwable) {
-                                false
-                            }
-                            if (!has) {
-                                0L
-                            } else try {
-                                val v = prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 0L)
-                                if (v < 0L) 0L else v
-                            } catch (_: ClassCastException) {
-                                0L
-                            } catch (_: Throwable) {
-                                0L
-                            }
-                        } catch (_: Throwable) {
-                            0L
+                            override fun readVersion(defValue: Long): Long =
+                                prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, defValue)
+                        })
+                        if (probe is VersionProbeResult.Unavailable) {
+                            return@synchronized false
+                        }
+                        val curVer: Long = when (probe) {
+                            is VersionProbeResult.Present -> probe.value
+                            VersionProbeResult.Absent, VersionProbeResult.Invalid -> 0L
+                            VersionProbeResult.Unavailable -> 0L // unreachable: aborted above
                         }
                         val newVer: Long = if (curVer >= Long.MAX_VALUE - 1L) 1L else curVer + 1L
-                        // 版本寫入 best-effort：測試 stub 可能不支援 putLong
-                        // （UnsupportedOperationException），此時仍須落盤包集合
-                        // （版本缺席由 hook 視為 Unknown sticky，不破壞既有語義）。
+                        // N04/N07: 版本寫入改為 fail-closed（不再是 best-effort）。
+                        // putLong 若因非取消原因失敗，整筆寫入中止、不 commit，
+                        // 避免包集合落盤但版本缺席被 hook 讀成 Unknown。取消仍透傳。
                         val ed = try {
                             if (raw == null) {
                                 prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
@@ -1114,7 +1121,9 @@ fun remoteHookPolicyStore(
                         } catch (ce: CancellationException) {
                             throw ce
                         } catch (_: Throwable) {
-                            // putLong 不支援（測試 stub）：保留包集合寫入，版本缺席。
+                            // putLong 失敗（含測試 stub 的 UnsupportedOperationException）：
+                            // 整筆中止、不 commit、不留部分狀態。取消仍透傳。
+                            return@synchronized false
                         }
                         try {
                             ed.commit()
