@@ -717,8 +717,10 @@ class HookPolicyStore(
     //
     // Best-effort like the legacy wrapper: every Throwable other than
     // CancellationException maps to Unknown and is swallowed. CancellationException
-    // is deliberately preserved — BbcInjectionToggleController relies on it to
-    // kill its actor without a failure toast on dispose/scope cancellation.
+    // is deliberately preserved as an interruption (not a write outcome); the
+    // app-scoped BbcToggleCoordinator runs under a SupervisorJob so a cancellation
+    // never surfaces as a failure toast. dispose() is UI-only (D05) and must not
+    // cancel the shared actor or an in-flight commit.
     internal fun setBbcInjectionEnabledDetailed(enabled: Boolean): BbcWriteOutcome = try {
         if (saveBbcEnabledRaw(enabled)) {
             BbcWriteOutcome.Confirmed(enabled)

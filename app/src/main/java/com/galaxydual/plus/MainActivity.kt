@@ -304,8 +304,9 @@ class MainActivity : ComponentActivity() {
     // dismiss，否則舊 Activity 的 window 洩漏。
     private var exportDialog: AlertDialog? = null
     private var settingsDialog: AlertDialog? = null
-    // PR #74 R2 N05：BBC 開關的單一 latest-intent actor。對話框重建時先 dispose
-    // 舊實例，Activity.onDestroy 再 dispose 最後一個，避免孤兒 consumer 持有舊 View。
+    // PR #74 R2 N05 / R3 D05：BBC 開關的 UI controller。對話框重建時先 dispose
+    // 舊實例（只切斷 UI 回呼），Activity.onDestroy 再 dispose 最後一個，避免孤兒
+    // 回呼持有舊 View。寫入序列化與在飛提交由 GalaxyApp 的 app 層級 coordinator 持有。
     private var bbcToggleController: BbcInjectionToggleController? = null
     // PR-74 A3：pre-clear 警告／ROOT 二次確認／卸載驗證對話框 handle（onDestroy 釋放，
     // 避免舊 Activity 的 window 洩漏；與既有 export/settings dialog 同一生命周期語義）。
@@ -2371,7 +2372,8 @@ class MainActivity : ComponentActivity() {
     // honestly that this may need a hook-process restart or a reboot and is NOT
     // a guard against Samsung's cold-start deletion (issue #75).
     private fun buildBbcInjectionToggle(): View {
-        // A fresh dialog rebuild replaces (and disposes) the previous actor.
+        // A fresh dialog rebuild disposes the previous controller's UI only;
+        // the app-scoped coordinator (and any in-flight commit) survives.
         bbcToggleController?.dispose()
         val toggle = CheckBox(this).apply {
             text = getString(R.string.settings_bbc_injection_label)
@@ -2384,17 +2386,12 @@ class MainActivity : ComponentActivity() {
         val summary = TextView(this).apply {
             text = getString(R.string.settings_bbc_injection_summary)
         }
-        // PR #74 R2 N05：單一 actor 接管 lastGood 與 generation；連點不再各起
-        // 一條 IO coroutine。restoring 守衛仍必要：controller 的 onRestored 會在
-        // Main 設定 isChecked，不可再觸發一次 onToggle。
+        // PR #74 R2 N05 + R3 D05：寫入序列化器現為 app 層級單例（跨對話框重建共用），
+        // controller 只保留 UI 狀態。restoring 守衛仍必要：controller 的 onRestored
+        // 會在 Main 設定 isChecked，不可再觸發一次 onToggle。
         var restoring = false
         bbcToggleController = BbcInjectionToggleController(
-            scope = lifecycleScope,
-            store = { enabled ->
-                withContext(Dispatchers.IO) {
-                    bbcPolicyStore().setBbcInjectionEnabled(enabled)
-                }
-            },
+            coordinator = (application as GalaxyApp).bbcToggleCoordinator,
             initialValue = initialChecked,
             onRestored = { lastGood ->
                 restoring = true

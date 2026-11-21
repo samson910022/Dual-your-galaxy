@@ -1,48 +1,47 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
-// PR #74 round 2 / N05: BBC 開關連點併發收斂 (single latest-intent actor).
+// PR #74 round 2 / N05 + round 3 / D05: BBC 開關連點併發收斂.
 //
-// EN: rapid CheckBox taps used to launch one IO coroutine per tap. The store's
-// internal lock serialises *commits*, but not *user-intent order*, so an older
-// write could land last and the UI could show OFF while storage was ON. This
-// controller funnels every tap through ONE conflated channel + ONE consumer,
-// so commits follow intent order for the surviving intents, and a generation
-// fence drops the result of any intent superseded while its commit was in
-// flight. Intermediate intents may be coalesced — that is the point.
+// EN: rapid CheckBox taps used to launch one IO coroutine per tap, and round-2's
+// single per-controller actor still died on every dialog rebuild. D05 promotes
+// the serializer to the app-scoped [BbcToggleCoordinator]: the sequence is
+// assigned at user-intent time from the shared state, and the single global
+// consumer serializes commits across controller lifetimes. This controller now
+// only owns UI state (lastGood / persistedValue / a local sequence fence) and
+// detaches its callbacks on dispose; it never cancels an in-flight write.
 //
-// 中文：連點曾經每次點擊都起一條 IO coroutine；store 的鎖只保證「寫入」互斥，
-// 不保證「使用者意圖順序」，舊寫入可能最後落地，造成 UI 顯示 OFF、儲存卻是 ON。
-// 本控制器把每次點擊送進單一 CONFLATED channel + 單一 consumer，讓「存活下來的
-// 意圖」依序提交；generation 柵欄則作廢提交期間被新意圖取代的舊結果。中間意圖
-// 被合併是預期行為。
+// 中文：連點曾經每次點擊都起一條 IO coroutine；round-2 的單一 actor 又會在對話框
+// 重建時被銷毀。D05 把序列化器提升為 app 層級的 BbcToggleCoordinator：序號在使用者
+// 意圖產生時由共享 state 指派，全域唯一 consumer 負責跨 controller 生命週期的寫入
+// 順序。本控制器只保留 UI 狀態（lastGood / persistedValue / 本地序號柵欄），dispose
+// 只切斷 UI 回呼，不再取消進行中的提交。
 //
 // Framework-free on purpose (no Android imports): only kotlinx.coroutines,
 // which the app already ships. Dispatchers are constructor seams so JVM tests
-// can drive everything on a single TestScheduler with no Robolectric.
+// can drive everything without Robolectric.
 package com.galaxydual.plus
 
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 internal class BbcInjectionToggleController(
-    private val scope: CoroutineScope,
-    /** Commit seam; returns true iff the store accepted the value (failure authority). */
-    private val store: suspend (Boolean) -> Boolean,
+    /** Process-wide serializer; NOT owned here — survives dialog/Activity rebuilds. */
+    private val coordinator: BbcToggleCoordinator,
     /** Initial persisted value, also the first "last known good". */
     initialValue: Boolean,
-    private val io: CoroutineDispatcher = Dispatchers.IO,
     /** Result handlers (checkbox restore / toast) always run here; Main.immediate in prod. */
     private val main: CoroutineDispatcher = Dispatchers.Main.immediate,
     /** Put the CheckBox back to the last confirmed value (Activity guards re-entry). */
     private val onRestored: (Boolean) -> Unit,
-    /** Best-effort UI toast on a rejected/throwing commit; never on cancellation. */
+    /** Best-effort UI toast on an Unknown commit; never on cancellation. */
     private val onFailed: (() -> Unit)? = null,
+    /** D04 seam for the explicit UNKNOWN UI state; no-op until D04 wires the UI. */
+    private val onUnknown: (() -> Unit)? = null,
 ) {
     // lastGood = last value the store confirmed for a NON-stale intent (or the
     // initial read); a failed commit must never advance it. persistedValue = the
@@ -50,73 +49,72 @@ internal class BbcInjectionToggleController(
     // stale commit still landed in storage even though its UI result is dropped.
     // A failure rollback must use persistedValue, not lastGood, or the CheckBox
     // would be restored to a value that disagrees with storage.
-    // @Volatile only to keep the JVM test accessors honest; production writes are
-    // serialised on the single actor (results applied on main, taps from main).
+    // NOTE (D04): persistedValue rollback semantics are intentionally unchanged
+    // in this phase; D04 replaces them with an explicit Unknown UI state.
+    // @Volatile only to keep JVM test accessors honest; production taps come
+    // from Main, results are applied on Main, and the single global coordinator
+    // consumer serializes commits.
     @Volatile
     private var lastGood: Boolean = initialValue
 
     @Volatile
     private var persistedValue: Boolean = initialValue
 
-    // Monotonically increasing, bumped ONLY by user intents (never by commits).
+    // Local, per-UI generation (observability only). The GLOBAL ordering fence
+    // is the sequence from the app-scoped BbcToggleRuntimeState.
     @Volatile
     private var generation: Long = 0L
 
-    // CONFLATED: a burst keeps just the newest tap; one consumer drains it.
-    private val intents = Channel<Boolean>(Channel.CONFLATED)
+    @Volatile
+    private var lastSubmittedSequence: Long = 0L
 
-    private val job: Job = scope.launch {
-        for (intent in intents) {
-            // Capture the generation of the *surviving* intent. If several taps
-            // were coalesced, this equals the newest tap's generation.
-            val gen = generation
+    @Volatile
+    private var alive: Boolean = true
 
-            val ok = try {
-                withContext(io) { store(intent) }
-            } catch (ce: CancellationException) {
-                // dispose()/scope cancellation: propagate and kill the actor.
-                // Do NOT report a failure toast or restore a dying Activity.
-                throw ce
-            } catch (_: Throwable) {
-                // Non-cancellation store failure (e.g. binder RemoteException)
-                // is the same as commit(false): take the failure path below.
-                false
-            }
+    // UI delivery job is local: it is cancelled on dispose so a queued callback
+    // cannot touch a dead View. It is a CHILD of the coordinator's app scope,
+    // so cancelling it never affects the shared write consumer.
+    private val parentJob: Job? = coordinator.scope.coroutineContext[Job]
+    private val uiJob = SupervisorJob(parent = parentJob)
+    private val uiScope = CoroutineScope(coordinator.scope.coroutineContext + uiJob + main)
 
-            // Disk truth advances on EVERY successful commit, BEFORE the
-            // generation fence below. A stale commit was dropped for the UI,
-            // but it really did write to storage; a later failure rollback
-            // must reflect that value.
-            if (ok) persistedValue = intent
-
-            withContext(main) {
-                // Stale result: a newer tap arrived while this commit ran.
-                // Dropping it is what stops an older write from winning the UI.
-                if (gen != generation) return@withContext
-
-                if (ok) {
-                    lastGood = intent
-                } else {
-                    // Restore the ACTUAL persisted value (which may come from a
-                    // stale-but-successful commit), not lastGood and not the
-                    // value that just failed.
-                    onRestored(persistedValue)
-                    onFailed?.invoke()
+    /** Called from the CheckBox listener; order of calls is the user-intent order. */
+    fun onToggle(checked: Boolean) {
+        if (!alive) return
+        generation++
+        // Sequence is assigned at USER-INTENT time from app-scoped state, so it
+        // keeps increasing even when this controller is rebuilt.
+        val seq = coordinator.state.nextSequence()
+        lastSubmittedSequence = seq
+        coordinator.submit(seq, checked) { outcome ->
+            // Coordinator consumer thread: disk truth advances on EVERY
+            // successful commit, BEFORE the fence below — a stale commit really
+            // did write to storage, so a later failure must roll back to it.
+            if (outcome is BbcWriteOutcome.Confirmed) persistedValue = outcome.value
+            uiScope.launch {
+                if (!alive) return@launch
+                // Per-controller fence: a result superseded by a newer tap on
+                // this UI must not move the CheckBox or fire a toast.
+                if (seq != lastSubmittedSequence) return@launch
+                when (outcome) {
+                    is BbcWriteOutcome.Confirmed -> lastGood = outcome.value
+                    BbcWriteOutcome.Unknown -> {
+                        onRestored(persistedValue)
+                        onFailed?.invoke()
+                        onUnknown?.invoke()
+                    }
                 }
             }
         }
     }
 
-    /** Called from the CheckBox listener; order of calls is the user-intent order. */
-    fun onToggle(checked: Boolean) {
-        generation++
-        intents.trySend(checked)
-    }
-
-    /** Cancel the single consumer (Activity.onDestroy, or dialog rebuild). */
+    /**
+     * Detach UI callbacks only (Activity.onDestroy / dialog rebuild).
+     * The shared coordinator consumer and any in-flight commit are untouched.
+     */
     fun dispose() {
-        job.cancel()
-        intents.close()
+        alive = false
+        uiJob.cancel()
     }
 
     // --- JVM-test seams (internal, same module) -------------------------------
@@ -124,5 +122,5 @@ internal class BbcInjectionToggleController(
 
     internal fun currentGeneration(): Long = generation
 
-    internal fun isActorActive(): Boolean = job.isActive
+    internal fun isAlive(): Boolean = alive
 }

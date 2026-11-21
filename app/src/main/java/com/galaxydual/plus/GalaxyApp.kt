@@ -16,6 +16,9 @@ import io.github.libxposed.service.XposedServiceHelper
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
@@ -35,6 +38,25 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
             initialConfirmed = remoteHookPolicyStore {
                 remotePreferences(PolicySource.POLICY_PREFS_NAME)
             }.isBbcInjectionEnabled(),
+        )
+    }
+
+    // PR #74 R3 D05: the ONE BBC write serializer for this app process. Built
+    // once on the Application lifetime (NOT lifecycleScope) so a controller
+    // rebuilt by a later dialog/Activity shares the same single consumer: an
+    // old synchronous commit cannot be abandoned and land after a newer intent.
+    // The scope is never cancelled by UI teardown; it ends with the process.
+    // commit uses the SAME remote store seam MainActivity uses. NOT a Samsung
+    // cold-start deletion guard (issue #75).
+    internal val bbcToggleCoordinator: BbcToggleCoordinator by lazy {
+        BbcToggleCoordinator(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            state = bbcToggleRuntimeState,
+            commit = { enabled ->
+                remoteHookPolicyStore {
+                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
+                }.setBbcInjectionEnabledDetailed(enabled)
+            },
         )
     }
 
