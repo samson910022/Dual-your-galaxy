@@ -8,7 +8,7 @@
 
 > **實機證據更新（2026-11-05）**：[S24 調查與追蹤計畫](docs/UX_REVIEW_S24.md) 區分原碼、歷史實機與本輪唯讀證據，並連結 issues #21–#29。指定正常 SHELL clone/remove＋手動通道歷史見該文 §5。下文較舊 F4a 段落中的「全部未驗／啟動時靜態選路」描述不應當成目前完整現況：手動通道、偏好保存與動態重選、Auto 降級皆已實作（見自動模式節）；尚待完成的是安全負向邊界及當前 source 的可追溯裝置驗收（實機驗收，非實作）。
 
-> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 [BBC_COLDSTART_DELETE_INCIDENT.md](docs/BBC_COLDSTART_DELETE_INCIDENT.md)、issue #75（issue #75 之 11-20 callback 仍誤標為『空回調』，待手動更正；以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。下文所有 11-17/11-18 驗收段皆受此更新節制。
+> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 [BBC_COLDSTART_DELETE_INCIDENT.md](docs/BBC_COLDSTART_DELETE_INCIDENT.md)、issue #75（issue #75 已於 2026-11-21 更正為非空回調；仍以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。下文所有 11-17/11-18 驗收段皆受此更新節制。
 
 ## 目標 (Goals)
 

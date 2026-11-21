@@ -59,7 +59,7 @@ val privilege: Privilege = when {
 > 未驗 —— (3)callback 可驗日誌缺（`system_server`／daagent 查詢面）、(4)非空政策之白名單 Stage-1 查詢面 DEVICE-UNVERIFIED（sealed false，零行為變更 by design；BBC 注入面已於 2026-11-17 驗證——pre-unification build：`BBC-HOOK merged +1 packages (total 7, pid=21472)`；unified build 已驗 2026-11-18（BBC1–BBC3；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6 毀滅分身——不得標 ☑；）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
 > 目標身分完整邊界（見 #21）、當前 source 可追溯部署。
 >
-> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 之 11-20 callback 仍誤標為『空回調』，待手動更正；以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。上方 11-17/11-18 的 BBC 注入／裝置證據段皆受此更新節制；「回傳位元一致」僅指回傳物件，不代表裝置行為不變。
+> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 已於 2026-11-21 更正為非空回調；仍以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。上方 11-17/11-18 的 BBC 注入／裝置證據段皆受此更新節制；「回傳位元一致」僅指回傳物件，不代表裝置行為不變。
 > 路由 hook-neutral：`routePrivilegeFromProbes(hasShizuku, hasRoot)` 為兩探針純函數，
 > `hasLsposed` 參數已移除；`channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
 
@@ -192,6 +192,17 @@ val privilege: Privilege = when {
    測試驗收分階段：JVM unit tests（CI `testDebugUnitTest` 全綠）只保證併發語意，不替代 S24 實機驗收。
    #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24）。
    `app/src/androidTest/` harness 見 docs/ACCEPTANCE.md §5（CI 綠不斷言測試數，數量隨演進調整）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
+
+### Gradle XML-writer flake（偶發基礎設施問題）
+
+- 定性：`Could not write XML test results` 為 Gradle test-result writer 偶發基礎設施 flake，非測試語意失敗；僅在單次「5 個重型 filter 併發」高負載下出現過一次，分開重跑即綠。
+- 實測（分支 `unify/bbc-on-main`，commit `fb8f59d1`，JDK 17.0.20.1，日期 2026-11-21 UTC；兩次均為單一樣本，只證明該次未復現，不證明該模式永不 flake）：
+  | # | 指令 | 結果 | XML writer flake |
+  | --- | --- | --- | --- |
+  | 1 | `./gradlew :app:testDebugUnitTest --no-parallel --rerun-tasks` | BUILD SUCCESSFUL in 5m 26s，53 tasks 全執行 | 無（輸出全文 grep `Could not write` = 0；`test-results/testDebugUnitTest/` 69 個 XML，0 個含 failures/errors） |
+  | 2 | `./gradlew :app:testDebugUnitTest --rerun-tasks`（預設 parallel，`org.gradle.parallel=true` 生效） | BUILD SUCCESSFUL in 4m 38s，53 tasks 全執行 | 無（輸出全文 grep `Could not write` = 0） |
+- CI 對照：CI 本來就跑在 `org.gradle.parallel=true` 下且持續全綠。CI 實際指令（`.github/workflows/android.yml:677`，`release.yml:180` 相同）為 `./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon`——沒有 `--no-parallel`。`gh pr checks 74`：`build` pass（8m22s）、`locale-instrumentation` pass；最近 6 個 PR run（含 main push）全 success；最新成功 run（`44850468823`，2026-11-21T01:29Z）job log 關鍵字搜尋（`Could not write`／`no-parallel`／`XML.*result`）零命中。
+- 無出處結論：「`--no-parallel` 下仍有偶發」在 repo、docs、註解、issue／PR 留言中均無出處（repo 全文搜尋 `no-parallel` 零命中，僅 `gradle.properties:6` 有 `org.gradle.parallel=true`；`Could not write XML` 零命中；15 個 OPEN issue 逐一查留言與 `gh pr view 74 --comments` 均無相關留言），本次兩次實測亦均未復現——該說法無證據支撐，不應作為結論引用；如需主張，須先提出可重現的 log 證據。
 
 ## Policy draft flow (hook-policy-source P2-P4 semantics)
 - App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效。BBC 注入面 2026-11-17 裝置已驗證（pre-unification build；`BBC-HOOK merged +1 packages (total 7, pid=21472)`）；unified build 讀者接線已於 2026-11-18 重驗（BBC1/BBC2/BBC3 重驗 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載）；白名單 Stage-1 查詢面 DEVICE-UNVERIFIED（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘，零行為變更 by design）。

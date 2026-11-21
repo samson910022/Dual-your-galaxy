@@ -285,7 +285,7 @@ observe-only）。App 一鍵與 listing 主驗證見 `docs/USAGE.md` §0／§3�
 > provenance 聲明（先讀）
 > 以下所有 log 與裝置行為，除非另有標注，皆為 **2026-11-17 於 pre-unification build**（政策 group `galaxydual_policy`／key `packages`，RemotePreferences listener 模型）實測所得。**2026-11-18 已於 unified build（`unify/bbc-on-main`）以 S23 Ultra 重驗（BBC1/BBC2/BBC3 OK；BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身，見 `BBC6_SSAID_INCIDENT.md`，詳該文件）。**證據 `s23_bbc_unified_20261118.log`／`s23u_02..04`。
 >
-> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 之 11-20 callback 仍誤標為『空回調』，待手動更正；以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。本節所有 11-17/11-18 證據段落皆受此更新節制。
+> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 已於 2026-11-21 更正為非空回調；仍以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。本節所有 11-17/11-18 證據段落皆受此更新節制。
 
 Samsung Dual Messenger 頁的「可用的應用程式」清單由 DAAgent 呼叫 BBC 庫
 `PmWrapper.getPossibleDualAppPackages(Context)->java.util.ArrayList` 取得
