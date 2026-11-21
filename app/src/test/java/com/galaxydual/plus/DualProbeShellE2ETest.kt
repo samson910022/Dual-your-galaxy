@@ -167,6 +167,49 @@ class DualProbeShellE2ETest {
         assertFalse(raw.out.contains("CLEAN com.a.app"))
     }
 
+    // A1 (PR #74 independent review): canonical `pm list packages -f` combined
+    // form (both '/' and '=' in the payload). Passes a prefix-only check but
+    // misses the exact grep -> false CLEAN -> silent clear (fail-open). Must be
+    // Failed via the FAIL marker.
+    @Test
+    fun e2e_canonicalFStylePackageToken_failsClosed() {
+        val (res, raw) = probeViaShell(
+            listOf("com.a.app"),
+            95,
+            "echo 'package:/data/app/com.a.app/base.apk=com.a.app'; exit 0",
+        )
+        assertTrue("-f combined package: token must be Failed, got: $res / raw=$raw", res is DualProbeResult.Failed)
+        assertFalse("must not emit CLEAN for a malformed package: token", raw.out.contains("CLEAN com.a.app"))
+        assertTrue("must emit FAIL marker for a malformed package: token", raw.out.contains("FAIL com.a.app"))
+    }
+
+    // A1 (PR #74 independent review): ':uid' suffix is outside [A-Za-z0-9_.],
+    // so the allowlist must reject it. Malformed payload -> Failed, never CLEAN.
+    @Test
+    fun e2e_uidSuffixPackageToken_failsClosed() {
+        val (res, raw) = probeViaShell(
+            listOf("com.a.app"),
+            95,
+            "echo 'package:com.a.app:uid'; exit 0",
+        )
+        assertTrue("uid-suffix package: token must be Failed, got: $res / raw=$raw", res is DualProbeResult.Failed)
+        assertFalse("must not emit CLEAN for a malformed package: token", raw.out.contains("CLEAN com.a.app"))
+        assertTrue("must emit FAIL marker for a malformed package: token", raw.out.contains("FAIL com.a.app"))
+    }
+
+    // A1 (PR #74 independent review): empty payload must fail closed too.
+    @Test
+    fun e2e_emptyPackagePayload_failsClosed() {
+        val (res, raw) = probeViaShell(
+            listOf("com.a.app"),
+            95,
+            "echo 'package:'; exit 0",
+        )
+        assertTrue("empty package: payload must be Failed, got: $res / raw=$raw", res is DualProbeResult.Failed)
+        assertFalse("must not emit CLEAN for an empty package: payload", raw.out.contains("CLEAN com.a.app"))
+        assertTrue("must emit FAIL marker for an empty package: payload", raw.out.contains("FAIL com.a.app"))
+    }
+
     // Requested package with no marker (truncated output) => Failed.
     @Test
     fun e2e_missingMarker_failsClosed() {

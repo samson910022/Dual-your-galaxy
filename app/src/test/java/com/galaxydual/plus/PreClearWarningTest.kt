@@ -104,9 +104,7 @@ class PreClearWarningTest {
     @Test
     fun builders_dropShellUnsafeTokens() {
         val probe = buildDualProbeCommand(listOf("com.a.app", "com..x", "..", "a-"), 95)
-        assertTrue(probe.contains("com.a.app"))
-        assertFalse(probe.contains("com..x"))
-        assertFalse(probe.contains("a-"))
+        assertEquals("com.a.app", probe.substringAfter("for pkg in ").substringBefore("; do"))
         val uninstall = buildDualUninstallCommand(listOf("com.a.app", "com..x"), 95)
         assertTrue(uninstall.contains("com.a.app"))
         assertFalse(uninstall.contains("com..x"))

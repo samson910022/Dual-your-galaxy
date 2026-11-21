@@ -7403,9 +7403,18 @@ internal fun buildDualProbeCommand(pkgs: List<String>, userId: Int): String {
     // "package:com.a.app " 這類周圍帶空白的行亦被 token 化為精確的
     // package:com.a.app，避免「_BAD 通過但精確 grep 落空」而對已安裝雙開誤發
     // CLEAN（fail-open）。兩者皆為正面比對（任一命中即 INST），不引入 fail-open。
+    // A1 (PR #74 review): allowlist — only `package:` + [A-Za-z0-9_.]+ is trusted.
+    // Empty payloads or any other char (e.g. canonical -f form
+    // package:/data/app/.../base.apk=com.a.app, or a :uid suffix) pass a mere
+    // prefix check but miss the exact grep -> false CLEAN -> silent clear
+    // (fail-open). Reject them via _BAD so the existing FAIL path is taken.
+    // A1 (PR #74 review): 白名單——僅 `package:` + [A-Za-z0-9_.]+ 視為可信。
+    // 空 payload 或含其他字元（如 -f 形式
+    // package:/data/app/.../base.apk=com.a.app、:uid 後綴）雖過前綴檢查，
+    // 精確 grep 落空 → 誤判 CLEAN → 靜默清除（fail-open）。故設 _BAD 走 FAIL。
     return "_PL=\$(pm list packages --user $userId); _RC=\$?; " +
         "_PN=\$(printf '%s\\n' \"\$_PL\" | tr -d '\\r'); " +
-        "_BAD=0; for _l in \$_PN; do case \"\$_l\" in package:*) ;; *) _BAD=1;; esac; done; " +
+        "_BAD=0; for _l in \$_PN; do case \"\$_l\" in package:|package:*[!A-Za-z0-9_.]*) _BAD=1;; package:*) ;; *) _BAD=1;; esac; done; " +
         "echo \"$DUAL_PROBE_RC=\$_RC\"; " +
         "for pkg in ${capped.joinToString(" ")}; do " +
         "if [ \$_RC -ne 0 ] || [ \$_BAD -ne 0 ]; then echo \"$DUAL_PROBE_FAIL \$pkg\"; " +
