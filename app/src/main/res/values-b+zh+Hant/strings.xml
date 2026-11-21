@@ -381,6 +381,10 @@
     <string name="settings_about_format">%1$s\n版本 %2$s（%3$s）\n\n• %4$s\n• %5$s\n\n%6$s</string>
     <string name="settings_about_feature">Zygote Hook 與 Shizuku 閘道</string>
     <string name="settings_license">MIT License - Dual your Galaxy contributors.</string>
+    <!-- PR #74 G1: BBC injection runtime opt-out (dual_policy/bbc_injection_enabled, default true). -->
+    <string name="settings_bbc_injection_label">BBC 注入（雙開可用清單擴充）</string>
+    <string name="settings_bbc_injection_summary">關閉後可能需重啟 hook 行程或重新開機才生效（RemotePreferences 快取）；此開關「不是」Samsung 冷啟動刪除的防護——刪除早於 BBC 回調（issue #75）。</string>
+    <string name="settings_bbc_injection_write_failed">BBC 注入偏好寫入失敗，請稍後重試。</string>
     <string name="settings_version_unknown">未知</string>
     <string name="badge_number_format">%1$d</string>
     <!-- Phase G (i18n): bullet/count prefixes as format resources (were

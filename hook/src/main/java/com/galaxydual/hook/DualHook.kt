@@ -23,6 +23,34 @@ internal interface BbcVersionedPrefsView {
     fun getStringSet(key: String, defValue: MutableSet<String>): MutableSet<String>?
 }
 
+// --- PR #74 G1: runtime BBC injection opt-out (framework-free seam) ---
+// Minimal view of the ONE boolean the BBC gate needs, so JVM tests can inject
+// a fake (absent key / read throws) without an Android runtime. Production
+// adapts the real SharedPreferences once in bbcInjectionEnabledNow().
+internal interface BbcInjectionPrefsView {
+    fun getBoolean(key: String, defValue: Boolean): Boolean
+}
+
+// Returns null on any read failure (key absent is handled by defValue=true in
+// the adapter). null is mapped to TRUE by bbcInjectionGateOpen: "off" is NOT a
+// safety guarantee (cold-start deletion happens before the BBC callback,
+// issue #75), so a transient read error must never fail closed into disabling
+// the shipped BBC effect. Never throws.
+internal fun readBbcInjectionEnabled(view: BbcInjectionPrefsView): Boolean? = try {
+    view.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true)
+} catch (_: Throwable) {
+    null
+}
+
+// Compile-time default AND runtime preference, with absent/failed => true
+// (preserve shipped behavior). Pure so JVM tests can pin all four combinations
+// including the NEW runtime key; no IPC here. The runtime read is LAZY so a
+// compile-time-closed gate keeps its historic zero-pref-read / zero-IPC path.
+internal inline fun bbcInjectionGateOpen(
+    compileTimeGate: Boolean,
+    runtimeEnabled: () -> Boolean?,
+): Boolean = compileTimeGate && (runtimeEnabled() ?: true)
+
 // Outcome of the self-consistent read. `failed` is true on a torn snapshot
 // (version-before != version-after) or any read failure; the caller maps that
 // to the Unknown signal (null packages, null version) with throttled logging.
@@ -744,13 +772,36 @@ class DualHook : XposedModule() {
     }
 
     // BBC 路徑專屬：以獨立 EffectivePolicyCache(bbcCache, sticky)讀取政策，
-    // 以 BBC_AVAILABLE_APPS_INJECTION 作為自己的效應開關（Stage-1 封緘不受
-    // 影響；白名單 effectiveCache 維持 fail-closed，零影響）。
+    // 以 BBC_AVAILABLE_APPS_INJECTION AND 執行期 dual_policy 偏好作為自己的
+    // 效應開關（Stage-1 封緘不受影響；白名單 effectiveCache 維持 fail-closed，
+    // 零影響）。偏好關閉時 getBbc 的 gate-closed 仍不碰 reader；偏好讀取本身
+    // 是快取 prefs 的布林查表（無新增 binder IPC，見 bbcInjectionEnabledNow）。
     // Phase A P0 sticky last-good：null/拋/contention/deadline/clock 失敗回
     // 上次成功非空快照；僅成功讀到空（帶版本證明 Cleared）方可收縮；TTL 過期
     // /invalidate 不丟 BBC last-good（僅 sticky cap 到期才過期，計數+節流日誌）。
     // TTL 60s／failureCooldown 5s／single-flight／50ms budget 語義與白名單
     // 一致，grace/deadline 取樣方式比照 effectivePolicy，不漂移。
+    //
+    // PR #74 G1：compile-time 開關 AND 執行期偏好（dual_policy/
+    // bbc_injection_enabled，預設 true）。偏好讀取走既有 remote prefs accessor
+    // （getRemotePreferences 在同一行程對同一 group 為快取查表，非新增 binder
+    // IPC），只有布林讀，null/拋出一律回 null → 預設 true（不因短暫讀失敗而
+    // 誤關效應）。此讀取在所有其他 bbcPolicy 邏輯之外另有 try/catch，任何
+    // Throwable 都不會逸出到 system_server/daagent。
+    private fun bbcInjectionEnabledNow(): Boolean? = try {
+        val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
+        if (prefs == null) {
+            null
+        } else {
+            readBbcInjectionEnabled(object : BbcInjectionPrefsView {
+                override fun getBoolean(key: String, defValue: Boolean): Boolean =
+                    prefs.getBoolean(key, defValue)
+            })
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
     private fun bbcPolicy(): EffectivePolicyCache.BbcPolicy = try {
         val t0Sample = DeadlineBudget.sampleClock()
         val clockOk = t0Sample.clockOk
@@ -772,7 +823,9 @@ class DualHook : XposedModule() {
         }
         bbcCache.getBbc(
             EXTRA_WHITELIST_PACKAGES,
-            bbcGateOpen = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            bbcGateOpen = bbcInjectionGateOpen(
+                PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            ) { bbcInjectionEnabledNow() },
             followerGraceMs = graceAtEntry,
             deadlineMs = deadlineMs,
         ) { policyReadBbcVersioned() }

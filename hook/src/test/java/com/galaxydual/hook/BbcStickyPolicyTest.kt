@@ -720,4 +720,77 @@ class BbcStickyPolicyTest {
         assertEquals(null, read.packages)
         assertEquals(null, read.version)
     }
+
+    // --- PR #74 G1: runtime BBC injection opt-out (default true) ---
+    // The compile-time gate-off pin above (bbcGateClosedReturnsClearedWithoutIo)
+    // is unchanged. These tests cover only the NEW runtime key semantics.
+
+    @Test
+    fun bbcKeyLiteralIsStable() {
+        assertEquals("bbc_injection_enabled", PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED)
+    }
+
+    @Test
+    fun runtimeOptOutFalseClosesGateAndNoMerge() {
+        // Runtime false ANDed with the (shipped true) compile-time gate must
+        // make getBbc short-circuit to Cleared with ZERO reader calls.
+        val enabled = readBbcInjectionEnabled(object : BbcInjectionPrefsView {
+            override fun getBoolean(key: String, defValue: Boolean): Boolean {
+                assertEquals(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, key)
+                return false
+            }
+        })
+        assertEquals(false, enabled)
+        val gate = bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION) { enabled }
+        assertFalse(gate)
+        var reads = 0
+        val (cache, _) = bbcCacheAt(1_000L)
+        val res = cache.getBbc(
+            emptySet(),
+            bbcGateOpen = gate,
+            reader = { reads++; Pair(setOf("com.good.a"), 1L) },
+        )
+        assertTrue(res is EffectivePolicyCache.BbcPolicy.Cleared)
+        // Gate-closed sentinel specifically: no version proof, no merge, no reads.
+        assertEquals(-1L, (res as EffectivePolicyCache.BbcPolicy.Cleared).version)
+        assertEquals(0, reads)
+    }
+
+    @Test
+    fun absentOrThrownRuntimeReadKeepsShippedDefaultOn() {
+        // Absent key: the prefs adapter supplies defValue=true. Thrown read:
+        // readBbcInjectionEnabled returns null; bbcInjectionGateOpen maps null
+        // to true so a transient IPC failure never silently disables the
+        // shipped BBC effect ("off" is not a safety guarantee, issue #75).
+        val absent = readBbcInjectionEnabled(object : BbcInjectionPrefsView {
+            override fun getBoolean(key: String, defValue: Boolean) = defValue
+        })
+        assertEquals(true, absent)
+        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION) { absent })
+
+        val thrown = readBbcInjectionEnabled(object : BbcInjectionPrefsView {
+            override fun getBoolean(key: String, defValue: Boolean): Boolean =
+                throw RuntimeException("transient read failure")
+        })
+        assertEquals(null, thrown)
+        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION) { thrown })
+
+        // Full provider failure (null prefs) is also null => default on.
+        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION) { null })
+    }
+
+    @Test
+    fun compileTimeGateStillCannotBeReopenedByRuntimePreference() {
+        // Stage-1 sealed gate and the BBC compile-time gate stay authoritative:
+        // a runtime "true" preference can never open a closed compile-time gate.
+        assertFalse(bbcInjectionGateOpen(false) { true })
+        assertFalse(bbcInjectionGateOpen(false) { null })
+        // Lazy runtime read: a compile-time-closed gate never touches prefs.
+        var runtimeReads = 0
+        assertFalse(bbcInjectionGateOpen(false) {
+            runtimeReads++
+            true
+        })
+        assertEquals(0, runtimeReads)
+    }
 }

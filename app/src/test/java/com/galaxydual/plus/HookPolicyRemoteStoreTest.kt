@@ -68,6 +68,9 @@ class HookPolicyRemoteStoreTest {
         // Phase A P0:模擬不支援 putLong 的 MinimalPrefs（舊 stub）：putLong 擲出，
         // 驗證 save 仍落盤包集合（版本缺席由 hook 視為 Unknown sticky）。
         var putLongThrows = false
+        // PR #74 G1: simulate a transient boolean read failure (binder/prefs
+        // unavailable) to pin the default-true behavior on read errors.
+        var booleanReadThrows = false
         // A3-1: 備份 commit 成功後，getAll 回報的 BACKUP_KEY 與實際寫入不一致
         // （模擬讀回被外部污染/後備讀不一致）→ backup 讀回驗證必須失敗。
         var mismatchBackupOnRead = false
@@ -97,8 +100,10 @@ class HookPolicyRemoteStoreTest {
         override fun getInt(key: String?, defValue: Int): Int = (data[key] as? Int) ?: defValue
         override fun getLong(key: String?, defValue: Long): Long = (data[key] as? Long) ?: defValue
         override fun getFloat(key: String?, defValue: Float): Float = (data[key] as? Float) ?: defValue
-        override fun getBoolean(key: String?, defValue: Boolean): Boolean =
-            (data[key] as? Boolean) ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean {
+            if (booleanReadThrows) throw RuntimeException("boolean read failed")
+            return (data[key] as? Boolean) ?: defValue
+        }
         override fun contains(key: String?): Boolean = data.containsKey(key)
         override fun edit(): SharedPreferences.Editor = RecordingEditor()
         override fun registerOnSharedPreferenceChangeListener(
@@ -1844,5 +1849,78 @@ class HookPolicyRemoteStoreTest {
         } finally {
             resetRemotePoisonForTests()
         }
+    }
+
+    // --- PR #74 G1: runtime BBC injection opt-out (round-trip + default true) ---
+    // The toggle uses a separate boolean key in the SAME dual_policy group;
+    // these tests prove it never touches the packages/version commit.
+
+    @Test
+    fun bbcInjectionPreferenceDefaultsTrueWhenKeyAbsent() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        assertTrue(store.isBbcInjectionEnabled())
+        assertEquals(0, prefs.commitCalls) // read must not write anything
+    }
+
+    @Test
+    fun bbcInjectionPreferenceRoundTripUsesAtomicCommit() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        assertTrue(store.isBbcInjectionEnabled())
+
+        assertTrue(store.setBbcInjectionEnabled(false))
+        assertEquals(1, prefs.commitCalls)
+        assertEquals(0, prefs.applyCalls)
+        assertEquals(false, prefs.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true))
+        assertFalse(store.isBbcInjectionEnabled())
+        // New store instance over the same provider sees the persisted value.
+        assertFalse(remoteHookPolicyStore { prefs }.isBbcInjectionEnabled())
+
+        assertTrue(store.setBbcInjectionEnabled(true))
+        assertEquals(2, prefs.commitCalls)
+        assertTrue(remoteHookPolicyStore { prefs }.isBbcInjectionEnabled())
+        // Package draft + version untouched by the toggle writes.
+        assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+        assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION))
+    }
+
+    @Test
+    fun bbcInjectionPreferenceFailuresAreBestEffortNeverThrow() {
+        val prefs = RecordingPrefs()
+        prefs.commitSucceeds = false
+        val store = remoteHookPolicyStore { prefs }
+        assertFalse(store.setBbcInjectionEnabled(false))
+        // NOTE: a failed commit still flushes the optimistic mMap in
+        // RemotePreferences, so this process could read back the new value.
+        // That is harmless here ("off" is not a safety guarantee); the API
+        // honestly reports the failure via its Boolean return. Read failures,
+        // however, must default to true.
+        prefs.booleanReadThrows = true
+        assertTrue(store.isBbcInjectionEnabled())
+        prefs.booleanReadThrows = false
+
+        val absent = remoteHookPolicyStore { null }
+        assertTrue(absent.isBbcInjectionEnabled())
+        assertFalse(absent.setBbcInjectionEnabled(false))
+
+        val throwing = remoteHookPolicyStore { throw RuntimeException("service dead") }
+        assertTrue(throwing.isBbcInjectionEnabled())
+        assertFalse(throwing.setBbcInjectionEnabled(false))
+
+        // commit() itself throws (binder RemoteException): still best-effort
+        // false, never propagates out of the store API.
+        val throwingCommitPrefs = RecordingPrefs()
+        throwingCommitPrefs.commitThrows = true
+        val throwingCommitStore = remoteHookPolicyStore { throwingCommitPrefs }
+        assertFalse(throwingCommitStore.setBbcInjectionEnabled(false))
+    }
+
+    @Test(expected = kotlinx.coroutines.CancellationException::class)
+    fun bbcInjectionPreferencePropagatesCancellation() {
+        // resolvePrefs() must let CancellationException through instead of
+        // mapping it to the default-true / false failure values.
+        remoteHookPolicyStore { throw kotlinx.coroutines.CancellationException("cancelled") }
+            .isBbcInjectionEnabled()
     }
 }

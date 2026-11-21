@@ -340,7 +340,10 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 | 開關 | 值 | 治理面 | 備註 |
 | --- | --- | --- | --- |
 | `PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`（Stage-1，sealed） | `const val false` | 白名單查詢面：`effective()` 的 sanitized 非空合併一律回空；`getAllWhitelistedPackages`／daagent 查詢 hook／`<clinit>` 合併 | 常閉；2026-11-17 使用者授權涵蓋的只有 BBC 效應面，全域翻閘授權**從未給過**；未來翻轉需另一份 SAMSUNG 階段 spec＋明示授權 |
-| `PolicySource.BBC_AVAILABLE_APPS_INJECTION`（BBC 注入） | `const val true` | 僅 `BbcInjector.mergeAvailableList` 的 BBC 清單 union-only 擴展（Dual Messenger「可用的應用程式」） | 2026-11-17 雙裝置裝置證據＋使用者授權（pre-unification build；2026-11-18 unified build 重驗 2026-11-18（BBC1/BBC2/BBC3 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身）；設 `false` 即 BBC 回傳物件與原物件位元一致（僅指回傳物件，不代表裝置行為不變；冷啟動刪除見 `BBC_COLDSTART_DELETE_INCIDENT.md`） |
+| `PolicySource.BBC_AVAILABLE_APPS_INJECTION`（BBC 注入） | `const val true`（compile-time default） | 僅 `BbcInjector.mergeAvailableList` 的 BBC 清單 union-only 擴展（Dual Messenger「可用的應用程式」） | 2026-11-17 雙裝置裝置證據＋使用者授權（pre-unification build；2026-11-18 unified build 重驗 2026-11-18（BBC1/BBC2/BBC3 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身）；設 `false` 即 BBC 回傳物件與原物件位元一致（僅指回傳物件，不代表裝置行為不變；冷啟動刪除見 `BBC_COLDSTART_DELETE_INCIDENT.md`） |
+| `dual_policy/bbc_injection_enabled`（執行期 opt-out，`PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED`） | 鍵缺席或讀取失敗 => `true`（預設開，維持出貨行為） | 與上列 compile-time 常數 **AND**；`false` 時 `getBbc` gate-closed 短路、BBC 不合併 | App「關於」對話框的「BBC 注入（雙開可用清單擴充）」開關經 `HookPolicyStore.setBbcInjectionEnabled` 寫入（同一 `dual_policy` remote prefs，單鍵 atomic commit）；hook 在 BBC 路徑以既有 prefs accessor 讀取。**可能需重啟 hook 行程或重新開機**（RemotePreferences 無跨行程推送／值有本地快取，直至 daemon 重啟／開機才保證讀到新值）。**這不是 Samsung 冷啟動刪除的防護**：DELETE 早於 BBC 回調、且回調非空（issue #75 / `BBC_COLDSTART_DELETE_INCIDENT.md`）；短暫讀取失敗一律回 true，絕不因讀失敗誤關效應。Stage-1 sealed gate 不受影響。 |
+
+**BBC 執行期 opt-out 的誠實邊界（PR #74 G1）**：此偏好只是「不需重新編譯即可關掉 BBC 清單合併」的便利性開關，**不是安全保證**。Samsung 以 system uid 進行的冷啟動刪除發生在 BBC 回調之前 116–144ms，且非空政策下回調仍非空（issue #75）；即使此開關為 `false`，也**不能**據此宣稱分身不會被刪除。寫入後 hook 行程可能仍讀到快取值（RemotePreferences 無跨行程通知，見 §1.3a），故**可能需重啟 hook 行程或重新開機**才觀察到關閉；讀取失敗／鍵缺席一律視為 `true`，避免在短暫 IPC 錯誤時意外改變出貨行為。JVM 測試鎖定偏好語意與 gate AND（`BbcStickyPolicyTest`／`HookPolicyRemoteStoreTest`），**未在裝置上驗證 opt-out 本身**。
 
 **程式碼層級 sealed gate 兩項（常閉，JVM 測試鎖定；皆非裝置驗證）：**
 
@@ -562,7 +565,14 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   (pre-unification build; unified build re-verified 2026-11-18, BBC1/BBC2/BBC3 only — BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroys the dual app). A code-level kill switch is kept:
   set the BBC const back to `false` to make the BBC callback return object bit-identical to
   Samsung's original object (this refers only to the returned object, not to unchanged device
-  behavior — cold-start deletion see `BBC_COLDSTART_DELETE_INCIDENT.md`).
+  behavior — cold-start deletion see `BBC_COLDSTART_DELETE_INCIDENT.md`). A runtime opt-out was
+  added in PR #74 G1: `dual_policy/bbc_injection_enabled` (App "About" dialog checkbox) is ANDed
+  with that const; absent/read-failure defaults to `true` (shipped behavior), `false` closes the
+  BBC gate without a rebuild. It MAY require a hook-process restart or a reboot (RemotePreferences caching;
+  cached values can stay stale until the daemon restarts or the device reboots),
+  and it is NOT a proven guard against Samsung's system-side cold-start deletion — DELETE precedes
+  the BBC callback by 116–144 ms (issue #75 / `BBC_COLDSTART_DELETE_INCIDENT.md`). The Stage-1
+  sealed gate is unaffected.
   *Installed*Whitelist* exclusions are intentionally preserved.]
 - `DualAppActivity#getAvailableApps` / `#updateDualAppList` cannot be deoptimized on One UI 9
   (methods renamed/inlined); the BBC callee hook does not depend on them — callback evidence

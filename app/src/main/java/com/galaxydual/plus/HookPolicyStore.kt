@@ -659,7 +659,39 @@ class HookPolicyStore(
     // 直接注入後端預設 null → loadForRepair() 即 loadResult())。VM 修復 pre/final
     // 讀一律經 loadForRepair()，正常 refresh/save/clear 仍經 loadResult()。
     private val repairProbe: (() -> LoadResult)? = null,
+    // PR #74 G1: BBC injection opt-out (dual_policy/bbc_injection_enabled).
+    // SEPARATE from the packages/version single-commit and the poison/seqlock
+    // machinery: a boolean preference cannot corrupt the policy draft snapshot.
+    // Direct-injected test backends default to "absent" (read => default true,
+    // write => false unless a backend is supplied).
+    private val loadBbcEnabledRaw: () -> Boolean? = { null },
+    private val saveBbcEnabledRaw: (Boolean) -> Boolean = { false },
 ) {
+
+    // PR #74 G1: persisted, owner-controlled BBC injection preference.
+    // Default TRUE when the key is absent or the read fails (preserve shipped
+    // behavior; "off" is not a safety guarantee — Samsung's cold-start deletion
+    // happens before the BBC callback, issue #75). CancellationException is
+    // propagated; all other throwables are swallowed (store never throws).
+    fun isBbcInjectionEnabled(): Boolean = try {
+        loadBbcEnabledRaw() ?: true
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        true
+    }
+
+    // PR #74 G1: atomic single-key commit of the BBC preference. Best-effort:
+    // returns false on failure (provider absent / IPC failure), never throws
+    // except CancellationException. Does NOT touch packages/version or poison.
+    fun setBbcInjectionEnabled(enabled: Boolean): Boolean = try {
+        saveBbcEnabledRaw(enabled)
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        false
+    }
+
     // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
     // fail-closed. Direct backends (repairProbe null) delegate to loadResult()
     // (no poison → already authoritative). Remote probe bypasses the poison
@@ -1262,6 +1294,49 @@ fun remoteHookPolicyStore(
                         }
                         LoadResult.Unavailable
                     }
+                }
+            }
+        },
+        // PR #74 G1: BBC opt-out lives in the SAME dual_policy group but is a
+        // standalone boolean key — it never enters the packages/version atomic
+        // commit nor the poison/seqlock fence (those protect the draft snapshot
+        // only). service absent => read default true / write false. CE propagates.
+        loadBbcEnabledRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    prefs.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        saveBbcEnabledRaw = { enabled ->
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                false
+            } else {
+                try {
+                    // Single-key atomic commit (never apply(): immediate
+                    // cross-process visibility of a user preference).
+                    // Defense in depth: serialize against the policy writer's
+                    // packages/version commit with the SAME process-wide lock.
+                    // A whole-map-commit libxposed implementation could
+                    // otherwise let a concurrent toggle commit drop the draft
+                    // (or vice versa). The policy writer itself is unchanged.
+                    synchronized(versionCommitLock) {
+                        prefs.edit()
+                            .putBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, enabled)
+                            .commit()
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
                 }
             }
         },

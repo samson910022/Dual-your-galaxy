@@ -2352,6 +2352,88 @@ class MainActivity : ComponentActivity() {
             label
         }
 
+    // PR #74 G1: the store handed to DualViewModel is created inline in
+    // DualViewModelFactory (no Activity-side field). A fresh binding over the
+    // SAME provider/group is equivalent — libxposed caches one SharedPreferences
+    // instance per group — and leaves the VM/policy write path untouched.
+    private fun bbcPolicyStore(): HookPolicyStore =
+        remoteHookPolicyStore { GalaxyApp.remotePreferences(PolicySource.POLICY_PREFS_NAME) }
+
+    // PR #74 G1: BBC injection opt-out UI. Programmatic views (same pattern as
+    // the rest of this Activity, no new layout resource). The summary states
+    // honestly that this may need a hook-process restart or a reboot and is NOT
+    // a guard against Samsung's cold-start deletion (issue #75).
+    private fun buildBbcInjectionToggle(): View {
+        val toggle = CheckBox(this).apply {
+            text = getString(R.string.settings_bbc_injection_label)
+            // Read at dialog open; best-effort (store defaults true on any failure).
+            isChecked = bbcPolicyStore().isBbcInjectionEnabled()
+            minimumHeight = dp(48)
+            setCompoundDrawablePadding(dp(8))
+        }
+        val summary = TextView(this).apply {
+            text = getString(R.string.settings_bbc_injection_summary)
+        }
+        // Last value the store actually accepted. On a failed commit the hook
+        // still injects with the old value, so leaving the CheckBox toggled
+        // would be a lie; restore it (guarded against re-entering the listener).
+        var lastGood = toggle.isChecked
+        var restoring = false
+        toggle.setOnCheckedChangeListener { _, checked ->
+            if (restoring) return@setOnCheckedChangeListener
+            writeBbcInjectionPreference(
+                enabled = checked,
+                onSuccess = { lastGood = checked },
+                onFailure = {
+                    restoring = true
+                    toggle.isChecked = lastGood
+                    restoring = false
+                },
+            )
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val side = dp(20)
+            setPadding(side, dp(8), side, dp(4))
+            addView(toggle, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+            addView(summary, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }
+    }
+
+    // Keep the prefs commit off the main thread (it can hit the LSPosed binder).
+    // lifecycleScope resumes on Main, so onFailure() may restore the CheckBox
+    // directly. A failed write is best-effort: report it AND roll the UI back
+    // to the last value the store accepted (retry by toggling again).
+    private fun writeBbcInjectionPreference(
+        enabled: Boolean,
+        onSuccess: () -> Unit,
+        onFailure: () -> Unit,
+    ) {
+        lifecycleScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                bbcPolicyStore().setBbcInjectionEnabled(enabled)
+            }
+            if (ok) {
+                onSuccess()
+            } else {
+                onFailure()
+                if (!isFinishing && !isDestroyed) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        R.string.settings_bbc_injection_write_failed,
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+            }
+        }
+    }
+
     private fun showSettingsDialog() {
         // Phase B B3：比照 syncRemoveDialog 的 isFinishing/isDestroyed 守衛，
         // 避免後台/銷毀時 show() 拋 WindowManager.BadTokenException。
@@ -2388,6 +2470,9 @@ class MainActivity : ComponentActivity() {
                 .setNegativeButton(getString(R.string.action_export_diagnosis)) { _, _ ->
                     showDiagnosticExport()
                 }
+                // PR #74 G1: runtime BBC injection opt-out (default on). The
+                // about message above stays unchanged; the toggle is appended.
+                .setView(buildBbcInjectionToggle())
                 .show()
         } catch (e: Exception) {
             Log.w(TAG, "showSettingsDialog failed", e)

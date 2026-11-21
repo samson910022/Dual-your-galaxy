@@ -378,6 +378,10 @@
     <string name="settings_about_format">%1$s\nVersion %2$s (%3$s)\n\n• %4$s\n• %5$s\n\n%6$s</string>
     <string name="settings_about_feature">Zygote Hook &amp; Shizuku Gateway</string>
     <string name="settings_license">MIT License - Dual your Galaxy contributors.</string>
+    <!-- PR #74 G1: BBC injection runtime opt-out (dual_policy/bbc_injection_enabled, default true). -->
+    <string name="settings_bbc_injection_label">BBC injection (Dual Messenger app-list expansion)</string>
+    <string name="settings_bbc_injection_summary">Turning this off may require restarting the hook process or rebooting to take effect (RemotePreferences cache). This is NOT a guard against Samsung\'s cold-start deletion — that deletion happens before the BBC callback (issue #75).</string>
+    <string name="settings_bbc_injection_write_failed">Failed to save the BBC injection preference. Please retry.</string>
     <string name="settings_version_unknown">unknown</string>
     <string name="badge_number_format">%1$d</string>
     <!-- Phase G (i18n): bullet/count prefixes as format resources (were
