@@ -307,11 +307,20 @@ class PreClearGatewayInjectTest {
         private val captured: PreClearDualTarget? = PreClearDualTarget(95, 7),
         live: PreClearDualTarget? = PreClearDualTarget(95, 7),
         fresh: VerifiedTarget? = VerifiedTarget(95, 7, 0),
+        reprobe: DualProbeResult = DualProbeResult.Ok(listOf("com.a.app")),
+        private val capturedInstalled: Set<String> = setOf("com.a.app"),
     ) {
         val gw = FakeGateway(CmdResult(0, "", ""))
         var liveTarget: PreClearDualTarget? = live
         var freshTarget: VerifiedTarget? = fresh
         var freshError: Throwable? = null
+        // R2-5 (N10)：Continue 重驗的 reprobe seam + proceed／政策寫入計數。
+        var reprobeResult: DualProbeResult = reprobe
+        var reprobeError: Throwable? = null
+        var reprobeCalls = 0
+        var proceedCalls = 0
+        var storeWrites = 0
+        var cancelCalls = 0
 
         suspend fun run(pkgs: List<String> = listOf("com.a.app")): Int? =
             rootUninstallIfTargetStillValid(
@@ -325,6 +334,33 @@ class PreClearGatewayInjectTest {
                 // FakeGateway call log：abort 路徑必須 0 呼叫 uninstall。
                 uninstall = { p, uid -> uninstallDualApps(p, uid, gw) },
             )
+
+        // 仿真 showPreClearWarning Positive 的 dispatch：只有 ProceedOk 才 onProceed
+        // （呼叫端據此寫政策）；其餘一律 onCancel、零寫入。
+        suspend fun continueCheck(): PreClearContinueOutcome {
+            val outcome = revalidatePreClearContinue(
+                captured = captured,
+                capturedInstalled = capturedInstalled,
+                resolveLiveTarget = { liveTarget },
+                fetchFreshVerifiedTarget = {
+                    freshError?.let { throw it }
+                    freshTarget
+                },
+                reprobe = {
+                    reprobeCalls++
+                    reprobeError?.let { throw it }
+                    reprobeResult
+                },
+            )
+            when (outcome) {
+                is PreClearContinueOutcome.ProceedOk -> {
+                    proceedCalls++
+                    storeWrites++
+                }
+                else -> cancelCalls++
+            }
+            return outcome
+        }
     }
 
     @Test
@@ -428,6 +464,107 @@ class PreClearGatewayInjectTest {
         val h = FenceHarness()
         h.freshError = IllegalStateException("identity channel boom")
         assertNull(runBlocking { h.run() })
+        assertEquals(0, h.gw.calls)
+    }
+
+    // ---- R2-5 (N10)：非 ROOT Continue 的 serial-bound + membership 重驗 ----
+
+    @Test
+    fun preClearContinue_sameTargetAndUnchangedInstalled_proceedsOnce() {
+        val h = FenceHarness()
+        val outcome = runBlocking { h.continueCheck() }
+        assertTrue("unchanged target/installed must proceed", outcome is PreClearContinueOutcome.ProceedOk)
+        assertEquals(1, h.proceedCalls)
+        assertEquals(1, h.storeWrites)
+        assertEquals(0, h.cancelCalls)
+        assertEquals(1, h.reprobeCalls)
+        assertEquals(0, h.gw.calls)
+    }
+
+    @Test
+    fun preClearContinue_profileRemapDifferentId_abortsNoProceed() {
+        // 警告顯示 95→Continue 時 remap 到 96（device hypothesis）；live fence 必攔。
+        val h = FenceHarness(live = PreClearDualTarget(96, 7))
+        val outcome = runBlocking { h.continueCheck() }
+        assertTrue(outcome is PreClearContinueOutcome.TargetChanged)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(1, h.cancelCalls)
+        assertEquals(0, h.gw.calls)
+    }
+
+    @Test
+    fun preClearContinue_sameIdNewSerial_abortsNoProceed() {
+        // 同 id 重建換 serial（continuityBreach）；fresh fetch fence 必攔。
+        val h = FenceHarness(fresh = VerifiedTarget(95, 8, 0))
+        val outcome = runBlocking { h.continueCheck() }
+        assertTrue(outcome is PreClearContinueOutcome.TargetChanged)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(1, h.cancelCalls)
+        assertEquals(0, h.gw.calls)
+    }
+
+    @Test
+    fun preClearContinue_freshToStaleAtContinue_abortsNoProceed() {
+        val stale = freshState().copy(
+            inventory = freshState().inventory.copy(freshness = InventoryFreshness.STALE),
+        )
+        assertNull(resolvePreClearDualTarget(stale))
+        val h = FenceHarness()
+        h.liveTarget = resolvePreClearDualTarget(stale)
+        val outcome = runBlocking { h.continueCheck() }
+        assertTrue(outcome is PreClearContinueOutcome.TargetChanged)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(0, h.gw.calls)
+    }
+
+    @Test
+    fun preClearContinue_newCloneInstalledDuringDialog_reportsMembershipChanged_noProceed() {
+        // 對話框期間新裝分身：同一 delta 重探的 installed 集合比凍結快照多一筆。
+        val h = FenceHarness(
+            reprobe = DualProbeResult.Ok(listOf("com.a.app", "com.b.app")),
+            capturedInstalled = setOf("com.a.app"),
+        )
+        val outcome = runBlocking { h.continueCheck() }
+        assertTrue(outcome is PreClearContinueOutcome.CloneMembershipChanged)
+        assertEquals(1, h.reprobeCalls)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(1, h.cancelCalls)
+        assertEquals(0, h.gw.calls)
+    }
+
+    @Test
+    fun preClearContinue_reprobeFails_reportsCannotDetermine_noProceed() {
+        // Failed 結果（truncated／marker 矛盾等）與例外／取消皆收斂 CannotDetermine。
+        val h = FenceHarness(reprobe = DualProbeResult.Failed("probe-rc: 1"))
+        val outcome = runBlocking { h.continueCheck() }
+        assertTrue(outcome is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(1, h.cancelCalls)
+
+        val h2 = FenceHarness()
+        h2.reprobeError = CancellationException("reprobe-cancel-seam")
+        val outcome2 = runBlocking { h2.continueCheck() }
+        assertTrue("cancellation must fail closed", outcome2 is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, h2.proceedCalls)
+        assertEquals(0, h2.storeWrites)
+        assertEquals(0, h2.gw.calls)
+    }
+
+    @Test
+    fun preClearContinue_capturedNull_abortsNoProceed() {
+        // 警告在沒有 verified target 的情況下顯示 ⇒ 無從重驗，直接 fail closed。
+        val h = FenceHarness(captured = null)
+        val outcome = runBlocking { h.continueCheck() }
+        assertTrue(outcome is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, h.reprobeCalls)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(1, h.cancelCalls)
         assertEquals(0, h.gw.calls)
     }
 }

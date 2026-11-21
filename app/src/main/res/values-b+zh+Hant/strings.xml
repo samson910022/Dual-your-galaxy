@@ -143,6 +143,8 @@
     <string name="pre_clear_root_uninstall_confirm">這會清除以下分身的資料與所有應用資料，確定？</string>
     <!-- Phase1 review(HIGH/TOCTOU)：點擊當下 verified uid 失效（remap／轉 STALE）時的 fail-closed 提示。 -->
     <string name="pre_clear_target_changed">雙開分身目標已變更，已取消代為關閉分身，請重新確認後再試。</string>
+    <!-- R2-5 (N10)：Continue 點擊當下重驗（目標身份／已裝分身清單）失敗的 fail-closed 提示。 -->
+    <string name="pre_clear_continue_recheck_failed">雙開分身目標或已安裝分身在對話框期間已變更／無法確認，清除已取消。請關閉對話框後重試。</string>
     <string name="pre_clear_probe_failed_title">無法探測分身狀態 · 仍可能卸載分身</string>
     <string name="pre_clear_probe_failed_message">這台裝置沒有 Root 或環境不支援，無法安全判斷哪些已安裝的分身曾於 11-18 在清除／空政策時被 Samsung 一併刪除（含雙開分身資料，觸發機制未證實）。若不確定，請先到 Samsung 設定關閉雙開後再清除政策。11-20/11-21 於非空政策下亦發生冷啟動刪除，非空不保證安全；刪除後資料無法復原。</string>
     <string name="pre_clear_probe_failed_proceed">仍然清除</string>

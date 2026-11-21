@@ -244,6 +244,10 @@ class PolicyActivity : ComponentActivity() {
                         fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
                         dialogHandles = destructiveDialogHandles,
                         capturedTarget = verifiedTarget,
+                        capturedInstalled = probe.installed.toSet(),
+                        // R2-5 (N10)：同一 verified uid／同一 delta 的重探；身分先由
+                        // revalidatePreClearContinue 與 live/fresh 比對。
+                        reprobe = { probeDualApps(delta, verifiedTarget?.userId) },
                         rootUninstallAllowed = verifiedTarget != null,
                     )
                 }

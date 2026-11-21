@@ -141,6 +141,8 @@
     <string name="pre_clear_root_uninstall_confirm">These dual-profile copies will be erased along with their data and apps. Proceed?</string>
     <!-- Phase1 review(HIGH/TOCTOU): fail-closed notice when the verified uid is no longer valid at click time. -->
     <string name="pre_clear_target_changed">The dual profile target changed, so automatic uninstall was cancelled. Please confirm again and retry.</string>
+    <!-- R2-5 (N10): fail-closed notice when the Continue recheck (target identity / installed clones) fails. -->
+    <string name="pre_clear_continue_recheck_failed">The dual profile target or the installed clones changed, or could not be determined, while the dialog was open. The clear was cancelled. Please close the dialog and retry.</string>
     <string name="pre_clear_probe_failed_title">Probe failed to check dual-app status · dual copies may still be erased</string>
     <string name="pre_clear_probe_failed_message">Root access is unavailable or the environment is unsupported, so installed dual copies cannot be enumerated safely. Clearing/empty policy was observed preceding Samsung auto-deletion of dual copies on 11-18 (mechanism unproven; dual-profile data unrecoverable). If unsure, turn off Dual Apps for the affected apps in Samsung Settings first. On 11-20/11-21 cold-start deletions also occurred under a non-empty policy; a non-empty policy is not guaranteed safe; data cannot be recovered after deletion.</string>
     <string name="pre_clear_probe_failed_proceed">Clear anyway</string>

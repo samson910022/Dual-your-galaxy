@@ -6130,6 +6130,10 @@ class MainActivity : ComponentActivity() {
                         fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
                         dialogHandles = destructiveDialogHandles,
                         capturedTarget = verifiedTarget,
+                        capturedInstalled = probe.installed.toSet(),
+                        // R2-5 (N10)：同一 verified uid／同一 delta 的重探；身分已由
+                        // revalidatePreClearContinue 先與 live/fresh 比對過。
+                        reprobe = { probeDualApps(delta, verifiedTarget?.userId) },
                         rootUninstallAllowed = verifiedTarget != null,
                     )
                 }
@@ -6232,6 +6236,9 @@ class MainActivity : ComponentActivity() {
                         fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
                         dialogHandles = destructiveDialogHandles,
                         capturedTarget = verifiedTarget,
+                        capturedInstalled = probe.installed.toSet(),
+                        // R2-5 (N10)：同 requestPreClearWarning，重探同一 delta。
+                        reprobe = { probeDualApps(delta, verifiedTarget?.userId) },
                         rootUninstallAllowed = verifiedTarget != null,
                     )
                 }
@@ -7838,6 +7845,87 @@ internal suspend fun rootUninstallIfTargetStillValid(
     return effectiveUid
 }
 
+// R2-5 (N10)：非 ROOT「繼續清除」按鈕的 fail-closed 重驗結果（純型別、JVM 可測）。
+// 只有 ProceedOk 才准呼叫 onProceed()；其餘三種一律不放行、不寫政策。
+internal sealed interface PreClearContinueOutcome {
+    data object ProceedOk : PreClearContinueOutcome
+    // 身份（id/serial）或新鮮度在對話框期間改變（remap／同 id 重建／轉 STALE）。
+    data object TargetChanged : PreClearContinueOutcome
+    // 同一 delta 重探後 installed 集合增減／改變（新裝分身等）。
+    data object CloneMembershipChanged : PreClearContinueOutcome
+    // 捕獲值缺失、探測失敗或任何例外／取消 ⇒ 無法判定，fail closed。
+    data object CannotDetermine : PreClearContinueOutcome
+}
+
+// R2-5 (N10)：警告對話框「繼續清除」（非 ROOT）點擊當下的 serial-bound + membership
+// fence（suspend seam，對稱 rootUninstallIfTargetStillValid）。四道關卡全過才回 ProceedOk：
+//  (0) 警告顯示時必須已捕獲 verified target；沒有捕獲值即無法判定（fail closed）；
+//  (1) 捕獲 (id,serial) 與當下 vm.state.value 重解析值一致（STALE／remap 攔截）；
+//  (2) 真正新鮮的 verified-target fetch 成功且 (id,serial) 仍與捕獲一致
+//      （delete+recreate 同 id 換 serial／known serial→null 攔截，對齊 continuityBreach）；
+//  (3) 以同一 verified uid 重探同一 delta，installed 集合必須與警告時凍結的快照完全相同
+//      （對話框期間新裝分身／清單變化攔截）。
+// 任一 re-resolve／fetch／re-probe 例外或取消（含 CancellationException）以及
+// re-probe 回 Failed ⇒ CannotDetermine；不同於 uninstall fence 的取消透傳，這裡
+// 沒有與之耦合的破壞性動作，改以四態結果明確收斂為 fail-closed（零 proceed／零寫入）。
+// log 只記狀態／計數，不記包名原文。
+internal suspend fun revalidatePreClearContinue(
+    captured: PreClearDualTarget?,
+    capturedInstalled: Set<String>,
+    resolveLiveTarget: () -> PreClearDualTarget?,
+    fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
+    reprobe: suspend () -> DualProbeResult,
+): PreClearContinueOutcome {
+    if (captured == null) {
+        preClearLog("pre-clear continue aborted: no captured verified target")
+        return PreClearContinueOutcome.CannotDetermine
+    }
+    val live: PreClearDualTarget? = try {
+        resolveLiveTarget()
+    } catch (_: Exception) {
+        // 只記狀態：例外訊息可能摻入包名／技術細節。
+        preClearLog("pre-clear continue aborted: live re-resolve failed status=exception")
+        return PreClearContinueOutcome.CannotDetermine
+    }
+    if (!preClearTargetStillValid(captured, live)) {
+        preClearLog("pre-clear continue aborted: live target lost or changed (id+serial)")
+        return PreClearContinueOutcome.TargetChanged
+    }
+    val fresh: VerifiedTarget? = try {
+        fetchFreshVerifiedTarget()
+    } catch (_: Exception) {
+        preClearLog("pre-clear continue aborted: fresh fetch failed status=exception")
+        return PreClearContinueOutcome.CannotDetermine
+    }
+    val freshTarget: PreClearDualTarget? = fresh?.let { PreClearDualTarget(it.userId, it.serial) }
+    if (!preClearTargetStillValid(captured, freshTarget)) {
+        preClearLog("pre-clear continue aborted: fresh target lost/recreated (id+serial)")
+        return PreClearContinueOutcome.TargetChanged
+    }
+    val reprobeResult: DualProbeResult = try {
+        reprobe()
+    } catch (_: Exception) {
+        preClearLog("pre-clear continue aborted: re-probe failed status=exception")
+        return PreClearContinueOutcome.CannotDetermine
+    }
+    val currentInstalled: Set<String> = when (reprobeResult) {
+        is DualProbeResult.Failed -> {
+            // reason 可能內嵌包名，log 只記狀態。
+            preClearLog("pre-clear continue aborted: re-probe failed status=failed")
+            return PreClearContinueOutcome.CannotDetermine
+        }
+        is DualProbeResult.Ok -> reprobeResult.installed.toSet()
+    }
+    if (currentInstalled != capturedInstalled) {
+        preClearLog(
+            "pre-clear continue aborted: installed set changed " +
+                "captured=${capturedInstalled.size} current=${currentInstalled.size}",
+        )
+        return PreClearContinueOutcome.CloneMembershipChanged
+    }
+    return PreClearContinueOutcome.ProceedOk
+}
+
 // PR-74 A3 (P3)：破壞性路徑對話框 handle 收集器（Activity 欄位持有，onDestroy 一次結清）。
 // showPreClearWarning 的警告／ROOT 二次確認與 showUninstallVerifyDialog 的驗證對話框
 // 先前 show() 後即丟棄 handle，銷毀時無法 dismiss → 舊 Activity window 洩漏；改由此
@@ -7884,6 +7972,9 @@ internal fun <T> dismissDialogHandle(handle: T?, dismiss: (T) -> Unit): T? {
 // 否則完全不執行、發出 fail-closed 訊息並 onCancel 還原 UI 狀態。
 // 三個新參數皆無預設值：任何新呼叫端都必須明確提供 fence 來源與 dialog holder
 // （fail-closed 編譯期約束）。
+// R2-5 (N10)：非 ROOT Positive「繼續清除」也必須通過 revalidatePreClearContinue 的
+// serial-bound + membership fence；capturedInstalled（警告時凍結的 installed 快照）與
+// reprobe（同一 verified uid／同一 delta 的重探 seam）皆無預設值，缺少任一即編譯失敗。
 // PR-74 A3：dialogHandles 收集本對話框與其巢狀 confirm／verify handle，供 onDestroy 釋放。
 internal fun showPreClearWarning(
     host: ComponentActivity,
@@ -7893,6 +7984,8 @@ internal fun showPreClearWarning(
     resolveLiveTarget: () -> PreClearDualTarget?,
     fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
     dialogHandles: DestructiveDialogHandles,
+    capturedInstalled: Set<String>,
+    reprobe: suspend () -> DualProbeResult,
     proceedLabelRes: Int = R.string.pre_clear_confirm_proceed,
     capturedTarget: PreClearDualTarget? = null,
     rootUninstallAllowed: Boolean = false,
@@ -7920,7 +8013,61 @@ internal fun showPreClearWarning(
             .setTitle(R.string.pre_clear_title)
             .setMessage(message)
             .setCancelable(true)
-            .setPositiveButton(proceedLabelRes) { _, _ -> onProceed() }
+            .setPositiveButton(proceedLabelRes) { _, _ ->
+                // R2-5 (N10)：非 ROOT Continue 不再直接用對話框顯示時凍結的 installed/
+                // 身份放行。fresh fetch + re-probe 是 suspend/IPC，故在既有 lifecycleScope
+                // launch 內執行，Main 不阻塞；只有 ProceedOk 才 onProceed（寫政策）。
+                host.lifecycleScope.launch {
+                    val outcome: PreClearContinueOutcome = try {
+                        revalidatePreClearContinue(
+                            captured = capturedTarget,
+                            capturedInstalled = capturedInstalled,
+                            resolveLiveTarget = resolveLiveTarget,
+                            fetchFreshVerifiedTarget = fetchFreshVerifiedTarget,
+                            reprobe = reprobe,
+                        )
+                    } catch (_: Exception) {
+                        // 防禦：helper 已把取消／例外收斂為 CannotDetermine；此處僅處理
+                        // 未預期失敗，維持零 proceed 的 fail-closed 語意（不記例外文字）。
+                        preClearLog("pre-clear continue aborted: revalidation status=exception")
+                        PreClearContinueOutcome.CannotDetermine
+                    }
+                    if (host.isFinishing || host.isDestroyed) {
+                        preClearLog("pre-clear continue aborted: host gone status=finishing-or-destroyed")
+                        try { onCancel() } catch (_: Exception) { }
+                        return@launch
+                    }
+                    when (outcome) {
+                        is PreClearContinueOutcome.ProceedOk -> {
+                            try {
+                                onProceed()
+                            } catch (_: Exception) {
+                                preClearLog("pre-clear continue onProceed failed status=exception")
+                                try { onCancel() } catch (_: Exception) { }
+                            }
+                        }
+                        else -> {
+                            // log 只記結果狀態，絕不記包名或其他對話框內容。
+                            preClearLog(
+                                "pre-clear continue aborted status=" + when (outcome) {
+                                    is PreClearContinueOutcome.TargetChanged -> "target-changed"
+                                    is PreClearContinueOutcome.CloneMembershipChanged -> "membership-changed"
+                                    is PreClearContinueOutcome.CannotDetermine -> "cannot-determine"
+                                    is PreClearContinueOutcome.ProceedOk -> "proceed-ok"
+                                },
+                            )
+                            try {
+                                Toast.makeText(
+                                    host,
+                                    R.string.pre_clear_continue_recheck_failed,
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            } catch (_: Exception) { }
+                            try { onCancel() } catch (_: Exception) { }
+                        }
+                    }
+                }
+            }
             .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
         // R05/NEW-1：unverified target 完全不顯示 ROOT 代關 Neutral。
         if (canRootUninstall) {
