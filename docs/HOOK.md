@@ -345,6 +345,13 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 
 **BBC 執行期 opt-out 的誠實邊界（PR #74 G1）**：此偏好只是「不需重新編譯即可關掉 BBC 清單合併」的便利性開關，**不是安全保證**。Samsung 以 system uid 進行的冷啟動刪除發生在 BBC 回調之前 116–144ms，且非空政策下回調仍非空（issue #75）；即使此開關為 `false`，也**不能**據此宣稱分身不會被刪除。寫入後 hook 行程可能仍讀到快取值（RemotePreferences 無跨行程通知，見 §1.3a），故**可能需重啟 hook 行程或重新開機**才觀察到關閉。讀取語意為混合規則：**首次**讀取失敗／鍵缺席視為 `true`，避免在單一短暫 IPC 錯誤時意外改變出貨行為；但一旦成功讀到 `false`（確認 OFF），接下來 30 分鐘（`BBC_STICKY_MAX_AGE_MS`）內的讀取失敗會**維持 OFF**，直到成功讀到 `true` 才清除；若系統時間倒退到該時間戳之前，視為 TTL 失效並 fail-open（清除 confirmed OFF）。此 sticky 狀態是 **process-local**（hook 行程的 `AtomicReference`，非跨行程、非裝置驗證，行程重啟即消失），不是 device-persisted 保證。gate 偏好讀取現在 `getBbc` 取樣 `now0` 後才執行，與政策讀取**共用同一個 50ms deadline 預算**（慢速讀取會吃掉 followers 的 grace）；真實 Binder 延遲仍**未測量**。JVM 測試鎖定偏好語意、gate AND 與混合失效規則（`BbcStickyPolicyTest`／`HookPolicyRemoteStoreTest`），**未在裝置上驗證 opt-out 本身**。
 
+> **round-2 合併閘門（N01／N08／N09；UNMEASURED／NOT a pass）**：本輪獨立審查未跑 Gradle 裝置測試、未觸碰任何 Samsung 裝置；已文件化或 JVM／CI 全綠皆**不是**通過。三項必要裝置證據與同基線三臂對照見 `docs/ACCEPTANCE.md` §6「11-21 round-2 待實機驗收」小節：
+> - **N01**：P0 冷啟動 DELETE 因果未證實；須先完成**同一 installed-state 基線三臂對照**（default BBC／confirmed-off runtime gate／Samsung baseline），缺一即不得宣稱安全或因果成立。runtime opt-out **不是刪除防護**（issue #75；DELETE 早於回調且回調非空）。
+> - **N08**：hot path 1/50/200/512 的 wall-time p50/p95/max 與 Binder IPC 次數（含 cold process）未量測；`BbcMergeTimingTest` 僅量純內存合併。須訂有界 fallback 與 measured go/no-go 閾值。
+> - **N09**：sticky 30 分鐘到期／fresh DAAgent 行程為有界降解、非安全保證；須分別觀測 force-stop／重啟／>30min 持續失敗後的 available-list 與 user/profile 資料狀態。
+>
+> **授權前提**：凡涉及分身刪除或 user-95 資料清除的步驟，必須在明確授權且已備份的裝置上由持有人親自執行；未經授權不得重跑破壞性實驗（issue #75）。round-2 hybrid「confirmed OFF」語意本身仍須實機驗證（見上；RemotePreferences 無跨行程推送）。
+
 **程式碼層級 sealed gate 兩項（常閉，JVM 測試鎖定；皆非裝置驗證）：**
 
 | # | sealed gate | 行為 | JVM 鎖定 |

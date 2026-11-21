@@ -119,6 +119,25 @@ BBC6 注意事項（unified build）：
 | BBC hot path 於政策規模 1/50/200/512（hook on/off）的量測 | 合併應為有界、線性、不阻塞 DAAgent UI | **UNMEASURED／需裝置 trace**：從未在裝置上量測 `pm.getApplicationInfo` 等 Binder IPC 次數或 DAAgent UI 延遲。`BbcMergeTimingTest` 僅鎖「純內存合併」工作量與 2s 寬鬆上界；once-per-PID stack-trace 捕獲修正僅 JVM 測試覆蓋，真實 IPC 成本未量測。**不得**據此宣稱「50ms 內完成／1/50/200/512 無 ANR」；本列不是通過項。 |
 | BBC 版本號 wraparound 重播視窗（~9.22e18 次寫入；`bbcVersionWraparoundReopensReplayWindowDocumentedBbc`） | 版本鍵固定格式、無 epoch；`Good(MAX)`→`Good(1)` 後 high-water 降到 1，中間範圍重播 `Good(500)` 被接受 | **已文件化限制／接受（非通過項）**：需約 9.22e18 次提交寫入才可能達成，實務不可及；未來若加入 epoch 方案，該測試應改為預期 Unknown。見 hook `BbcStickyPolicyTest.bbcVersionWraparoundReopensReplayWindowDocumentedBbc` 與 `EffectivePolicyCache.isBbcVersionWraparound`。本列為已知限制，不是驗收通過。 |
 
+### 11-21 round-2 待實機驗收（UNMEASURED／NOT a pass／不得據此合併）
+
+> **免責框架（先讀）**：本節所有列在產生實機證據前，一律標記為 **UNMEASURED／NOT a pass**；「已文件化」與「JVM／CI 全綠」皆**不是**通過。本輪獨立審查環境未執行 Gradle 裝置測試、未觸碰任何 Samsung 裝置。凡涉及分身刪除或 user-95 資料清除的步驟，必須在**明確授權且已備份**的裝置上、由持有人親自執行；未經授權**不得重跑破壞性實驗**（issue #75）。本節不得解讀為圓滿驗收，亦不得據以宣稱 P0 風險已關閉。
+
+| 項目 | 狀態（round 2） | 未完成之必要裝置證據 |
+| --- | --- | --- |
+| N01 P0 冷啟動 DELETE（default BBC） | **UNMEASURED／NOT a pass**；causal 機制未證實；runtime opt-out 非刪除防護 | 同基線三臂對照（見下）；trace 系統端 pre-DELETE 決策輸入；DELETE 與 callback 相對時序 |
+| N08 BBC hot path 1/50/200/512 | **UNMEASURED／NOT a pass**；`BbcMergeTimingTest` 僅量純內存合併 | wall-time p50/p95/max 與 Binder IPC 次數（含 cold process）；定義有界 fallback 與 measured go/no-go 閾值 |
+| N09 sticky 30 分鐘到期／fresh DAAgent 行程 | **UNMEASURED／NOT a pass**；設計為有界降解，非安全保證 | force-stop／重啟／>30 min 持續失敗後，分別觀測 available-list 與 user/profile 資料狀態 |
+
+**N01 必要三臂同基線對照（缺一不可）**：在**同一台已備份且明確授權**的 Samsung 裝置、同一 user-95 app installed-state 起點，分別量測：
+- **A 臂｜default BBC**：`BBC_AVAILABLE_APPS_INJECTION=true` 且 runtime gate `dual_policy/bbc_injection_enabled` 維持預設 ON；
+- **B 臂｜confirmed-off runtime gate**：`dual_policy/bbc_injection_enabled=false`，且已確認 hook 行程確實讀到新值（RemotePreferences 無跨行程推送，可能需重啟 hook 行程／開機）；
+- **C 臂｜Samsung baseline**：未安裝本模組，或本模組完全停用且未注入（Samsung 原生行為）。
+
+每臂皆須記錄：daagent cold-start 後是否出現 `START DELETE PACKAGE`（caller uid）、DELETE 與 `BBC-HOOK callback` 的相對時序與回調是否非空、available-list 內容、分身是否存在、user-95 資料是否存活。**同一 installed-state 基線**是比較前提；無此三臂對照，不得宣稱任一臂安全、亦不得宣稱因果成立。B 臂的「OFF」在 round 2 N06 之後為「最後一次已確認 OFF；後續讀取失敗沿用」，但此語意本身**仍須實機驗證**。
+
+**Scope A dialog（issue #73）**：PreClear warning dialog 從未在裝置上觸發或擷錄，維持 **UNMEASURED／NOT a pass／device verification pending（backup+consent）**。
+
 擷錄指引：
 - S23 Ultra：BBC-HOOK 行只出現在 LSPosed verbose mirror：`adb shell su -c 'grep -E "BBC-HOOK|BBC-SPIKE|RemotePreferences" /data/adb/lspd/log/verbose_*.log'`；logcat 僅見 `adb logcat -d -s GalaxyDualHook`（unified build 不再印 `RemotePreferences initial load/updated`，pool/TTL 模式無此行）。
 - 擷錄檔命名不含序號，存放於本機裝置證據目錄（私有，不入 repo），不入 repo；本節證據欄位僅記檔名。
