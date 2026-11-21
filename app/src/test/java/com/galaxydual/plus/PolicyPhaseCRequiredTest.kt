@@ -629,6 +629,77 @@ class PolicyPhaseCRequiredTest {
         }
     }
 
+    // D03a：與 5c-guard 同形——所有新 UI 寫入路徑的公開 request seam 都必須把
+    // 第一階段警告捕獲的 consent 帶進 installed pending，且內容正確：
+    //   delta = old − candidate、capturedInstalled = probe.installed 的快照、
+    //   generation 由 VM 重寫為 pending.generation。
+    // legacy 反射注入的 pending 仍為 null（與 baseFreshGen==-1 carve-out 同形）。
+    @Test
+    fun normalWarningPaths_alwaysInstallPendingWithConsent() {
+        val delta = setOf("com.b.app")
+        val installed = listOf("com.b.app")
+        val consent = buildPolicyWriteConsent(
+            delta = delta,
+            verifiedTarget = PreClearDualTarget(95, 7),
+            installed = installed,
+        )
+
+        fun makeSeamVm(): DualViewModel {
+            val fake = FakePolicyStore(initialDraft = setOf("com.a.app", "com.b.app"))
+            val vm = makeVm(fake.store)
+            seedSelection(vm, listOf("com.a.app", "com.b.app"), setOf("com.a.app", "com.b.app"))
+            return vm
+        }
+        fun assertConsent(vm: DualViewModel, label: String) {
+            val pending = vm.state.value.pendingPolicyWrite
+            assertNotNull("$label must install a pending", pending)
+            val captured = pending!!.consent
+            assertNotNull("$label must carry a non-null consent", captured)
+            assertEquals("$label delta must be old − candidate", delta, captured!!.delta)
+            assertEquals(
+                "$label capturedInstalled must be the probe snapshot",
+                installed.toSet(),
+                captured.capturedInstalled,
+            )
+            assertEquals(95, captured.capturedUserId)
+            assertEquals("7", captured.capturedSerial)
+            assertEquals(
+                "consent.generation must match the installed pending generation",
+                pending.generation,
+                captured.generation,
+            )
+            vm.cancelPolicyWrite()
+        }
+
+        run {
+            val vm = makeSeamVm()
+            vm.requestPolicyWriteForWarning(setOf("com.a.app"), vm.currentWarningBinding(), consent = consent)
+            assertConsent(vm, "requestPolicyWriteForWarning(consent)")
+        }
+        run {
+            val vm = makeSeamVm()
+            vm.replacePolicyDraft(setOf("com.a.app"), vm.currentWarningBinding(), consent = consent)
+            assertConsent(vm, "replacePolicyDraft(consent)")
+        }
+        run {
+            val vm = makeSeamVm()
+            vm.requestPolicyWrite(vm.currentWarningBinding(), consent = consent)
+            assertConsent(vm, "requestPolicyWrite(consent)")
+        }
+
+        // legacy carve-out：反射直接注入的 pending（未經 request seam）consent 仍為 null。
+        val vm = makeSeamVm()
+        val legacy = PendingPolicyWrite(
+            packages = setOf("com.b.app"),
+            requestedAtMs = System.currentTimeMillis(),
+            baseDraftVersion = -1L,
+            baseCoordinatorRevision = -1L,
+            baseFreshGen = -1L,
+        )
+        assertNull("legacy injected pending must keep consent=null", legacy.consent)
+        vm.cancelPolicyWrite()
+    }
+
     // 6a. delta接線：空集跳過probe直接proceed（純函數層）。
     @Test
     fun delta_emptySkipsProbe() {

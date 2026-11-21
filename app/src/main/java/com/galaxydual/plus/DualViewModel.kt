@@ -239,6 +239,13 @@ data class PendingPolicyWrite(
     // 即 fail-closed 中止（UNKNOWN_REFRESH），不得整包覆寫未被告知的內容。
     // null＝legacy 注入／無警告綁定，跳過內容比對（保既有測試綠）。
     val baseWarnedOld: Set<String>? = null,
+    // D03a (PR #74 round 3)：第一階段警告捕獲的不可變 consent（delta + 已驗證
+    // (id,serial) + installed 快照），供 confirm 的 control-flow 新鮮度重驗使用。
+    // 本階段只「攜帶」不做任何 fence／validation（D03b 才接 confirm）。
+    // null＝legacy 注入（反射直接 setPending）／無警告捕獲，與 baseFreshGen==-1L
+    // 的 carve-out 同形，既有測試不受影響。
+    // generation 由 requestPolicyWriteFor 在安裝 pending 時重寫為本 pending 的 generation。
+    val consent: PolicyWriteConsent? = null,
 )
 
 data class PendingRemove(
@@ -8651,13 +8658,17 @@ class DualViewModel(
      * 候選指紋的新鮮度已改由呼叫端（PolicyActivity.performWritePolicy）在擁有
      * Editor live ticks 處用 isWarningCandidateFresh 檢查；VM 不再跨來源重算。
      */
-    fun replacePolicyDraft(packages: Set<String>, warningBinding: PolicyWarningBinding? = null) {
+    fun replacePolicyDraft(
+        packages: Set<String>,
+        warningBinding: PolicyWarningBinding? = null,
+        consent: PolicyWriteConsent? = null,
+    ) {
         if (!policyWriteGatesPass()) return
         if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
             rejectStaleWarningBinding()
             return
         }
-        requestPolicyWriteFor(packages, catalogDropped = 0, warningBinding = warningBinding)
+        requestPolicyWriteFor(packages, catalogDropped = 0, warningBinding = warningBinding, consent = consent)
     }
 
     // 兩階段寫入 phase 1：為當下勾選建待確認快照 (同步，不碰 store)。與
@@ -8665,7 +8676,10 @@ class DualViewModel(
     // 尾段；policyWriteGatesPass＝共享 gates）；catalog 專屬門控與 mapped 推導
     // 穿插在與舊版完全相同的序列位置（1:1 呼叫序列不變）。
     // Phase C：warningBinding 同上（Main 寫入入口攜 Activity 探測綁定）。
-    fun requestPolicyWrite(warningBinding: PolicyWarningBinding? = null) {
+    fun requestPolicyWrite(
+        warningBinding: PolicyWarningBinding? = null,
+        consent: PolicyWriteConsent? = null,
+    ) {
         if (!policyWriteGatesPass()) return
         if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
             rejectStaleWarningBinding()
@@ -8687,7 +8701,7 @@ class DualViewModel(
             return
         }
         val (mapped, catalogDropped) = selectedPackagesForPolicy()
-        requestPolicyWriteFor(mapped, catalogDropped, warningBinding = warningBinding)
+        requestPolicyWriteFor(mapped, catalogDropped, warningBinding = warningBinding, consent = consent)
     }
 
     // R03 (PR #74)：Main 寫入入口的「凍結候選」版本。與 requestPolicyWrite 的
@@ -8697,7 +8711,11 @@ class DualViewModel(
     // isWarningCandidateFresh(live=writeCandidateForWarning()) 攔截（失配即
     // UNKNOWN_REFRESH、零寫入）；VM 不再跨來源重算指紋。若 binding 無指紋
     // （legacy／clear），仍照凍結集合寫入。
-    fun requestPolicyWriteForWarning(packages: Set<String>, warningBinding: PolicyWarningBinding? = null) {
+    fun requestPolicyWriteForWarning(
+        packages: Set<String>,
+        warningBinding: PolicyWarningBinding? = null,
+        consent: PolicyWriteConsent? = null,
+    ) {
         if (!policyWriteGatesPass()) return
         if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
             rejectStaleWarningBinding()
@@ -8721,6 +8739,7 @@ class DualViewModel(
             packages,
             catalogDropped = warningBinding?.warningDropped ?: 0,
             warningBinding = warningBinding,
+            consent = consent,
         )
     }
 
@@ -8809,6 +8828,7 @@ class DualViewModel(
         packages: Set<String>,
         catalogDropped: Int,
         warningBinding: PolicyWarningBinding? = null,
+        consent: PolicyWriteConsent? = null,
     ) {
         // Phase 5 polish：建 pending 前先對候選集合消毒（與 confirm 同消毒）：
         // 顯示數與寫入數一致；dropped 拆 catalog 缺失＋非法文法兩類（後者經
@@ -8973,6 +8993,10 @@ class DualViewModel(
                         // R04：把警告所依據的 old 集合綁進 pending，confirm 前
                         // 權威重讀 Known 漂移即中止。null=legacy 跳過比對。
                         baseWarnedOld = warningBinding?.warnedOld?.let { HashSet(it) },
+                        // D03a：consent 的 generation 在 UI 警告時尚無 pending（-1 哨兵），
+                        // 此處綁到實際安裝的 generation，維持「consent.generation 必等於
+                        // PendingPolicyWrite.generation」的不變數。null=legacy carve-out。
+                        consent = consent?.copy(generation = generation),
                     ),
                     policyWritePhase = PolicyWritePhase.QUEUED,
                     // Allocated INSIDE the CAS lambda on purpose: the monotonic
@@ -10194,7 +10218,12 @@ class DualViewModel(
     // 兩者皆過才 disarm 執行。BUSY／RECONCILING 拒絕一律保留既有 arm（不碰
     // 四元組）；owner-gate 拒絕則 disarm（非 owner 不得殘留確認態）。
     // Phase C：rev 亦納入世代綁定（observedSnapshot.rev），覆蓋警告綁修訂後作廢。
-    fun clearPolicyDraft(warningBinding: PolicyWarningBinding? = null) {
+    // D03a：consent 為第一階段警告的捕獲快照；本階段只透傳攜帶，confirm/clear
+    // 的 fence 由 D03b 接入（null＝legacy carve-out，與其它 request API 同形）。
+    fun clearPolicyDraft(
+        warningBinding: PolicyWarningBinding? = null,
+        consent: PolicyWriteConsent? = null,
+    ) {
         // owner-user 門控 (defense-in-depth)：hook 只讀 user 0；非 owner 的
         // 清除不會被 hook 看到，故直接拒絕且不碰 store。Stage D：同步 disarm
         //（非 owner tap 不得殘留 arm，免切回 owner 後單步誤刪）。
@@ -12626,7 +12655,10 @@ class DualViewModel(
     // 維持原盲清／正常清除語義），純函數僅作 VM 內部決策 helper／JVM 可測。
     // Phase C：warningBinding 為 Activity 警告綁定（probe 前快照）；CLEAR 路徑透傳，
     // 修復路徑維持原語義（不透傳綁定，修復自有 rev 門控）。
-    fun onClearPolicyButtonTap(warningBinding: PolicyWarningBinding? = null) {
+    fun onClearPolicyButtonTap(
+        warningBinding: PolicyWarningBinding? = null,
+        consent: PolicyWriteConsent? = null,
+    ) {
         when (
             clearPolicyButtonRoute(
                 _state.value.policyDraftKnown,
@@ -12636,7 +12668,7 @@ class DualViewModel(
         ) {
             ClearPolicyButtonRoute.REPAIR_CONFIRM -> confirmRepairCorruptDraft()
             ClearPolicyButtonRoute.REPAIR_REQUEST -> requestRepairCorruptDraft()
-            ClearPolicyButtonRoute.CLEAR -> clearPolicyDraft(warningBinding = warningBinding)
+            ClearPolicyButtonRoute.CLEAR -> clearPolicyDraft(warningBinding = warningBinding, consent = consent)
         }
     }
 

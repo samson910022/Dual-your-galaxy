@@ -1047,7 +1047,9 @@ class MainActivity : ComponentActivity() {
             // 從當下勾選重導；候選漂移／綁定失配皆作廢。
             setOnClickListener {
                 requestPreWriteWarning(
-                    proceed = { binding, frozen -> vm.requestPolicyWriteForWarning(frozen, binding) },
+                    proceed = { binding, frozen ->
+                        vm.requestPolicyWriteForWarning(frozen, binding, consent = pendingWarningConsent)
+                    },
                 )
             }
         }
@@ -1067,7 +1069,7 @@ class MainActivity : ComponentActivity() {
             // （第二參數為凍結候選，clear 路徑固定空集，VM 清除入口忽略它）。
             setOnClickListener {
                 requestPreClearWarning(
-                    proceed = { binding, _ -> vm.onClearPolicyButtonTap(binding) },
+                    proceed = { binding, _ -> vm.onClearPolicyButtonTap(binding, consent = pendingWarningConsent) },
                 )
             }
         }
@@ -6048,6 +6050,11 @@ class MainActivity : ComponentActivity() {
     // 跨屏仍各私有（Main/Editor 各自持有），但警告綁修訂後作廢機制覆蓋競態。
     private var pendingClearConfirm = false
 
+    // D03a：第一階段警告捕獲的 consent。警告函式在 probe 的每個 outcome 寫入，
+    // proceed closure（簽名維持 (binding, frozen) 不變）在真正呼叫 VM 寫入／清除
+    // 入口時讀出並透傳。每次警告要求開頭清空，避免跨警告沿用舊 consent。
+    private var pendingWarningConsent: PolicyWriteConsent? = null
+
     // R03：旗標翻轉時立即重渲染，讓勾選／選取控制項在 probe 啟動前就禁用；
     // 取消／完成／例外路徑同樣立刻恢復。render 在測試路徑（未 buildUi）可能
     // 失敗，best-effort 不影響警告流程本身。
@@ -6076,6 +6083,8 @@ class MainActivity : ComponentActivity() {
         proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
     ) {
+        // D03a：每次警告重新開始，不沿用上一個對話框捕獲的 consent。
+        pendingWarningConsent = null
         // Phase C：快照 old＋Known＋綁定（單一來源，避免 TOCTOU 借用）。
         val snap: PolicyWarningSnapshot = try {
             vm.snapshotPolicyForWarning()
@@ -6132,6 +6141,17 @@ class MainActivity : ComponentActivity() {
                 setPendingClearConfirm(false)
                 return@launch
             }
+            // D03a：三種 probe outcome（Failed / Ok(empty) / Ok(non-empty)）都在這裡
+            // 凍結 consent；Failed 與 Ok(empty) 的 installed 皆為空（合法快照），
+            // capturedInstalled 絕不與「未捕獲」混為一談（身份 null 才是 fail-closed）。
+            pendingWarningConsent = buildPolicyWriteConsent(
+                delta = delta,
+                verifiedTarget = verifiedTarget,
+                installed = when (probe) {
+                    is DualProbeResult.Ok -> probe.installed
+                    is DualProbeResult.Failed -> emptyList()
+                },
+            )
             when (probe) {
                 is DualProbeResult.Failed -> {
                     showPreClearProbeFailedWarning(
@@ -6177,6 +6197,8 @@ class MainActivity : ComponentActivity() {
         proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
     ) {
+        // D03a：每次警告重新開始，不沿用上一個對話框捕獲的 consent。
+        pendingWarningConsent = null
         val snap: PolicyWarningSnapshot = try {
             vm.snapshotPolicyForWarning()
         } catch (_: Exception) {
@@ -6232,6 +6254,16 @@ class MainActivity : ComponentActivity() {
                 setPendingClearConfirm(false)
                 return@launch
             }
+            // D03a：三種 probe outcome 都在這裡凍結 consent；delta=old−candidate，
+            // capturedInstalled 為 probe.installed 的防禦拷貝（空集合法）。
+            pendingWarningConsent = buildPolicyWriteConsent(
+                delta = delta,
+                verifiedTarget = verifiedTarget,
+                installed = when (probe) {
+                    is DualProbeResult.Ok -> probe.installed
+                    is DualProbeResult.Failed -> emptyList()
+                },
+            )
             when (probe) {
                 is DualProbeResult.Failed -> {
                     showPreClearProbeFailedWarning(
@@ -7950,6 +7982,51 @@ internal suspend fun revalidatePreClearContinue(
         return PreClearContinueOutcome.CloneMembershipChanged
     }
     return PreClearContinueOutcome.ProceedOk
+}
+
+// D03a：把第一階段警告當下的 (delta, verified (id,serial), probe.installed) 凍結成
+// 不可變 consent。generation 在 UI 側尚無 pending，故用 -1 哨兵；VM 於安裝
+// pending 時以真實 generation 重寫（見 requestPolicyWriteFor）。delta 與
+// installed 皆做防禦拷貝，避免警告後外部集合變動竄改捕獲內容。
+internal fun buildPolicyWriteConsent(
+    delta: Set<String>,
+    verifiedTarget: PreClearDualTarget?,
+    installed: List<String>,
+): PolicyWriteConsent = PolicyWriteConsent(
+    generation = -1L,
+    delta = HashSet(delta),
+    capturedUserId = verifiedTarget?.userId,
+    capturedSerial = verifiedTarget?.serial?.toString(),
+    capturedInstalled = HashSet(installed),
+)
+
+// D03a：consent → 既有 revalidatePreClearContinue 的薄適配器。四道關卡完全復用，
+// 這裡只做 (1) 身份重建 guard：null id/serial（或 serial 無法轉回 code 欄位）
+// 代表警告時沒有可還原的 FRESH verified target，直接 fail closed；
+// (2) 把 consent 的捕獲值映射到 PreClearDualTarget 並帶入既有函式。
+// resolveLiveTarget／fetchFreshVerifiedTarget／reprobe 全為注入 seam，JVM 可測。
+internal suspend fun revalidatePolicyWriteConsent(
+    consent: PolicyWriteConsent,
+    resolveLiveTarget: () -> PreClearDualTarget?,
+    fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
+    reprobe: suspend () -> DualProbeResult,
+): PreClearContinueOutcome {
+    val userId = consent.capturedUserId
+    val serial = consent.capturedSerial?.toIntOrNull()
+    if (userId == null || consent.capturedSerial == null || serial == null) {
+        preClearLog("policy-write consent aborted: captured identity cannot be reconstructed")
+        return PreClearContinueOutcome.CannotDetermine
+    }
+    // 還原的 (id,serial) 即警告時 FRESH resolve 捕獲的配對（buildPolicyWriteConsent
+    // 只從 resolvePreClearDualTarget 的結果取值，故不可能攜帶非 FRESH 身份）。
+    val captured = PreClearDualTarget(userId, serial)
+    return revalidatePreClearContinue(
+        captured = captured,
+        capturedInstalled = consent.capturedInstalled,
+        resolveLiveTarget = resolveLiveTarget,
+        fetchFreshVerifiedTarget = fetchFreshVerifiedTarget,
+        reprobe = reprobe,
+    )
 }
 
 // PR-74 A3 (P3)：破壞性路徑對話框 handle 收集器（Activity 欄位持有，onDestroy 一次結清）。

@@ -361,7 +361,39 @@ class PreClearGatewayInjectTest {
             }
             return outcome
         }
+
+        // D03a：同一組注入 seam 改走 consent 適配器（复用 revalidatePreClearContinue）。
+        suspend fun consentCheck(consent: PolicyWriteConsent): PreClearContinueOutcome {
+            val outcome = revalidatePolicyWriteConsent(
+                consent = consent,
+                resolveLiveTarget = { liveTarget },
+                fetchFreshVerifiedTarget = {
+                    freshError?.let { throw it }
+                    freshTarget
+                },
+                reprobe = {
+                    reprobeCalls++
+                    reprobeError?.let { throw it }
+                    reprobeResult
+                },
+            )
+            when (outcome) {
+                is PreClearContinueOutcome.ProceedOk -> {
+                    proceedCalls++
+                    storeWrites++
+                }
+                else -> cancelCalls++
+            }
+            return outcome
+        }
     }
+
+    private fun testConsent(
+        userId: Int? = 95,
+        serial: String? = "7",
+        installed: Set<String> = setOf("com.a.app"),
+        delta: Set<String> = setOf("com.a.app"),
+    ): PolicyWriteConsent = PolicyWriteConsent(-1L, delta, userId, serial, installed)
 
     @Test
     fun resolvePreClearDualTarget_capturesSerial_freshOnly() {
@@ -566,5 +598,76 @@ class PreClearGatewayInjectTest {
         assertEquals(0, h.storeWrites)
         assertEquals(1, h.cancelCalls)
         assertEquals(0, h.gw.calls)
+    }
+
+    // ---- D03a：consent 適配器（复用 revalidatePreClearContinue 的四道關卡）----
+
+    @Test
+    fun consent_proceedOk_control() {
+        // 對照組：身份一致、installed 未變 → ProceedOk（唯一放行態）。
+        val h = FenceHarness()
+        val outcome = runBlocking { h.consentCheck(testConsent()) }
+        assertTrue(outcome is PreClearContinueOutcome.ProceedOk)
+        assertEquals(1, h.proceedCalls)
+        assertEquals(1, h.storeWrites)
+        assertEquals(1, h.reprobeCalls)
+        assertEquals(0, h.cancelCalls)
+    }
+
+    @Test
+    fun consent_okEmptyThenNewClone_failsClosed() {
+        // Ok(empty) 警告路徑捕獲空 installed（合法）；對話框後重探卻多一筆 → 攔。
+        val h = FenceHarness(reprobe = DualProbeResult.Ok(listOf("com.a.app")))
+        val outcome = runBlocking { h.consentCheck(testConsent(installed = emptySet())) }
+        assertTrue(outcome is PreClearContinueOutcome.CloneMembershipChanged)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(1, h.reprobeCalls)
+        assertEquals(1, h.cancelCalls)
+    }
+
+    @Test
+    fun consent_serialChange_failsClosed() {
+        // 同 id 換 serial（delete+recreate）：fresh 身分失配 → TargetChanged。
+        val h = FenceHarness(fresh = VerifiedTarget(95, 8, 0))
+        val outcome = runBlocking { h.consentCheck(testConsent(serial = "7")) }
+        assertTrue(outcome is PreClearContinueOutcome.TargetChanged)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(0, h.gw.calls)
+        assertEquals(1, h.cancelCalls)
+    }
+
+    @Test
+    fun consent_probeFailure_failsClosed() {
+        // 重探Failed → CannotDetermine（不寫入）。
+        val h = FenceHarness(reprobe = DualProbeResult.Failed("probe-rc: 1"))
+        val outcome = runBlocking { h.consentCheck(testConsent()) }
+        assertTrue(outcome is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(1, h.reprobeCalls)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(1, h.cancelCalls)
+    }
+
+    @Test
+    fun consent_nullIdentity_failsClosed() {
+        // null id/serial ⇒ 無法重建捕獲身份，adapter guard 直接 CannotDetermine
+        // （zero reprobe／zero write）。
+        val h1 = FenceHarness()
+        val outcome1 = runBlocking { h1.consentCheck(testConsent(userId = null)) }
+        assertTrue(outcome1 is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, h1.reprobeCalls)
+        assertEquals(0, h1.proceedCalls)
+        assertEquals(0, h1.storeWrites)
+        assertEquals(1, h1.cancelCalls)
+
+        val h2 = FenceHarness()
+        val outcome2 = runBlocking { h2.consentCheck(testConsent(serial = null)) }
+        assertTrue(outcome2 is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, h2.reprobeCalls)
+        assertEquals(0, h2.proceedCalls)
+        assertEquals(0, h2.storeWrites)
+        assertEquals(1, h2.cancelCalls)
     }
 }

@@ -135,6 +135,10 @@ class PolicyActivity : ComponentActivity() {
     // 跨屏仍各私有（Main/Editor 各自持有），警告綁修訂後作廢機制覆蓋競態。
     private var pendingClearConfirm = false
 
+    // D03a：第一階段警告捕獲的 consent；performWritePolicy 的 proceed closure
+    // 讀出並透傳給 VM（proceed 簽名維持不變）。每次警告開頭清空。
+    private var pendingWarningConsent: PolicyWriteConsent? = null
+
     // R03：旗標翻轉時立即重建列，讓勾選控制項在 probe 啟動前就禁用；
     // 取消／完成／例外路徑同樣立刻恢復。
     private fun setPendingClearConfirm(value: Boolean) {
@@ -173,6 +177,8 @@ class PolicyActivity : ComponentActivity() {
         proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
     ) {
+        // D03a：每次警告重新開始，不沿用上一個對話框捕獲的 consent。
+        pendingWarningConsent = null
         val snap = policyWarningSnapshotOrUnknown()
         // Phase C：候選先消毒（與 VM 寫入同文法），delta=old-minus-消毒後候選。
         // R03：消毒結果即凍結候選，probe／對話框期間一律寫這一份。
@@ -220,6 +226,16 @@ class PolicyActivity : ComponentActivity() {
                 setPendingClearConfirm(false)
                 return@launch
             }
+            // D03a：三種 probe outcome 都在這裡凍結 consent；Failed 的 installed
+            // 為空（合法快照），身份 null 才代表無 FRESH verified target。
+            pendingWarningConsent = buildPolicyWriteConsent(
+                delta = delta,
+                verifiedTarget = verifiedTarget,
+                installed = when (probe) {
+                    is DualProbeResult.Ok -> probe.installed
+                    is DualProbeResult.Failed -> emptyList()
+                },
+            )
             when (probe) {
                 is DualProbeResult.Failed -> {
                     showPreClearProbeFailedWarning(
@@ -626,9 +642,9 @@ class PolicyActivity : ComponentActivity() {
                 vm.rejectStaleWarningBinding()
                 return
             }
-            vm.replacePolicyDraft(HashSet(candidate), binding)
+            vm.replacePolicyDraft(HashSet(candidate), binding, consent = pendingWarningConsent)
         } else {
-            vm.replacePolicyDraft(HashSet(candidate))
+            vm.replacePolicyDraft(HashSet(candidate), consent = pendingWarningConsent)
         }
         val cur = try {
             vm.state.value
