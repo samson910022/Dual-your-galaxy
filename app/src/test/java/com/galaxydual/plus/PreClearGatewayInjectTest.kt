@@ -23,6 +23,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class PreClearGatewayInjectTest {
@@ -393,7 +394,11 @@ class PreClearGatewayInjectTest {
         serial: String? = "7",
         installed: Set<String> = setOf("com.a.app"),
         delta: Set<String> = setOf("com.a.app"),
-    ): PolicyWriteConsent = PolicyWriteConsent(-1L, delta, userId, serial, installed)
+        fromFailedProbe: Boolean = false,
+        rootVerifiedEmpty: Boolean = false,
+    ): PolicyWriteConsent = PolicyWriteConsent(
+        -1L, delta, userId, serial, installed, fromFailedProbe, rootVerifiedEmpty,
+    )
 
     @Test
     fun resolvePreClearDualTarget_capturesSerial_freshOnly() {
@@ -669,5 +674,239 @@ class PreClearGatewayInjectTest {
         assertEquals(0, h2.proceedCalls)
         assertEquals(0, h2.storeWrites)
         assertEquals(1, h2.cancelCalls)
+    }
+
+    // ---- D03b PART 1：最終 confirm 的四態派遣器（framework-free，JVM 可測，無 Robolectric）----
+
+    private class DispatchProbe(hostAlive: Boolean = true) {
+        // AtomicBoolean so hostAlive is genuinely re-evaluated at dispatch time
+        // (can be flipped between computing the outcome and dispatching it).
+        val alive = AtomicBoolean(hostAlive)
+        var confirms = 0
+        var revokes = 0
+        var notifies = 0
+
+        suspend fun run(outcome: PreClearContinueOutcome) = dispatchConsentGatedConfirm(
+            outcome = outcome,
+            confirm = { confirms++ },
+            revoke = { revokes++ },
+            notify = { notifies++ },
+            hostAlive = { alive.get() },
+        )
+    }
+
+    @Test
+    fun confirmDispatch_proceedOk_callsConfirmOnce() = runBlocking {
+        // 唯一放行態：ProceedOk + host 存活 ⇒ confirm 恰一次，零 revoke／零 notify。
+        val p = DispatchProbe(hostAlive = true)
+        p.run(PreClearContinueOutcome.ProceedOk)
+        assertEquals(1, p.confirms)
+        assertEquals(0, p.revokes)
+        assertEquals(0, p.notifies)
+    }
+
+    @Test
+    fun confirmDispatch_targetChanged_revokesAndNotifies_noConfirm() = runBlocking {
+        // 身份／新鮮度在警告↔confirm 間改變 ⇒ revoke+notify，零寫入。
+        val p = DispatchProbe(hostAlive = true)
+        p.run(PreClearContinueOutcome.TargetChanged)
+        assertEquals(0, p.confirms)
+        assertEquals(1, p.revokes)
+        assertEquals(1, p.notifies)
+    }
+
+    @Test
+    fun confirmDispatch_membershipChanged_revokesAndNotifies_noConfirm() = runBlocking {
+        // 新裝分身讓 installed 集合改變 ⇒ revoke+notify，零寫入。
+        val p = DispatchProbe(hostAlive = true)
+        p.run(PreClearContinueOutcome.CloneMembershipChanged)
+        assertEquals(0, p.confirms)
+        assertEquals(1, p.revokes)
+        assertEquals(1, p.notifies)
+    }
+
+    @Test
+    fun confirmDispatch_cannotDetermine_revokesAndNotifies_noConfirm() = runBlocking {
+        // 重探失敗／捕獲缺失 ⇒ CannotDetermine ⇒ revoke+notify，
+        // 不再有「確認失敗仍強制放行」的靜默路徑（carry-forward #6）。
+        val p = DispatchProbe(hostAlive = true)
+        p.run(PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, p.confirms)
+        assertEquals(1, p.revokes)
+        assertEquals(1, p.notifies)
+    }
+
+    @Test
+    fun confirmDispatch_hostGone_revokesNoConfirm() = runBlocking {
+        // host 已 destroying ⇒ 即便 ProceedOk 也不 confirm。
+        val p = DispatchProbe(hostAlive = false)
+        p.run(PreClearContinueOutcome.ProceedOk)
+        assertEquals(0, p.confirms)
+        assertEquals(1, p.revokes)
+        assertEquals(1, p.notifies)
+    }
+
+    @Test
+    fun confirmDispatch_hostGoneAfterAwait_noConfirm() = runBlocking {
+        // await 前算出 ProceedOk 且 host 仍活；await 期間 host 消失（flip），
+        // dispatch 當下重新求值 hostAlive ⇒ 失效，零 confirm（stale host 不得放行）。
+        val p = DispatchProbe(hostAlive = true)
+        val outcomeBeforeAwait = PreClearContinueOutcome.ProceedOk
+        assertTrue(p.alive.get())
+        p.alive.set(false) // host 在 await 後消失
+        assertFalse(p.alive.get())
+        p.run(outcomeBeforeAwait)
+        assertEquals(0, p.confirms)
+        assertEquals(1, p.revokes)
+        assertEquals(1, p.notifies)
+    }
+
+    @Test
+    fun reentrantWarningRequest_doesNotResetConsentWhenPendingClear() {
+        // pendingClearConfirm=true（probe／對話框存活期）的 re-entrant 要求不得清空 consent。
+        assertFalse(consentResetAllowedForNewWarning(true))
+        // 真正的新警告（非 re-entrant）才清空。
+        assertTrue(consentResetAllowedForNewWarning(false))
+        // 限制：Activity 私欄位 pendingWarningConsent 不可從 JVM 觀測；此純函數鎖住
+        // 「是否允許重置」語義，兩個 Activity 的 reset 皆改走此 guard（carry-forward #2）。
+    }
+
+    // ---- D03b FIXER M1/M2/M3/M4/M5/M6：回歸防護 ----
+
+    @Test
+    fun consent_fromFailedProbe_neverProceeds_evenIfReprobeSucceeds() = runBlocking {
+        // M6：警告 probe  Failed 的 consent（force-proceed）即便重探成功也不可放行；
+        // 必須在任何 seam（含 reprobe）之前 fail closed，零寫入。
+        val h = FenceHarness(reprobe = DualProbeResult.Ok(listOf("com.a.app")))
+        val outcome = h.consentCheck(testConsent(fromFailedProbe = true))
+        assertTrue(outcome is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, h.reprobeCalls)
+        assertEquals(0, h.proceedCalls)
+        assertEquals(0, h.storeWrites)
+        assertEquals(1, h.cancelCalls)
+    }
+
+    @Test
+    fun consent_rootVerifiedEmpty_skipsOnlyMembership_identityStillEnforced() = runBlocking {
+        // M2a：身分一致但 installed 集合已變（卸載後合法為空）⇒ 只跳 membership ⇒ ProceedOk。
+        val h1 = FenceHarness(reprobe = DualProbeResult.Ok(listOf("com.a.app", "com.b.app")))
+        val out1 = h1.consentCheck(testConsent(installed = setOf("com.a.app"), rootVerifiedEmpty = true))
+        assertTrue(out1 is PreClearContinueOutcome.ProceedOk)
+        assertEquals(1, h1.proceedCalls)
+
+        // M2b：fresh gateway (id,serial) 改動（同 id 換 serial）⇒ 仍 TargetChanged。
+        val h2 = FenceHarness(fresh = VerifiedTarget(95, 8, 0))
+        val out2 = h2.consentCheck(testConsent(rootVerifiedEmpty = true))
+        assertTrue(out2 is PreClearContinueOutcome.TargetChanged)
+        assertEquals(0, h2.proceedCalls)
+
+        // M2c：live (id,serial) remap ⇒ 仍 TargetChanged（沒有 ROOT⇒ProceedOk 捷徑）。
+        val h3 = FenceHarness(live = PreClearDualTarget(96, 7))
+        val out3 = h3.consentCheck(testConsent(rootVerifiedEmpty = true))
+        assertTrue(out3 is PreClearContinueOutcome.TargetChanged)
+        assertEquals(0, h3.proceedCalls)
+    }
+
+    @Test
+    fun buildFastPathConsent_deltaEmpty_buildsRealConsentAndFencePasses() = runBlocking {
+        // M1/M3：空草稿清除／delta-empty 寫入現場建的是真實 consent（fresh resolve＋probe），
+        // 不是 null blanket bypass；空 delta 兩次 probe 皆空 ⇒ membership 相等 ⇒ ProceedOk。
+        var probeCalls = 0
+        val consent = buildFastPathConsent(
+            delta = emptySet(),
+            resolveLiveTarget = { PreClearDualTarget(95, 7) },
+            reprobe = { pkgs, uid ->
+                probeCalls++
+                assertTrue("delta must be empty", pkgs.isEmpty())
+                assertEquals(95, uid)
+                DualProbeResult.Ok(emptyList())
+            },
+        )
+        assertEquals(emptySet<String>(), consent.delta)
+        assertEquals(95, consent.capturedUserId)
+        assertEquals("7", consent.capturedSerial)
+        assertEquals(emptySet<String>(), consent.capturedInstalled)
+        assertFalse(consent.fromFailedProbe)
+        assertFalse(consent.rootVerifiedEmpty)
+        assertEquals(1, probeCalls)
+
+        // 把建出的 consent 真正餵进 fence（單次呼叫，無 restart callback ⇒ 無遞迴）。
+        val h = FenceHarness(reprobe = DualProbeResult.Ok(emptyList()))
+        val outcome = h.consentCheck(consent)
+        assertTrue(outcome is PreClearContinueOutcome.ProceedOk)
+        assertEquals(1, h.reprobeCalls) // reprobe 恰一次，無重入
+    }
+
+    @Test
+    fun buildFastPathConsent_failedProbe_marksFlagAndFailsClosed() = runBlocking {
+        // M1/M6：fast path 的 probe 失敗 ⇒ fromFailedProbe=true ⇒ fence CannotDetermine，
+        // 不會把「探測失敗」偷偷當成 ProceedOk。
+        val consent = buildFastPathConsent(
+            delta = setOf("com.a.app"),
+            resolveLiveTarget = { PreClearDualTarget(95, 7) },
+            reprobe = { _, _ -> DualProbeResult.Failed("probe-rc: 1") },
+        )
+        assertTrue(consent.fromFailedProbe)
+        val h = FenceHarness(reprobe = DualProbeResult.Ok(listOf("com.a.app")))
+        val outcome = h.consentCheck(consent)
+        assertTrue(outcome is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, h.reprobeCalls)
+        assertEquals(0, h.storeWrites)
+    }
+
+    @Test
+    fun inFlightGuard_dropsSecondConfirm() {
+        // M5：double-tap——第二段 confirm 在 in-flight 時被丟棄，完成後可再用。
+        val g = InFlightGuard()
+        assertTrue(g.tryEnter())
+        assertFalse(g.tryEnter())
+        g.exit()
+        assertTrue(g.tryEnter())
+    }
+
+    @Test
+    fun oneShotRestartGuard_dropsReentrantSchedule() {
+        // M3：abort→restart→再 abort 的同步遞迴被 one-shot guard 擋下。
+        val g = OneShotRestartGuard()
+        assertTrue(g.trySchedule())
+        assertFalse(g.trySchedule())
+        g.reset()
+        assertTrue(g.trySchedule())
+    }
+
+    @Test
+    fun autoRestartCap_allowsOneThenStops_untilUserReTap() {
+        // Availability fix：每次使用者點入口只自動重警 1 次；結構性 fail-closed 原因
+        //（空草稿 + 目標不存在／probe 持續失敗）否則會跨 Handler post 無限循環。
+        assertTrue(canAutoRestart(0)) // 第一次自動重啟：允許
+        assertFalse(canAutoRestart(1)) // 已用罷：不再排程，使用者必須重新點入口
+        assertFalse(canAutoRestart(2))
+        // 使用者重新點入口會把 autoRestartCount 重置為 0（Activity 行為，非 JVM 可測），
+        // 之後 canAutoRestart(0) 再次為 true。fail-closed 寫入不受影響。
+    }
+
+    @Test
+    fun confirmDispatch_callbackException_isContained() = runBlocking {
+        // M4：confirm 拋錯不得逸出，且要補做 revoke+notify（fail-closed 清理）。
+        var revokes = 0
+        var notifies = 0
+        dispatchConsentGatedConfirm(
+            outcome = PreClearContinueOutcome.ProceedOk,
+            confirm = { throw IllegalStateException("confirm boom") },
+            revoke = { revokes++ },
+            notify = { notifies++ },
+            hostAlive = { true },
+        )
+        assertEquals(1, revokes)
+        assertEquals(1, notifies)
+
+        // revoke / notify 自身拋錯同样不得逸出。
+        dispatchConsentGatedConfirm(
+            outcome = PreClearContinueOutcome.CannotDetermine,
+            confirm = { fail("confirm must not run for non-ProceedOk") },
+            revoke = { throw IllegalStateException("revoke boom") },
+            notify = { throw IllegalStateException("notify boom") },
+            hostAlive = { true },
+        )
     }
 }

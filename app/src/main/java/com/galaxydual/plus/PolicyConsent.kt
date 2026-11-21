@@ -34,6 +34,17 @@ package com.galaxydual.plus
  * - [generation] must match the generation of the [PendingPolicyWrite] that
  *   carries this token. The VM rebinds it at pending-install time (the UI builds
  *   the token before a pending exists).
+ * - [fromFailedProbe] (D03b fixer M6): true iff the FIRST-STAGE warning's probe
+ *   was `DualProbeResult.Failed` (i.e. the "仍然清除／寫入" force-proceed path).
+ *   Such a consent can never authorize a write: the fence returns
+ *   `CannotDetermine` regardless of what any later reprobe reports. Default
+ *   false keeps legacy/device-unverified seams compiling.
+ * - [rootVerifiedEmpty] (D03b fixer M2): true ONLY after the ROOT uninstall
+ *   verification's success callbacks (`onClearVerified` / `onForceClear`).
+ *   It skips ONLY the `capturedInstalled` membership comparison (the expected
+ *   set is legitimately empty after uninstall); live + fresh (id,serial)
+ *   identity checks are STILL enforced. Never a "ROOT => ProceedOk" shortcut.
+ *   Default false; the non-ROOT Positive button never sets it.
  */
 data class PolicyWriteConsent(
     val generation: Long,
@@ -41,4 +52,6 @@ data class PolicyWriteConsent(
     val capturedUserId: Int?,
     val capturedSerial: String?,
     val capturedInstalled: Set<String>,
+    val fromFailedProbe: Boolean = false,
+    val rootVerifiedEmpty: Boolean = false,
 )

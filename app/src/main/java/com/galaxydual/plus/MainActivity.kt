@@ -101,6 +101,8 @@ import com.galaxydual.hook.HookLog
 import com.galaxydual.hook.PolicySource
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -1045,13 +1047,7 @@ class MainActivity : ComponentActivity() {
             // Phase C：寫入前先算 old-minus-candidate delta，對 installed user95 彈警告；
             // R03：proceed 攜「綁定＋警告前凍結候選」進 VM，寫入凍結集合而非
             // 從當下勾選重導；候選漂移／綁定失配皆作廢。
-            setOnClickListener {
-                requestPreWriteWarning(
-                    proceed = { binding, frozen ->
-                        vm.requestPolicyWriteForWarning(frozen, binding, consent = pendingWarningConsent)
-                    },
-                )
-            }
+            setOnClickListener { startWriteWarning() }
         }
         clearPolicyBtn = Button(this).apply {
             text = getString(R.string.action_clear_policy_draft)
@@ -1067,11 +1063,7 @@ class MainActivity : ComponentActivity() {
             // VM 內部決策 helper／JVM 可測，不在此重複分發，避免雙路由器漂移）。
             // Phase C：清除候選為空集，delta=old 全量；proceed 攜綁定進 VM
             // （第二參數為凍結候選，clear 路徑固定空集，VM 清除入口忽略它）。
-            setOnClickListener {
-                requestPreClearWarning(
-                    proceed = { binding, _ -> vm.onClearPolicyButtonTap(binding, consent = pendingWarningConsent) },
-                )
-            }
+            setOnClickListener { startClearWarning() }
         }
         // Phase 2：手動重新整理草稿（唯讀，不觸發寫入；Unknown 時計數行保留
         // 未知提示，不改 dialog 主流程）。
@@ -4612,7 +4604,11 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
                 confirmSaving
             }
-            if (policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, curPolicySaving)) vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null)
+            // D03b：最終 confirm 經 consent fence（警告↔confirm 期間的 clone TOCTOU）；
+            // ProceedOk 且 host 存活才真正寫入，其餘一律 revoke pending＋強制新警告。
+            if (policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, curPolicySaving)) {
+                confirmWriteWithConsent(pending)
+            }
         }
         // Phase 5：SAVING 中取消改為可感知 toast（前身靜默 no-op）：按鈕保持可點，
         // 點按時即時重讀 phase；Stage J4：SAVING 即 toast「寫入中，無法取消」且不調 VM；
@@ -6079,11 +6075,229 @@ class MainActivity : ComponentActivity() {
         return false
     }
 
+    // D03b：最近一次警告要求的 re-trigger。fail-closed abort 後呼叫以強制一次
+    // 全新警告（新 probe／新 consent）；Activity 重建後為 null（使用者須再點入口）。
+    private var pendingWarningRestart: (() -> Unit)? = null
+
+    // D03b fixer M5：confirm 重入防護（double-tap）——第一段 enter 成功才 launch。
+    private val consentConfirmInFlight = InFlightGuard()
+    // D03b fixer M3：abort 後重啟警告的 one-shot 排程 guard（打破同步遞迴）。
+    private val warningRestartGuard = OneShotRestartGuard()
+    // D03b fixer (availability)：每次使用者真正點入口重置；自動重啟最多 MAX 次。
+    private val autoRestartCount = AtomicInteger(0)
+
+    // D03b fixer M3：abort 後共用清理——清 consent、顯示既有 recheck 訊息，
+    // 並以 main Handler.post + one-shot guard 排程新警告（不再同步 invoke 造成遞迴／死路）。
+    private fun consentAbortCleanup() {
+        pendingWarningConsent = null
+        if (!isFinishing && !isDestroyed) {
+            try {
+                Toast.makeText(this, R.string.pre_clear_continue_recheck_failed, Toast.LENGTH_LONG).show()
+            } catch (_: Exception) {
+            }
+        }
+        scheduleWarningRestart()
+    }
+
+    // D03b fixer M3 + availability cap：one-shot + post 打破同步遞迴，並以 autoRestartCount
+    // 限制「連續 post」次數（結構性 fail-closed 原因否則會無限重警）。用罷只顯示既有
+    // recheck 訊息（consentAbortCleanup 已顯示），不再排程——使用者必須重新點入口。
+    // fail-closed 寫入不變：abort 依然零寫入。
+    private fun scheduleWarningRestart() {
+        if (!warningRestartGuard.trySchedule()) {
+            preClearLog("warning restart already scheduled; dropping re-entrant request")
+            return
+        }
+        val previous = autoRestartCount.getAndIncrement()
+        if (!canAutoRestart(previous)) {
+            preClearLog("warning restart cap reached; user must re-tap entry")
+            warningRestartGuard.reset() // 未 post，必須歸還 guard
+            return
+        }
+        Handler(Looper.getMainLooper()).post {
+            try {
+                pendingWarningRestart?.invoke()
+            } catch (_: Exception) {
+                preClearLog("warning restart failed status=exception")
+            } finally {
+                warningRestartGuard.reset()
+            }
+        }
+    }
+
+    // D03b fixer M1/M3：fast path 用真實 seam 現場建 consent，再執行 action。
+    // 不再讓任何會安裝 pending／清除的路徑帶著 null consent 進入 final confirm。
+    private fun buildRealConsentThen(delta: Set<String>, action: (PolicyWriteConsent) -> Unit) {
+        lifecycleScope.launch {
+            val consent = buildFastPathConsent(
+                delta = delta,
+                resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
+                reprobe = { pkgs, uid -> probeDualApps(pkgs, uid) },
+            )
+            if (isFinishing || isDestroyed) return@launch
+            pendingWarningConsent = consent
+            action(consent)
+        }
+    }
+
+    // D03b fixer M2：只有 ROOT 卸載驗證成功回呼才會把 rootVerifiedEmpty 蓋到 consent；
+    // 非 ROOT Positive 按鈕完全不經過此回呼（fence 照樣做 membership 比對）。
+    private val markRootVerifiedEmpty: () -> Unit = {
+        pendingWarningConsent = pendingWarningConsent?.copy(rootVerifiedEmpty = true)
+    }
+
+    // D03b：Main 寫入入口 —— 記錄 restart callback 後發出警告（consent 由警告捕獲）。
+    // fromUserTap=false 表示由 scheduleWarningRestart 的 post 呼叫：不得重置自動重啟上限。
+    private fun startWriteWarning(fromUserTap: Boolean = true) {
+        if (fromUserTap) autoRestartCount.set(0)
+        val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, frozen ->
+            vm.requestPolicyWriteForWarning(frozen, binding, consent = pendingWarningConsent)
+        }
+        pendingWarningRestart = { startWriteWarning(fromUserTap = false) }
+        requestPreWriteWarning(proceed = proceed, onRootVerified = markRootVerifiedEmpty)
+    }
+
+    // D03b：Main 清除入口 —— 清除沒有 PendingPolicyWrite carrier，consent 由 Activity
+    // 欄位攜帶，在真正清除確認前由 confirmClearWithConsent 做同一道 fail-closed fence。
+    private fun startClearWarning(fromUserTap: Boolean = true) {
+        if (fromUserTap) autoRestartCount.set(0)
+        val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, _ ->
+            confirmClearWithConsent(binding)
+        }
+        pendingWarningRestart = { startClearWarning(fromUserTap = false) }
+        requestPreClearWarning(proceed = proceed, onRootVerified = markRootVerifiedEmpty)
+    }
+
+    // D03b fixer：fence + 派遣共用主體（suspend；不自行取得 in-flight guard）。
+    private suspend fun dispatchClearFence(binding: PolicyWarningBinding, consent: PolicyWriteConsent) {
+        val outcome: PreClearContinueOutcome = try {
+            revalidatePolicyWriteConsent(
+                consent = consent,
+                resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
+                fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
+                reprobe = { probeDualApps(consent.delta, consent.capturedUserId) },
+            )
+        } catch (_: Exception) {
+            PreClearContinueOutcome.CannotDetermine
+        }
+        dispatchConsentGatedConfirm(
+            outcome = outcome,
+            confirm = { vm.onClearPolicyButtonTap(binding, consent = consent) },
+            revoke = { /* 清除未建 pending：不放行即已 rollback，無需額外 revoke */ },
+            notify = { consentAbortCleanup() },
+            hostAlive = { !isFinishing && !isDestroyed },
+        )
+    }
+
+    // D03b：清除路徑 final-confirm fence。清除未建 pending，無可 revoke；
+    // 任何失配／缺 consent／host 消失即「不執行清除 + consentAbortCleanup（含強制新警告）」。
+    private fun confirmClearWithConsent(binding: PolicyWarningBinding) {
+        if (!consentConfirmInFlight.tryEnter()) {
+            preClearLog("consent confirm dropped: clear already in flight")
+            return
+        }
+        lifecycleScope.launch {
+            try {
+                val consent = pendingWarningConsent
+                if (consent == null) {
+                    // M3：fresh 重讀為空草稿的「真 no-op 清除」——現場建 REAL consent
+                    //（identity＋probe 照樣重驗），直接走 VM 既有 no-op 行為，不再觸發警告。
+                    val snap = try { vm.snapshotPolicyForWarning() } catch (_: Exception) { null }
+                    if (snap?.known == true && snap.draft.isEmpty()) {
+                        val real = buildFastPathConsent(
+                            delta = emptySet(),
+                            resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
+                            reprobe = { p, uid -> probeDualApps(p, uid) },
+                        )
+                        pendingWarningConsent = real
+                        dispatchClearFence(binding, real)
+                    } else {
+                        // carry-forward #4：Activity 重建／consent 缺失 ⇒ fail closed，零清除。
+                        preClearLog("policy-write consent aborted: clear confirm has no consent")
+                        consentAbortCleanup()
+                    }
+                    return@launch
+                }
+                dispatchClearFence(binding, consent)
+            } finally {
+                consentConfirmInFlight.exit()
+            }
+        }
+    }
+
+    // D03b：寫入路徑 final-confirm fence（由 policyWriteDialog Positive 觸發）。
+    // 四道關卡是唯一新鮮度權威；generation 只作 pending 身份比對（binding-only）。
+    private fun confirmWriteWithConsent(pending: PendingPolicyWrite) {
+        if (!consentConfirmInFlight.tryEnter()) {
+            preClearLog("consent confirm dropped: write already in flight")
+            return
+        }
+        lifecycleScope.launch {
+            try {
+                val livePending = try {
+                    vm.state.value.pendingPolicyWrite
+                } catch (_: Exception) {
+                    null
+                }
+                if (livePending == null || livePending.generation != pending.generation) {
+                    preClearLog("policy-write consent aborted: pending gone/changed at confirm")
+                    try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
+                    consentAbortCleanup()
+                    return@launch
+                }
+                val consent = livePending.consent
+                if (consent == null) {
+                    // carry-forward #4：Activity 重建／legacy 注入 ⇒ fail closed，零寫入。
+                    preClearLog("policy-write consent aborted: missing at confirm")
+                    try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
+                    consentAbortCleanup()
+                    return@launch
+                }
+                val outcome: PreClearContinueOutcome = try {
+                    revalidatePolicyWriteConsent(
+                        consent = consent,
+                        resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
+                        fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
+                        reprobe = { probeDualApps(consent.delta, consent.capturedUserId) },
+                    )
+                } catch (_: Exception) {
+                    PreClearContinueOutcome.CannotDetermine
+                }
+                // await 後再驗 pending 身份／generation（binding-only 身份比對，非新鮮度依據）。
+                val afterPending = try {
+                    vm.state.value.pendingPolicyWrite
+                } catch (_: Exception) {
+                    null
+                }
+                if (afterPending == null || afterPending.generation != pending.generation) {
+                    preClearLog("policy-write consent aborted: pending changed after revalidation")
+                    try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
+                    consentAbortCleanup()
+                    return@launch
+                }
+                dispatchConsentGatedConfirm(
+                    outcome = outcome,
+                    confirm = { vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null) },
+                    revoke = { try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { } },
+                    notify = { consentAbortCleanup() },
+                    hostAlive = { !isFinishing && !isDestroyed },
+                )
+            } finally {
+                consentConfirmInFlight.exit()
+            }
+        }
+    }
+
     private fun requestPreClearWarning(
         proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
+        // D03b fixer M2：ROOT 卸載驗證成功時由 showPreClearWarning 回呼，
+        // 把 rootVerifiedEmpty 旗標蓋到當下 consent（只跳 membership 比對）。
+        onRootVerified: () -> Unit = {},
     ) {
-        // D03a：每次警告重新開始，不沿用上一個對話框捕獲的 consent。
+        // D03b carry-forward #2：re-entrant 要求（probe／警告對話框存活期）直接返回，
+        // 不清空活躍警告捕獲的 consent。只有真正的新警告才清空（consentResetAllowed...）。
+        if (!consentResetAllowedForNewWarning(pendingClearConfirm)) return
         pendingWarningConsent = null
         // Phase C：快照 old＋Known＋綁定（單一來源，避免 TOCTOU 借用）。
         val snap: PolicyWarningSnapshot = try {
@@ -6094,6 +6308,9 @@ class MainActivity : ComponentActivity() {
         // R03：清除路徑沒有候選漂移問題（候選固定空集），只把 warnedOld 凍結
         // 進綁定供 VM 使用；candidateFingerprint 保持 null（無候選檢查）。
         val warnedBinding = snap.binding.withWarning(snap.draft, null)
+        // M1/M3：delta 先算好（Unknown 時 snap.draft 為空 ⇒ delta 為空），
+        // 所有 fast path 都能用同一個真實 consent 建造器。
+        val delta = policyRemovalDelta(snap.draft, emptySet())
         // Phase C：Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
         // stale 非空不得當授權依據；即使 stale 為空亦不可信（重讀前不得放行）。
         if (!snap.known) {
@@ -6101,21 +6318,24 @@ class MainActivity : ComponentActivity() {
             setPendingClearConfirm(true)
             showPreClearProbeFailedWarning(
                 this@MainActivity,
-                onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
+                onProceed = {
+                    setPendingClearConfirm(false)
+                    // M1：force-proceed 也建真實 consent（真 probe 決定 fromFailedProbe）。
+                    buildRealConsentThen(delta) { proceed(warnedBinding, emptySet()) }
+                },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
             )
             return
         }
         val old = snap.draft
         // Known 空草稿：無刪可警，直接進 VM（VM 仍掌握 blind-clear 語義）。
+        // M3：真 no-op 清除——建真實 consent 後直走 VM，不重觸發警告。
         if (old.isEmpty()) {
-            proceed(warnedBinding, emptySet())
+            buildRealConsentThen(delta) { proceed(warnedBinding, emptySet()) }
             return
         }
-        // Phase C：清除 delta=old 全量（候選空集）。
-        val delta = policyRemovalDelta(old, emptySet())
         if (delta.isEmpty()) {
-            proceed(warnedBinding, emptySet())
+            buildRealConsentThen(delta) { proceed(warnedBinding, emptySet()) }
             return
         }
         if (pendingClearConfirm) return
@@ -6151,6 +6371,8 @@ class MainActivity : ComponentActivity() {
                     is DualProbeResult.Ok -> probe.installed
                     is DualProbeResult.Failed -> emptyList()
                 },
+                // M6：警告 probe 失敗（force-proceed）標記 ⇒ fence 永遠 CannotDetermine。
+                fromFailedProbe = probe is DualProbeResult.Failed,
             )
             when (probe) {
                 is DualProbeResult.Failed -> {
@@ -6181,6 +6403,7 @@ class MainActivity : ComponentActivity() {
                         // revalidatePreClearContinue 先與 live/fresh 比對過。
                         reprobe = { probeDualApps(delta, verifiedTarget?.userId) },
                         rootUninstallAllowed = verifiedTarget != null,
+                        onRootVerified = onRootVerified,
                     )
                 }
             }
@@ -6196,8 +6419,11 @@ class MainActivity : ComponentActivity() {
     private fun requestPreWriteWarning(
         proceed: (PolicyWarningBinding, Set<String>) -> Unit,
         onCancel: () -> Unit = {},
+        // D03b fixer M2：ROOT 卸載驗證成功回呼（只跳 membership 比對）。
+        onRootVerified: () -> Unit = {},
     ) {
-        // D03a：每次警告重新開始，不沿用上一個對話框捕獲的 consent。
+        // D03b carry-forward #2：同上——re-entrant 要求不得清空活躍警告的 consent。
+        if (!consentResetAllowedForNewWarning(pendingClearConfirm)) return
         pendingWarningConsent = null
         val snap: PolicyWarningSnapshot = try {
             vm.snapshotPolicyForWarning()
@@ -6212,6 +6438,9 @@ class MainActivity : ComponentActivity() {
             emptySet()
         }
         val warnedBinding = snap.binding.withWarning(old, candidate)
+        // M1/M3：delta 先算（Unknown / 空候選 snap.draft 為空 ⇒ delta 為空），
+        // fast path 共用真實 consent 建造器；不再留下 consent=null 的寫入路徑。
+        val delta = policyRemovalDelta(old, candidate)
         if (!snap.known) {
             if (pendingClearConfirm) return
             setPendingClearConfirm(true)
@@ -6219,7 +6448,9 @@ class MainActivity : ComponentActivity() {
                 this@MainActivity,
                 onProceed = {
                     setPendingClearConfirm(false)
-                    if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                    buildRealConsentThen(delta) {
+                        if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                    }
                 },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
             )
@@ -6227,13 +6458,17 @@ class MainActivity : ComponentActivity() {
         }
         // 空候選（空勾選／空 catalog／映射全捨）交由 VM 門控（EMPTY_SELECTION／
         // CATALOG_LOADING／CATALOG_MISSING），此處不警告直接進 VM。
+        // M1：即便 VM 最終拒絕，也先建真實 consent，確保 pending 永不帶 null。
         if (candidate.isEmpty()) {
-            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+            buildRealConsentThen(delta) {
+                if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+            }
             return
         }
-        val delta = policyRemovalDelta(old, candidate)
         if (delta.isEmpty()) {
-            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+            buildRealConsentThen(delta) {
+                if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+            }
             return
         }
         if (pendingClearConfirm) return
@@ -6263,6 +6498,8 @@ class MainActivity : ComponentActivity() {
                     is DualProbeResult.Ok -> probe.installed
                     is DualProbeResult.Failed -> emptyList()
                 },
+                // M6：警告 probe 失敗（force-proceed）⇒ fence 永遠 CannotDetermine。
+                fromFailedProbe = probe is DualProbeResult.Failed,
             )
             when (probe) {
                 is DualProbeResult.Failed -> {
@@ -6298,6 +6535,7 @@ class MainActivity : ComponentActivity() {
                         // R2-5 (N10)：同 requestPreClearWarning，重探同一 delta。
                         reprobe = { probeDualApps(delta, verifiedTarget?.userId) },
                         rootUninstallAllowed = verifiedTarget != null,
+                        onRootVerified = onRootVerified,
                     )
                 }
             }
@@ -7933,6 +8171,10 @@ internal suspend fun revalidatePreClearContinue(
     resolveLiveTarget: () -> PreClearDualTarget?,
     fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
     reprobe: suspend () -> DualProbeResult,
+    // D03b fixer M2：ROOT 卸載驗證成功後，expected installed 集合已合法變空；
+    // 只跳過 (3) membership 比對，關卡 (0)(1)(2) 身分／新鮮度照樣強制。
+    //  default false = 既有非 ROOT 路徑完全不變。
+    skipMembershipCheck: Boolean = false,
 ): PreClearContinueOutcome {
     if (captured == null) {
         preClearLog("pre-clear continue aborted: no captured verified target")
@@ -7959,6 +8201,13 @@ internal suspend fun revalidatePreClearContinue(
     if (!preClearTargetStillValid(captured, freshTarget)) {
         preClearLog("pre-clear continue aborted: fresh target lost/recreated (id+serial)")
         return PreClearContinueOutcome.TargetChanged
+    }
+    // D03b fixer M2：關卡 (0)(1)(2) 已全數通過才到這裡。ROOT 卸載驗證成功旗標只
+    // 跳過 (3) installed membership 比對（預期集合已合法變空）；沒有任何
+    // 「ROOT ⇒ ProceedOk」捷徑，identity／fresh 失配早在上方 fail closed。
+    if (skipMembershipCheck) {
+        preClearLog("pre-clear continue: root verified-empty, membership comparison skipped")
+        return PreClearContinueOutcome.ProceedOk
     }
     val reprobeResult: DualProbeResult = try {
         reprobe()
@@ -7992,12 +8241,16 @@ internal fun buildPolicyWriteConsent(
     delta: Set<String>,
     verifiedTarget: PreClearDualTarget?,
     installed: List<String>,
+    fromFailedProbe: Boolean = false,
+    rootVerifiedEmpty: Boolean = false,
 ): PolicyWriteConsent = PolicyWriteConsent(
     generation = -1L,
     delta = HashSet(delta),
     capturedUserId = verifiedTarget?.userId,
     capturedSerial = verifiedTarget?.serial?.toString(),
     capturedInstalled = HashSet(installed),
+    fromFailedProbe = fromFailedProbe,
+    rootVerifiedEmpty = rootVerifiedEmpty,
 )
 
 // D03a：consent → 既有 revalidatePreClearContinue 的薄適配器。四道關卡完全復用，
@@ -8011,6 +8264,13 @@ internal suspend fun revalidatePolicyWriteConsent(
     fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
     reprobe: suspend () -> DualProbeResult,
 ): PreClearContinueOutcome {
+    // D03b fixer M6：第一階段警告 probe 失敗（含「仍然清除／寫入」force-proceed）
+    // 捕獲的 consent 永遠不可放行——即便稍後 reprobe 剛好成功也不得翻成 ProceedOk。
+    // 必須在身份重建／任何 seam 之前 fail closed（零 reprobe／零寫入）。
+    if (consent.fromFailedProbe) {
+        preClearLog("policy-write consent aborted: warning probe failed (force-proceed)")
+        return PreClearContinueOutcome.CannotDetermine
+    }
     val userId = consent.capturedUserId
     val serial = consent.capturedSerial?.toIntOrNull()
     if (userId == null || consent.capturedSerial == null || serial == null) {
@@ -8026,8 +8286,122 @@ internal suspend fun revalidatePolicyWriteConsent(
         resolveLiveTarget = resolveLiveTarget,
         fetchFreshVerifiedTarget = fetchFreshVerifiedTarget,
         reprobe = reprobe,
+        skipMembershipCheck = consent.rootVerifiedEmpty,
     )
 }
+
+// D03b fixer M1/M3：fast path（空草稿清除／delta-empty／candidate-empty／Unknown）
+// 不得沿用 null consent。用與警告路徑相同的真實 seam（fresh 身份 resolve＋probe）
+// 現場建出一個「真的」consent，讓 final-confirm fence 能誠實通過或 fail closed。
+// delta 可為空：probeDualApps(empty) 兩次皆回 Ok(empty) ⇒ membership 相等 ⇒ ProceedOk。
+// 身份 null 或 probe Failed ⇒ fromFailedProbe／null identity ⇒ fence fail closed（不放寬）。
+internal suspend fun buildFastPathConsent(
+    delta: Set<String>,
+    resolveLiveTarget: () -> PreClearDualTarget?,
+    reprobe: suspend (Set<String>, Int?) -> DualProbeResult,
+): PolicyWriteConsent {
+    val target: PreClearDualTarget? = try {
+        resolveLiveTarget()
+    } catch (_: Exception) {
+        null
+    }
+    val probe: DualProbeResult = try {
+        reprobe(delta, target?.userId)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        DualProbeResult.Failed("exec-failed")
+    }
+    val capturedInstalled: Set<String> = when (probe) {
+        is DualProbeResult.Ok -> HashSet(probe.installed)
+        is DualProbeResult.Failed -> emptySet()
+    }
+    return PolicyWriteConsent(
+        generation = -1L,
+        delta = HashSet(delta),
+        capturedUserId = target?.userId,
+        capturedSerial = target?.serial?.toString(),
+        capturedInstalled = capturedInstalled,
+        fromFailedProbe = probe is DualProbeResult.Failed,
+        rootVerifiedEmpty = false,
+    )
+}
+
+// D03b (PR #74 round 3) PART 1：最終 confirm 的四態派遣器。
+// Framework-free（無 Android import）故 JVM 可測，不必動用 Robolectric。
+// 只有 ProceedOk 且 host 仍存活才 confirm()；其它任何 outcome
+//（TargetChanged / CloneMembershipChanged / CannotDetermine）或 host 消失，
+// 一律 revoke()+notify() 且零 confirm()（fail-closed：零政策寫入／零清除）。
+//  - revoke：作廢 pending / 清除路徑的等價 rollback（呼叫端注入）。
+//  - notify：顯示既有 pre_clear_continue_recheck_failed（呼叫端自行 guard Activity 生命週期）。
+//  - hostAlive：在 await 後重新求值，攔截「警告→confirm 期間 Activity 已 destroying」的 stale host。
+// 注意（carry-forward 釘住）：
+//  * generation 僅作 pending 身份比對（binding-only），不是新鮮度依據；
+//    四道關卡完全由 revalidatePolicyWriteConsent / revalidatePreClearContinue 判定。
+//  * ROOT/卸載成功後由 consent.rootVerifiedEmpty 在 fence 內「只」跳 membership 比對
+//    （identity 仍強制）；非 ROOT 路徑不得比照鬆綁。
+//  * M6：警告 probe 失敗（force-proceed）的 consent 由 revalidatePolicyWriteConsent
+//    直接回 CannotDetermine；重探失敗也收斂 CannotDetermine。兩者皆 revoke+notify，
+//    沒有「確認失敗仍強制放行」的靜默路徑。
+//  * M4：三個回呼全包 try/catch，任何例外（含 CancellationException）都不逸出
+//    lifecycleScope.launch；confirm 拋錯時補做 revoke+notify（fail-closed 清理）。
+internal suspend fun dispatchConsentGatedConfirm(
+    outcome: PreClearContinueOutcome,
+    confirm: () -> Unit,
+    revoke: () -> Unit,
+    notify: () -> Unit,
+    hostAlive: () -> Boolean,
+) {
+    val proceed = outcome is PreClearContinueOutcome.ProceedOk && hostAlive()
+    if (proceed) {
+        try {
+            confirm()
+            return
+        } catch (e: Exception) {
+            // confirm 已拋錯：不得放過，補做 fail-closed 清理（status-only log）。
+            preClearLog("consent-gated confirm failed status=exception")
+        }
+    }
+    try {
+        revoke()
+    } catch (e: Exception) {
+        preClearLog("consent-gated revoke failed status=exception")
+    }
+    try {
+        notify()
+    } catch (e: Exception) {
+        preClearLog("consent-gated notify failed status=exception")
+    }
+}
+
+// D03b fixer M3/M5：兩個 one-shot guard（framework-free、JVM 可測）。
+// - InFlightGuard：confirm 重入防護——第一段 enter 成功者才 launch，其餘直接丟棄。
+// - OneShotRestartGuard：abort 後的重啟警告排程去抖＋打破同步遞迴
+//   （Activities 用 main Handler.post 實際延後；guard 只鎖「是否已排程」語義）。
+internal class InFlightGuard {
+    private val inFlight = AtomicBoolean(false)
+    fun tryEnter(): Boolean = inFlight.compareAndSet(false, true)
+    fun exit() { inFlight.set(false) }
+}
+
+internal class OneShotRestartGuard {
+    private val scheduled = AtomicBoolean(false)
+    fun trySchedule(): Boolean = scheduled.compareAndSet(false, true)
+    fun reset() { scheduled.set(false) }
+}
+
+// D03b fixer (availability)：自動重啟警告的次數上限（每次「使用者真正點入口」重置）。
+// OneShotRestartGuard 只擋同一次 post 內的 re-entrant scheduling；此上限擋的是
+// 「連續多次 post」。結構性 fail-closed 原因（空草稿 + 目標不存在／probe 持續失敗）
+// 否則會跨 post 無限重警。用罷即不再排程，使用者必須重新點入口；不影響 fail-closed
+// 寫入（abort 依然零寫入）。pure function 故 JVM 可測。
+internal const val MAX_AUTO_WARNING_RESTARTS = 1
+internal fun canAutoRestart(previousCount: Int): Boolean = previousCount < MAX_AUTO_WARNING_RESTARTS
+
+// D03b：只有「非 re-entrant」的新警告要求才可清空 consent。pendingClearConfirm 期間
+//（probe／警告對話框存活期）的再次要求必須保留活躍警告捕獲的 consent，避免被誤清成
+// fail-closed（carry-forward #2）。Activity 私欄位本身不可從 JVM 觀測，故此純函數鎖語義。
+internal fun consentResetAllowedForNewWarning(pendingClearConfirm: Boolean): Boolean = !pendingClearConfirm
 
 // PR-74 A3 (P3)：破壞性路徑對話框 handle 收集器（Activity 欄位持有，onDestroy 一次結清）。
 // showPreClearWarning 的警告／ROOT 二次確認與 showUninstallVerifyDialog 的驗證對話框
@@ -8092,6 +8466,8 @@ internal fun showPreClearWarning(
     proceedLabelRes: Int = R.string.pre_clear_confirm_proceed,
     capturedTarget: PreClearDualTarget? = null,
     rootUninstallAllowed: Boolean = false,
+    // D03b fixer M2：ONLY 由 ROOT 卸載驗證成功回呼觸發（非 ROOT Positive 不帶此 callback）。
+    onRootVerified: () -> Unit = {},
 ) {
     if (installed.isEmpty()) {
         preClearLog("pre-clear warning called with empty list; treating as cancelled")
@@ -8181,6 +8557,10 @@ internal fun showPreClearWarning(
                 // Phase D：二次確認通過後先執行卸載，再重跑 probeDualApps 驗證：
                 // 殘留非空即失敗；驗證結果經三選一對話框明確選擇（驗證成功→清除／
                 // 仍要清除自擔／取消），失敗 never 默認 proceed。
+                // D03b fixer M2：不再有「ROOT 已跳過 fence」的假設。ROOT 成功後由
+                // onRootVerified 把 rootVerifiedEmpty 蓋到 consent，fence 內「只」跳
+                // installed membership 比對（預期集合已合法變空）；live+fresh (id,serial)
+                // 身分檢查照樣強制，非 ROOT 路徑不受影響。
                 // PR-74 A3：保存 handle 供 onDestroy 釋放（先前直接丟棄 → window 洩漏）。
                 dialogHandles.rootConfirm = try {
                     AlertDialog.Builder(host)
@@ -8261,8 +8641,10 @@ internal fun showPreClearWarning(
                                     showUninstallVerifyDialog(
                                         host = host,
                                         outcome = outcome,
-                                        onClearVerified = { onProceed() },
-                                        onForceClear = { onProceed() },
+                                        // D03b fixer M2：ONLY 這兩個 ROOT 驗證成功回呼標記
+                                        // rootVerifiedEmpty；非 ROOT Positive 不走此處。
+                                        onClearVerified = { onRootVerified(); onProceed() },
+                                        onForceClear = { onRootVerified(); onProceed() },
                                         onCancel = { onCancel() },
                                         dialogHandles = dialogHandles,
                                     )
