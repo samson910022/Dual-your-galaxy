@@ -31,6 +31,15 @@ class BbcStickyPolicyTest {
         return Pair(c, t)
     }
 
+    // JVM tests have no behavioral seam that distinguishes an old Cleared
+    // marker from a reset one after a higher Good (both are != the high-water),
+    // so pin the high-water-owner invariant directly.
+    private fun clearedMarker(cache: EffectivePolicyCache): Long {
+        val field = EffectivePolicyCache::class.java.getDeclaredField("lastBbcClearedVersion")
+        field.isAccessible = true
+        return field.get(cache) as Long
+    }
+
     @Test
     fun successNonEmptyWithoutVersionIsGoodBbc() {
         // Old-draft backward compat: non-empty WITHOUT version proof stays
@@ -596,6 +605,64 @@ class BbcStickyPolicyTest {
         val reaccepted = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) })
         assertTrue(reaccepted is EffectivePolicyCache.BbcPolicy.Good)
         assertEquals(setOf("A"), (reaccepted as EffectivePolicyCache.BbcPolicy.Good).packages)
+    }
+
+    @Test
+    fun sameVersionGoodWithoutCanonicalFailsClosedBbc() {
+        // H1: a same-version Good can only be content-checked against a cached
+        // or sticky canonical snapshot. Once BOTH are gone (sticky cap expired
+        // after a failed read, then invalidate empties cached), an arbitrary
+        // same-version Good must FAIL CLOSED as Unknown, not be accepted
+        // unconditionally just because its version matches the high-water.
+        val (cache, time) = bbcCacheAt(1_000L)
+        assertTrue(
+            cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
+                is EffectivePolicyCache.BbcPolicy.Good,
+        )
+        // Advance past the sticky cap; the failed read expires the sticky
+        // snapshot (stickyIfValidLocked). invalidate() then empties cached and
+        // resets the failure cooldown so the next read reaches the version gate.
+        time.set(1_000L + EffectivePolicyCache.BBC_STICKY_MAX_AGE_MS + 1L)
+        val failed = cache.getBbc(emptySet(), reader = { Pair(null, null) })
+        assertTrue(failed is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (failed as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertEquals(1L, cache.bbcStickyExpiredCount.get())
+        cache.invalidate()
+        val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
+        assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (replay as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+    }
+
+    @Test
+    fun higherGoodResetsClearedHighWaterBbc() {
+        // H2: Cleared(v5) owns the high-water and its Cleared marker; a later
+        // higher-version Good must take over ownership so a same-version Good
+        // replay is content-checked against the GOOD snapshot, not the earlier
+        // Cleared snapshot. A differing same-version set stays Unknown.
+        val (cache, _) = bbcCacheAt(1_000L)
+        val cleared = cache.getBbc(emptySet(), reader = { Pair(emptySet(), 5L) })
+        assertTrue(cleared is EffectivePolicyCache.BbcPolicy.Cleared)
+        assertEquals(5L, (cleared as EffectivePolicyCache.BbcPolicy.Cleared).version)
+        assertEquals(5L, clearedMarker(cache))
+        cache.invalidate()
+        val good = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 6L) })
+        assertTrue(good is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A"), (good as EffectivePolicyCache.BbcPolicy.Good).packages)
+        // The higher Good now owns the high-water: the stale Cleared marker is
+        // dropped (without the fix it still reads 5).
+        assertEquals(-1L, clearedMarker(cache))
+        cache.invalidate()
+        val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 6L) })
+        assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(setOf("A"), (replay as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        // The high-water itself is unchanged at 6 (the marker reset must not
+        // lower it): Cleared(6) is still a duplicate, Cleared(7) advances.
+        cache.invalidate()
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(emptySet(), 6L) }) is EffectivePolicyCache.BbcPolicy.Unknown)
+        cache.invalidate()
+        val next = cache.getBbc(emptySet(), reader = { Pair(emptySet(), 7L) })
+        assertTrue(next is EffectivePolicyCache.BbcPolicy.Cleared)
+        assertEquals(7L, (next as EffectivePolicyCache.BbcPolicy.Cleared).version)
     }
 
     // --- F3: documented wraparound replay-window limitation (option (b)) ---

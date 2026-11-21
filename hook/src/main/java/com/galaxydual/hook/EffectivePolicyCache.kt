@@ -321,7 +321,11 @@ class EffectivePolicyCache(
     // Unknown, so it can no longer re-attach a revoked package. Comparing
     // against BOTH cached and sticky keeps the legacy
     // successEmptyWithoutVersionKeepsLastGoodBbc (same-version same-content
-    // re-acceptance after a failed read) working.
+    // re-acceptance after a failed read) working, as long as a genuine
+    // snapshot exists. If BOTH are absent (e.g. the sticky cap expired after a
+    // sustained failure storm), content compatibility cannot be proven and the
+    // same-version Good is REJECTED (fail-closed) instead of being accepted
+    // unconditionally.
     private fun isGoodVersionAcceptableLocked(v: Long, candidate: Set<String>): Boolean {
         if (v < 1L) return false
         val last = lastBbcSeenVersion
@@ -331,7 +335,7 @@ class EffectivePolicyCache(
         if (v == last && lastBbcClearedVersion != last) {
             val canonical = cached.takeIf { it.isNotEmpty() }
                 ?: lastGoodSticky?.takeIf { it.isNotEmpty() }
-                ?: return true
+                ?: return false // FAIL-CLOSED: no canonical snapshot to compare against.
             // Equal (a re-read of the current state) or a strict subset (a
             // legitimate same-version shrink) is safe: no previously removed
             // package can come back. Any other set is a stale replay.
@@ -1293,6 +1297,17 @@ class EffectivePolicyCache(
                         }
                         return BbcPolicy.Cleared(clearedVersion)
                     } else {
+                        // A higher-version Good takes over the high-water from
+                        // any earlier Cleared. Drop the stale Cleared marker so
+                        // the same-version Good gate classifies this version as
+                        // Good-owned (content-aware against this Good's own
+                        // snapshot) instead of comparing a replay against a
+                        // canonical from the earlier Cleared version. This does
+                        // NOT lower lastBbcSeenVersion: observeBbcVersionLocked
+                        // only advances it (except the documented wraparound).
+                        if (goodVersion != null && goodVersion > lastBbcSeenVersion) {
+                            lastBbcClearedVersion = -1L
+                        }
                         try {
                             observeBbcVersionLocked(goodVersion)
                         } catch (_: Throwable) {
