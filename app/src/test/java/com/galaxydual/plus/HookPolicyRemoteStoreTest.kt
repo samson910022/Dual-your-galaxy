@@ -1948,6 +1948,143 @@ class HookPolicyRemoteStoreTest {
         }
     }
 
+    // D02 (no-commit poison lockout): a version-probe abort must NOT latch poison.
+    // prePoison used to run unconditionally before the probe, so a probe failure
+    // (no editor, no commit) still poisoned this prefs instance forever: after the
+    // probe recovered, loadResult() stayed Unavailable even though v50 + packages
+    // were intact, and the VM refused all same-process writes. Poison must be
+    // published only at the commit point.
+    @Test
+    fun versionContainsAbortKeepsLoadKnownAndWritePossibleBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionContainsThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            // No commit attempted: store byte-identical, commit count unchanged.
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            prefs.versionContainsThrows = false
+            // No poison latched: immediate Known read + a same-process write works.
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("new2"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // D02: same recovery guarantee when probeVersion's getLong (non-CCE) fails.
+    @Test
+    fun versionGetLongAbortKeepsLoadKnownAndWritePossibleBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionGetLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            assertEquals(commitsBefore, prefs.commitCalls)
+            prefs.versionGetLongThrows = false
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // D02: putLong failure aborts before the poison/commit point. Staging only
+    // touches the editor's pending map (mMap stays byte-identical), so no poison
+    // must be latched and the instance must recover immediately after restore.
+    @Test
+    fun versionPutLongAbortKeepsLoadKnownAndWritePossibleBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.putLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            // Zero new commits; persisted v50 + {"old"} remain byte-identical.
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            prefs.putLongThrows = false
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // D02: same no-commit recovery for the clear() path — a probe abort must not
+    // leave the prefs instance permanently Unknown/locked out of writes.
+    @Test
+    fun versionProbeAbortOnClearKeepsLoadKnownBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionContainsThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.clear())
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            prefs.versionContainsThrows = false
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            // A same-process write after the aborted clear must still succeed.
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
     // NEW-2 (P2): concurrent save() calls must each bump the version exactly
     // once — distinct + monotonically increasing committed versions, no lost
     // saves. Before the versionCommitLock, two threads could read the same

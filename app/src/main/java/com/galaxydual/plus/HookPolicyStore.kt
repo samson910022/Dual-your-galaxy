@@ -1061,8 +1061,11 @@ fun remoteHookPolicyStore(
                     notePrefsIdentity(prefs, storeIdentityRef)
                 } catch (_: Throwable) {
                 }
-                // 關 commit-vs-publish 窗:先 CAS 加毒再 commit,重疊讀必見 gen 變化。
-                val ownToken = prePoison(prefs)
+                // D02: poison is published ONLY at the commit point (see below).
+                // A no-commit abort (probe Unavailable / putLong failure) skips
+                // the CAS entirely: no poison latched, nothing to undo, and the
+                // prefs instance stays recoverable in the same process.
+                var poisonToken: Long? = null
                 try {
                     // NEW-2 (P2): serialize the whole version
                     // read->increment->putLong->commit under ONE process-wide
@@ -1070,8 +1073,11 @@ fun remoteHookPolicyStore(
                     // same current version and commit duplicates (a duplicate
                     // later presented as Cleared would be rejected by the hook's
                     // monotonic gate). The lock includes the commit so packages
-                    // + version stay in the same atomic commit; poison bookkeeping
-                    // below stays outside the lock (minimal scope).
+                    // + version stay in the same atomic commit. The poison CAS is
+                    // intentionally performed INSIDE this lock, immediately before
+                    // commit(), to keep the commit-vs-publish fence unchanged; this
+                    // is deadlock-free because the poison primitives take no lock
+                    // (only an AtomicReference CAS, no re-entry into this lock).
                     val ok: Boolean = synchronized(versionCommitLock) {
                         // Phase A P0 policy_version 同步寫入（與包集合同一 commit
                         // 原子落盤）：每次 save/clear 單調 +1。舊草稿遷移：版本鍵
@@ -1125,6 +1131,10 @@ fun remoteHookPolicyStore(
                             // 整筆中止、不 commit、不留部分狀態。取消仍透傳。
                             return@synchronized false
                         }
+                        // D02: publish poison here, immediately before commit(), so
+                        // the optimistic mMap update inside commit() is always
+                        // fenced by a visible gen bump. No commit => no poison.
+                        poisonToken = prePoison(prefs)
                         try {
                             ed.commit()
                         } catch (ce: CancellationException) {
@@ -1134,16 +1144,22 @@ fun remoteHookPolicyStore(
                         }
                     }
                     if (ok) {
-                        val cleared = clearPoison(prefs, ownToken)
-                        if (cleared) {
-                            // Stage N1 P1:成功重同步即洗白 evidence (verified resync)。
-                            // Token 失配 (併發新毒) 則保留，不蓋掉併發診斷。
-                            try {
-                                clearCorruptEvidence(prefs)
-                            } catch (_: Exception) {
+                        poisonToken?.let { token ->
+                            val cleared = clearPoison(prefs, token)
+                            if (cleared) {
+                                // Stage N1 P1:成功重同步即洗白 evidence (verified resync)。
+                                // Token 失配 (併發新毒) 則保留，不蓋掉併發診斷。
+                                try {
+                                    clearCorruptEvidence(prefs)
+                                } catch (_: Exception) {
+                                }
                             }
                         }
-                    } else {
+                    } else if (poisonToken != null) {
+                        // A real commit was attempted (it returned false): the
+                        // optimistic mMap may be dirty, so keep the poison fence.
+                        // A no-commit abort leaves poisonToken == null: nothing
+                        // was published, so there is nothing to fence.
                         try {
                             ensurePoisoned(prefs)
                         } catch (_: Exception) {
@@ -1151,18 +1167,24 @@ fun remoteHookPolicyStore(
                     }
                     ok
                 } catch (ce: CancellationException) {
-                    try {
-                        ensurePoisoned(prefs)
-                    } catch (_: Exception) {
+                    // D02: only re-latch if a commit was actually attempted.
+                    if (poisonToken != null) {
+                        try {
+                            ensurePoisoned(prefs)
+                        } catch (_: Exception) {
+                        }
                     }
                     throw ce
                 } catch (e: Throwable) {
                     // 已拿到實例後的 edit/commit 拋出 (如 binder RemoteException
                     // 或 Error):樂觀更新可能已污染 mMap，加毒後重拋由
                     // HookPolicyStore.save/clear 統一轉 false (取消除外)。
-                    try {
-                        ensurePoisoned(prefs)
-                    } catch (_: Exception) {
+                    // D02: only re-latch if a commit was actually attempted.
+                    if (poisonToken != null) {
+                        try {
+                            ensurePoisoned(prefs)
+                        } catch (_: Exception) {
+                        }
                     }
                     throw e
                 }
