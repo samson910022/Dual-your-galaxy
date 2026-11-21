@@ -8,6 +8,8 @@ import org.junit.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 // Phase A P0 BBC sticky last-good JVM pins.
 //
@@ -230,7 +232,7 @@ class BbcStickyPolicyTest {
         val (cache, _) = bbcCacheAt(1_000L)
         val res = cache.getBbc(
             emptySet(),
-            bbcGateOpen = false,
+            bbcGateOpen = { false },
             reader = { reads++; Pair(setOf("com.good.a"), 1L) },
         )
         assertTrue(res is EffectivePolicyCache.BbcPolicy.Cleared)
@@ -810,13 +812,18 @@ class BbcStickyPolicyTest {
             }
         })
         assertEquals(false, enabled)
-        val gate = bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION) { enabled }
+        // Fresh process-local state so this confirmed-OFF pin cannot leak into
+        // other tests (the production default is a process-wide singleton).
+        val gate = bbcInjectionGateOpen(
+            PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            stickyState = AtomicReference(null),
+        ) { enabled }
         assertFalse(gate)
         var reads = 0
         val (cache, _) = bbcCacheAt(1_000L)
         val res = cache.getBbc(
             emptySet(),
-            bbcGateOpen = gate,
+            bbcGateOpen = { gate },
             reader = { reads++; Pair(setOf("com.good.a"), 1L) },
         )
         assertTrue(res is EffectivePolicyCache.BbcPolicy.Cleared)
@@ -828,24 +835,28 @@ class BbcStickyPolicyTest {
     @Test
     fun absentOrThrownRuntimeReadKeepsShippedDefaultOn() {
         // Absent key: the prefs adapter supplies defValue=true. Thrown read:
-        // readBbcInjectionEnabled returns null; bbcInjectionGateOpen maps null
-        // to true so a transient IPC failure never silently disables the
-        // shipped BBC effect ("off" is not a safety guarantee, issue #75).
+        // readBbcInjectionEnabled returns null. With NO prior confirmed OFF in
+        // this (fresh) process-local state, the hybrid rule still maps null to
+        // true so a transient IPC failure never silently disables the shipped
+        // BBC effect ("off" is not a safety guarantee, issue #75). Once OFF has
+        // been confirmed the failures stay closed for up to 30 min — pinned by
+        // failedReadAfterConfirmedOffKeepsGateClosedWithinTtl below.
+        val freshState = { AtomicReference<Long?>(null) }
         val absent = readBbcInjectionEnabled(object : BbcInjectionPrefsView {
             override fun getBoolean(key: String, defValue: Boolean) = defValue
         })
         assertEquals(true, absent)
-        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION) { absent })
+        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION, stickyState = freshState()) { absent })
 
         val thrown = readBbcInjectionEnabled(object : BbcInjectionPrefsView {
             override fun getBoolean(key: String, defValue: Boolean): Boolean =
                 throw RuntimeException("transient read failure")
         })
         assertEquals(null, thrown)
-        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION) { thrown })
+        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION, stickyState = freshState()) { thrown })
 
         // Full provider failure (null prefs) is also null => default on.
-        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION) { null })
+        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION, stickyState = freshState()) { null })
     }
 
     @Test
@@ -861,6 +872,289 @@ class BbcStickyPolicyTest {
             true
         })
         assertEquals(0, runtimeReads)
+    }
+
+    // --- N06(a): hybrid runtime opt-out — confirmed OFF is sticky for TTL ---
+    // The stateful pins below inject a fresh AtomicReference + fake clock: the
+    // production state is process-local (not device-verified, not cross-process).
+
+    private val gateTtl = EffectivePolicyCache.BBC_STICKY_MAX_AGE_MS
+
+    private fun throwingRead(): () -> Boolean? = { throw RuntimeException("prefs read failed") }
+
+    // Deterministic stale-CAS interleaving WITHOUT subclassing AtomicReference
+    // (both get() and compareAndSet() are final). The injected nowMs() is called
+    // AFTER get() captures `cur` but BEFORE compareAndSet, so parking on its
+    // first invocation guarantees a stale-cur CAS that must fail and retry.
+    // No sleeps and no lock is held around the runtime prefs read.
+    private class BlockingClock(private val base: Long) {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val calls = AtomicInteger(0)
+
+        fun now(): Long {
+            val n = calls.incrementAndGet()
+            if (n == 1) {
+                entered.countDown()
+                if (!release.await(5, TimeUnit.SECONDS)) {
+                    throw IllegalStateException("clock release timeout")
+                }
+            }
+            return base + n
+        }
+    }
+
+    @Test
+    fun hybridRuleHelperPinsDecisionTableWithoutAndroid() {
+        val t0 = 1_000L
+        val ttl = gateTtl
+        // compile-time closed always wins and leaves sticky state untouched.
+        val pinned = bbcInjectionGateOpenWithSticky(false, true, t0, t0, ttl)
+        assertFalse(pinned.open)
+        assertEquals(t0, pinned.confirmedOffAtMs)
+        // false stamps OFF; true clears it; null inside TTL keeps it; null
+        // before any OFF / after expiry fails open to the shipped default.
+        assertTrue(bbcInjectionGateOpenWithSticky(true, false, null, t0, ttl).let {
+            !it.open && it.confirmedOffAtMs == t0
+        })
+        assertTrue(bbcInjectionGateOpenWithSticky(true, true, t0, t0 + 10L, ttl).let {
+            it.open && it.confirmedOffAtMs == null
+        })
+        assertTrue(bbcInjectionGateOpenWithSticky(true, null, t0, t0 + ttl / 2, ttl).let {
+            !it.open && it.confirmedOffAtMs == t0
+        })
+        assertTrue(bbcInjectionGateOpenWithSticky(true, null, null, t0, ttl).open)
+        assertTrue(bbcInjectionGateOpenWithSticky(true, null, t0, t0 + ttl + 1, ttl).open)
+    }
+
+    @Test
+    fun failedReadAfterConfirmedOffKeepsGateClosedWithinTtl() {
+        val t0 = 1_000L
+        val now = AtomicLong(t0)
+        val state = AtomicReference<Long?>(null)
+        fun gate(read: () -> Boolean?): Boolean = bbcInjectionGateOpen(
+            PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            nowMs = { now.get() },
+            ttlMs = gateTtl,
+            stickyState = state,
+            runtimeEnabled = read,
+        )
+        // t0: confirmed OFF -> closed, timestamp recorded.
+        assertFalse(gate { false })
+        assertEquals(t0, state.get())
+        // t0 + TTL/2: read throws -> sticky OFF still within TTL -> closed.
+        now.set(t0 + gateTtl / 2)
+        assertFalse(gate(throwingRead()))
+        assertEquals(t0, state.get())
+    }
+
+    @Test
+    fun failedReadAfterConfirmedOffExpiresAfterTtl_defaultsTrue() {
+        val t0 = 1_000L
+        val now = AtomicLong(t0)
+        val state = AtomicReference<Long?>(null)
+        fun gate(read: () -> Boolean?): Boolean = bbcInjectionGateOpen(
+            PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            nowMs = { now.get() },
+            ttlMs = gateTtl,
+            stickyState = state,
+            runtimeEnabled = read,
+        )
+        assertFalse(gate { false })
+        assertEquals(t0, state.get())
+        // t0 + TTL + 1: sticky OFF expired, failure falls back to shipped ON.
+        now.set(t0 + gateTtl + 1)
+        assertTrue(gate(throwingRead()))
+        assertEquals(null, state.get())
+    }
+
+    @Test
+    fun failedReadBeforeAnyConfirmedOff_defaultsTrue() {
+        val now = AtomicLong(1_000L)
+        val state = AtomicReference<Long?>(null)
+        assertTrue(bbcInjectionGateOpen(
+            PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            nowMs = { now.get() },
+            ttlMs = gateTtl,
+            stickyState = state,
+            runtimeEnabled = throwingRead(),
+        ))
+        assertEquals(null, state.get())
+    }
+
+    @Test
+    fun confirmedOffClearedByLaterTrueRead() {
+        val t0 = 1_000L
+        val now = AtomicLong(t0)
+        val state = AtomicReference<Long?>(null)
+        fun gate(read: () -> Boolean?): Boolean = bbcInjectionGateOpen(
+            PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            nowMs = { now.get() },
+            ttlMs = gateTtl,
+            stickyState = state,
+            runtimeEnabled = read,
+        )
+        assertFalse(gate { false })
+        assertEquals(t0, state.get())
+        // A later confirmed ON clears the sticky OFF entirely.
+        now.set(t0 + 100L)
+        assertTrue(gate { true })
+        assertEquals(null, state.get())
+        // Therefore a subsequent failure now defaults ON again.
+        now.set(t0 + 200L)
+        assertTrue(gate(throwingRead()))
+        assertEquals(null, state.get())
+    }
+
+    @Test
+    fun concurrentOffAndOnReads_finalStateMatchesLastConfirmedRead() {
+        // "Last confirmed read" is the transition whose CAS commits last
+        // (the linearization point), not merely the one whose prefs read ran
+        // last — that is the property the CAS loop must guarantee.
+        val t0 = 1_000L
+        val state = AtomicReference<Long?>(t0) // prior confirmed OFF
+        val clock = BlockingClock(t0)
+        fun gate(read: () -> Boolean?): Boolean = bbcInjectionGateOpen(
+            PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            nowMs = { clock.now() },
+            ttlMs = gateTtl,
+            stickyState = state,
+            runtimeEnabled = read,
+        )
+
+        // ON thread captures stale cur=t0, then parks inside nowMs() (call #1)
+        // before its CAS. No lock is held, so the other thread can proceed.
+        var onGate: Boolean? = null
+        val onThread = Thread { onGate = gate { true } }
+        onThread.start()
+        assertTrue(clock.entered.await(5, TimeUnit.SECONDS))
+
+        // OFF thread commits meanwhile (clock call #2 => state = t0 + 2).
+        var offGate: Boolean? = null
+        val offThread = Thread { offGate = gate { false } }
+        offThread.start()
+        offThread.join(5_000L)
+        assertEquals(t0 + 2, state.get())
+
+        // Release the ON thread: its stale CAS(t0, null) MUST fail, the loop
+        // retries from the fresh value (clock call #3) and commits ON.
+        clock.release.countDown()
+        onThread.join(5_000L)
+
+        assertEquals(true, onGate)
+        assertEquals(false, offGate)
+        assertEquals(3, clock.calls.get()) // retry executed (3rd nowMs call)
+        assertEquals(null, state.get()) // last committed read (ON) wins
+
+        // A later failing read follows that last confirmed ON => fail open.
+        assertTrue(gate(throwingRead()))
+        assertEquals(null, state.get())
+    }
+
+    @Test
+    fun gateReadInsideGuardedBudget_seesElapsedAfterSlowProvider() {
+        val (cache, time) = bbcCacheAt(1_000L)
+        // Seed a sticky last-good, then force a re-read so a leader/follower
+        // contest is possible.
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("com.good.a"), 1L) }) is EffectivePolicyCache.BbcPolicy.Good)
+        cache.invalidate()
+        val leaderStarted = CountDownLatch(1)
+        val leaderRelease = CountDownLatch(1)
+        val leader = Thread {
+            cache.getBbc(emptySet(), reader = {
+                leaderStarted.countDown()
+                leaderRelease.await(5, TimeUnit.SECONDS)
+                Pair(setOf("com.leader"), 9L)
+            })
+        }
+        leader.start()
+        assertTrue(leaderStarted.await(5, TimeUnit.SECONDS))
+
+        // Follower's gate provider simulates a slow pref read: it advances the
+        // SAME fake clock getBbc sampled for now0 by >50ms (the grace budget).
+        // Because the provider is evaluated after now0, the follower's elapsed
+        // clamp sees the cost and the 40ms deadline (1_040L) is already spent.
+        var followerReads = 0
+        var followerResult: EffectivePolicyCache.BbcPolicy? = null
+        val follower = Thread {
+            followerResult = cache.getBbc(
+                emptySet(),
+                bbcGateOpen = {
+                    time.addAndGet(60L) // slow pref read, charged to the budget
+                    true
+                },
+                followerGraceMs = 50L,
+                deadlineMs = 1_040L,
+                reader = { followerReads++; Pair(setOf("com.unexpected"), 10L) },
+            )
+        }
+        follower.start()
+        follower.join(5_000L)
+        leaderRelease.countDown()
+        leader.join(5_000L)
+
+        // Deadline clamp/fail-closed sticky fallback, NOT a normal merged Good.
+        assertTrue(followerResult is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(
+            setOf("com.good.a"),
+            (followerResult as EffectivePolicyCache.BbcPolicy.Unknown).lastGood,
+        )
+        assertEquals(0, followerReads) // no merge, no extra reader call
+    }
+
+    @Test
+    fun gateReadInsideGuardedBudget_graceOnlySeesElapsedAfterSlowProvider() {
+        // Same contest, but with NO absolute deadline: only followerGraceMs -
+        // elapsed can fail closed. The absolute-deadline variant above would
+        // still pass if the gate were read before now0 (a stale deadline would
+        // clamp); here the cost MUST show up in elapsed to beat the 50ms grace.
+        val (cache, time) = bbcCacheAt(1_000L)
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("com.good.a"), 1L) }) is EffectivePolicyCache.BbcPolicy.Good)
+        cache.invalidate()
+        val leaderStarted = CountDownLatch(1)
+        val leaderRelease = CountDownLatch(1)
+        val leader = Thread {
+            cache.getBbc(emptySet(), reader = {
+                leaderStarted.countDown()
+                leaderRelease.await(5, TimeUnit.SECONDS)
+                Pair(setOf("com.leader"), 9L)
+            })
+        }
+        leader.start()
+        assertTrue(leaderStarted.await(5, TimeUnit.SECONDS))
+
+        var followerReads = 0
+        var followerResult: EffectivePolicyCache.BbcPolicy? = null
+        val gateReadDone = CountDownLatch(1)
+        val follower = Thread {
+            followerResult = cache.getBbc(
+                emptySet(),
+                bbcGateOpen = {
+                    time.addAndGet(60L) // > 50ms grace, charged to elapsed
+                    gateReadDone.countDown()
+                    true
+                },
+                followerGraceMs = 50L,
+                deadlineMs = -1L,
+                reader = { followerReads++; Pair(setOf("com.unexpected"), 10L) },
+            )
+        }
+        follower.start()
+        assertTrue(gateReadDone.await(5, TimeUnit.SECONDS))
+        // The leader stays blocked: with the old eager ordering the follower
+        // would park the full 50ms grace and increment followerGraceHits. With
+        // the lazy provider elapsed=60 already spent the grace => no park.
+        follower.join(5_000L)
+        leaderRelease.countDown()
+        leader.join(5_000L)
+
+        assertTrue(followerResult is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(
+            setOf("com.good.a"),
+            (followerResult as EffectivePolicyCache.BbcPolicy.Unknown).lastGood,
+        )
+        assertEquals(0, followerReads)
+        assertEquals(0, cache.followerGraceHits.get()) // no wait: cost hit elapsed
     }
 
     // --- N03: version-key read failure must NOT masquerade as absence ---

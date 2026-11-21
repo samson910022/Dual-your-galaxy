@@ -32,24 +32,95 @@ internal interface BbcInjectionPrefsView {
 }
 
 // Returns null on any read failure (key absent is handled by defValue=true in
-// the adapter). null is mapped to TRUE by bbcInjectionGateOpen: "off" is NOT a
-// safety guarantee (cold-start deletion happens before the BBC callback,
-// issue #75), so a transient read error must never fail closed into disabling
-// the shipped BBC effect. Never throws.
+// the adapter). null is fed to the hybrid rule in bbcInjectionGateOpen: the
+// FIRST failure still defaults to TRUE ("off" is NOT a safety guarantee —
+// cold-start deletion happens before the BBC callback, issue #75), but once
+// OFF has been confirmed a failure keeps it CLOSED for BBC_STICKY_MAX_AGE_MS.
+// This reader itself is unchanged and never throws.
 internal fun readBbcInjectionEnabled(view: BbcInjectionPrefsView): Boolean? = try {
     view.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true)
 } catch (_: Throwable) {
     null
 }
 
-// Compile-time default AND runtime preference, with absent/failed => true
-// (preserve shipped behavior). Pure so JVM tests can pin all four combinations
-// including the NEW runtime key; no IPC here. The runtime read is LAZY so a
-// compile-time-closed gate keeps its historic zero-pref-read / zero-IPC path.
+// N06(a): process-local confirmed-OFF timestamp (millis on the injected clock;
+// null = no confirmed OFF in this process). compareAndSet in the gate makes the
+// get -> decide -> write transition atomic/visibility-safe under concurrent BBC
+// queries (no lock is held around the prefs read). It is deliberately NOT
+// device-verified and NOT cross-process: a daemon restart clears it, so a
+// stale OFF cannot outlive the process that observed it.
+internal val bbcConfirmedOffAtMs = AtomicReference<Long?>(null)
+
+// Pure, Android-free statement of the hybrid rule. `runtime` is the already
+// observed boolean read: false = confirmed OFF, true = confirmed ON,
+// null = read failure/absence. Returns the gate decision plus the state to
+// store (null = no confirmed OFF). No I/O, no shared state — JVM tests pin the
+// full decision table through this helper.
+internal data class BbcGateDecision(val open: Boolean, val confirmedOffAtMs: Long?)
+
+internal fun bbcInjectionGateOpenWithSticky(
+    compileTimeGate: Boolean,
+    runtime: Boolean?,
+    confirmedOffAtMs: Long?,
+    nowMs: Long,
+    ttlMs: Long = EffectivePolicyCache.BBC_STICKY_MAX_AGE_MS,
+): BbcGateDecision {
+    // Compile-time gate stays authoritative and never mutates sticky state.
+    if (!compileTimeGate) return BbcGateDecision(false, confirmedOffAtMs)
+    val (open, nextOffAtMs) = when (runtime) {
+        false -> false to nowMs // confirmed OFF: stamp it and keep the gate closed
+        true -> true to null // confirmed ON: clear any prior OFF
+        null -> {
+            val off = confirmedOffAtMs
+            if (off != null && nowMs >= off && nowMs - off < ttlMs) {
+                false to off // sticky OFF within TTL (bounded, process-local)
+            } else {
+                true to null // first failure / expired TTL => shipped default ON
+            }
+        }
+    }
+    return BbcGateDecision(open, nextOffAtMs)
+}
+
+// Compile-time default AND the hybrid runtime rule. The runtime read is LAZY
+// so a compile-time-closed gate keeps its historic zero-pref-read / zero-IPC
+// path. nowMs/ttlMs/stickyState are injectable for JVM tests; production uses
+// the process-local AtomicReference above and wall-clock millis. Never throws
+// into the hook caller: every failure degrades to the fail-open default.
 internal inline fun bbcInjectionGateOpen(
     compileTimeGate: Boolean,
+    nowMs: () -> Long = { System.currentTimeMillis() },
+    ttlMs: Long = EffectivePolicyCache.BBC_STICKY_MAX_AGE_MS,
+    stickyState: AtomicReference<Long?> = bbcConfirmedOffAtMs,
+    // Kept last so the historic trailing-lambda call sites still bind here.
     runtimeEnabled: () -> Boolean?,
-): Boolean = compileTimeGate && (runtimeEnabled() ?: true)
+): Boolean {
+    if (!compileTimeGate) return false // ZERO runtime read (existing pin)
+    val runtime = try {
+        runtimeEnabled()
+    } catch (_: Throwable) {
+        null
+    }
+    while (true) {
+        val committedOpen: Boolean? = try {
+            val cur = stickyState.get()
+            val d = bbcInjectionGateOpenWithSticky(
+                compileTimeGate = true,
+                runtime = runtime,
+                confirmedOffAtMs = cur,
+                nowMs = nowMs(),
+                ttlMs = ttlMs,
+            )
+            // Atomic CAS keeps the transition linearizable: if another query
+            // changed the state after our get(), retry from the fresh value.
+            // NO lock is held here (the prefs read above is lock-free).
+            if (stickyState.compareAndSet(cur, d.confirmedOffAtMs)) d.open else null
+        } catch (_: Throwable) {
+            return true // fail open to the shipped default, never throw into the hook
+        }
+        if (committedOpen != null) return committedOpen
+    }
+}
 
 // Outcome of the self-consistent read. `failed` is true on a torn snapshot
 // (version-before != version-after) or any read failure; the caller maps that
@@ -795,8 +866,9 @@ class DualHook : XposedModule() {
     // PR #74 G1：compile-time 開關 AND 執行期偏好（dual_policy/
     // bbc_injection_enabled，預設 true）。偏好讀取走既有 remote prefs accessor
     // （getRemotePreferences 在同一行程對同一 group 為快取查表，非新增 binder
-    // IPC），只有布林讀，null/拋出一律回 null → 預設 true（不因短暫讀失敗而
-    // 誤關效應）。此讀取在所有其他 bbcPolicy 邏輯之外另有 try/catch，任何
+    // IPC），只有布林讀；null/拋出交給 bbcInjectionGateOpen 的混合規則：
+    // 首次失敗仍回 true，但已確認 OFF 後 30 分鐘內的失敗維持關閉（process-local，
+    // 非裝置驗證）。此讀取在所有其他 bbcPolicy 邏輯之外另有 try/catch，任何
     // Throwable 都不會逸出到 system_server/daagent。
     private fun bbcInjectionEnabledNow(): Boolean? = try {
         val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
@@ -833,9 +905,14 @@ class DualHook : XposedModule() {
         }
         bbcCache.getBbc(
             EXTRA_WHITELIST_PACKAGES,
-            bbcGateOpen = bbcInjectionGateOpen(
-                PolicySource.BBC_AVAILABLE_APPS_INJECTION,
-            ) { bbcInjectionEnabledNow() },
+            // N06(b): LAZY provider — getBbc samples now0 first, then calls this
+            // inside the guarded section, so a slow pref read is charged to the
+            // same 50ms deadline budget instead of running outside it.
+            bbcGateOpen = {
+                bbcInjectionGateOpen(
+                    PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+                ) { bbcInjectionEnabledNow() }
+            },
             followerGraceMs = graceAtEntry,
             deadlineMs = deadlineMs,
         ) { policyReadBbcVersioned() }

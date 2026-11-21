@@ -877,18 +877,29 @@ class EffectivePolicyCache(
     // snapshot; Unknown never shrinks. TTL expiry / invalidate never discard
     // sticky (only BBC_STICKY_MAX_AGE_MS expires it, counted + throttled).
     // Gate-closed short-circuits to Cleared(-1) with zero IPC/state (BBC
-    // injection disabled => empty, no Unknown log).
+    // injection disabled => empty, no Unknown log). N06(b): the gate is a LAZY
+    // provider evaluated after now0 so a slow read is charged to the same
+    // bounded 50ms deadline budget.
     fun getBbc(
         seed: Set<String>,
-        bbcGateOpen: Boolean = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+        bbcGateOpen: () -> Boolean = { PolicySource.BBC_AVAILABLE_APPS_INJECTION },
         followerGraceMs: Long = DEFAULT_FOLLOWER_GRACE_MS,
         deadlineMs: Long = -1L,
         reader: () -> Pair<Set<String>?, Long?>,
     ): BbcPolicy {
-        if (!bbcGateOpen) return BbcPolicy.Cleared(-1L)
         val now0: Long = try {
             nowMs()
         } catch (_: Throwable) {
+            // Preserve the gate-closed invariant even when the clock sample
+            // fails: re-evaluate the opt-out provider (wrapped, never throws)
+            // and still short-circuit to Cleared(-1) with zero reader calls.
+            // A broken provider cannot mask the existing clock fallback.
+            val gateClosed = try {
+                !bbcGateOpen()
+            } catch (_: Throwable) {
+                false
+            }
+            if (gateClosed) return BbcPolicy.Cleared(-1L)
             val sticky: Set<String>? = synchronized(lock) { lastGoodSticky }
             if (sticky != null) {
                 try {
@@ -913,6 +924,11 @@ class EffectivePolicyCache(
             noteBbcFallback("clock-no-sticky")
             return BbcPolicy.Unknown(emptySet())
         }
+        // N06(b): gate read happens AFTER now0/deadline sampling, inside the
+        // guarded section, so a slow pref read consumes the same deadline
+        // budget (visible to the follower elapsed clamp below). Gate-closed
+        // still returns the exact Cleared(-1) sentinel with ZERO reader calls.
+        if (!bbcGateOpen()) return BbcPolicy.Cleared(-1L)
         val gen0: Long
         var isFollower = false
         synchronized(lock) {
