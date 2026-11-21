@@ -28,6 +28,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 class PhaseDConfirmDialogTest {
@@ -354,6 +355,26 @@ class PhaseDConfirmDialogTest {
         // 直接呼叫 onClearVerified/onForceClear 的路徑；Back/觸外走 onCancel).
         // Neutral (仍要清除) / Negative (取消) 的 widget 層 isEnabled/click/dismiss
         // 需真機驗證，見尾 MATRIX M2 (DEVICE-UNVERIFIED)；此處不宣稱其可用。
+    }
+
+    // PR-74 A3 (P3)：onDestroy 的 dialog handle 釋放語義——純函式 seam，以假 handle
+    // 驗證「dismiss 一次＋回 null」，且 dismiss 拋出時仍清空（不阻斷後續 handle）。
+    // 真正的 AlertDialog.show()/dismiss() 仍 DEVICE-UNVERIFIED（見尾 MATRIX M2）。
+    @Test
+    fun dialogHandle_dismissBestEffort_returnsNull_evenOnThrow() {
+        class FakeHandle(var dismissCount: Int = 0, val throwOnDismiss: Boolean = false)
+
+        val ok = FakeHandle()
+        assertNull(dismissDialogHandle(ok) { it.dismissCount++ })
+        assertEquals(1, ok.dismissCount)
+        assertNull(dismissDialogHandle(null) { fail("null handle must not dismiss") })
+
+        val broken = FakeHandle(throwOnDismiss = true)
+        assertNull(dismissDialogHandle(broken) {
+            it.dismissCount++
+            throw IllegalStateException("BadToken")
+        })
+        assertEquals(1, broken.dismissCount)
     }
 }
 

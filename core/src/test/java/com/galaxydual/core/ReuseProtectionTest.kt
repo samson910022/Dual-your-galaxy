@@ -136,6 +136,25 @@ class ReuseProtectionTest {
         return (result ?: error("suspend block never resumed")).getOrThrow()
     }
 
+    // PR-74 A2: the public fresh-fetch seam used by the app-side ROOT-uninstall
+    // click fence must run a genuinely NEW identity triple every call (never
+    // cached from inventory/vm state), so a delete+recreate that reuses id 95
+    // with a new serial is observable and the destructive action is refused.
+    @Test
+    fun freshVerifiedTargetFetch_isGenuinelyNew_reflectsSerialFlip() {
+        val gw = FlipGateway(
+            verboseSerials = mutableListOf(7, 8),
+            dumpsysSerials = mutableListOf(7, 8),
+        )
+        val repo = DualRepository(gw)
+        assertEquals(VerifiedTarget(95, 7, 0), runSuspend { repo.fetchFreshVerifiedTarget() })
+        assertEquals(VerifiedTarget(95, 8, 0), runSuspend { repo.fetchFreshVerifiedTarget() })
+        // 每次 fetch 都重新跑三通道（no cache / no shortcut）。
+        assertEquals(2, gw.commands.count { it == DualRepository.CMD_USER_LIST_VERBOSE })
+        assertEquals(2, gw.commands.count { it == DualRepository.CMD_DUMPSYS_USER })
+        assertEquals(2, gw.commands.count { it == DualRepository.CMD_GETPROP_DUAL })
+    }
+
     // Auto clone with a reused id (resolve serial 15, fresh serial 99) is
     // refused with zero install-existing writes. Refused (not NoDual) proves
     // the reuse guard fired rather than a plain unknown.

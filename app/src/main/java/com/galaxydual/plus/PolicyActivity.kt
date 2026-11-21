@@ -117,6 +117,9 @@ class PolicyActivity : ComponentActivity() {
     // Editor 至少 dialog 欄位化＋onDestroy dismiss＋onSaveInstanceState 世代保留（見下）。
     private var policyConfirmDialog: AlertDialog? = null
     private val policyConfirmState = PolicyConfirmDialogState()
+    // PR-74 A3：pre-clear 警告／ROOT 二次確認／卸載驗證對話框 handle（onDestroy 釋放，
+    // 與 MainActivity 同源；先前 show() 後丟棄 handle 致舊 Activity window 洩漏）。
+    private val destructiveDialogHandles = DestructiveDialogHandles()
     // Issue #73：候選集清空＝整組清除持久化草稿＝ BBC6 風險（政策清空＝Samsung 自動
     // 刪除 verified target 分身，資料不可復原）。先探測分身安裝狀態並顯示警告對話框，
     // 通過後才執行實際寫入／保持未勾選；詳見 MainActivity 同名流程。
@@ -202,9 +205,9 @@ class PolicyActivity : ComponentActivity() {
             // Failed 一律走探測失敗警告；Ok(non-empty) 走雙開提醒。
             // Phase C：僅探 delta（old-minus-candidate）。
             // R05/NEW-1：uid 由 verified target 解析，unverified => Failed 警告。
-            val verifiedUid = resolvePreClearDualUserId(vm.state.value)
+            val verifiedTarget = resolvePreClearDualTarget(vm.state.value)
             val probe = try {
-                probeDualApps(delta, verifiedUid)
+                probeDualApps(delta, verifiedTarget?.userId)
             } catch (e: CancellationException) {
                 setPendingClearConfirm(false)
                 throw e
@@ -236,9 +239,11 @@ class PolicyActivity : ComponentActivity() {
                         probe.installed,
                         onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, sanitizedCandidate) },
                         onCancel = { setPendingClearConfirm(false); onCancel() },
-                        resolveLiveUserId = { resolvePreClearDualUserId(vm.state.value) },
-                        userId = verifiedUid,
-                        rootUninstallAllowed = verifiedUid != null,
+                        resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
+                        fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
+                        dialogHandles = destructiveDialogHandles,
+                        capturedTarget = verifiedTarget,
+                        rootUninstallAllowed = verifiedTarget != null,
                     )
                 }
             }
@@ -445,6 +450,14 @@ class PolicyActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         policyConfirmDialog = null
+        // PR-74 A3：破壞性路徑三個 handle 逐一 best-effort dismiss + null
+        // （與 MainActivity.onDestroy 同口徑；單一失敗不阻斷後續）。
+        destructiveDialogHandles.preClearWarning =
+            dismissDialogHandle(destructiveDialogHandles.preClearWarning) { it.dismiss() }
+        destructiveDialogHandles.rootConfirm =
+            dismissDialogHandle(destructiveDialogHandles.rootConfirm) { it.dismiss() }
+        destructiveDialogHandles.uninstallVerify =
+            dismissDialogHandle(destructiveDialogHandles.uninstallVerify) { it.dismiss() }
         policyConfirmState.onPendingCleared()
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()

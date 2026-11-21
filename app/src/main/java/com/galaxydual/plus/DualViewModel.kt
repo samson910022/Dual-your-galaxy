@@ -16,6 +16,7 @@ import com.galaxydual.core.ProfilesSnapshot
 import com.galaxydual.core.RefreshOutcome
 import com.galaxydual.core.RemoveOutcome
 import com.galaxydual.core.VerifyState
+import com.galaxydual.core.VerifiedTarget
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.SuElevator
 import com.galaxydual.core.channelReadyFor
@@ -4059,6 +4060,12 @@ class DualViewModel(
     // unblocked.
     private suspend fun <T> onIo(block: suspend () -> T): T =
         withContext(Dispatchers.IO) { block() }
+
+    // PR-74 A2：ROOT 代關點擊當下的新鮮身份查證（薄委派，經 onIo 免阻塞 Main）。
+    // 走 repo.fetchFreshVerifiedTarget() 的真正新 gateway triple（非 state 快取），
+    // 回傳 (id, serial, parentId) 供 app 側 serial-bound TOCTOU fence 比對；
+    // null/Unknown/通道失敗一律由呼叫端 fail closed。cancellation 透傳。
+    suspend fun fetchFreshVerifiedTarget(): VerifiedTarget? = onIo { repo.fetchFreshVerifiedTarget() }
 
     // Phase N2 Shizuku binding teardown (issue #34 re-review), hardened by
     // Phase B P2-2: ViewModel has no onCleared, so the retained + current

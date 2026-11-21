@@ -93,6 +93,7 @@ import com.galaxydual.core.DualRepository
 // Alias: core TRUNCATION_MARKER ("[truncated]") is distinct from the local UI
 // TRUNCATION_MARKER (" [truncated]") used for remove-label shortening below.
 import com.galaxydual.core.TRUNCATION_MARKER as CORE_TRUNCATION_MARKER
+import com.galaxydual.core.VerifiedTarget
 import com.galaxydual.core.ShizukuElevator
 import com.galaxydual.core.ShellEscaper
 import com.galaxydual.core.SuElevator
@@ -303,6 +304,9 @@ class MainActivity : ComponentActivity() {
     // dismiss，否則舊 Activity 的 window 洩漏。
     private var exportDialog: AlertDialog? = null
     private var settingsDialog: AlertDialog? = null
+    // PR-74 A3：pre-clear 警告／ROOT 二次確認／卸載驗證對話框 handle（onDestroy 釋放，
+    // 避免舊 Activity 的 window 洩漏；與既有 export/settings dialog 同一生命周期語義）。
+    private val destructiveDialogHandles = DestructiveDialogHandles()
 
     // Main-thread delivery for binder/permission callbacks; the ViewModel
     // entry points are thread-safe anyway (viewModelScope), this only keeps
@@ -638,6 +642,14 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         settingsDialog = null
+        // PR-74 A3：破壞性路徑的三個對話框 handle 逐一 best-effort dismiss + null
+        // （單一 handle 失敗不阻斷後續；dismissDialogHandle 為 JVM 可測純函式）。
+        destructiveDialogHandles.preClearWarning =
+            dismissDialogHandle(destructiveDialogHandles.preClearWarning) { it.dismiss() }
+        destructiveDialogHandles.rootConfirm =
+            dismissDialogHandle(destructiveDialogHandles.rootConfirm) { it.dismiss() }
+        destructiveDialogHandles.uninstallVerify =
+            dismissDialogHandle(destructiveDialogHandles.uninstallVerify) { it.dismiss() }
         try {
             catalogJob?.cancel()
         } catch (_: Exception) {
@@ -5999,9 +6011,9 @@ class MainActivity : ComponentActivity() {
             // Failure/截斷皆靜默當空，失敗警告為死碼；現皆歸 Failed 使其變活）。
             // Phase C：僅探 delta（old-minus-candidate），非全量 old。
             // R05/NEW-1：uid 必須來自 verified target；unverified => Failed 警告。
-            val verifiedUid = resolvePreClearDualUserId(vm.state.value)
+            val verifiedTarget = resolvePreClearDualTarget(vm.state.value)
             val probe = try {
-                probeDualApps(delta, verifiedUid)
+                probeDualApps(delta, verifiedTarget?.userId)
             } catch (e: CancellationException) {
                 setPendingClearConfirm(false)
                 throw e
@@ -6033,9 +6045,11 @@ class MainActivity : ComponentActivity() {
                         probe.installed,
                         onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
                         onCancel = { setPendingClearConfirm(false); onCancel() },
-                        resolveLiveUserId = { resolvePreClearDualUserId(vm.state.value) },
-                        userId = verifiedUid,
-                        rootUninstallAllowed = verifiedUid != null,
+                        resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
+                        fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
+                        dialogHandles = destructiveDialogHandles,
+                        capturedTarget = verifiedTarget,
+                        rootUninstallAllowed = verifiedTarget != null,
                     )
                 }
             }
@@ -6093,9 +6107,9 @@ class MainActivity : ComponentActivity() {
         setPendingClearConfirm(true)
         lifecycleScope.launch {
             // R05/NEW-1：同 requestPreClearWarning，uid 來自 verified target。
-            val verifiedUid = resolvePreClearDualUserId(vm.state.value)
+            val verifiedTarget = resolvePreClearDualTarget(vm.state.value)
             val probe = try {
-                probeDualApps(delta, verifiedUid)
+                probeDualApps(delta, verifiedTarget?.userId)
             } catch (e: CancellationException) {
                 setPendingClearConfirm(false)
                 throw e
@@ -6133,9 +6147,11 @@ class MainActivity : ComponentActivity() {
                             if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
                         },
                         onCancel = { setPendingClearConfirm(false); onCancel() },
-                        resolveLiveUserId = { resolvePreClearDualUserId(vm.state.value) },
-                        userId = verifiedUid,
-                        rootUninstallAllowed = verifiedUid != null,
+                        resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
+                        fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
+                        dialogHandles = destructiveDialogHandles,
+                        capturedTarget = verifiedTarget,
+                        rootUninstallAllowed = verifiedTarget != null,
                     )
                 }
             }
@@ -6347,8 +6363,14 @@ internal fun shouldShowBlankInputReason(isBlank: Boolean, busy: Boolean, writeBl
 internal fun verifiedTargetAvailable(s: UiState): Boolean =
     s.inventory.targetId > 0 && s.inventory.targetSerial != null
 
-// R05/NEW-1 / Phase1 review(HIGH)：pre-clear 破壞性路徑（probe／uninstall／
-// ROOT 代關按鈕）唯一的 uid 來源。
+// PR-74 A2：pre-clear 破壞性路徑捕獲的目標身份＝(id, serial) 配對（不可變值）。
+// 只帶 app 側需要的兩欄（對應 core.VerifiedTarget 的 userId/serial），避免破壞性
+// 路徑的公開簽名依賴 core 的完整 target；serial 可空是因 legacy/SerialUnavailable
+// 快照存在，但 resolvePreClearDualTarget 永不產出 serial=null 的捕獲值。
+internal data class PreClearDualTarget(val userId: Int, val serial: Int?)
+
+// R05/NEW-1 / Phase1 review(HIGH) / PR-74 A2：pre-clear 破壞性路徑（probe／uninstall／
+// ROOT 代關按鈕）唯一的身份來源，現在回傳 (id, serial) 而非裸 id。
 //
 // 授權不變數（invariant）：只有「新鮮且已驗證」的 target 才授權破壞性動作——
 // targetId>0、targetSerial 已知，且 inventory.freshness == FRESH。STALE／UNKNOWN
@@ -6356,21 +6378,39 @@ internal fun verifiedTargetAvailable(s: UiState): Boolean =
 // profile remap（95→96）後拿到陳舊 id 而誤授權 pm uninstall／probe 到錯誤 profile，
 // 故一律回 null = fail-closed。
 //
-// 為何不再追加 Confirmed pin 欄位：UiState 沒有比 FRESH 更權威且便宜的 Confirmed
-// pin（inventory.freshness==FRESH 已是 pinned verify 成功的產物）；因此本路徑的安全
-// 條件是「FRESH + click-time re-resolve」——警告顯示時解析的 id 只是候選，真正執行前
-// 必須經 preClearUidStillValid 以當下 vm.state.value 重解析確認（見 showPreClearWarning）。
+// PR-74 A2 (P2)：id 單獨不足以辨識 profile 實例——delete+recreate 可重用同一 id
+// 但換發新 serial；因此捕獲值必須帶 serial，且點擊當下要再比較 serial（見
+// preClearTargetStillValid）並做新鮮 verified-target fetch（見
+// rootUninstallIfTargetStillValid），對齊 core.continuityBreach 的 fail-closed 語意。
 // 字面 95 只是 device hypothesis（profile 可被 remap），永不授權破壞性動作。
-internal fun resolvePreClearDualUserId(s: UiState): Int? =
+internal fun resolvePreClearDualTarget(s: UiState): PreClearDualTarget? =
     if (verifiedTargetAvailable(s) && s.inventory.freshness == InventoryFreshness.FRESH) {
-        s.inventory.targetId
+        PreClearDualTarget(s.inventory.targetId, s.inventory.targetSerial)
     } else {
         null
     }
 
-// Phase1 review(HIGH)：ROOT 代關 Neutral OK 點擊當下的 TOCTOU fence（純函數、JVM 可測）。
-// captured=警告顯示時解析的 id；live=點擊瞬間從 vm.state.value 重解析的 id。
-// 只有兩者皆非 null、皆 >0 且相等才放行；null／mismatch（含 remap 95→96）一律 false。
+// 既有 int-only 呼叫端/測試的薄別名（只取 id）；ROOT 代關 uninstall 嚴禁只靠它
+// 授權——必須走 resolvePreClearDualTarget + preClearTargetStillValid（serial 綁定）。
+internal fun resolvePreClearDualUserId(s: UiState): Int? = resolvePreClearDualTarget(s)?.userId
+
+// PR-74 A2 (P2)：serial-bound TOCTOU fence（純函數、JVM 可測）。
+// captured=警告顯示時捕獲的 (id,serial)；live=點擊瞬間從 vm.state.value 重解析的
+// (id,serial)（或新鮮 fetch 的 (id,serial)，見 rootUninstallIfTargetStillValid）。
+// 放行條件：兩者皆非 null、id>0、serial 非 null，且 id 與 serial 皆相等。
+// 同 id 換 serial（delete+recreate）、known serial→null（continuity lost）、
+// remap 95→96、任一 null/<=0 一律 false，對齊 core.continuityBreach。
+internal fun preClearTargetStillValid(
+    captured: PreClearDualTarget?,
+    live: PreClearDualTarget?,
+): Boolean =
+    captured != null && live != null &&
+        captured.userId > 0 && live.userId > 0 &&
+        captured.serial != null && live.serial != null &&
+        captured.userId == live.userId && captured.serial == live.serial
+
+// 舊 int-only fence：保留供既有測試（95/96 remap）與非破壞性推導使用；
+// 破壞性 ROOT 路徑不得只靠它授權（無 serial 綁定，無法攔截同 id 重建）。
 internal fun preClearUidStillValid(captured: Int?, live: Int?): Boolean =
     captured != null && live != null && captured > 0 && live > 0 && captured == live
 
@@ -7661,6 +7701,86 @@ internal suspend fun uninstallDualApps(
     }
 }
 
+// PR-74 A2 (P2)：ROOT 代關二次確認 OK 點擊當下的 serial-bound fence（suspend seam，
+// JVM 可測）。三道關卡全過才執行 uninstall：
+//  (1) 捕獲 (id,serial) 與當下 vm.state.value 重解析值一致（STALE／remap 攔截）；
+//  (2) 真正新鮮的 verified-target fetch 成功（非 state／inventory 快取）；
+//  (3) 新鮮值的 (id,serial) 仍與捕獲一致（delete+recreate 同 id 換 serial、
+//      known serial→null 皆攔截，對齊 core.continuityBreach）。
+// uninstall 以 lambda 注入：JVM 測試用 FakeGateway call log 證明 abort 路徑零呼叫；
+// 生產傳 { pkgs, uid -> uninstallDualApps(pkgs, uid) }。回傳有效 uid 表示 uninstall
+// 已執行（其失敗仍不阻擋後續驗證，沿用既有「失敗只記 log」語意）；任一關失敗回
+// null（呼叫端 Toast + onCancel，不 uninstall、不 re-probe、不 proceed）。
+internal suspend fun rootUninstallIfTargetStillValid(
+    installed: List<String>,
+    captured: PreClearDualTarget?,
+    resolveLiveTarget: () -> PreClearDualTarget?,
+    fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
+    uninstall: suspend (List<String>, Int) -> Boolean,
+): Int? {
+    val live: PreClearDualTarget? = try {
+        resolveLiveTarget()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        preClearLog("root-uninstall live re-resolve failed", e)
+        null
+    }
+    if (!preClearTargetStillValid(captured, live)) {
+        preClearLog("root-uninstall aborted: live target lost or changed (id+serial)")
+        return null
+    }
+    val fresh: VerifiedTarget? = try {
+        fetchFreshVerifiedTarget()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        preClearLog("root-uninstall fresh verified-target fetch failed", e)
+        null
+    }
+    val freshTarget: PreClearDualTarget? = fresh?.let { PreClearDualTarget(it.userId, it.serial) }
+    if (!preClearTargetStillValid(captured, freshTarget)) {
+        preClearLog("root-uninstall aborted: fresh target lost/recreated (id+serial)")
+        return null
+    }
+    // 兩道 fence 已確認三者 (id,serial) 相同；用捕獲 id 執行（與 live/fresh 相等）。
+    // uninstall 本身的失敗沿用既有「只記 log、仍讓後續驗證決定」語意（成敗回傳值
+    // 不影響 fence 結論），只有 cancellation 透傳。
+    val effectiveUid = captured!!.userId
+    try {
+        uninstall(installed, effectiveUid)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        preClearLog("dual-profile uninstall failed", e)
+    }
+    return effectiveUid
+}
+
+// PR-74 A3 (P3)：破壞性路徑對話框 handle 收集器（Activity 欄位持有，onDestroy 一次結清）。
+// showPreClearWarning 的警告／ROOT 二次確認與 showUninstallVerifyDialog 的驗證對話框
+// 先前 show() 後即丟棄 handle，銷毀時無法 dismiss → 舊 Activity window 洩漏；改由此
+// holder 統一持有，onDestroy 逐個 best-effort dismiss + null（不影響按鈕行為）。
+internal class DestructiveDialogHandles {
+    var preClearWarning: AlertDialog? = null
+    var rootConfirm: AlertDialog? = null
+    var uninstallVerify: AlertDialog? = null
+}
+
+// PR-74 A3：best-effort 關閉單一 handle 並回 null（純函式、JVM 可測：dismiss lambda
+// 可注入假物件）。即使 dismiss 拋出仍吞掉並照樣清空，避免第一個 handle 失敗阻斷
+// 後續 handle 的釋放（與既有 onDestroy 的 try/catch 風格一致）。
+internal fun <T> dismissDialogHandle(handle: T?, dismiss: (T) -> Unit): T? {
+    if (handle != null) {
+        try {
+            dismiss(handle)
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+    }
+    return null
+}
+
 // 清除政策前雙開提醒對話框。
 // Phase B：僅接受 Ok(non-empty)的 installed 清單。Ok(empty) 由呼叫端直接放行
 // （requestPreClearWarning 的 Ok(empty) 分支），Failed 一律走探測失敗警告；
@@ -7670,23 +7790,30 @@ internal suspend fun uninstallDualApps(
 // onCancel＝取消清除（Negative／返回鍵／點擊外部／ROOT 代關二次確認中取消；呼叫端負責還原勾選等）。
 // Neutral（ROOT 代關）先補一道不可復原的二次確認；確認後對 installed 全部套用
 // pm uninstall --user <verified uid>，失敗仍 proceed（只記 log；使用者意圖優先）。
-// R05/NEW-1：只有 verified target 存在（rootUninstallAllowed && userId != null）
-// 才顯示 ROOT 代關 Neutral；unverified 時該按鈕完全不出現，杜絕 unresolved uid
-// 的破壞性 pm uninstall。兩參數預設皆為 fail-closed（false / null）。
+// R05/NEW-1：只有 verified target 存在（rootUninstallAllowed && capturedTarget != null
+// && serial 已知）才顯示 ROOT 代關 Neutral；unverified 時該按鈕完全不出現，杜絕
+// unresolved uid 的破壞性 pm uninstall。兩參數預設皆為 fail-closed（false / null）。
 //
-// Phase1 review(HIGH/TOCTOU)：userId 是警告顯示時解析的候選值，可能被 remap／轉 STALE。
-// resolveLiveUserId 由呼叫端綁定 vm.state.value（即 { resolvePreClearDualUserId(vm.state.value) }），
-// 在二次確認 OK 點擊當下重新解析；只有 preClearUidStillValid(captured, live) 成立才執行
-// uninstall／re-probe，否則完全不執行、發出 fail-closed 訊息並 onCancel 還原 UI 狀態。
-// 參數無預設值：任何新呼叫端都必須明確提供重解析來源（fail-closed 編譯期約束）。
+// Phase1 review(HIGH/TOCTOU) + PR-74 A2 (P2)：capturedTarget 是警告顯示時捕獲的
+// (id,serial) 候選值，可能被 remap／轉 STALE／同 id 重建（新 serial）。
+// resolveLiveTarget 由呼叫端綁定 vm.state.value（{ resolvePreClearDualTarget(...) }），
+// fetchFreshVerifiedTarget 綁定 VM→repo 的真正新 gateway triple（非 state 快取）。
+// 兩者在二次確認 OK 點擊當下經 rootUninstallIfTargetStillValid 做 serial-bound fence；
+// 只有 preClearTargetStillValid 對 live 與 fresh 皆成立才執行 uninstall／re-probe，
+// 否則完全不執行、發出 fail-closed 訊息並 onCancel 還原 UI 狀態。
+// 三個新參數皆無預設值：任何新呼叫端都必須明確提供 fence 來源與 dialog holder
+// （fail-closed 編譯期約束）。
+// PR-74 A3：dialogHandles 收集本對話框與其巢狀 confirm／verify handle，供 onDestroy 釋放。
 internal fun showPreClearWarning(
     host: ComponentActivity,
     installed: List<String>,
     onProceed: () -> Unit,
     onCancel: () -> Unit,
-    resolveLiveUserId: () -> Int?,
+    resolveLiveTarget: () -> PreClearDualTarget?,
+    fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
+    dialogHandles: DestructiveDialogHandles,
     proceedLabelRes: Int = R.string.pre_clear_confirm_proceed,
-    userId: Int? = null,
+    capturedTarget: PreClearDualTarget? = null,
     rootUninstallAllowed: Boolean = false,
 ) {
     if (installed.isEmpty()) {
@@ -7695,7 +7822,8 @@ internal fun showPreClearWarning(
         return
     }
     if (host.isFinishing || host.isDestroyed) { onCancel(); return }
-    val canRootUninstall = rootUninstallAllowed && preClearRootUninstallAllowed(userId)
+    val canRootUninstall = rootUninstallAllowed && capturedTarget != null &&
+        capturedTarget.serial != null && preClearRootUninstallAllowed(capturedTarget.userId)
     val sorted = installed.sorted()
     val shown = sorted.take(PRE_CLEAR_LIST_MAX)
     val list = shown.joinToString("\n") + if (sorted.size > PRE_CLEAR_LIST_MAX) "\n…" else ""
@@ -7722,7 +7850,8 @@ internal fun showPreClearWarning(
                 // Phase D：二次確認通過後先執行卸載，再重跑 probeDualApps 驗證：
                 // 殘留非空即失敗；驗證結果經三選一對話框明確選擇（驗證成功→清除／
                 // 仍要清除自擔／取消），失敗 never 默認 proceed。
-                try {
+                // PR-74 A3：保存 handle 供 onDestroy 釋放（先前直接丟棄 → window 洩漏）。
+                dialogHandles.rootConfirm = try {
                     AlertDialog.Builder(host)
                         .setTitle(R.string.pre_clear_root_uninstall)
                         .setMessage(
@@ -7742,31 +7871,35 @@ internal fun showPreClearWarning(
                         )
                         .setCancelable(true)
                         .setPositiveButton(android.R.string.ok) { _, _ ->
-                            // Phase1 review(HIGH/TOCTOU)：執行前以「當下」vm.state.value 重解析，
-                            // 永不重用警告顯示時捕獲的 userId（可能 remap 95→96／轉 STALE）。
-                            val liveUid = try {
-                                resolveLiveUserId()
-                            } catch (e: Exception) {
-                                preClearLog("root-uninstall re-resolve failed", e)
-                                null
-                            }
-                            if (!preClearUidStillValid(userId, liveUid)) {
-                                // fail-closed：不 uninstall、不 re-probe、不 proceed。
-                                preClearLog("root-uninstall aborted: verified uid no longer valid")
-                                try {
-                                    Toast.makeText(host, R.string.pre_clear_target_changed, Toast.LENGTH_LONG).show()
-                                } catch (_: Exception) { }
-                                try { onCancel() } catch (_: Exception) { }
-                                return@setPositiveButton
-                            }
-                            val effectiveUid = liveUid!!
+                            // PR-74 A2 (P2)：執行前兩道 serial-bound fence——
+                            //  (1) 當下 vm.state.value 重解析 (id,serial) 與捕獲一致；
+                            //  (2) 真正新鮮 verified-target fetch 的 (id,serial) 仍一致。
+                            // fresh fetch 是 suspend，故整道 fence 放進既有 launch；
+                            // delete+recreate 同 id 換 serial（continuityBreach）與
+                            // known→null 皆攔截；任一失敗不 uninstall／re-probe／proceed。
                             host.lifecycleScope.launch {
-                                try {
-                                    uninstallDualApps(installed, effectiveUid)
+                                val effectiveUid: Int? = try {
+                                    rootUninstallIfTargetStillValid(
+                                        installed = installed,
+                                        captured = capturedTarget,
+                                        resolveLiveTarget = resolveLiveTarget,
+                                        fetchFreshVerifiedTarget = fetchFreshVerifiedTarget,
+                                        uninstall = { pkgs, uid -> uninstallDualApps(pkgs, uid) },
+                                    )
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (e: Exception) {
-                                    preClearLog("dual-profile uninstall failed", e)
+                                    preClearLog("root-uninstall fresh target check failed", e)
+                                    null
+                                }
+                                if (effectiveUid == null) {
+                                    // fail-closed：uninstall／re-probe／proceed 全不做。
+                                    preClearLog("root-uninstall aborted: verified target no longer valid")
+                                    try {
+                                        Toast.makeText(host, R.string.pre_clear_target_changed, Toast.LENGTH_LONG).show()
+                                    } catch (_: Exception) { }
+                                    try { onCancel() } catch (_: Exception) { }
+                                    return@launch
                                 }
                                 // Phase D post-verify: re-probe the same warned set.
                                 // Residual non-empty (or probe failure) = verification
@@ -7800,6 +7933,7 @@ internal fun showPreClearWarning(
                                         onClearVerified = { onProceed() },
                                         onForceClear = { onProceed() },
                                         onCancel = { onCancel() },
+                                        dialogHandles = dialogHandles,
                                     )
                                 } catch (e: CancellationException) {
                                     throw e
@@ -7815,11 +7949,13 @@ internal fun showPreClearWarning(
                 } catch (e: RuntimeException) {
                     preClearLog("pre-clear root-uninstall confirm failed to show", e)
                     onCancel()
+                    null
                 }
             }
         }
         builder.setOnCancelListener { onCancel() }
-        builder.show()
+        // PR-74 A3：保存警告對話框 handle 供 onDestroy 釋放。
+        dialogHandles.preClearWarning = builder.show()
     } catch (e: RuntimeException) {
         // BadToken / OOM 等 → 視同取消（不默默放行，由呼叫端重置旗標）。
         preClearLog("pre-clear warning failed to show", e)
@@ -7840,6 +7976,7 @@ internal fun showUninstallVerifyDialog(
     onClearVerified: () -> Unit,
     onForceClear: () -> Unit,
     onCancel: () -> Unit,
+    dialogHandles: DestructiveDialogHandles,
 ) {
     if (host.isFinishing || host.isDestroyed) { onCancel(); return }
     val message: String = try {
@@ -7872,6 +8009,9 @@ internal fun showUninstallVerifyDialog(
             .setNegativeButton(R.string.pre_clear_cancel, null)
             .setOnCancelListener { onCancel() }
             .show()
+        // PR-74 A3：保存 handle 供 onDestroy 釋放（按鈕自身 dismiss 後仍留在 holder，
+        // onDestroy 再 best-effort dismiss 一次無副作用）。
+        dialogHandles.uninstallVerify = dialog
         val positiveEnabled = uninstallVerifyPositiveEnabled(outcome)
         dialog.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
             isEnabled = positiveEnabled

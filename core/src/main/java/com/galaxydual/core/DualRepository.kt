@@ -658,6 +658,13 @@ class DualRepository(
     // Unknown/Refused/channel failure (fail closed).
     private suspend fun fetchVerifiedTarget(): VerifiedTarget? = gateway.fetchVerifiedTarget()
 
+    // PR-74 A2: 公開的新鮮 verified-target fetch，供 app 側 ROOT 代關點擊當下的
+    // TOCTOU fence 使用。與上面 private helper 同一個 gateway triple（無快取、
+    // 不重用 inventory 快照），因此 delete+recreate 重用同一 id 但換了 serial
+    // 會在比對時被攔下；null = Unknown/Refused/通道失敗，呼叫端一律 fail closed。
+    // 僅 cancellation 會拋出（與 canonical fetch 一致）。
+    suspend fun fetchFreshVerifiedTarget(): VerifiedTarget? = fetchVerifiedTarget()
+
     // Single shared serial-bound identity fetch (PR-33 R2, P1; single-source
     // policy PR-33 D2): same three gateway runs, CancellationException
     // rethrow, and fail-closed mapping as fetchVerifiedDualId, but keeps the

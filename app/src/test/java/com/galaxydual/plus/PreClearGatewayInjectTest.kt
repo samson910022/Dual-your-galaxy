@@ -12,6 +12,7 @@ import com.galaxydual.core.CmdGateway
 import com.galaxydual.core.CmdResult
 import com.galaxydual.core.Privilege
 import com.galaxydual.core.TRUNCATION_MARKER
+import com.galaxydual.core.VerifiedTarget
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -290,5 +291,143 @@ class PreClearGatewayInjectTest {
         assertFalse(preClearUidStillValid(null, null))
         assertFalse(preClearUidStillValid(0, 0))
         assertFalse(preClearUidStillValid(-1, -1))
+    }
+
+    // ---- PR-74 A2 (P2): id+serial 綁定的 TOCTOU fence（同 id 換 serial 必拒） ----
+
+    private fun freshState(id: Int = 95, serial: Int? = 7): UiState = UiState(
+        inventory = InventorySnapshot(
+            targetId = id,
+            targetSerial = serial,
+            freshness = InventoryFreshness.FRESH,
+        ),
+    )
+
+    private class FenceHarness(
+        private val captured: PreClearDualTarget? = PreClearDualTarget(95, 7),
+        live: PreClearDualTarget? = PreClearDualTarget(95, 7),
+        fresh: VerifiedTarget? = VerifiedTarget(95, 7, 0),
+    ) {
+        val gw = FakeGateway(CmdResult(0, "", ""))
+        var liveTarget: PreClearDualTarget? = live
+        var freshTarget: VerifiedTarget? = fresh
+        var freshError: Throwable? = null
+
+        suspend fun run(pkgs: List<String> = listOf("com.a.app")): Int? =
+            rootUninstallIfTargetStillValid(
+                installed = pkgs,
+                captured = captured,
+                resolveLiveTarget = { liveTarget },
+                fetchFreshVerifiedTarget = {
+                    freshError?.let { throw it }
+                    freshTarget
+                },
+                // FakeGateway call log：abort 路徑必須 0 呼叫 uninstall。
+                uninstall = { p, uid -> uninstallDualApps(p, uid, gw) },
+            )
+    }
+
+    @Test
+    fun resolvePreClearDualTarget_capturesSerial_freshOnly() {
+        assertEquals(PreClearDualTarget(95, 7), resolvePreClearDualTarget(freshState()))
+        assertEquals(PreClearDualTarget(101, 8), resolvePreClearDualTarget(freshState(101, 8)))
+        // 與 int 薄別名一致（既有呼叫端/測試不破壞）。
+        assertEquals(95, resolvePreClearDualUserId(freshState()))
+        // STALE/UNKNOWN/serial-null/id<=0 一律 null（fail closed）。
+        val stale = freshState().copy(
+            inventory = freshState().inventory.copy(freshness = InventoryFreshness.STALE),
+        )
+        assertNull(resolvePreClearDualTarget(stale))
+        assertNull(resolvePreClearDualTarget(freshState(serial = null)))
+        assertNull(resolvePreClearDualTarget(freshState(id = -1)))
+    }
+
+    @Test
+    fun preClearTargetStillValid_serialBinding_failsClosed() {
+        val captured = PreClearDualTarget(95, 7)
+        assertTrue(preClearTargetStillValid(captured, PreClearDualTarget(95, 7)))
+        // 同 id 換 serial（delete+recreate）＝身份重用，必須拒絕。
+        assertFalse(preClearTargetStillValid(captured, PreClearDualTarget(95, 8)))
+        // known serial -> null（continuity lost）必須拒絕。
+        assertFalse(preClearTargetStillValid(captured, PreClearDualTarget(95, null)))
+        // remap / null / 非正 id 皆拒絕。
+        assertFalse(preClearTargetStillValid(captured, PreClearDualTarget(96, 7)))
+        assertFalse(preClearTargetStillValid(captured, null))
+        assertFalse(preClearTargetStillValid(null, PreClearDualTarget(95, 7)))
+        assertFalse(preClearTargetStillValid(PreClearDualTarget(-1, 7), PreClearDualTarget(-1, 7)))
+    }
+
+    @Test
+    fun rootUninstall_sameIdSameSerial_uninstallsOnce() {
+        val h = FenceHarness()
+        assertEquals(95, runBlocking { h.run() })
+        assertEquals("fresh 通過後應執行一次 uninstall", 1, h.gw.calls)
+        assertTrue((h.gw.lastCmd ?: "").contains("--user 95"))
+    }
+
+    @Test
+    fun rootUninstall_sameIdDifferentSerial_abortsWithoutUninstall() {
+        // 精確事故形狀：id 重用但 serial 翻新（live 仍舊、fresh 是新 serial）。
+        val h = FenceHarness(fresh = VerifiedTarget(95, 8, 0))
+        assertNull(runBlocking { h.run() })
+        assertEquals("serial 翻新絕不 uninstall", 0, h.gw.calls)
+    }
+
+    @Test
+    fun rootUninstall_liveSerialChanged_abortsWithoutUninstall() {
+        // inventory 在警告顯示後被改寫為同 id 新 serial（recreate），点击當下即攔。
+        val h = FenceHarness(live = PreClearDualTarget(95, 8))
+        assertNull(runBlocking { h.run() })
+        assertEquals(0, h.gw.calls)
+    }
+
+    @Test
+    fun rootUninstall_knownSerialToNull_abortsWithoutUninstall() {
+        // continuity lost：fresh 查不到 serial（expected known -> fresh null）。
+        val h = FenceHarness(fresh = VerifiedTarget(95, null, 0))
+        assertNull(runBlocking { h.run() })
+        assertEquals(0, h.gw.calls)
+        // live 的 serial 消失亦同。
+        val h2 = FenceHarness(live = PreClearDualTarget(95, null))
+        assertNull(runBlocking { h2.run() })
+        assertEquals(0, h2.gw.calls)
+    }
+
+    @Test
+    fun rootUninstall_freshToStaleAtClick_abortsWithoutUninstall() {
+        // 警告顯示時 FRESH，点击瞬間 inventory 已被標 STALE（resolveLive 回 null）。
+        val stale = freshState().copy(
+            inventory = freshState().inventory.copy(freshness = InventoryFreshness.STALE),
+        )
+        assertNull(resolvePreClearDualTarget(stale))
+        val h = FenceHarness()
+        h.liveTarget = resolvePreClearDualTarget(stale)
+        assertNull(runBlocking { h.run() })
+        assertEquals(0, h.gw.calls)
+    }
+
+    @Test
+    fun rootUninstall_nullOrUnverified_abortsWithoutUninstall() {
+        // captured null（警告顯示時 unverified）。
+        val h1 = FenceHarness(captured = null)
+        assertNull(runBlocking { h1.run() })
+        assertEquals(0, h1.gw.calls)
+        // fresh fetch 回 null（Unknown/Refused/通道失敗）。
+        val h2 = FenceHarness(fresh = null)
+        assertNull(runBlocking { h2.run() })
+        assertEquals(0, h2.gw.calls)
+        // live 回 null（unverified / remap 已丟目標）。
+        val h3 = FenceHarness(live = null)
+        assertNull(runBlocking { h3.run() })
+        assertEquals(0, h3.gw.calls)
+    }
+
+    @Test
+    fun rootUninstall_freshFetchThrows_abortsWithoutUninstall() {
+        // gateway 查詢例外被 fence 吞成 null（取消除外），仍 fail closed 零 uninstall。
+        val h = FenceHarness()
+        h.freshError = IllegalStateException("identity channel boom")
+        assertNull(runBlocking { h.run() })
+        assertEquals(0, h.gw.calls)
     }
 }
