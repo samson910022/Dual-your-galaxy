@@ -85,6 +85,17 @@ class DualHookDeadlineParityTest {
         )
     }
 
+    /**
+     * NON-BEHAVIORAL source-parity guard — NOT behavioral coverage.
+     *
+     * This test reads DualHook.kt as text (regex/indexOf) and pins only the
+     * structural contract that EffectivePolicyDeadlineTest's mirror assumes.
+     * It asserts nothing about runtime behavior, so do not count it as
+     * behavioral coverage for the deadline orchestration — that coverage lives
+     * in EffectivePolicyDeadlineTest. Keep these assertions intact when adding
+     * behavioral tests: their sole job is to fail loudly on source drift
+     * between production and the mirror.
+     */
     @Test
     fun dualHookDeadlineOrchestrationIsStructurallyPinned() {
         val file = locateDualHookSource()

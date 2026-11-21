@@ -333,18 +333,27 @@ class PhaseDConfirmDialogTest {
     }
 
     @Test
-    fun uninstallVerify_neutralNegative_alwaysAvailable() {
-        // Neutral (仍要清除自擔風險) / Negative (取消) 全 outcome 可點：
-        // dialog 側 isEnabled=true 硬編碼；此處鎖定「失敗不鎖死選擇」語義 —
-        // positive 禁用時，使用者仍可經 neutral/cancel 明確選擇 (never auto-proceed).
+    fun uninstallVerify_positiveDisabledOnFailure_neverAutoProceeds() {
+        // 失敗 outcome (Residual / Failed) 的 positive 一律禁用且點擊 no-op；
+        // 僅 VerifiedEmpty 放行。uninstallVerifyPositiveClickShouldProceed 是 dialog
+        // positive onClick 的單一守衛，下列以真實純謂詞鎖定其規格 —
+        // 「失敗不鎖死選擇、亦不自動 proceed」。
         val residual = decideUninstallVerifyResult(DualProbeResult.Ok(listOf("com.a.app")))
         val failed = decideUninstallVerifyResult(DualProbeResult.Failed("timeout: unknown"))
-        // Positive 禁用 ≠ 無路可走：兩個失敗 outcome 的 positive 皆禁用…
+        val verifiedEmpty = decideUninstallVerifyResult(DualProbeResult.Ok(emptyList()))
+        assertTrue(verifiedEmpty is UninstallVerifyOutcome.VerifiedEmpty)
+        // 失敗態：positive 不得 proceed — Residual / Failed 兩個 outcome 皆 false。
         assertFalse(uninstallVerifyPositiveEnabled(residual))
+        assertFalse(uninstallVerifyPositiveClickShouldProceed(residual))
         assertFalse(uninstallVerifyPositiveEnabled(failed))
-        // …但 dialog 本體不自動 proceed (showUninstallVerifyDialog 內無任何
+        assertFalse(uninstallVerifyPositiveClickShouldProceed(failed))
+        // 成功態：只有 VerifiedEmpty 放行 positive click。
+        assertTrue(uninstallVerifyPositiveEnabled(verifiedEmpty))
+        assertTrue(uninstallVerifyPositiveClickShouldProceed(verifiedEmpty))
+        // dialog 本體不自動 proceed (showUninstallVerifyDialog 內無任何
         // 直接呼叫 onClearVerified/onForceClear 的路徑；Back/觸外走 onCancel).
-        // Widget 層 (isEnabled/click/dismiss) 需真機驗證，見尾 MATRIX (DEVICE-UNVERIFIED).
+        // Neutral (仍要清除) / Negative (取消) 的 widget 層 isEnabled/click/dismiss
+        // 需真機驗證，見尾 MATRIX M2 (DEVICE-UNVERIFIED)；此處不宣稱其可用。
     }
 }
 

@@ -402,9 +402,10 @@ class PolicyPhaseCRequiredTest {
         await { vmB.state.value.pendingPolicyWrite == null }
         assertEquals(setOf("com.b.app"), vmB.state.value.policyDraft)
         // 等A收斂（_latest collector可能已將A更新為B；無論是否收斂，舊綁定皆須作廢）。
-        // 若已收斂，本地三元組失配；若未收斂，coordinator失配。兩者皆false。
-        // 給予短暫收斂窗口後斷言（若仍未收斂，coordinator分支仍保證false）。
-        Thread.sleep(300)
+        // 若已收斂，本地三元組失配；若未收斂，coordinator失配 — 兩條分支都令
+        // isWarningBindingFresh 為 false，故 !fresh 必定成立。改用 condition-based
+        // await 取代固定 Thread.sleep(300)：不依賴 wall-clock 收斂窗口，deterministic。
+        await { !vmA.isWarningBindingFresh(bindingA) }
         assertFalse(vmA.isWarningBindingFresh(bindingA))
         val savesBefore = saveCalls.get()
         vmA.replacePolicyDraft(setOf("com.c.app"), bindingA)
@@ -488,6 +489,10 @@ class PolicyPhaseCRequiredTest {
     }
 
     // 5b. legacy豁免：baseFreshGen==-1跳過權威重讀（後端Unknown仍放行寫入）。
+    // 這是有意保留、已文件化的 legacy carve-out（baseFreshGen == -1L 跳過重讀）：
+    // 所有新 UI 路徑都攜帶 warning binding（baseFreshGen != -1），其 fail-closed
+    // 重讀保證由 5c (freshBinding_withBackendUnknown_abortsZeroSave) 釘住；此 legacy
+    // seam 不適用該 fail-closed 保證。本測試刻意鎖住放行行為，勿「修正」為作廢。
     @Test
     fun legacy_baseFreshGenMinusOne_skipsReread() {
         val fake = FakePolicyStore(initialDraft = setOf("com.a.app"))
@@ -669,6 +674,18 @@ class PolicyPhaseCRequiredTest {
         assertFalse(isWarningBindingFreshPure(2L, 2L, 3L, b))
         assertFalse(isWarningBindingFreshPure(1L, 9L, 3L, b))
         assertFalse(isWarningBindingFreshPure(1L, 2L, 9L, b))
+    }
+
+    // 6i. 純函數 legacy/clear carve-out：candidateFingerprint == null 時略過候選比較，
+    // 任何 live 候選（含空集）皆視為新鮮。這是 clear 路徑／legacy 注入的明確豁免，
+    // 現有 7a/7b/7c2 等呼叫全帶非 null 指紋，故此分支原本未被純函式層覆蓋。
+    @Test
+    fun pure_isWarningCandidateFresh_nullFingerprint_bypassesCandidateCheck() {
+        val legacyBinding = PolicyWarningBinding(rev = 1L, draftVersion = 2L, freshGen = 3L)
+        assertNull(legacyBinding.candidateFingerprint)
+        // null 指紋直接回 true，不比較 live 候選內容。
+        assertTrue(isWarningCandidateFresh(legacyBinding, setOf("com.x.app")))
+        assertTrue(isWarningCandidateFresh(legacyBinding, emptySet()))
     }
 
     // ===== R03 (PR #74)：警告候選凍結＋漂移作廢 =====
