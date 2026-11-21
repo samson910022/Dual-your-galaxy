@@ -665,8 +665,14 @@ class HookPolicyStore(
     // PR #74 G1: BBC injection opt-out (dual_policy/bbc_injection_enabled).
     // SEPARATE from the packages/version single-commit and the poison/seqlock
     // machinery: a boolean preference cannot corrupt the policy draft snapshot.
+    // The BBC key is outside the draft poison/commit fence on purpose.
     // Direct-injected test backends default to "absent" (read => default true,
     // write => false unless a backend is supplied).
+    //
+    // PR #74 R3-1: saveBbcEnabledRaw's Boolean is a WRITE ACK, not a value read:
+    // false => UNKNOWN (BbcWriteOutcome.Unknown), never "the old value is still
+    // in force" — the caller's local RemotePreferences mMap may be optimistically
+    // polluted with the new value even though the commit did not persist.
     private val loadBbcEnabledRaw: () -> Boolean? = { null },
     private val saveBbcEnabledRaw: (Boolean) -> Boolean = { false },
 ) {
@@ -676,6 +682,11 @@ class HookPolicyStore(
     // behavior; "off" is not a safety guarantee — Samsung's cold-start deletion
     // happens before the BBC callback, issue #75). CancellationException is
     // propagated; all other throwables are swallowed (store never throws).
+    //
+    // PR #74 R3-1: this is only a READ of the persisted key; it cannot tell
+    // whether a write was confirmed. A failed write returns false/Unknown from
+    // the write seam even though this optimistic-local-process read may return
+    // the NEW value. Never reconstruct write confirmation from this Boolean.
     fun isBbcInjectionEnabled(): Boolean = try {
         loadBbcEnabledRaw() ?: true
     } catch (ce: CancellationException) {
@@ -687,12 +698,37 @@ class HookPolicyStore(
     // PR #74 G1: atomic single-key commit of the BBC preference. Best-effort:
     // returns false on failure (provider absent / IPC failure), never throws
     // except CancellationException. Does NOT touch packages/version or poison.
-    fun setBbcInjectionEnabled(enabled: Boolean): Boolean = try {
-        saveBbcEnabledRaw(enabled)
+    //
+    // PR #74 R3-1: `false` means UNKNOWN — NOT "still the old value". A remote
+    // prefs commit can flush the optimistic local mMap before the binder fails,
+    // so this process may read the NEW value back after a failed commit. There
+    // is no evidence that the previous value survived; callers needing that
+    // distinction must use setBbcInjectionEnabledDetailed(). The BBC key stays
+    // outside the packages/version atomic commit and the poison/commit fence.
+    fun setBbcInjectionEnabled(enabled: Boolean): Boolean =
+        setBbcInjectionEnabledDetailed(enabled) is BbcWriteOutcome.Confirmed
+
+    // PR #74 R3-1: tri-state write seam. Confirmed(value) = the daemon
+    // acknowledged the PERSISTED PREFERENCE (never an assertion about immediate
+    // hook behavior — the hook may read a cached value). Unknown = commit(false)
+    // or a throw; the local mMap may be optimistically polluted, and Unknown
+    // must NEVER be treated as "restored to the old value". The BBC opt-out is
+    // NOT a Samsung cold-start deletion guard (issue #75).
+    //
+    // Best-effort like the legacy wrapper: every Throwable other than
+    // CancellationException maps to Unknown and is swallowed. CancellationException
+    // is deliberately preserved — BbcInjectionToggleController relies on it to
+    // kill its actor without a failure toast on dispose/scope cancellation.
+    internal fun setBbcInjectionEnabledDetailed(enabled: Boolean): BbcWriteOutcome = try {
+        if (saveBbcEnabledRaw(enabled)) {
+            BbcWriteOutcome.Confirmed(enabled)
+        } else {
+            BbcWriteOutcome.Unknown
+        }
     } catch (ce: CancellationException) {
         throw ce
     } catch (_: Throwable) {
-        false
+        BbcWriteOutcome.Unknown
     }
 
     // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
@@ -1332,6 +1368,12 @@ fun remoteHookPolicyStore(
         // standalone boolean key — it never enters the packages/version atomic
         // commit nor the poison/seqlock fence (those protect the draft snapshot
         // only). service absent => read default true / write false. CE propagates.
+        //
+        // PR #74 R3-1: saveBbcEnabledRaw's false means UNKNOWN, not "the old
+        // value survived": RemotePreferences may have flushed the optimistic
+        // local mMap before the binder failed, so the caller can read back the
+        // new value even though nothing persisted. The tri-state mapping lives
+        // in HookPolicyStore.setBbcInjectionEnabledDetailed().
         loadBbcEnabledRaw = {
             val prefs = resolvePrefs()
             if (prefs == null) {

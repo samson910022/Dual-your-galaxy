@@ -10,6 +10,7 @@ package com.galaxydual.plus
 import android.app.Application
 import android.content.SharedPreferences
 import android.os.Process
+import com.galaxydual.hook.PolicySource
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 import java.util.concurrent.CopyOnWriteArrayList
@@ -21,6 +22,21 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     // Stage G2：App-scoped PolicyTxCoordinator（跨 VM 最小 coordinator；
     // MainActivity factory 經 applicationContext 取用；VM onCleared 不清除）。
     val policyTxCoordinator = PolicyTxCoordinator()
+
+    // PR #74 R3-1: app-process-local BBC toggle state (last KNOWN write outcome
+    // + monotonic intent sequence). Lazy because the XposedService binder is not
+    // bound yet in Application.onCreate(); first access reinitializes from the
+    // PERSISTED preference via the same remote store seam MainActivity uses
+    // (default true on read failure). Dialog/Activity rebuilds MUST reuse this
+    // instance. NOT persisted, NOT the hook process's bbcConfirmedOffAtMs, and
+    // NOT a Samsung cold-start deletion guard (issue #75).
+    internal val bbcToggleRuntimeState: BbcToggleRuntimeState by lazy {
+        BbcToggleRuntimeState(
+            initialConfirmed = remoteHookPolicyStore {
+                remotePreferences(PolicySource.POLICY_PREFS_NAME)
+            }.isBbcInjectionEnabled(),
+        )
+    }
 
     override fun onCreate() {
         super.onCreate()

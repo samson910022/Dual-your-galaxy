@@ -2164,6 +2164,10 @@ class HookPolicyRemoteStoreTest {
         // That is harmless here ("off" is not a safety guarantee); the API
         // honestly reports the failure via its Boolean return. Read failures,
         // however, must default to true.
+        // PR #74 R3-1: the tri-state view of these same failures is pinned by
+        // bbcCommitFalse_returnsUnknown_notConfirmedOldValue and
+        // bbcCommitThrow_returnsUnknown_andDoesNotThrow below; this legacy
+        // best-effort contract deliberately stays unchanged.
         prefs.booleanReadThrows = true
         assertTrue(store.isBbcInjectionEnabled())
         prefs.booleanReadThrows = false
@@ -2190,5 +2194,88 @@ class HookPolicyRemoteStoreTest {
         // mapping it to the default-true / false failure values.
         remoteHookPolicyStore { throw kotlinx.coroutines.CancellationException("cancelled") }
             .isBbcInjectionEnabled()
+    }
+
+    // --- PR #74 R3-1: tri-state write outcome (no UI/preference semantics change) ---
+
+    @Test
+    fun bbcCommitFalse_returnsUnknown_notConfirmedOldValue() {
+        val prefs = RecordingPrefs()
+        prefs.commitSucceeds = false
+        val store = remoteHookPolicyStore { prefs }
+        assertTrue("precondition: persisted default is true", store.isBbcInjectionEnabled())
+
+        val outcome = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue("failed commit must be Unknown", outcome is BbcWriteOutcome.Unknown)
+        assertFalse("UNKNOWN must never be Confirmed(true) / restored-to-old",
+            outcome is BbcWriteOutcome.Confirmed && outcome.value)
+
+        // The fake remote prefs flush the optimistic mMap before commit(false),
+        // exactly like the real RemotePreferences: this process may now read the
+        // NEW value even though nothing was persisted. That is why `false` is
+        // UNKNOWN and not "the old value is still in force".
+        assertFalse(prefs.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true))
+    }
+
+    @Test
+    fun bbcCommitThrow_returnsUnknown_andDoesNotThrow() {
+        val prefs = RecordingPrefs()
+        prefs.commitThrows = true // binder RemoteException after the optimistic flush
+        val store = remoteHookPolicyStore { prefs }
+
+        val outcome = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue("throwing commit must map to Unknown without propagating",
+            outcome is BbcWriteOutcome.Unknown)
+    }
+
+    @Test
+    fun bbcCommitTrue_returnsConfirmed_andWrapperStillTrue() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+
+        val confirmedOff = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue(confirmedOff is BbcWriteOutcome.Confirmed)
+        assertEquals(false, (confirmedOff as BbcWriteOutcome.Confirmed).value)
+        assertFalse(store.isBbcInjectionEnabled())
+
+        val confirmedOn = store.setBbcInjectionEnabledDetailed(true)
+        assertEquals(BbcWriteOutcome.Confirmed(true), confirmedOn)
+
+        // Legacy Boolean callers (e.g. BbcInjectionToggleController via
+        // MainActivity) are source- and behavior-compatible: true on success,
+        // false on failure; the detailed seam adds knowledge, not new semantics.
+        assertTrue(store.setBbcInjectionEnabled(false))
+        prefs.commitSucceeds = false
+        assertFalse(store.setBbcInjectionEnabled(true))
+    }
+}
+
+// PR #74 R3-1: app-process-local state holder (no Android framework needed).
+internal class BbcToggleRuntimeStateTest {
+
+    @Test
+    fun runtimeState_confirmedUnknownTransitionsAndGlobalSequence() {
+        // Simulates first use after an app restart: initialized from the
+        // persisted preference (off here); null would mean Unknown.
+        val state = BbcToggleRuntimeState(initialConfirmed = false)
+        assertEquals(false, state.confirmedOrUnknown)
+
+        state.mark(BbcWriteOutcome.Confirmed(false))
+        assertEquals(false, state.confirmedOrUnknown)
+
+        state.mark(BbcWriteOutcome.Unknown)
+        assertNull("Unknown must never masquerade as restored-to-old", state.confirmedOrUnknown)
+
+        state.mark(BbcWriteOutcome.Confirmed(true))
+        assertEquals(true, state.confirmedOrUnknown)
+
+        // Two fake dialog/Activity rebuilds: they share the app-scoped holder,
+        // so the sequence keeps increasing instead of restarting at 1.
+        val beforeFirstRebuild = state.nextSequence()
+        val afterFirstRebuild = state.nextSequence()
+        val afterSecondRebuild = state.nextSequence()
+        assertTrue(afterFirstRebuild > beforeFirstRebuild)
+        assertTrue(afterSecondRebuild > afterFirstRebuild)
+        assertEquals(3L, afterSecondRebuild)
     }
 }
