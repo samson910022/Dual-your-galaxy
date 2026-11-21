@@ -544,7 +544,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   > policy, a daagent cold start was followed by Samsung deleting the u95 clone as system uid, with
   > DELETE preceding the BBC callback by 116–144 ms; toggle-ON restores it but all data is wiped.
   > The 11-18 "only empty policy deletes" / "bit-identical return = zero behavior change" claim does
-  > not describe the cold-start risk. See `docs/BBC_COLDSTART_DELETE_INCIDENT.md`, issue #75 (issue #75 still mislabels the 11-20 callback as 'empty'; manual correction pending; `BBC_COLDSTART_DELETE_INCIDENT.md` is authoritative). All
+  > not describe the cold-start risk. See `docs/BBC_COLDSTART_DELETE_INCIDENT.md`, issue #75 (corrected 2026-11-21: the 11-20 callback was non-empty; `BBC_COLDSTART_DELETE_INCIDENT.md` remains authoritative). All
   > 11-17/11-18 verification paragraphs above are qualified by this note.
 - **Stage 1 (fail-closed):** `*Installed*Whitelist*` composite queries
   (`isInstalledWhitelistedPackage*`, daagent `getAllInstalledWhitelistedPackages`/

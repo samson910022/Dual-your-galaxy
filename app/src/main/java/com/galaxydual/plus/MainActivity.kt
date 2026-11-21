@@ -4754,7 +4754,7 @@ class MainActivity : ComponentActivity() {
                     pending.droppedCount,
                 )
             } catch (_: Exception) {
-                "已捨去 ${pending.droppedCount} 項不在來源清單的勾選" // JVM-test seam (keys exist in all 3 locales); production reads resources
+                "已捨去 ${pending.droppedCount} 項不符合寫入條件的項目（不在來源清單或格式無效）" // JVM-test seam (keys exist in all 3 locales); production reads resources
             }
             message += "\n$droppedSuffix"
         }
@@ -5929,7 +5929,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // Issue #73：清除草稿前先探測 verified target 分身安裝狀態並顯示警告對話框
-    // （BBC6：政策清空＝Samsung 自動系統刪分身，分身資料不可復原）。
+    // （BBC6：清除／空政策曾於 11-18 伴隨 Samsung 自動系統刪分身，觸發機制未證實，分身資料不可復原）。
     // Phase C：
     // - old-minus-candidate delta：清除候選為空集，delta=old 全量；僅對 delta 探測。
     // - Unknown stale 非空不得當授權依據：!known 一律走 cannot-determine 對話框

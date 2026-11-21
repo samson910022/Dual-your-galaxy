@@ -15276,9 +15276,9 @@ data class PolicyText(
     val count: Int = 0,
 )
 
-// 預設繁中字面（與 values/strings.xml 同文；en 見 values-en/）：生產 factory
-// 以 Application Context 解析同鍵資源（plurals 走 getQuantityString），JVM
-// 預設走此分支，語義不動。
+// 預設繁中字面（JVM fallback；與 values/strings.xml 同鍵、口徑同步，但不保證逐字相同；
+// en 見 values-en/）：生產 factory 以 Application Context 解析同鍵資源
+// （plurals 走 getQuantityString），JVM 走此分支。
 internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.BUSY -> "政策寫入進行中，請稍候"
     PolicyTextKind.OWNER_WRITE -> "政策草稿必須由主用戶（owner user）寫入，否則 hook 讀不到"
@@ -15287,7 +15287,7 @@ internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.EMPTY_SELECTION -> "未勾選任何應用"
     PolicyTextKind.CATALOG_LOADING -> "來源清單尚未載入，請稍候再試"
     PolicyTextKind.CATALOG_MISSING -> "勾選的應用已不在來源清單，請重選"
-    PolicyTextKind.DROPPED -> "已捨去 $count 項不在來源清單的勾選"
+    PolicyTextKind.DROPPED -> "已捨去 $count 項不符合寫入條件的項目（不在來源清單或格式無效）"
     PolicyTextKind.CANCELLED -> "已取消寫入政策（未寫入任何草稿）"
     PolicyTextKind.NO_PENDING -> "沒有待確認的政策寫入"
     PolicyTextKind.IN_PROGRESS -> "政策寫入已在進行中，請稍候"
@@ -15297,7 +15297,7 @@ internal fun PolicyText.defaultText(): String = when (kind) {
     PolicyTextKind.NO_STORE_READ -> "無政策 store，無法讀取草稿"
     PolicyTextKind.WRITE_SUCCESS -> "已寫入政策草稿 $count 項（勾選≠安裝，可隨時清除）"
     PolicyTextKind.WRITE_FAILED -> "寫入政策失敗"
-    PolicyTextKind.CLEAR_SUCCESS -> "已清除政策草稿（注意：政策為空時Samsung會自動刪除分身及其資料，無法復原）"
+    PolicyTextKind.CLEAR_SUCCESS -> "已清除政策草稿（注意：清除／空政策曾於 11-18 伴隨 Samsung 自動刪除分身及其資料，觸發機制未證實；11-20/11-21 於非空政策下亦發生冷啟動刪除，非空不保證安全；刪除後資料無法復原）"
     PolicyTextKind.CLEAR_FAILED -> "清除草稿失敗"
     // Dedicated string (R.string.policy_refreshed): JVM default mirrors the
     // resource verbatim; production resolves via resources (see factory).

@@ -580,7 +580,7 @@ class PolicyWriteTest {
 
         vm.requestPolicyWrite()
 
-        assertTrue(vm.state.value.msg.contains("已捨去 1 項不在來源清單的勾選"))
+        assertTrue(vm.state.value.msg.contains("已捨去 1 項不符合寫入條件的項目"))
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         assertEquals(
             setOf("com.example.a"),

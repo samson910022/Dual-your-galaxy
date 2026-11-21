@@ -16,8 +16,9 @@
 // (daagent) reads the draft from dual_policy/extra_whitelist_packages through
 // EffectivePolicyCache (60s TTL / 5s failure cooldown / single-flight / 50ms
 // budget); a non-empty draft may relax the whitelist on its next poll or
-// after a reboot. NOT guaranteed to take effect; device-verified on One UI 5
-// (Tab S7) and One UI 9 (S23 Ultra) on 2026-11-17.
+// after a reboot. NOT guaranteed to take effect. The 2026-11-17 device evidence
+// (One UI 5 Tab S7 / One UI 9 S23 Ultra) was for the BBC injector effect on a
+// PRE-UNIFICATION build — not for this editor / pre-clear / verified-uid path.
 //
 // UI is programmatic views, same style as the rest of the app (no Compose,
 // no new dependencies). This screen replaces the free-text package input
@@ -120,8 +121,8 @@ class PolicyActivity : ComponentActivity() {
     // PR-74 A3：pre-clear 警告／ROOT 二次確認／卸載驗證對話框 handle（onDestroy 釋放，
     // 與 MainActivity 同源；先前 show() 後丟棄 handle 致舊 Activity window 洩漏）。
     private val destructiveDialogHandles = DestructiveDialogHandles()
-    // Issue #73：候選集清空＝整組清除持久化草稿＝ BBC6 風險（政策清空＝Samsung 自動
-    // 刪除 verified target 分身，資料不可復原）。先探測分身安裝狀態並顯示警告對話框，
+    // Issue #73：候選集清空＝整組清除持久化草稿＝ BBC6 風險（清除／空政策曾於 11-18 伴隨
+    // Samsung 自動刪除 verified target 分身，觸發機制未證實，資料不可復原）。先探測分身安裝狀態並顯示警告對話框，
     // 通過後才執行實際寫入／保持未勾選；詳見 MainActivity 同名流程。
     // Phase C：
     // - N→M 覆寫：old-minus-candidate delta，對 installed dual 彈警告；
@@ -821,7 +822,7 @@ class PolicyActivity : ComponentActivity() {
                     pending.droppedCount,
                 )
             } catch (_: Exception) {
-                "將捨去 ${pending.droppedCount} 項不在來源清單的勾選"
+                "將捨去 ${pending.droppedCount} 項不符合寫入條件的項目（不在來源清單或格式無效）"
             }
             message += "\n$suffix"
         }
