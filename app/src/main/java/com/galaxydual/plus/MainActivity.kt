@@ -2373,43 +2373,72 @@ class MainActivity : ComponentActivity() {
     // a guard against Samsung's cold-start deletion (issue #75).
     private fun buildBbcInjectionToggle(): View {
         // A fresh dialog rebuild disposes the previous controller's UI only;
-        // the app-scoped coordinator (and any in-flight commit) survives.
+        // the app-scoped coordinator/holder (and any in-flight commit) survives.
         bbcToggleController?.dispose()
+        val app = application as GalaxyApp
+        // D04: after commit(false)/throw the local mMap may be optimistically
+        // polluted, so isBbcInjectionEnabled() is NOT authority. The app-scoped
+        // holder's null means UNKNOWN from a prior failed write; render the
+        // honest "effect unknown" row regardless of the mMap read below.
+        val effectUnknownOnOpen = app.bbcToggleRuntimeState.confirmedOrUnknown == null
         val toggle = CheckBox(this).apply {
             text = getString(R.string.settings_bbc_injection_label)
             // Read at dialog open; best-effort (store defaults true on any failure).
+            // DO NOT flip this to "restore" after a failed commit.
             isChecked = bbcPolicyStore().isBbcInjectionEnabled()
             minimumHeight = dp(48)
             setCompoundDrawablePadding(dp(8))
+            if (effectUnknownOnOpen) {
+                alpha = 0.6f // visually unverified; still tappable
+                setTypeface(null, Typeface.ITALIC)
+            }
         }
         val initialChecked = toggle.isChecked
         val summary = TextView(this).apply {
-            text = getString(R.string.settings_bbc_injection_summary)
+            text = if (effectUnknownOnOpen) {
+                getString(R.string.settings_bbc_injection_effect_unknown)
+            } else {
+                getString(R.string.settings_bbc_injection_summary)
+            }
         }
         // PR #74 R2 N05 + R3 D05：寫入序列化器現為 app 層級單例（跨對話框重建共用），
         // controller 只保留 UI 狀態。restoring 守衛仍必要：controller 的 onRestored
         // 會在 Main 設定 isChecked，不可再觸發一次 onToggle。
         var restoring = false
+        // onUnknown (D04) and the legacy onFailed toast path can both fire for
+        // the same failed commit; dedupe the toast per user intent.
+        var unknownToastShown = false
+
+        fun markEffectUnknown() {
+            // Keep the CheckBox at the user's last intent — never silently flip
+            // it. Only the row presentation is downgraded to "unverified".
+            summary.text = getString(R.string.settings_bbc_injection_effect_unknown)
+            toggle.alpha = 0.6f
+            toggle.setTypeface(null, Typeface.ITALIC)
+            if (!unknownToastShown && !isFinishing && !isDestroyed) {
+                unknownToastShown = true
+                Toast.makeText(
+                    this@MainActivity,
+                    R.string.settings_bbc_injection_effect_unknown,
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+
         bbcToggleController = BbcInjectionToggleController(
-            coordinator = (application as GalaxyApp).bbcToggleCoordinator,
+            coordinator = app.bbcToggleCoordinator,
             initialValue = initialChecked,
             onRestored = { lastGood ->
                 restoring = true
                 toggle.isChecked = lastGood
                 restoring = false
             },
-            onFailed = {
-                if (!isFinishing && !isDestroyed) {
-                    Toast.makeText(
-                        this@MainActivity,
-                        R.string.settings_bbc_injection_write_failed,
-                        Toast.LENGTH_SHORT,
-                    ).show()
-                }
-            },
+            onUnknown = { markEffectUnknown() },
+            onFailed = { markEffectUnknown() }, // legacy failure Toast path, now the Unknown message
         )
         toggle.setOnCheckedChangeListener { _, checked ->
             if (restoring) return@setOnCheckedChangeListener
+            unknownToastShown = false
             bbcToggleController?.onToggle(checked)
         }
         return LinearLayout(this).apply {

@@ -1,6 +1,6 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
-// PR #74 round 2 / N05 + round 3 / D05: BBC 開關連點併發收斂.
+// PR #74 round 2 / N05 + round 3 / D05 + D04: BBC 開關連點併發收斂 / 失敗誠實.
 //
 // EN: rapid CheckBox taps used to launch one IO coroutine per tap, and round-2's
 // single per-controller actor still died on every dialog rebuild. D05 promotes
@@ -9,12 +9,18 @@
 // consumer serializes commits across controller lifetimes. This controller now
 // only owns UI state (lastGood / persistedValue / a local sequence fence) and
 // detaches its callbacks on dispose; it never cancels an in-flight write.
+// D04: a failed commit is UNKNOWN, not a rollback. Neither the local mMap nor
+// persistedValue is an authority after commit(false)/throw, so the CheckBox is
+// left at the user's last intent and onUnknown() marks the effect unverified.
+// This is NOT a Samsung cold-start deletion guard (issue #75).
 //
 // 中文：連點曾經每次點擊都起一條 IO coroutine；round-2 的單一 actor 又會在對話框
 // 重建時被銷毀。D05 把序列化器提升為 app 層級的 BbcToggleCoordinator：序號在使用者
 // 意圖產生時由共享 state 指派，全域唯一 consumer 負責跨 controller 生命週期的寫入
 // 順序。本控制器只保留 UI 狀態（lastGood / persistedValue / 本地序號柵欄），dispose
-// 只切斷 UI 回呼，不再取消進行中的提交。
+// 只切斷 UI 回呼，不再取消進行中的提交。D04：提交失敗即 UNKNOWN，不得謊稱回滾；
+// 本地 mMap 與 persistedValue 都不可作為失敗後的權威，CheckBox 保持使用者最後意圖，
+// 由 onUnknown() 標示未驗證。此開關不是 Samsung 冷啟動刪除防護（issue #75）。
 //
 // Framework-free on purpose (no Android imports): only kotlinx.coroutines,
 // which the app already ships. Dispatchers are constructor seams so JVM tests
@@ -40,17 +46,19 @@ internal class BbcInjectionToggleController(
     private val onRestored: (Boolean) -> Unit,
     /** Best-effort UI toast on an Unknown commit; never on cancellation. */
     private val onFailed: (() -> Unit)? = null,
-    /** D04 seam for the explicit UNKNOWN UI state; no-op until D04 wires the UI. */
+    /** D04: mark the CheckBox/row UNKNOWN; the effect cannot be verified here. */
     private val onUnknown: (() -> Unit)? = null,
 ) {
     // lastGood = last value the store confirmed for a NON-stale intent (or the
-    // initial read); a failed commit must never advance it. persistedValue = the
-    // ACTUAL disk truth after ANY successful commit, including stale ones — a
-    // stale commit still landed in storage even though its UI result is dropped.
-    // A failure rollback must use persistedValue, not lastGood, or the CheckBox
-    // would be restored to a value that disagrees with storage.
-    // NOTE (D04): persistedValue rollback semantics are intentionally unchanged
-    // in this phase; D04 replaces them with an explicit Unknown UI state.
+    // initial read); a failed commit must never advance it. persistedValue is now
+    // ONLY bookkeeping of the ACTUAL disk truth after ANY successful commit,
+    // including stale ones — a stale commit still landed in storage even though
+    // its UI result is dropped.
+    // NOTE (D04): persistedValue is NEVER used after a failed commit. commit()
+    // returning false or throwing may have optimistically polluted the local
+    // RemotePreferences mMap, so neither that mMap nor this bookkeeping value is
+    // an authority for a rollback. Unknown is reported via onUnknown() instead.
+    // This is NOT a Samsung cold-start deletion guard (issue #75).
     // @Volatile only to keep JVM test accessors honest; production taps come
     // from Main, results are applied on Main, and the single global coordinator
     // consumer serializes commits.
@@ -87,9 +95,10 @@ internal class BbcInjectionToggleController(
         val seq = coordinator.state.nextSequence()
         lastSubmittedSequence = seq
         coordinator.submit(seq, checked) { outcome ->
-            // Coordinator consumer thread: disk truth advances on EVERY
+            // Coordinator consumer thread: bookkeeping advances on EVERY
             // successful commit, BEFORE the fence below — a stale commit really
-            // did write to storage, so a later failure must roll back to it.
+            // did write to storage. D04: this value is NEVER consulted for a
+            // failed commit (the local mMap may be polluted).
             if (outcome is BbcWriteOutcome.Confirmed) persistedValue = outcome.value
             uiScope.launch {
                 if (!alive) return@launch
@@ -99,9 +108,11 @@ internal class BbcInjectionToggleController(
                 when (outcome) {
                     is BbcWriteOutcome.Confirmed -> lastGood = outcome.value
                     BbcWriteOutcome.Unknown -> {
-                        onRestored(persistedValue)
-                        onFailed?.invoke()
+                        // D04: do NOT call onRestored(persistedValue) and do NOT
+                        // claim a rollback. The CheckBox stays at the user's last
+                        // intent; the holder/UI marks it as UNKNOWN instead.
                         onUnknown?.invoke()
+                        onFailed?.invoke()
                     }
                 }
             }

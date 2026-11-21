@@ -41,6 +41,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.coroutineContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -58,6 +59,7 @@ class BbcToggleConcurrencyTest {
         val commits = mutableListOf<Boolean>()
         val restored = mutableListOf<Boolean>()
         var failures = 0
+        var unknown = 0
         val gates = mutableMapOf<Int, CompletableDeferred<Unit>>()
         var resultAt: (Int) -> Boolean = { true }
         var throwAt: (Int) -> Boolean = { false }
@@ -104,6 +106,7 @@ class BbcToggleConcurrencyTest {
         main = StandardTestDispatcher(testScheduler),
         onRestored = { sink.restored.add(it) },
         onFailed = { sink.failures++ },
+        onUnknown = { sink.unknown++ },
     )
 
     @Test
@@ -175,22 +178,26 @@ class BbcToggleConcurrencyTest {
         gate0.complete(Unit)
         testScheduler.advanceUntilIdle()
 
-        // Delayed failure is stale: no rollback, no toast; lastGood advances
-        // only through the newer successful commit.
+        // Delayed failure is stale: no rollback, no unknown UI, no toast;
+        // lastGood advances only through the newer successful commit.
         assertEquals(0, sink.restored.size)
+        assertEquals(0, sink.unknown)
         assertEquals(0, sink.failures)
         assertEquals(true, c.currentLastGood())
         assertEquals(true, sink.persisted)
         assertEquals(true, coordinator.state.confirmedOrUnknown)
 
-        // A genuinely current failure must restore the LATEST lastGood (true),
-        // not the value that just failed (false) nor a stale snapshot.
+        // D04: a genuinely current failure must NOT restore anything. The
+        // CheckBox stays at the user's last intent and onUnknown fires; lastGood
+        // remains the last CONFIRMED value (true), not a rollback authority.
         sink.resultAt = { idx -> idx != 2 } // next commit (idx 2) fails
         c.onToggle(false) // seq 3
         testScheduler.advanceUntilIdle()
-        assertEquals(listOf(true), sink.restored)
+        assertEquals(0, sink.restored.size)
+        assertEquals(1, sink.unknown)
         assertEquals(1, sink.failures)
         assertEquals(true, c.currentLastGood())
+        assertNull("failed commit must clear confirmation", coordinator.state.confirmedOrUnknown)
         c.dispose()
     }
 
@@ -222,7 +229,7 @@ class BbcToggleConcurrencyTest {
     }
 
     @Test
-    fun commitFalse_rollsBackAndReportsFailure() = runTest {
+    fun commitFalse_marksUnknownDoesNotRestore() = runTest {
         val sink = Sink(initial = true)
         sink.resultAt = { false } // commit return is the authority
         val coordinator = testCoordinator(sink, BbcToggleRuntimeState(initialConfirmed = true))
@@ -231,13 +238,42 @@ class BbcToggleConcurrencyTest {
         c.onToggle(false)
         testScheduler.advanceUntilIdle()
 
-        // The controller does NOT re-read storage: it trusts commit(false) and
-        // rolls the CheckBox back to lastGood + reports the failure.
-        assertEquals(listOf(true), sink.restored) // rollback to lastGood
-        assertEquals(1, sink.failures) // toast path taken
+        // D04: commit(false) is UNKNOWN. The controller neither re-reads storage
+        // nor claims a rollback: the CheckBox stays at the user's last intent,
+        // onUnknown marks the effect unverified, and lastGood stays confirmed.
+        assertEquals(0, sink.restored.size) // no rollback
+        assertEquals(1, sink.unknown) // explicit UNKNOWN UI
+        assertEquals(1, sink.failures) // legacy toast path taken
         assertEquals(true, c.currentLastGood())
         assertEquals(null, coordinator.state.confirmedOrUnknown) // Unknown clears confirmation
         c.dispose()
+    }
+
+    @Test
+    fun unknownOutcome_callsOnUnknownNotRestored() = runTest {
+        // Both Unknown sources (commit false and a throw) must route to
+        // onUnknown and never call onRestored.
+        val falseSink = Sink(initial = true)
+        falseSink.resultAt = { false }
+        val falseCoordinator = testCoordinator(falseSink, BbcToggleRuntimeState(initialConfirmed = true))
+        val falseController = testController(falseCoordinator, initial = true, sink = falseSink)
+        falseController.onToggle(false)
+        testScheduler.advanceUntilIdle()
+        assertEquals(0, falseSink.restored.size)
+        assertEquals(1, falseSink.unknown)
+        assertNull(falseCoordinator.state.confirmedOrUnknown)
+        falseController.dispose()
+
+        val throwSink = Sink(initial = true)
+        throwSink.throwAt = { true }
+        val throwCoordinator = testCoordinator(throwSink, BbcToggleRuntimeState(initialConfirmed = true))
+        val throwController = testController(throwCoordinator, initial = true, sink = throwSink)
+        throwController.onToggle(false)
+        testScheduler.advanceUntilIdle()
+        assertEquals(0, throwSink.restored.size)
+        assertEquals(1, throwSink.unknown)
+        assertNull(throwCoordinator.state.confirmedOrUnknown)
+        throwController.dispose()
     }
 
     @Test
@@ -278,19 +314,21 @@ class BbcToggleConcurrencyTest {
         assertFalse("controller UI callbacks must be detached", c.isAlive())
         assertTrue("shared consumer must survive controller dispose", coordinator.isConsumerActive())
 
-        // Late taps after dispose must be inert: no commit, no rollback, no toast.
+        // Late taps after dispose must be inert: no commit, no rollback, no
+        // unknown UI, no toast.
         c.onToggle(true)
         testScheduler.runCurrent()
         testScheduler.advanceUntilIdle()
         assertEquals(0, sink.commits.size)
         assertEquals(0, sink.restored.size)
+        assertEquals(0, sink.unknown)
         assertEquals(0, sink.failures)
         assertEquals(false, sink.persisted)
         assertEquals(0L, coordinator.latestSequence())
     }
 
     @Test
-    fun staleSuccessThenNewerFailure_restoresActualPersistedValue() = runTest {
+    fun staleSuccessThenNewerFailure_unknownNotPersistedRollback() = runTest {
         val sink = Sink(initial = false) // persisted starts OFF
         val gate0 = CompletableDeferred<Unit>()
         sink.gates[0] = gate0
@@ -307,12 +345,16 @@ class BbcToggleConcurrencyTest {
         testScheduler.advanceUntilIdle()
 
         // ON really landed on disk (persisted=true) but its seq-1 result was
-        // stale for the UI, so lastGood stayed false. The newer OFF commit fails;
-        // rollback must restore ON (disk truth), NOT OFF (the stale lastGood).
-        assertEquals(listOf(true), sink.restored)
+        // stale for the UI, so lastGood stayed false. The newer OFF commit fails.
+        // D04: that real persisted ON must NOT be claimed as a rollback — no
+        // onRestored at all — because the failed commit may have polluted the
+        // local mMap. The unknown callback fires instead.
+        assertEquals("no rollback may claim the real persisted value", 0, sink.restored.size)
+        assertEquals(1, sink.unknown)
         assertEquals(1, sink.failures)
         assertEquals(false, c.currentLastGood())
-        assertEquals(true, sink.persisted)
+        assertEquals(true, sink.persisted) // real disk truth, NEVER used as rollback
+        assertNull(coordinator.state.confirmedOrUnknown)
         c.dispose()
     }
 

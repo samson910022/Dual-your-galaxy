@@ -2159,15 +2159,15 @@ class HookPolicyRemoteStoreTest {
         prefs.commitSucceeds = false
         val store = remoteHookPolicyStore { prefs }
         assertFalse(store.setBbcInjectionEnabled(false))
-        // NOTE: a failed commit still flushes the optimistic mMap in
-        // RemotePreferences, so this process could read back the new value.
-        // That is harmless here ("off" is not a safety guarantee); the API
-        // honestly reports the failure via its Boolean return. Read failures,
-        // however, must default to true.
-        // PR #74 R3-1: the tri-state view of these same failures is pinned by
-        // bbcCommitFalse_returnsUnknown_notConfirmedOldValue and
-        // bbcCommitThrow_returnsUnknown_andDoesNotThrow below; this legacy
-        // best-effort contract deliberately stays unchanged.
+        // D04: the tri-state view of this same failure MUST be Unknown — never
+        // Confirmed, and never "restored to the old value". A failed commit still
+        // flushes the optimistic mMap in RemotePreferences, so this process could
+        // read back the new value; neither that mMap nor a cached "persisted"
+        // value is an authority after the failure. Read failures default to true.
+        // The legacy Boolean best-effort contract above stays unchanged.
+        val triState = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue("failed commit must be tri-state Unknown", triState is BbcWriteOutcome.Unknown)
+        assertFalse("Unknown must NOT be treated as confirmed", triState is BbcWriteOutcome.Confirmed)
         prefs.booleanReadThrows = true
         assertTrue(store.isBbcInjectionEnabled())
         prefs.booleanReadThrows = false
@@ -2247,6 +2247,55 @@ class HookPolicyRemoteStoreTest {
         assertTrue(store.setBbcInjectionEnabled(false))
         prefs.commitSucceeds = false
         assertFalse(store.setBbcInjectionEnabled(true))
+    }
+
+    @Test
+    fun bbcFailedCommit_doesNotLetReopenReadAuthoritativeOff() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        // App-scoped holder is seeded from the persisted preference, like
+        // GalaxyApp does; non-null here means a provisional confirmed seed.
+        val state = BbcToggleRuntimeState(initialConfirmed = true)
+
+        // Seed persisted ON via a SUCCESSFUL commit; the holder records Confirmed.
+        val confirmedOn = store.setBbcInjectionEnabledDetailed(true)
+        assertEquals(BbcWriteOutcome.Confirmed(true), confirmedOn)
+        assertTrue(state.mark(confirmedOn, state.nextSequence()))
+        assertTrue(store.isBbcInjectionEnabled())
+        assertEquals(true, state.confirmedOrUnknown)
+
+        // Failed write of OFF: the fake mirrors RemotePreferences' optimistic
+        // flush, so the local mMap now reads false even though nothing persisted.
+        prefs.commitSucceeds = false
+        val failedOff = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue("failed OFF commit must be Unknown", failedOff is BbcWriteOutcome.Unknown)
+        assertFalse("UNKNOWN must never be Confirmed(OFF)", failedOff is BbcWriteOutcome.Confirmed)
+        assertTrue(state.mark(failedOff, state.nextSequence()))
+        assertNull("holder must report UNKNOWN after a failed commit", state.confirmedOrUnknown)
+        assertFalse("mMap is polluted with OFF", prefs.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true))
+
+        // Dialog rebuild: a NEW store over the SAME prefs reads the polluted mMap.
+        val reopened = remoteHookPolicyStore { prefs }
+        assertFalse("reopen reads false from the polluted mMap — not authoritative",
+            reopened.isBbcInjectionEnabled())
+        // The UI decision consults the app-scoped holder, not that read: Unknown
+        // means "effect unknown", NOT a confirmed OFF.
+        val uiDecision = if (state.confirmedOrUnknown == null) {
+            "effect unknown"
+        } else {
+            "confirmed ${state.confirmedOrUnknown}"
+        }
+        assertEquals("effect unknown", uiDecision)
+        assertFalse("polluted read must not be claimed as a confirmed OFF",
+            reopened.setBbcInjectionEnabledDetailed(false) is BbcWriteOutcome.Confirmed)
+
+        // A later successful Confirmed(true) clears the Unknown state.
+        prefs.commitSucceeds = true
+        val confirmedAgain = reopened.setBbcInjectionEnabledDetailed(true)
+        assertEquals(BbcWriteOutcome.Confirmed(true), confirmedAgain)
+        assertTrue(state.mark(confirmedAgain, state.nextSequence()))
+        assertEquals(true, state.confirmedOrUnknown)
+        assertTrue(reopened.isBbcInjectionEnabled())
     }
 }
 

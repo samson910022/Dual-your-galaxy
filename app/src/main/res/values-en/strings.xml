@@ -384,6 +384,8 @@
     <string name="settings_bbc_injection_label">BBC injection (Dual Messenger app-list expansion)</string>
     <string name="settings_bbc_injection_summary">Turning this off may require restarting the hook process or rebooting to take effect (RemotePreferences cache). This is NOT a guard against Samsung\'s cold-start deletion — that deletion happens before the BBC callback (issue #75).</string>
     <string name="settings_bbc_injection_write_failed">Failed to save the BBC injection preference. Please retry.</string>
+    <!-- PR #74 R3 D04: honest UNKNOWN state after a failed commit (no placeholders). -->
+    <string name="settings_bbc_injection_effect_unknown">Effect unknown — restart the hook process (or reboot) and verify. This switch is NOT a Samsung cold-start deletion guard.</string>
     <string name="settings_version_unknown">unknown</string>
     <string name="badge_number_format">%1$d</string>
     <!-- Phase G (i18n): bullet/count prefixes as format resources (were
