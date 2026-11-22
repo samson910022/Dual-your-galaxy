@@ -3,7 +3,7 @@
 // Phase C Required補測（code+test兩份review Required）：
 // - confirm重讀Corrupt/超時/已知漂移
 // - 跨屏雙VM舊綁定作廢
-// - blindClear rev推進重arm＋armedRev==-1旁路
+// - blindClearDisabled：rev 推進／armedRev==-1 皆不再重 arm（R5-0 fail-closed）
 // - legacy豁免（null綁定＋baseFreshGen==-1）
 // - delta接線（空集/安裝空/Editor指引/clear作廢disarm＋BUSY優先/coordinator失配/reset作廢）
 //
@@ -501,7 +501,7 @@ class PolicyPhaseCRequiredTest {
 
     // R5-0 (F01): blind-clear disabled — a rev advance cannot re-arm anything.
     @Test
-    fun blindClear_revAdvance_rearmsWithFirstZeroClear() {
+    fun blindClearDisabled_revAdvance_neverClears() {
         var now = 10_000L
         val fake = FakePolicyStore(initialDraft = setOf("com.a.app"))
         val coord = PolicyTxCoordinator()
@@ -532,7 +532,7 @@ class PolicyPhaseCRequiredTest {
 
     // R5-0 (F01): observed/rev bookkeeping no longer feeds any clear path.
     @Test
-    fun blindClear_armedRevMinusOne_bypassesRevGate() {
+    fun blindClearDisabled_armedRevMinusOne_neverClears() {
         var now = 20_000L
         val fake = FakePolicyStore(initialDraft = null)
         fake.saved = null

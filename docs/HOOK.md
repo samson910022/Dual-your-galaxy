@@ -75,14 +75,12 @@
   永久快取實例，底層 mMap 可能仍陳舊，故仍受 TTL＋重啟語義約束（daemon 重建前版本亦可能
   過期），僅為「可觀測的新鮮度證據」，**非推送替代**；不保證 60s 內或下一次 poll 看到新集合，
   重啟 hook 行程後才保證讀到新值。DevOps 端無須額外操作，但端到端 read-after-write 仍待實機證明。
-- App 側失敗語義（Phase1 fence／Phase2 blind-clear＋refresh／Phase3 phase／
+- App 側失敗語義（Phase1 fence／Phase2 Unknown 權威 refresh（盲清已撤回停用）／Phase3 phase／
   Phase4 timeout／Stage G1 settle＋世代拆分／Stage G2 auto-recheck＋coordinator，見 `docs/USAGE.md` 政策寫入流程與 `DualViewModel`）不改變
   生效點：`WhitelistPatch`/`PolicySource` 本階段不動，僅 fail-closed 可觀測
-  （Unknown fence、blind-clear 二次確認〈僅 Unavailable 瞬斷專用：第一次 tap 告警並 arm，
-  第二次 tap 先判 TTL〈逾 5 分鐘重 arm〉再判世代〈`policyDraftVersion`／`policyFreshnessGen`
-  失配重 arm〉，同世代＋TTL 內才執行；切換前景／切通道／重連／已知結果翻轉即 disarm；
-  Corrupt 永不盲清，走修復流程〉、手動重整、超時轉 RECONCILING 核對）；端到端仍
-  DEVICE-UNVERIFIED。
+  （所有非 Known 草稿皆 fail-closed：Unknown 需先手動重整或警告 Retry 的權威
+  `refreshPolicyDraft()` 回到 Known 才能清除，Corrupt 走修復流程，超時轉 RECONCILING
+  核對）；端到端仍 DEVICE-UNVERIFIED。
 - 熱路徑 stall 預算（P1-2，K4 P2#6 硬化，Phase7 端到端 total）：hook 白名單查詢執行緒上的有效政策重讀經
   `PolicyRefreshGate`（at-most-one guard＋stuck-worker breaker）＋零隊列執行器
   （`ThreadPoolExecutor(0,1,60s,SynchronousQueue)`，滿載／爭用即拒收）＋50ms 端到端總預算
@@ -348,6 +346,8 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 **round-3 opt-out／同意語意（R3-1..R3-7）**：偏好寫入改為三態——失敗（`commit(false)` 或拋錯）顯示 **生效未知（Unknown）**，**不是回滾**：本地 `RemotePreferences` 的 `mMap` 可能已被樂觀污染，故不得解讀為「已恢復舊值」；須**重啟 hook 行程**後重新讀取才能驗證。`Confirmed` 只涵蓋**已持久化的偏好**（daemon 已 ack），不代表 hook 的立即行為。寫入由 app-scoped 的 **latest-intent coordinator** 跨對話框／Activity 生命週期全局序列化（late-join 以最新意圖為準）。以上語意**皆非刪除防護**。另（D07）：損毀版本修復（Invalid→v1）在已接受較高版本的執行中 Hook 行程會被單調 high-water 門控拒收，**需重啟 Hook 行程**才生效；App 端 save 成功**不證明** BBC 已套用。（D03 同意柵欄）最終政策確認與清除現在 Activity 層與獨立 VM pre-IO 層**雙重重跑四道關卡同意檢查**；generation 失配、檢查失敗或同意不存在一律零寫入。generation 僅作 pending 身分綁定（binding-only），**不是新鮮度權威**；ROOT 驗證對話框繼續後（VerifiedEmpty 或 Residual/ProbeFailed 的自擔風險覆寫，後者非驗證成功）只跳過 installed 成員比對，(id,serial) 身分檢查仍強制；第一階段探測失敗的 consent 不可繼續（CannotDetermine）。以上皆為 JVM 可驗證的控制流性質，**不是裝置驗證**；P0 冷啟動刪除閘門**維持開啟、未關閉**。
 
 **round-4 同意／UI 語意更新（E01–E07）**：第一階段探測失敗（Failed）的警告不再提供永遠無法履行的「仍然清除／寫入」做為政策寫入的 force-proceed；該入口改為「重試探測／取消」，寫入入口的按鈕／toast 改用「寫入」而非「清除」。consent fence 本身**不放寬**——`fromFailedProbe` 仍無條件 `CannotDetermine`（D03 fail-closed 不變）。新增「破壞性（δ=old−candidate≠∅）」與「增量／首次新增（δ=∅ 且 Known snapshot）」的同意規則區分：真正不移除任何項目的操作不再要求預先存在可驗證的雙開 profile；此例外**不適用**於任何縮減／清除，也不適用於 Unknown snapshot。共用版本探測對 `CancellationException` 改為透傳（App writer 的 `contains`／`getLong` 丟出 CE 時向上透傳、0 commit、無 poison）；Hook reader 在自己的邊界接住 CE 並維持 never-throw 與單調 high-water。VM 的生產寫入 seam 要求非 null consent，legacy bypass 限 test-only。BBC toggle 的 Unknown→Confirmed 在同一 dialog 解除灰化；探測失敗警告 dialog 納入 handle 於 onDestroy 釋放。Invalid→v1 修復顯示「可能尚未生效、需重啟 Hook 行程驗證、不代表新政策已套用」提示；epoch/generation 修復不在本輪範圍。以上皆為 JVM／UI 可驗證的控制流性質，**不是裝置驗證**；E00／E08 維持 **UNMEASURED／NOT a pass**，P0 合併閘門未關閉，**opt-out is NOT a deletion guard**。
+
+**round-5 誠實註記（2026-11-23，F00–F06；更新而非取代 round-2+3+4）**：F01–F04 僅為 App／VM／UI 契約修正（Unknown 警告重新整理改為權威 `refreshPolicyDraft()` 並 await settle、仍 Unknown／Corrupt 給非遞迴引導，盲清正式撤回停用；Invalid→v1 修復提示 app-scoped 跨 VM 在 Main＋Editor 可見；BBC toggle CheckBox 於繼承 `Confirmed(value)` 時同步；VM 對非 null consent 重算移除 delta）。**F00（＝D01/N01 P0 冷啟動 DELETE）與 F06（＝D06 gate 延遲／D08 512-entry IPC／sticky／Scope A dialog）維持 UNMEASURED／NOT a pass**；P0 合併門檻未關閉。**三臂同基線對照（default BBC／confirmed-off runtime gate／Samsung baseline）與備份＋明確授權＋持有人同意前提完全不變**；JVM／UI 全綠不是通過。**opt-out is NOT a deletion guard**（issue #75）。Round-2 的 hybrid「confirmed OFF」語意、D03 consent fence 與 round-4 的三臂／備份＋同意框架皆未改變。
 
 > **round-2+3 合併閘門（N01／D01、D06、D08、N09／D08；UNMEASURED／NOT a pass）**：本輪獨立審查未跑 Gradle 裝置測試、未觸碰任何 Samsung 裝置；已文件化或 JVM／CI 全綠皆**不是**通過。必要裝置證據與同基線三臂對照見 `docs/ACCEPTANCE.md` §6「11-21／11-22 round-2+3 待實機驗收」小節：
 > - **N01／D01**：P0 冷啟動 DELETE 因果未證實；須先完成**同一 installed-state 基線三臂對照**（default BBC／confirmed-off runtime gate／Samsung baseline），缺一即不得宣稱安全或因果成立。runtime opt-out **不是刪除防護**（issue #75；DELETE 早於回調且回調非空）。

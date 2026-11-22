@@ -1681,7 +1681,7 @@ class PolicyWriteTest {
         try {
             requester.start()
             assertTrue(seamHit.await(5, java.util.concurrent.TimeUnit.SECONDS))
-            // 以反射註冊合成在途政策 op key（同 blindClear_busy_preservesArm 的
+            // 以反射註冊合成在途政策 op key（同 blindClearDisabled_busy_neverClears 的
             // 反射注入手法；不經 mutex，同步可觀測）。
             val f = DualViewModel::class.java.getDeclaredField("inFlightWrites").apply { isAccessible = true }
             @Suppress("UNCHECKED_CAST")
@@ -3964,7 +3964,7 @@ class PolicyWriteTest {
     // R5-0 (F01): no Unknown tap clears, regardless of TTL. Only an explicit
     // authoritative refresh restoring Known opens the clear path again.
     @Test
-    fun blindClear_secondTapWithinTtl_executes() {
+    fun blindClearDisabled_secondTapWithinTtl_neverClears() {
         var now = 10_000L
         val fake = FakePolicyStore()
         fake.saved = null
@@ -4000,7 +4000,7 @@ class PolicyWriteTest {
     // R5-0 (F01): with blind-clear disabled there is no TTL/EXPIRED/re-arm
     // state machine; every late tap gives the same refresh-first guidance.
     @Test
-    fun blindClear_secondTapAfterTtl_showsExpiredAndRearms() {
+    fun blindClearDisabled_secondTapAfterTtl_neverClears() {
         var now = 20_000L
         val fake = FakePolicyStore()
         fake.saved = null
@@ -4026,7 +4026,7 @@ class PolicyWriteTest {
 
     // R5-0 (F01): every tap in a 3-tap sequence is fail-closed; no re-arm chain.
     @Test
-    fun blindClear_expiredRearm_thirdTapWithinTtl_executes() {
+    fun blindClearDisabled_expiredRearm_thirdTap_neverClears() {
         var now = 30_000L
         val fake = FakePolicyStore()
         fake.saved = null
@@ -4053,7 +4053,7 @@ class PolicyWriteTest {
     // R5-0 (F01): reconnect cannot re-enable a destructive clear path; the
     // fail-closed Unknown contract is identical before and after reconnect.
     @Test
-    fun blindClear_reconnect_disarms() {
+    fun blindClearDisabled_reconnect_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -4081,7 +4081,7 @@ class PolicyWriteTest {
 
     // R5-0 (F01): foreground cannot re-enable blind-clear; fail-closed holds.
     @Test
-    fun blindClear_foreground_disarms() {
+    fun blindClearDisabled_foreground_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -4109,7 +4109,7 @@ class PolicyWriteTest {
     // R5-0 (F01): generation bumps no longer install/re-arm a blind clear;
     // Unknown taps stay fail-closed even after an unknown-gate confirm.
     @Test
-    fun blindClear_generationMismatch_rearms() {
+    fun blindClearDisabled_generationMismatch_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -4147,7 +4147,7 @@ class PolicyWriteTest {
     // R5-0 (F01): BUSY precedence is unchanged, but there is no arm to
     // preserve; after BUSY clears the Unknown tap is still fail-closed.
     @Test
-    fun blindClear_busy_preservesArm() {
+    fun blindClearDisabled_busy_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -7480,8 +7480,8 @@ class PolicyWriteTest {
         assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
     }
 
-    // Stage J3-5 blind-clear-requires-Known：load→Unknown，TTL 內 double clear→
-    // store.clear 永不呼叫（不刪未見內容）。
+    // R5-0 (F01)：load→Unknown 後任何 double clear（含 TTL 內）皆零 store.clear
+    // （盲清已停用，所有非 Known 草稿 fail-closed，不刪未見內容）。
     @Test
     fun j3_blindClearRequiresKnown_doubleClearNeverCallsStore() {
         var now = 50_000L
@@ -8092,7 +8092,8 @@ class PolicyWriteTest {
         }
     }
 
-    // Stage L4 P2#3 corrupt double-clear 仍零 store 觸碰（盲清僅 Unavailable 專用）。
+    // Stage L4 / R5-0：corrupt double-clear 仍零 store 觸碰（盲清已停用，
+    // 所有非 Known 草稿皆 fail-closed）。
     @Test
     fun l4_corruptDoubleClear_stillZeroStoreCalls() {
         var clearCalls = 0
@@ -11287,7 +11288,7 @@ class PolicyWriteTest {
     // grants a delete. Only an explicit authoritative refresh restoring Known
     // can open the clear path.
     @Test
-    fun s4_blindClear_lastKnownNull_classicDoubleTapSemantics() {
+    fun s4_blindClearDisabled_lastKnownNull_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -11369,7 +11370,7 @@ class PolicyWriteTest {
     // fail-closed; only an explicit authoritative refresh restoring Known
     // opens the clear path (same contract as the inherited-Known case).
     @Test
-    fun s4_blindClear_newProcessCoordinator_classicDoubleTapSemantics() {
+    fun s4_blindClearDisabled_newProcessCoordinator_neverClears() {
         val coordA = PolicyTxCoordinator()
         val fake = FakePolicyStore() // 初始 Known（setOf("com.seed")）
         // VM-A：同前測，觀察過 Known 後以 Activity finish 語義銷毀。

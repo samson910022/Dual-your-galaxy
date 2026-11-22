@@ -197,8 +197,9 @@ private val policyWriteGeneration = java.util.concurrent.atomic.AtomicLong()
 // 載入覆寫較新的 save 所寫入的 policyDraft。
 private val policyDraftVersion = java.util.concurrent.atomic.AtomicLong()
 // Stage G1 世代拆分：顯示 vs 所有權。
-// - policyFreshnessGen：refresh/load 顯示 TOCTOU（重疊 load 丟棄、盲清 arm、
-//   成功/失敗顯示 fence）。refresh 期中（Tx 存活）只推進此者，不碰 ownership。
+// - policyFreshnessGen：refresh/load 顯示 TOCTOU（重疊 load 丟棄、成功/失敗顯示 fence）；
+//   VM 內部歷史 blind-clear arm 欄位仍引用此世代，但盲清已停用、UI 不可達。
+//   refresh 期中（Tx 存活）只推進此者，不碰 ownership。
 // - policyOwnershipGen：Tx 所有權（reconciler 世代、late-join 結清判定）。
 //   reconciler 只比 version＋ownership；refresh 期中永不推進 ownership，
 //   故 yielding 不致 TOCTOU 丟棄 reconciler（保留 fence）。
@@ -509,8 +510,10 @@ data class UiState(
     val policyDraftKnown: Boolean = false,
     // Stage L4 P2#3: corrupt flag (CCE). True only when the last load observed
     // LoadResult.Corrupt; Unavailable keeps this false. Request refuses both
-    // (Known==false); clear blind-clear only for Unavailable; Corrupt goes via
-    // repair flow (requestRepair/confirmRepair). Render shows corrupt_detected
+    // (Known==false); R5-0 (F01) withdrew/disabled blind-clear: only Known clears,
+    // and every Unknown (Unavailable/Corrupt) fails closed — Corrupt goes via the
+    // repair flow (requestRepair/confirmRepair), Unavailable requires an
+    // authoritative refresh back to Known first. Render shows corrupt_detected
     // when true.
     val policyDraftCorrupt: Boolean = false,
     // E07 (PR #74 R4): sticky UI hint that a SUCCESSFUL write repaired an
@@ -827,9 +830,9 @@ class DualViewModel(
         // 同意有效期語意相同，故不另設值；政策路徑一律用此別名，移除路徑續用
         // 原名，grep 可區分調用點）。
         const val POLICY_CONFIRM_TTL_MS = REMOVE_CONFIRM_TTL_MS
-        // Stage D (P2 blind-clear 有界 + 世代綁定)：blind-clear 二次確認有效期
-        // ＝POLICY_CONFIRM_TTL_MS（與政策寫入同意同值：皆為「對話框/告警後
-        // generation 綁定＋二次確認＋TTL」，5min 語意相同，故不另設值）。
+        // R5-0 起 blind-clear 已停用；此常數僅為 VM 內部遺留 TTL 別名（UI 不可達）。
+        // Corrupt 修復複用作為自身兩步確認有效期（＝POLICY_CONFIRM_TTL_MS，
+        // 「告警後 generation 綁定＋二次確認＋TTL」，5min 語意相同，故不另設值）。
         const val BLIND_CLEAR_TTL_MS = POLICY_CONFIRM_TTL_MS
         // Phase 4:confirm/clear 持 opMutex 橫跨 onIo save/clear 的有界超時。
         // RemotePreferences 為 binder IPC,無超時會長 pin opMutex 餓死其他操作;
@@ -3939,38 +3942,34 @@ class DualViewModel(
     // Phase 3：UiState.policyEpoch 的推進源（相位變遷即 +1；QUEUED→SAVING 保持
     // 同一 epoch，僅翻相位，見 request/cancel/confirm/clear 各點）。
     private val policyPhaseEpoch = java.util.concurrent.atomic.AtomicLong()
-    // Stage D blind-clear 兩步確認（有界＋世代綁定）：Unknown 下第一次 clear
-    // 僅告警並 arm，第二次才執行（防靜默單步刪除未見內容；見 clearPolicyDraft）。
-    // Known（或 null-store）下直接單步執行並順手 disarm。
-    // - blindClearArmedAtMs：arm 時刻 nowMonoMs()，-1＝未 arm（disarmed）。
-    // - blindClearArmedVersion／FreshGen：arm 當下 policyDraftVersion／
-    //   policyFreshnessGen 快照；第二 tap 比對失配即視為 stale（期間有
-    //   save/clear/refresh/load 推進）→重 arm（視為新的第一次）。
-    //   Stage G1：追 freshness（顯示），不追 ownership（Tx 期中 refresh yielding
-    //   只推 freshness，仍應視為新事實而重 arm）。
-    // - TTL：now - armedAt > BLIND_CLEAR_TTL_MS 即過期→重 arm＋EXPIRED 文案。
-    // 三者以 -1 哨兵同步（disarm 全置 -1，arm 全寫當下值）；isArmed 以
-    // armedAtMs != -1 判定。AtomicLong：Unconfined 測試下多執行緒可見，
-    // 生產全 Main 串行。
+    // VM 內部遺留的 blind-clear arm 欄位（R5-0 起此路徑已停用）：
+    // 原為「Unknown 第一次 tap 告警並 arm、第二次 tap 才執行」的兩步確認，
+    // 現已完全不參與清除決策——clearPolicyDraft 對任何 Unknown 皆 fail-closed
+    // （零 store 觸碰、回 UNKNOWN_REFRESH），只有 Known 才清除。
+    // - blindClearArmedAtMs：原 arm 時刻 nowMonoMs()，-1＝未 arm（disarmed）。
+    // - blindClearArmedVersion／FreshGen：原 arm 當下 policyDraftVersion／
+    //   policyFreshnessGen 快照（第二 tap 失配重 arm 的舊語意，現已不適用）。
+    // - blindClearArmedRev：原第二 tap 的權威 rev 比對（見下），現亦不適用。
+    // 三者（含 rev）以 -1 哨兵同步；isArmed 以 armedAtMs != -1 判定。
+    // AtomicLong：Unconfined 測試下多執行緒可見，生產全 Main 串行。
+    // 欄位保留僅供既有 JVM 測試/向後相容，不代表任何可用清除路徑。
     private val blindClearArmedAtMs = AtomicLong(-1L)
     private val blindClearArmedVersion = AtomicLong(-1L)
     private val blindClearArmedFreshGen = AtomicLong(-1L)
-    // Phase C：盲清 arm 另攜權威 rev（observedSnapshot.rev）。
-    // 第二 tap 比對失配即視為 stale（期間有外來修訂推進）→重 arm。
-    // -1L=legacy/未觀察（跳過 rev 檢查，僅走 version/freshGen 門控）。
+    // VM 內部遺留：原供 blind-clear 第二 tap 比對的權威 rev（observedSnapshot.rev）。
+    // 盲清已停用，此欄不再為任何清除路徑提供門控；-1L=legacy/未觀察。
     private val blindClearArmedRev = AtomicLong(-1L)
 
-    // S4（blind-clear defense-in-depth）：行程級（process-lifetime）最後一次
+    // 行程級（process-lifetime）最後一次
     // 「已驗證 Known」的政策草稿快照（null＝從未觀察到），由 app-scoped
     // coordinator（GalaxyApp 持有的 PolicyTxCoordinator）持有，而非 VM 本機欄。
     // 同行程內跨 Activity 重建／重開（新 VM 實例）不變；只有新行程（新 coordinator、
     // 本欄＋VM 本機欄皆 null）才解除。所有 verified-Known 終態/刷新/載入的
     // noteLastKnownDraft() 呼叫點更新此欄（同一防禦拷貝複製第二份寫入 coordinator；兩份皆為拷貝，
     // 互不共享可變身份）。
-    // 僅作為盲清前置門：盲清 armed 且（coordinator 或 VM 本機）有 Known 歷史時，
-    // clearPolicyDraft 不再單純依賴兩次點擊，而是先強制一次
-    // 權威重讀（refreshPolicyDraft）；只有重讀恢復 Known 才允許本次清除，
-    // 重讀失敗（仍 Unknown/Unavailable）→ 中止並提示（UNKNOWN_REFRESH）。
+    // R5-0 起不再作為任何清除前置門：盲清已停用，任何非 Known 草稿皆
+    // fail-closed（零 store 觸碰、回 UNKNOWN_REFRESH），Unavailable 須由
+    // 使用者/警告 Retry 的權威 refreshPolicyDraft 回到 Known 才能清除。
     // Known 本身即證據；此欄只是「曾經 Known」的行程級歷史，永不被覆寫為 null。
     private val lastKnownPolicyDraft = AtomicReference<Set<String>?>(null)
 
@@ -4021,11 +4020,12 @@ class DualViewModel(
         blindClearArmedFreshGen.set(-1L)
         blindClearArmedRev.set(-1L)
     }
-    // Stage L4 P2#3 corrupt-repair 兩步確認（與盲清 Unavailable 分離，平行 arm）：
+    // Stage L4 P2#3 corrupt-repair 兩步確認（獨立 arm；盲清已停用）：
     // Corrupt 下第一次修復請求僅告警並 arm，第二次才執行（防靜默單步刪除）。
-    // Known（無損壞）或 Unavailable 下不 arm（分別走正常清除／盲清）。
-    // - TTL 複用 BLIND_CLEAR_TTL_MS（5min，同盲清口徑）；逾時複用 EXPIRED 文案。
-    // - 世代綁定同盲清：version／freshGen 任一失配即重 arm。
+    // Known（無損壞）走正常清除；Unavailable 為 Unknown、fail-closed（需先
+    // 權威重整至 Known），兩者皆不 arm 修復。
+    // - TTL 複用 BLIND_CLEAR_TTL_MS（5min，VM 內部遺留常數名）；逾時複用 EXPIRED 文案。
+    // - 世代綁定：version／freshGen 任一失配即重 arm。
     private val corruptRepairArmedAtMs = AtomicLong(-1L)
     private val corruptRepairArmedVersion = AtomicLong(-1L)
     private val corruptRepairArmedFreshGen = AtomicLong(-1L)
@@ -4250,7 +4250,8 @@ class DualViewModel(
 
     // Test-visible entry: onCleared is protected, so JVM tests drive disposal
     // through here (same idempotent body).
-    // Stage D：同步 disarm blind-clear（VM 丟棄後不得殘留確認態）。
+    // 同步清理 VM 內部遺留 blind-clear arm 欄位（VM 丟棄後不得殘留舊 arm 狀態；
+    // 該清除路徑已停用）。
     // Stage L4: 同步 disarm corrupt-repair（同上）。
     // Stage F2：盡力關閉 legacy 獨立讀池 policyReconcileDispatcher（阻塞中執行緒仍滯留至行程結束）。
     // Stage O1 P2#2: owner-liveness revoke — dispose marks any owned PREPARING
@@ -4707,8 +4708,8 @@ class DualViewModel(
         // 永不到 probe/refresh 的清除點 → 同殘 true；外層補取消清 loading
         // (僅取消路徑，成功/失敗語意不動；生產 job 只隨 scope 清除被取消，
         // 無手動 cancel，此為保險)。
-        // Stage D：斷開/重連即 disarm blind-clear（通道/遠端可能已變，舊 arm
-        // 不得殘留；含 coalesced trailing 經此路徑）。
+        // 斷開/重連即清理 VM 內部遺留 blind-clear arm 欄位（通道/遠端可能已變，
+        // 舊 arm 不得殘留；該清除路徑已停用；含 coalesced trailing 經此路徑）。
         // Stage L4: 同步 disarm corrupt-repair（同上）。
         _state.update { it.copy(loading = true) }
         disarmBlindClear()
@@ -10477,11 +10478,10 @@ class DualViewModel(
     }
 
     // 清除草稿：只刪 HookPolicyStore 條目，不清記憶體勾選，不碰裝置寫入路徑
-    // (≠卸載≠安裝)。Phase 2 blind-clear 門控：Unknown 下不再靜默單步執行——
-    // 第一次呼叫僅告警並 arm，不清 pending、不碰 store、不耗
-    // clearGeneration/inFlight；第二次呼叫才執行（明確刪除≠覆寫未見內容，
-    // 故第二步不受 unknown 門控阻擋）。Known（或 null-store，無遠端內容可刪）
-    // 維持單步。保持 clearGeneration/inFlight 互斥。
+    // (≠卸載≠安裝)。R5-0 (F01) 起 blind-clear 已停用：Unknown（Unavailable/Corrupt）
+    // 一律 fail-closed——不清 pending、不碰 store、不耗 clearGeneration/inFlight，
+    // 直接回 UNKNOWN_REFRESH；須先權威 refreshPolicyDraft 回到 Known 才能清除。
+    // Known（或 null-store，無遠端內容可刪）維持單步。保持 clearGeneration/inFlight 互斥。
     // Foreign-Known exemption (PR #60 Phase 2 裁決，ADR: foreign-Known
     // mid-clear delete semantics): a foreign-Known B committed mid-clear is
     // deleted by design — this is an explicit user delete, not a blind write,
@@ -10496,20 +10496,19 @@ class DualViewModel(
     // success-side claim (spec carve-out) — see the claimForPublish KDoc.
     // See docs/ARCHITECTURE.md
     // §政策寫入流程 and the A3-3 claim sites.
-    // Stage D（有界＋世代綁定）：arm 攜 armedAtMs（nowMonoMs）＋version／freshGen
-    // 快照；第二 tap 先判 TTL（now - armedAt > BLIND_CLEAR_TTL_MS→重 arm＋
-    // EXPIRED 文案），再判世代（version／freshGen／rev 失配→重 arm＋FIRST 文案），
-    // 兩者皆過才 disarm 執行。BUSY／RECONCILING 拒絕一律保留既有 arm（不碰
-    // 四元組）；owner-gate 拒絕則 disarm（非 owner 不得殘留確認態）。
-    // Phase C：rev 亦納入世代綁定（observedSnapshot.rev），覆蓋警告綁修訂後作廢。
+    // 盲清（Stage D 的 arm/TTL/世代兩段式清除）已於 R5-0 正式停用：此處僅保留
+    // 舊欄位與 helper 的歷史註記；Unknown/Unavailable 一律 fail-closed（零 store
+    // 寫入），僅 Known 可清除，且需先經權威 refresh 回到 Known。下列 arm/TTL/
+    // rev 描述僅說明仍存在的 VM 內部 legacy 欄位，不代表可達的清除路徑。
+    // Phase C：rev 曾納入世代綁定（observedSnapshot.rev），現同屬 legacy。
     // D03a：consent 為第一階段警告的捕獲快照；本階段只透傳攜帶，confirm/clear
     // 的 fence 由 D03b 接入（null＝legacy carve-out，與其它 request API 同形）。
     fun clearPolicyDraft(
         warningBinding: PolicyWarningBinding? = null,
         consent: PolicyWriteConsent? = null,
     ) {
-        // R4-4: consentless clear is refused before the owner gate, any blind-clear
-        // arm/disarm, or any store touch.
+        // R4-4: consentless clear is refused before the owner gate, any VM-internal
+        // legacy arm/disarm, or any store touch (blind-clear itself is disabled).
         if (requirePolicyWriteConsent && consent == null) {
             _state.update {
                 it.copy(msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)), msgKind = MsgKind.INVALID)
@@ -10568,8 +10567,8 @@ class DualViewModel(
             }
             return
         }
-        // Stage L4: Corrupt 永不走盲清（盲清僅 Unavailable 瞬斷專用）。
-        // Corrupt 雙 tap 仍零 store 觸碰（保 corrupt double-clear 0 契約），
+        // Stage L4 / R5-0：所有非 Known 草稿皆 fail-closed（盲清已停用）。
+        // Corrupt 雙 tap 零 store 觸碰（保 corrupt double-clear 0 契約），
         // 導向修復流程（requestRepair/confirmRepair）。
         if (hookPolicyStore != null && !_state.value.policyDraftKnown && _state.value.policyDraftCorrupt) {
             _state.update {
@@ -10837,7 +10836,8 @@ class DualViewModel(
                         // baseWarnedOld 內容比對同義）：警告綁定路徑（warnedOld != null）
                         // 在警告與清除之間被外部寫成另一個 Known 時，內容與使用者
                         // 所見不符 → fail-closed 中止，避免清除掉未曾被告知的雙開。
-                        // 無綁定／legacy（warnedOld==null）維持既有盲清語意（不再比對）。
+                        // 無綁定／legacy（warnedOld==null）此比對不適用；盲清已於 R5-0
+                        // 停用，任何非 Known（Unknown/Corrupt）皆 fail-closed，零 store 觸碰。
                         if (preRead is LoadResult.Known &&
                             warningBinding?.warnedOld != null &&
                             preRead.packages != warningBinding.warnedOld
@@ -11586,7 +11586,8 @@ class DualViewModel(
         }
     }
 
-    // Stage L4 P2#3 corrupt-repair 兩步確認（與盲清 Unavailable 平行，獨立 arm）：
+    // Stage L4 P2#3 corrupt-repair 兩步確認（獨立 arm；Unavailable 為 Unknown、
+    // fail-closed，需先權威重整，不走此路徑）：
     // - requestRepairCorruptDraft：第一次 tap，Corrupt 才 arm＋CORRUPT_REPAIR_FIRST；
     //   Known（無損壞）/Unavailable/無 store/非 owner/BUSY/RECONCILING 一律拒絕
     //  （不 arm、不碰 store）。BUSY/RECONCILING 保留既有 arm。
@@ -12933,8 +12934,10 @@ class DualViewModel(
     // Stage L4 fix(a) 清除鈕統一入口（MainActivity 唯一調用點，thin wrapper →
     // onClearPolicyButtonTap 為 single source）：路由謂詞與 TTL/世代雙檢皆在
     // VM 內經 pure clearPolicyButtonRoute(known,corrupt,armed) 判定（僅
-    // !known&&corrupt 走修復；Known（含髒 Corrupt 殘留）／Unavailable 一律 CLEAR，
-    // 維持原盲清／正常清除語義），純函數僅作 VM 內部決策 helper／JVM 可測。
+    // !known&&corrupt 走修復；Known（含髒 Corrupt 殘留）走 CLEAR；Unavailable
+    // 亦路由 CLEAR，但 R5-0 起盲清已正式停用，clearPolicyDraft 對 Unknown 一律
+    // fail-closed 回 UNKNOWN_REFRESH＋零 store 觸碰，須先權威 refreshPolicyDraft
+    // 回到 Known 才能清除），純函數僅作 VM 內部決策 helper／JVM 可測。
     // Phase C：warningBinding 為 Activity 警告綁定（probe 前快照）；CLEAR 路徑透傳，
     // 修復路徑維持原語義（不透傳綁定，修復自有 rev 門控）。
     fun onClearPolicyButtonTap(
@@ -15554,7 +15557,8 @@ enum class PolicyTextKind {
     // Stage D：blind-clear 確認逾時（arm 超過 BLIND_CLEAR_TTL_MS）。msgKind 複用
     // CHANNEL（與 FIRST 同級：未知＋需重新確認＋建議先重新整理）。
     BLIND_CLEAR_EXPIRED,
-    // Stage L4 P2#3 corrupt repair（損壞 CCE 專用，與盲清 Unavailable 分離）：
+    // Stage L4 P2#3 corrupt repair（損壞 CCE 專用；所有非 Known fail-closed，
+    // Unavailable 需先權威重整至 Known）：
     // DETECTED＝refresh/init 觀測到 Corrupt（CHANNEL，保留舊快照）；
     // REPAIR_FIRST＝修復第一次 arm（CHANNEL，需二次確認）；
     // REPAIRED＝修復成功 Known(empty)（INFO）；
@@ -15579,11 +15583,10 @@ enum class PolicyTextKind {
     // VM 層第二道門（UI positive 鈕為第一道），不寫 store、不清 pending。
     // msgKind INVALID。
     POLICY_NOT_ACKNOWLEDGED,
-    // Phase 2 S4（blind-clear refresh-first）：盲清第二次點擊時發現行程級
-    // （process-lifetime，coordinator 持有；同行程 Activity 重開不變，僅新行程
-    // 解除）最後 Known 草稿快照，遂強制先重讀（refreshPolicyDraft）；本次
-    // 點擊不刪除任何內容。恢復 Known 後下一次清除即走一般 Known 單步路徑；
-    // 若重讀仍未知，草稿維持未知且不可盲刪（fail-closed）。msgKind CHANNEL。
+    // R5-0 (F01)：Unknown 清除一律 fail-closed、零 store 觸碰，導向權威
+    // refreshPolicyDraft（由使用者「重新整理草稿」或警告 Retry 觸發）回到 Known
+    // 後才走一般 Known 單步路徑。此文字狀態保留供既有文案/測試相容，
+    // 不再有「第二次點擊強制重讀後刪除」的路徑。msgKind CHANNEL。
     BLIND_CLEAR_REFRESH_FIRST,
     // Phase 2 A3-1（repair backup honesty）：修復（刪除損壞內容）已發生且
     // post-read 驗證為 Known(empty)，但 best-effort 備份失敗 —— 舊損壞內容
@@ -15688,8 +15691,10 @@ fun UiState.hookEvidence(): HookEvidence = HookEvidence(
 
 // Stage L4 fix(a) 清除鈕路由 single source（純函數，JVM 可測，不碰 VM/Activity）：
 // 僅 !known&&corrupt 走修復（未 arm→REPAIR_REQUEST arm＋警告，已 arm→
-// REPAIR_CONFIRM TTL＋世代雙檢後執行）；其餘一律 CLEAR（Known 單步清除／
-// Unavailable 盲清雙確認；Known+Corrupt 殘留亦 CLEAR走正常清除路徑）。
+// REPAIR_CONFIRM TTL＋世代雙檢後執行）；其餘路由 CLEAR（Known 單步清除／
+// Known+Corrupt 殘留亦走正常清除）。Unavailable 雖路由 CLEAR，但 R5-0 起
+// 盲清已停用：clearPolicyDraft 對任何 Unknown 皆 fail-closed（零 store 觸碰、
+// 回 UNKNOWN_REFRESH），須先權威 refreshPolicyDraft 回到 Known 才能清除。
 // 直調 clearPolicyDraft 的 !known&&corrupt 仍由其內 CORRUPT_DETECTED 拒絕兜底
 // （零 store 觸碰），永不走盲清；VM onClearPolicyButtonTap 唯一經此分發，
 // Activity 僅 thin wrapper 直調，不重複 when。

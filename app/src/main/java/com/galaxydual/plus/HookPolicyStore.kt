@@ -816,7 +816,8 @@ class HookPolicyStore(
         if (raw == null) LoadResult.Unavailable else LoadResult.Known(sanitizeHookPolicy(raw))
     } catch (_: ClassCastException) {
         // Stage J3:永不 auto-delete（見上）；保留舊快照，僅回 Corrupt。
-        // Stage L4: CCE 即 Corrupt（非 Unavailable），觸發修復流程而非盲清。
+        // Stage L4: CCE 即 Corrupt（非 Unavailable），觸發修復流程；
+        // 所有非 Known 草稿皆 fail-closed（盲清已停用）。
         LoadResult.Corrupt
     } catch (ce: CancellationException) {
         throw ce
@@ -1086,7 +1087,8 @@ fun remoteHookPolicyStore(
                     } catch (cce: ClassCastException) {
                         // Stage L4: CCE 型別損壞即 Corrupt（非 Unavailable），加毒
                         // relatch 後重拋，由外層 loadResult 映射為 Corrupt；永不
-                        // 吞為 Unavailable（免損壞走盲清），永不自清。
+                        // 吞為 Unavailable（仍為 Unknown，清除 fail-closed、
+                        // 需先權威重整），永不自清。
                         // Stage N1 P1: 同時記錄 trusted corruption evidence (first-wins)，
                         // 供修復路徑在毒短路下仍能辨識 Corrupt vs transient。
                         try {

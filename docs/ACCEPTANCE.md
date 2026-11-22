@@ -143,6 +143,8 @@ BBC6 注意事項（unified build）：
 
 > **round-4 更新（2026-11-22，E00–E08）**：本輪僅完成 E01–E07 的程式碼／UI 契約修正（E01/E02 政策操作流程、E03 CancellationException 透傳、E04 toggle 的 Unknown→Confirmed UI 恢復、E05 探測失敗對話框生命週期 handle、E06 VM 生產寫入 seam 強制非 null consent、E07 Invalid→v1 需重啟的 UI 提示）；epoch/generation 修復不在本輪範圍。**E00（P0 冷啟動 DELETE）與 E08（512 條目 IPC／15ms 真實 Binder 延遲／sticky 30 分鐘／Scope A dialog）維持 UNMEASURED／NOT a pass，三臂同基線對照要求與備份＋授權前提完全不變**；不得因 E01–E07 的 JVM／UI 修正而宣稱任何裝置閘門通過。E07 的 UI 提示僅為誠實告知（修復可能尚未生效、需重新啟動 Hook 行程後驗證、不代表新政策已套用），不代表跨行程立即生效。**opt-out is NOT a deletion guard**（issue #75）；runtime opt-out 仍非刪除防護。
 
+> **round-5 更新（2026-11-23，F00–F06；更新而非取代 round-2+3+4）**：本輪 F01–F04 僅為 JVM／UI 契約修正（F01 Unknown 警告的重新整理改為權威 `refreshPolicyDraft()` 並 await、盲清正式撤回停用；F02 修復提示 app-scoped 跨 VM 在 Main＋Editor 可見；F03 繼承 `Confirmed(value)` 時同步 CheckBox；F04 VM 對非 null consent 重算移除 delta）。**F00（＝D01/N01 P0 冷啟動 DELETE）與 F06（＝D06 gate 延遲／D08 512-entry IPC／sticky／Scope A dialog）維持 UNMEASURED／NOT a pass**；P0 合併門檻未關閉。**三臂同基線對照（default BBC／confirmed-off runtime gate／Samsung baseline）與備份＋明確授權＋持有人同意前提完全不變**；不得因 JVM／UI 全綠而宣稱任何裝置閘門通過。**opt-out is NOT a deletion guard**（issue #75）。
+
 **Scope A dialog（issue #73）**：PreClear warning dialog 從未在裝置上觸發或擷錄，維持 **UNMEASURED／NOT a pass／device verification pending（backup+consent）**。
 
 擷錄指引：

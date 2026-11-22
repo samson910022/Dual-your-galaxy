@@ -3695,7 +3695,8 @@ class MainActivity : ComponentActivity() {
                 // Stage L4 fix(a) 修復模式標籤：Corrupt 下重貼 repair 文案＋CD，
                 // 使 TalkBack 可感知「修復（兩步確認）」而非「清除」；msg 播報仍走
                 // VM 的 CORRUPT_DETECTED / REPAIR_FIRST 資源文案。非 Corrupt 回原
-                // 清除文案（Unavailable 盲清維持清除語義）。
+                // 非 Corrupt（含 Unavailable）回原清除文案；R5-0 起盲清已停用，
+                // Unknown 清除 fail-closed，需先權威 refreshPolicyDraft 回到 Known。
                 try {
                     val wantText = getString(clearPolicyButtonTextRes(s.policyDraftCorrupt))
                     if (clearPolicyBtn.text.toString() != wantText) {
@@ -6469,7 +6470,8 @@ class MainActivity : ComponentActivity() {
             return
         }
         val old = snap.draft
-        // Known 空草稿：無刪可警，直接進 VM（VM 仍掌握 blind-clear 語義）。
+        // Known 空草稿：無刪可警，直接進 VM（此為已知快照的單步清除；R5-0 起
+        // 盲清已停用，Unknown 須先權威 refreshPolicyDraft 回到 Known 才能清除）。
         // M3：真 no-op 清除——建真實 consent 後直走 VM，不重觸發警告。
         // R4-1 (E02)：snap.known 已驗證且 delta==old==∅ ⇒ 可證明不移除。
         if (old.isEmpty()) {
