@@ -175,6 +175,9 @@ class MainActivity : ComponentActivity() {
     // Stage2 (hook-policy-source P1)：白名單政策（草稿）最小入口（核心引擎頁
     // 技術卡一節＋兩階段寫入對話框，沿用 remove ack 模式；不改首頁大佈局）。
     private lateinit var policyDraftView: TextView
+    // E07 (PR #74 R4): persistent, honest hint shown only while the VM's
+    // app-local repair signal is latched. Never asserts the hook applied.
+    private lateinit var policyRepairHintView: TextView
     private lateinit var writePolicyBtn: Button
     private lateinit var clearPolicyBtn: Button
     private lateinit var refreshPolicyBtn: Button
@@ -1033,6 +1036,14 @@ class MainActivity : ComponentActivity() {
             setTextColor(getColor(R.color.oneui_text_secondary))
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
         }
+        policyRepairHintView = TextView(this).apply {
+            text = getString(R.string.policy_repair_hook_restart_required)
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_text_secondary))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            visibility = View.GONE
+            contentDescription = text
+        }
         writePolicyBtn = Button(this).apply {
             text = getString(R.string.action_write_policy)
             background = getDrawable(R.drawable.bg_pill_button_secondary)
@@ -1711,6 +1722,9 @@ class MainActivity : ComponentActivity() {
         // Stage2：白名單政策（草稿）一節（最小入口：計數行＋寫入/清除/重新整理列；
         // 寫入走兩階段確認 dialog，見 syncPolicyWriteDialog）。
         techCard.addView(policyDraftView)
+        // E07: the hook-restart hint lives directly under the policy status
+        // line so it cannot be overwritten by a later unrelated status msg.
+        techCard.addView(policyRepairHintView)
         val policyRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(writePolicyBtn, rowParams())
@@ -3336,6 +3350,23 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     lastPolicyDraftText = newDraftText
+                }
+            }
+        } catch (_: Exception) {
+            // Best effort: render may run before buildUi in tests.
+        }
+        // E07 (PR #74 R4): persistent hook-restart hint. The VM flag is
+        // sticky, so the hint stays visible across later unrelated status
+        // updates; it is NOT a claim that the hook has actually reloaded.
+        try {
+            if (::policyRepairHintView.isInitialized) {
+                val needHint = s.policyRepairNeedsHookRestart
+                val wantVisibility = if (needHint) View.VISIBLE else View.GONE
+                if (policyRepairHintView.visibility != wantVisibility) {
+                    policyRepairHintView.visibility = wantVisibility
+                    policyRepairHintView.accessibilityLiveRegion =
+                        if (needHint) View.ACCESSIBILITY_LIVE_REGION_POLITE
+                        else View.ACCESSIBILITY_LIVE_REGION_NONE
                 }
             }
         } catch (_: Exception) {

@@ -513,6 +513,13 @@ data class UiState(
     // repair flow (requestRepair/confirmRepair). Render shows corrupt_detected
     // when true.
     val policyDraftCorrupt: Boolean = false,
+    // E07 (PR #74 R4): sticky UI hint that a SUCCESSFUL write repaired an
+    // Invalid version key (v1) while a hook may still hold a higher version
+    // high-water and reject v1 as a replay. Sourced solely from the app-local
+    // one-shot HookPolicyStore signal; NOT proof of hook state. Once raised it
+    // stays true for this ViewModel's lifetime (a later clean write must never
+    // silently erase an honest warning); only a new ViewModel clears it.
+    val policyRepairNeedsHookRestart: Boolean = false,
     val pendingPolicyWrite: PendingPolicyWrite? = null,
     // Phase 3：政策寫入可觀測相位＋單一 epoch（唯一真相，render 只讀此二欄）。
     // - policyWritePhase：IDLE/QUEUED/SAVING（見 PolicyWritePhase KDoc）。
@@ -7136,6 +7143,29 @@ class DualViewModel(
         bumpPolicyGenerations()
     }
 
+    // E07 (PR #74 R4): drain the app-process-local one-shot signal right after
+    // a store.save/store.clear result of true. Called at EVERY successful write
+    // completion (coordinator lazy deferred and fallback, save and clear) so an
+    // Invalid->v1 repair cannot be reported as an unqualified success. The
+    // flag is deliberately STICKY: a later unrelated successful write that
+    // returns no repair signal does not lower it — once the user has been
+    // warned, only a fresh ViewModel (process/VM restart) clears it. No claim
+    // about the hook's actual version is made here (no cross-process pass).
+    private fun noteInvalidVersionRepairAfterCommit(store: HookPolicyStore, ok: Boolean) {
+        if (!ok) return
+        val repaired = try {
+            store.consumeInvalidVersionRepair()
+        } catch (_: Throwable) {
+            false
+        }
+        if (repaired) {
+            _state.update { cur ->
+                if (cur.policyRepairNeedsHookRestart) cur
+                else cur.copy(policyRepairNeedsHookRestart = true)
+            }
+        }
+    }
+
     // Stage H2 P1: winner triple bump (order contract for claim->bump->update->emit
     // ordering, not a single helper). Every winner terminal (Success/Mismatch Known,
     // Failed Unknown via mark) advances version+freshness+ownership synchronously
@@ -9601,7 +9631,10 @@ class DualViewModel(
                         }
                         writeLocked = true
                         val lazy = h1Coord.scope.async(Dispatchers.IO, start = CoroutineStart.LAZY) {
-                            store.save(sanitized)
+                            // E07: consume the repair signal at this successful
+                            // commit point (coordinator save path; the other VM
+                            // may await this same deferred via the fallback arm).
+                            store.save(sanitized).also { noteInvalidVersionRepairAfterCommit(store, it) }
                         }
                         val tx = PolicyTx(
                             txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
@@ -9878,7 +9911,10 @@ class DualViewModel(
                     }
                     try {
                         val deferred: Deferred<Boolean> = h1Deferred ?: viewModelScope.async(Dispatchers.IO) {
-                            store.save(sanitized)
+                            // E07: fallback save path (no coordinator claim, or
+                            // coordinator deferred handed over). h1Deferred, when
+                            // present, was already wrapped at its creation site.
+                            store.save(sanitized).also { noteInvalidVersionRepairAfterCommit(store, it) }
                         }
                         val ok: Boolean? = try {
                             withTimeout(policyIoTimeoutMs) {
@@ -10803,7 +10839,9 @@ class DualViewModel(
                             // Phase 2 O3 (S4): last-moment Known re-check inside the IO arm —
                             // refuse the delete (fail-closed) if a refresh flipped Known
                             // since the commit gate; never clear unobserved content.
-                            if (knownCommitFence && !_state.value.policyDraftKnown) false else store.clear()
+                            // E07: coordinator clear path — consume only on a real success.
+                            (if (knownCommitFence && !_state.value.policyDraftKnown) false else store.clear())
+                                .also { noteInvalidVersionRepairAfterCommit(store, it) }
                         }
                         val txClear = PolicyTx(
                             txId = policyTxCoordinator?.nextTxId() ?: policyTxId.incrementAndGet(),
@@ -11058,7 +11096,10 @@ class DualViewModel(
                     val deferred: Deferred<Boolean> = h1ClearDeferred ?: viewModelScope.async(Dispatchers.IO) {
                         // Phase 2 O3 (S4): last-moment Known re-check inside the fallback
                         // IO arm — refuse the delete if a refresh flipped Known (fail-closed).
-                        if (knownCommitFence && !_state.value.policyDraftKnown) false else store.clear()
+                        // E07: fallback clear path; h1ClearDeferred, when present, was
+                        // already wrapped at its creation site.
+                        (if (knownCommitFence && !_state.value.policyDraftKnown) false else store.clear())
+                            .also { noteInvalidVersionRepairAfterCommit(store, it) }
                     }
                     val ok: Boolean? = try {
                         withTimeout(policyIoTimeoutMs) {

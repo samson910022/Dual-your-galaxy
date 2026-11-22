@@ -154,6 +154,21 @@ class PolicyPhaseCRequiredTest {
         (f.get(vm) as AtomicBoolean).set(stale)
     }
 
+    // E07: arm the store's app-process-local one-shot signal directly. The
+    // production route (Invalid -> v1 successful commit) is covered in
+    // HookPolicyRemoteStoreTest; here we only need the VM to observe it.
+    private fun armRepairSignal(store: HookPolicyStore) {
+        val f = HookPolicyStore::class.java.getDeclaredField("invalidVersionRepaired").apply { isAccessible = true }
+        (f.get(store) as AtomicBoolean).set(true)
+    }
+
+    private fun completeSuccessfulWrite(vm: DualViewModel, next: Set<String>) {
+        vm.replacePolicyDraft(next, vm.currentWarningBinding())
+        val pending = vm.state.value.pendingPolicyWrite ?: throw AssertionError("no pending installed")
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { vm.state.value.pendingPolicyWrite == null && vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+    }
+
     // R03：建立來源清單並勾選指定包名（appKey 形式 "0:<pkg>"）。
     private fun seedSelection(vm: DualViewModel, catalog: List<String>, selected: Set<String>) {
         vm.setSourceCatalog(catalog.map { SourceAppEntry(it, it, 0, false) })
@@ -170,6 +185,35 @@ class PolicyPhaseCRequiredTest {
             val v = f.get(vm) as java.util.concurrent.atomic.AtomicLong
             v.get() != -1L
         }
+    }
+
+    // E07 (PR #74 R4): both successful write completion paths (fallback save
+    // and coordinator save) drain the one-shot repair signal into UI state,
+    // and the hint is sticky across later clean writes. The flag is only an
+    // app-process-local hint: no claim is made about the hook's actual version.
+    @Test
+    fun repairSignalSurfacesHookRestartHintInUiStateBbc() {
+        // Fallback save arm (no coordinator claim).
+        val fake = FakePolicyStore(initialDraft = setOf("com.a.app"))
+        armRepairSignal(fake.store)
+        val vm = makeVm(fake.store, coordinator = null, policyIoTimeoutMs = 500L)
+        assertFalse(vm.state.value.policyRepairNeedsHookRestart)
+        completeSuccessfulWrite(vm, setOf("com.b.app"))
+        assertTrue(vm.state.value.policyRepairNeedsHookRestart)
+        assertFalse("signal must be consumed exactly once", fake.store.consumeInvalidVersionRepair())
+        // A later non-repair write has no signal and must not lower the flag.
+        completeSuccessfulWrite(vm, setOf("com.c.app"))
+        assertTrue("sticky until a fresh ViewModel", vm.state.value.policyRepairNeedsHookRestart)
+
+        // Coordinator save arm (lazy deferred claimed by the coordinator).
+        val fake2 = FakePolicyStore(initialDraft = setOf("com.a.app"))
+        armRepairSignal(fake2.store)
+        val coord = PolicyTxCoordinator()
+        val vm2 = makeVm(fake2.store, coordinator = coord, policyIoTimeoutMs = 500L)
+        assertFalse(vm2.state.value.policyRepairNeedsHookRestart)
+        completeSuccessfulWrite(vm2, setOf("com.b.app"))
+        assertTrue(vm2.state.value.policyRepairNeedsHookRestart)
+        assertFalse(fake2.store.consumeInvalidVersionRepair())
     }
 
     // 1. confirm重讀Corrupt：loadRaw拋CCE→CORRUPT_DETECTED+corrupt=true+零save。

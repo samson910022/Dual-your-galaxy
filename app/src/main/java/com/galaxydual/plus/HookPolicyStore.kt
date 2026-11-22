@@ -677,6 +677,29 @@ class HookPolicyStore(
     private val saveBbcEnabledRaw: (Boolean) -> Boolean = { false },
 ) {
 
+    // E07 (PR #74 R4): app-process-local, one-shot signal that a SUCCESSFUL
+    // version-key commit repaired a VersionProbeResult.Invalid key
+    // (Invalid -> curVer=0 -> newVer=1). Only the production saveRaw sets it
+    // (both save() and clear() route through saveRaw); no prefs key, no IPC
+    // and no epoch/generation are added.
+    //
+    // HONESTY CONTRACT: this is NOT proof of hook state. A hook already running
+    // with lastBbcSeenVersion > 1 treats the repaired v1 as a decreasing replay
+    // and keeps its previous sticky snapshot — a successful App commit does
+    // NOT prove the repair took effect in that process. The VM consumes this
+    // signal after a true save/clear result to show a hook-restart hint; no
+    // claim about the hook's actual version is made (DEVICE-UNVERIFIED).
+    private val invalidVersionRepaired = AtomicBoolean(false)
+
+    // Production wiring seam only (remoteHookPolicyStore's saveRaw lambda runs
+    // before the store instance exists). Never call from UI code.
+    internal fun noteInvalidVersionRepaired() {
+        invalidVersionRepaired.set(true)
+    }
+
+    // One-shot drain: true at most once per repaired commit, then false.
+    fun consumeInvalidVersionRepair(): Boolean = invalidVersionRepaired.getAndSet(false)
+
     // PR #74 G1: persisted, owner-controlled BBC injection preference.
     // Default TRUE when the key is absent or the read fails (preserve shipped
     // behavior; "off" is not a safety guarantee — Samsung's cold-start deletion
@@ -991,6 +1014,11 @@ fun remoteHookPolicyStore(
     provider: () -> SharedPreferences?,
 ): HookPolicyStore {
     val storeIdentityRef = AtomicReference<SharedPreferences?>(null)
+    // E07: the saveRaw lambda below is constructed before the store instance
+    // exists, so it reaches this one-shot signal through this holder. Wired in
+    // the .also block immediately below; production callers can only invoke
+    // saveRaw after the factory has returned the fully wired store.
+    val invalidRepairTarget = AtomicReference<HookPolicyStore?>(null)
     fun resolvePrefs(): SharedPreferences? = try {
         provider()
     } catch (ce: CancellationException) {
@@ -1104,6 +1132,10 @@ fun remoteHookPolicyStore(
                 // the CAS entirely: no poison latched, nothing to undo, and the
                 // prefs instance stays recoverable in the same process.
                 var poisonToken: Long? = null
+                // E07: true only when this write's probe classified an Invalid
+                // version key; combined with ok==true below it is the sole
+                // condition for raising the app-local hook-restart signal.
+                var repairedInvalidVersion = false
                 try {
                     // NEW-2 (P2): serialize the whole version
                     // read->increment->putLong->commit under ONE process-wide
@@ -1179,6 +1211,7 @@ fun remoteHookPolicyStore(
                         if (probe is VersionProbeResult.Unavailable) {
                             return@synchronized false
                         }
+                        repairedInvalidVersion = probe is VersionProbeResult.Invalid
                         val curVer: Long = when (probe) {
                             is VersionProbeResult.Present -> probe.value
                             VersionProbeResult.Absent, VersionProbeResult.Invalid -> 0L
@@ -1240,6 +1273,17 @@ fun remoteHookPolicyStore(
                         try {
                             ensurePoisoned(prefs)
                         } catch (_: Exception) {
+                        }
+                    }
+                    // E07: only a commit that ACTUALLY succeeded and repaired an
+                    // Invalid version key raises the signal. A false/aborted/
+                    // throwing commit (or a normal Present/Absent monotonic
+                    // write) never does. The hook may still reject v1 as a
+                    // replay; see the field KDoc (no claim about hook state).
+                    if (ok && repairedInvalidVersion) {
+                        try {
+                            invalidRepairTarget.get()?.noteInvalidVersionRepaired()
+                        } catch (_: Throwable) {
                         }
                     }
                     ok
@@ -1455,6 +1499,8 @@ fun remoteHookPolicyStore(
             }
         },
     ).also { store ->
+        // E07: wire the one-shot repair signal back to the saveRaw lambda above.
+        invalidRepairTarget.set(store)
         // Stage N1 P1: evidence probe for hasCorruptEvidence() (zero-touch,
         // 僅查 evidence map，不碰 prefs getStringSet)。
         store.setCorruptEvidenceProbe {

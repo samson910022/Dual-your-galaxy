@@ -1925,9 +1925,51 @@ class HookPolicyRemoteStoreTest {
             prefs.versionTypeCorrupt = true // getLong(version) 擲 CCE → Invalid
             val store = remoteHookPolicyStore { prefs }
             assertTrue(store.save(setOf("new")))
+            // E07: the successful Invalid->v1 repair raises the app-local
+            // one-shot signal; this is NOT a claim that any hook applied it.
+            assertTrue(store.consumeInvalidVersionRepair())
+            assertFalse(store.consumeInvalidVersionRepair())
             prefs.versionTypeCorrupt = false
             assertEquals(1L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
             assertEquals(setOf("new"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // E07 (PR #74 R4): the Invalid->v1 repair signal is app-process-local and
+    // one-shot, set ONLY when the commit actually succeeded. A failed commit, a
+    // second consume, and a later normal (Present) monotonic write must all be
+    // false. There is no hook-state query here: a running hook may still reject
+    // v1 as a replay, so this signal must never be read as "hook applied".
+    @Test
+    fun invalidVersionRepairSetsOneShotSignalOnlyOnSuccessfulCommitBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            prefs.versionTypeCorrupt = true // getLong(version) throws CCE -> Invalid
+            val store = remoteHookPolicyStore { prefs }
+
+            prefs.commitSucceeds = false
+            assertFalse(store.save(setOf("new")))
+            assertFalse("failed commit must not signal a repair", store.consumeInvalidVersionRepair())
+
+            prefs.commitSucceeds = true
+            assertTrue(store.save(setOf("new")))
+            assertTrue("successful Invalid->v1 commit sets the signal", store.consumeInvalidVersionRepair())
+            assertFalse("one-shot signal must not fire twice", store.consumeInvalidVersionRepair())
+
+            prefs.versionTypeCorrupt = false // now reads the committed v1 as Present
+            assertEquals(1L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertTrue(store.save(setOf("later")))
+            assertFalse("normal monotonic write is not a repair", store.consumeInvalidVersionRepair())
+            assertEquals(2L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            // No new claim about hook state: the only observable is the
+            // app-local one-shot flag above; no cross-process pass is asserted.
         } finally {
             resetRemotePoisonForTests()
         }
