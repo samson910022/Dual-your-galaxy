@@ -43,8 +43,10 @@ class ProbeFailedDialogConfigTest {
         assertEquals(R.string.pre_write_probe_failed_message, writeUnknown.messageRes)
         assertEquals(R.string.pre_clear_unknown_refresh_retry, writeUnknown.retryLabelRes)
 
-        // Only two message variants; both keep the cold-start DELETE risk
-        // sentences verbatim in all three locale strings.xml files.
+        // Only two message variants. This JVM test checks descriptor resource
+        // IDs only — it does NOT verify locale string contents/parity; those
+        // strings are NOT verified in this suite (DEVICE-UNVERIFIED / needs
+        // locale-instrumentation or a source-scan guard).
         assertEquals(
             2,
             setOf(

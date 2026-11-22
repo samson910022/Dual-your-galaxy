@@ -15,6 +15,8 @@
 // 不靠睡眠、不靠 Robolectric。D05 新測試改用真實單執行緒 + CountDownLatch.await()
 // 做出真正不可取消的阻塞提交；若用可取消的 CompletableDeferred，舊 actor 一 dispose
 // 就能拋棄提交，測試會變成空架子。Java latch 只做同步握手，不含時間假設。
+//
+// DEVICE-UNVERIFIED: real View styling in MainActivity.renderEffect is not exercised.
 package com.galaxydual.plus
 
 import kotlinx.coroutines.CompletableDeferred

@@ -1372,6 +1372,39 @@ class PolicyPhaseCRequiredTest {
         return vm to fake
     }
 
+    // F3 (final reviewer): build the VM exactly as production does — every named
+    // arg matches makeVm, but requirePolicyWriteConsent is deliberately OMITTED so
+    // Kotlin applies the production default (`= true`). All other factories in
+    // this file pass the flag explicitly (mostly false), so none of them pin the
+    // fail-safe default. Keeping this separate from makeVm leaves every existing
+    // test's flag semantics untouched.
+    private fun makeProductionDefaultVm(policyStore: HookPolicyStore): DualViewModel {
+        val vm = DualViewModel(
+            repo = DualRepository(NoOpGateway()),
+            gatewayPrivilege = Privilege.NONE,
+            elevators = emptyList(),
+            preference = ChannelPreference.AUTO,
+            appPackageName = "com.example.test",
+            persistPreference = null,
+            suPresentCheck = { false },
+            shizukuAuthCheck = { false },
+            activeGateway = NoOpGateway(),
+            currentChannel = ResolvedChannel.NOOP,
+            hookDirectReads = { listOf(MarkerRead.Readable(null)) },
+            hookDiagnosticGateways = { emptyList() },
+            hookPolicyStore = policyStore,
+            currentUserId = { 0 },
+            nowMonoMs = { System.currentTimeMillis() },
+            policyIoTimeoutMs = 500L,
+            // requirePolicyWriteConsent intentionally omitted -> production default true
+            policyTxCoordinator = null,
+        )
+        vms.add(vm)
+        await { vm.state.value.policyDraftKnown }
+        await { !vm.state.value.loading }
+        return vm
+    }
+
     private fun assertConsentlessWriteRefused(vm: DualViewModel, fake: FakePolicyStore) {
         assertNull("no pending may be installed", vm.state.value.pendingPolicyWrite)
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
@@ -1385,7 +1418,20 @@ class PolicyPhaseCRequiredTest {
         )
     }
 
-    // R4-4 BBC-1: the fail-safe production default refuses a consentless
+    // F3 (final reviewer): no other factory exercises the production default —
+    // makeVm always passes the flag. A VM built without the flag must still refuse
+    // a consentless guarded seam exactly like an explicitly-required one. If the
+    // production default ever flips to false, this test fails (a pending appears).
+    @Test
+    fun productionDefaultRequiresConsentForPolicyWritesBbc() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.a.app", "com.b.app"))
+        val vm = makeProductionDefaultVm(fake.store)
+        seedSelection(vm, listOf("com.a.app", "com.b.app"), setOf("com.a.app", "com.b.app"))
+        vm.requestPolicyWrite(consent = null)
+        assertConsentlessWriteRefused(vm, fake)
+    }
+
+    // R4-4 BBC-1: an explicitly consent-required VM refuses a consentless
     // requestPolicyWrite before any gate/selection/store work.
     @Test
     fun vmWithConsentRequiredRejectsConsentlessRequestPolicyWriteBbc() {

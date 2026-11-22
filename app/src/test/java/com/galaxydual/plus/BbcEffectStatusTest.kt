@@ -3,6 +3,7 @@
 // PR #74 round 4 / E04: framework-free JVM tests for the app-scoped effect
 // status projection. No Robolectric, no wall-clock waits: the collector runs on
 // Dispatchers.Unconfined so StateFlow replay/emission is observed synchronously.
+// DEVICE-UNVERIFIED: real View styling in MainActivity.renderEffect is not exercised.
 package com.galaxydual.plus
 
 import kotlinx.coroutines.Dispatchers
