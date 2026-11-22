@@ -145,7 +145,7 @@ BBC6 注意事項（unified build）：
 
 > **round-5 更新（2026-11-23，F00–F06；更新而非取代 round-2+3+4）**：本輪 F01–F04 僅為 JVM／UI 契約修正（F01 Unknown 警告的重新整理改為權威 `refreshPolicyDraft()` 並 await、盲清正式撤回停用；F02 修復提示 app-scoped 跨 VM 在 Main＋Editor 可見；F03 繼承 `Confirmed(value)` 時同步 CheckBox；F04 VM 對非 null consent 重算移除 delta）。**F00（＝D01/N01 P0 冷啟動 DELETE）與 F06（＝D06 gate 延遲／D08 512-entry IPC／sticky／Scope A dialog）維持 UNMEASURED／NOT a pass**；P0 合併門檻未關閉。**三臂同基線對照（default BBC／confirmed-off runtime gate／Samsung baseline）與備份＋明確授權＋持有人同意前提完全不變**；不得因 JVM／UI 全綠而宣稱任何裝置閘門通過。**opt-out is NOT a deletion guard**（issue #75）。
 
-> **round-6 更新（2026-11-23，G03／G04；更新而非取代 round-2+3+4+5）**：G03 僅下修 SSAID 因果用語（直接存取未發現；間接貢獻未確立亦未排除；根因 UNKNOWN）；G04 僅要求效能／UI／安全驗收門檻維持 **UNMEASURED／NOT a pass**。**F00／F06 與 G00／G04 一律 UNMEASURED／NOT a pass；P0 合併門檻維持開啟**；三臂 A/B/C 僅為重要負向控制關聯，不是安全通過或根因定論。JVM／CI 全綠與破壞性 A/B/C 皆不構成通過；任何涉及分身刪除或 user-95 資料清除的步驟仍須明確授權＋備份＋持有人同意後親自執行（issue #75）。runtime opt-out 不是刪除防護。此輪為純文件誠實性修正，不涉及禁止的 SSAID／Scope B 修改，亦不宣稱任何程式碼修正關閉 P0。
+> **round-6 更新（2026-11-23，G03／G04；更新而非取代 round-2+3+4+5）**：G03 僅下修 SSAID 因果用語（直接存取未發現；間接貢獻未確立亦未排除；根因 UNKNOWN）；G04 僅要求效能／UI／安全驗收門檻維持 **UNMEASURED／NOT a pass**。**F00／F06 與 G00／G04 一律 UNMEASURED／NOT a pass；P0 合併門檻維持開啟**；三臂 A/B/C 僅為重要負向控制關聯，不是安全通過或根因定論。JVM／CI 全綠與破壞性 A/B/C 皆不構成通過；任何涉及分身刪除或 user-95 資料清除的步驟仍須明確授權＋備份＋持有人同意後親自執行（issue #75）。runtime opt-out 不是刪除防護。此輪 G03／G04 部分為純文件誠實性修正（G01／G02 為程式修正），不涉及禁止的 SSAID／Scope B 修改，亦不宣稱任何程式碼修正關閉 P0。
 
 **Scope A dialog（issue #73）**：PreClear warning dialog 從未在裝置上觸發或擷錄，維持 **UNMEASURED／NOT a pass／device verification pending（backup+consent）**。
 

@@ -54,7 +54,7 @@ data class PolicySettled(
 // tryInsertClaimTombstone）。top-level internal：coordinator 與測試共用單一常數。
 internal const val CLAIM_TOMBSTONE_MAX = 512
 
-class PolicyTxCoordinator(
+class PolicyTxCoordinator internal constructor(
     // PR #74 R6-2 (G02):app-private 維修提示持久化 store。
     // null (預設) = 純記憶體行為,保持既有 60+ 測試呼叫點完全不變；
     // 生產由 GalaxyApp 注入 SharedPreferences-backed store。
@@ -121,12 +121,14 @@ class PolicyTxCoordinator(
     }
 
     // JVM-test seam: inspect the persisted marker without an injected store.
+    @get:Synchronized
     internal val repairHintPersistedState: RepairHintState get() = persisted
 
     /**
      * Raise the app-scoped hint after a successful Invalid->v1 repair commit.
      * Idempotent: an already-active marker never bumps [RepairHintState.generation].
      */
+    @Synchronized
     fun markRepairHint(repairedVersion: Long = -1L) {
         if (persisted.active) {
             // Already active: keep the live truth raised, no generation bump.
@@ -143,6 +145,7 @@ class PolicyTxCoordinator(
     }
 
     /** Explicit user acknowledgement. The ONLY production clear. */
+    @Synchronized
     fun acknowledgeRepairHint() {
         applyRepairHint(persisted.copy(active = false))
     }
@@ -151,10 +154,12 @@ class PolicyTxCoordinator(
     // A future binder contract would have to supply VERIFIED hook identity before
     // an identity-based auto-clear could be justified; nothing here claims any
     // on-device verification or observes the hook process's PID / high-water.
+    @Synchronized
     internal fun clearOnVerifiedHookRebirth() {
         applyRepairHint(persisted.copy(active = false))
     }
 
+    @Synchronized
     private fun applyRepairHint(next: RepairHintState) {
         persisted = next
         _repairHint.value = next.active
