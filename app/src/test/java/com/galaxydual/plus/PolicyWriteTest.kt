@@ -171,6 +171,8 @@ class PolicyWriteTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = policyStore,
+            // R4-4: legacy no-consent callers; production keeps the fail-safe default.
+            requirePolicyWriteConsent = false,
             currentUserId = { userId },
             nowMonoMs = nowMonoMs,
             selectionStore = selectionStore,
@@ -5267,6 +5269,8 @@ class PolicyWriteTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = store,
+            // R4-4: legacy no-consent callers; production keeps the fail-safe default.
+            requirePolicyWriteConsent = false,
             currentUserId = { 0 },
             policyIoTimeoutMs = policyIoTimeoutMs,
             policyTxCoordinator = coord,
@@ -6897,6 +6901,8 @@ class PolicyWriteTest {
                 hookDirectReads = { listOf(MarkerRead.Readable(null)) },
                 hookDiagnosticGateways = { emptyList() },
                 hookPolicyStore = fake.store,
+                // R4-4: legacy no-consent clearPolicyDraft() caller in this test.
+                requirePolicyWriteConsent = false,
                 currentUserId = { 0 },
                 selectionStore = blockingSelectionStore,
                 policyTxCoordinator = coord,

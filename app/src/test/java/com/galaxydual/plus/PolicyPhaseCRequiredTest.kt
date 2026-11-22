@@ -118,6 +118,7 @@ class PolicyPhaseCRequiredTest {
         coordinator: PolicyTxCoordinator? = null,
         policyIoTimeoutMs: Long = 500L,
         nowMonoMs: () -> Long = { System.currentTimeMillis() },
+        requirePolicyWriteConsent: Boolean = false,
     ): DualViewModel {
         if (coordinator != null && !coords.contains(coordinator)) coords.add(coordinator)
         val vm = DualViewModel(
@@ -134,6 +135,7 @@ class PolicyPhaseCRequiredTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = policyStore,
+            requirePolicyWriteConsent = requirePolicyWriteConsent,
             currentUserId = { userId },
             nowMonoMs = nowMonoMs,
             policyIoTimeoutMs = policyIoTimeoutMs,
@@ -1310,5 +1312,112 @@ class PolicyPhaseCRequiredTest {
         assertEquals("clear count must be 1", 1, clearCalls.get())
         assertEquals("backend must be empty", emptySet<String>(), backend.get())
         assertNull(vm.state.value.pendingPolicyWrite)
+    }
+
+    // R4-4: reflection read of the blind-clear arm, so "no arm installed" is an
+    // observable assertion rather than an inference from zero store calls.
+    private fun blindClearArmAtMs(vm: DualViewModel): Long {
+        val f = DualViewModel::class.java.getDeclaredField("blindClearArmedAtMs").apply { isAccessible = true }
+        return (f.get(vm) as java.util.concurrent.atomic.AtomicLong).get()
+    }
+
+    private fun newConsentRequiredVm(): Pair<DualViewModel, FakePolicyStore> {
+        val fake = FakePolicyStore(initialDraft = setOf("com.a.app", "com.b.app"))
+        val vm = makeVm(fake.store, requirePolicyWriteConsent = true)
+        seedSelection(vm, listOf("com.a.app", "com.b.app"), setOf("com.a.app", "com.b.app"))
+        return vm to fake
+    }
+
+    private fun assertConsentlessWriteRefused(vm: DualViewModel, fake: FakePolicyStore) {
+        assertNull("no pending may be installed", vm.state.value.pendingPolicyWrite)
+        assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+        assertEquals("no store save", 0, fake.saveCalls.get())
+        assertEquals("no store clear", 0, fake.clearCalls.get())
+        assertEquals("no blind-clear arm installed", -1L, blindClearArmAtMs(vm))
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+        assertEquals(
+            PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(),
+            vm.state.value.msg,
+        )
+    }
+
+    // R4-4 BBC-1: the fail-safe production default refuses a consentless
+    // requestPolicyWrite before any gate/selection/store work.
+    @Test
+    fun vmWithConsentRequiredRejectsConsentlessRequestPolicyWriteBbc() {
+        val (vm, fake) = newConsentRequiredVm()
+        vm.requestPolicyWrite()
+        assertConsentlessWriteRefused(vm, fake)
+    }
+
+    // R4-4 BBC-2: every remaining production policy-write seam fails closed on
+    // null consent. The onClearPolicyButtonTap case exercises the CLEAR route
+    // (Known, not corrupt, no repair arm) so the REPAIR routes stay untouched.
+    @Test
+    fun vmWithConsentRequiredRejectsConsentlessReplaceAndClearAndWarningBbc() {
+        run {
+            val (vm, fake) = newConsentRequiredVm()
+            vm.replacePolicyDraft(setOf("com.b.app"))
+            assertConsentlessWriteRefused(vm, fake)
+        }
+        run {
+            val (vm, fake) = newConsentRequiredVm()
+            vm.requestPolicyWriteForWarning(setOf("com.b.app"))
+            assertConsentlessWriteRefused(vm, fake)
+        }
+        run {
+            val (vm, fake) = newConsentRequiredVm()
+            vm.clearPolicyDraft()
+            assertConsentlessWriteRefused(vm, fake)
+        }
+        run {
+            val (vm, fake) = newConsentRequiredVm()
+            assertTrue("route must be CLEAR to exercise the policy-write seam", vm.state.value.policyDraftKnown)
+            vm.onClearPolicyButtonTap()
+            assertConsentlessWriteRefused(vm, fake)
+        }
+    }
+
+    // R4-4 BBC-3: with the flag on, a valid consent still installs a pending and
+    // the ordinary confirm path (fence seam → store save) proceeds unchanged.
+    @Test
+    fun vmWithConsentRequiredAllowsValidConsentBbc() {
+        val backend = AtomicReference<Set<String>?>(setOf("com.a.app", "com.b.app"))
+        val saveCalls = AtomicInteger(0)
+        val clearCalls = AtomicInteger(0)
+        val store = atomicBackendStore(backend, saveCalls, clearCalls)
+        val vm = makeVm(store, requirePolicyWriteConsent = true)
+        seedSelection(vm, listOf("com.a.app", "com.b.app"), setOf("com.b.app"))
+        vm.policyWriteConsentFenceForTests = { _ -> PreClearContinueOutcome.ProceedOk }
+
+        vm.requestPolicyWrite(consent = consentTemplate())
+        val pending = vm.state.value.pendingPolicyWrite
+        assertNotNull("valid consent must still install a pending", pending)
+        val captured = pending!!.consent
+        assertNotNull("installed pending must carry the consent", captured)
+        assertEquals(pending.generation, captured!!.generation)
+
+        vm.confirmPolicyWrite(pending, pending.generation)
+        await { saveCalls.get() == 1 }
+        await { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
+        assertEquals(setOf("com.b.app"), backend.get())
+        assertEquals(0, clearCalls.get())
+        assertNull(vm.state.value.pendingPolicyWrite)
+    }
+
+    // R4-4 BBC-4: the opt-out seam is pinned — legacy test factories that set the
+    // flag false still create a consentless pending, unchanged from before.
+    @Test
+    fun testBypassFlagRestoresLegacyCarveOutBbc() {
+        val fake = FakePolicyStore(initialDraft = setOf("com.a.app", "com.b.app"))
+        val vm = makeVm(fake.store)
+        seedSelection(vm, listOf("com.a.app", "com.b.app"), setOf("com.a.app", "com.b.app"))
+        vm.requestPolicyWrite()
+        val pending = vm.state.value.pendingPolicyWrite
+        assertNotNull("legacy carve-out must still install a pending", pending)
+        assertNull("legacy carve-out pending keeps consent=null", pending!!.consent)
+        assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+        assertEquals(0, fake.saveCalls.get())
+        assertEquals(0, fake.clearCalls.get())
     }
 }

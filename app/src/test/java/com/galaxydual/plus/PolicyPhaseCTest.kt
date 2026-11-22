@@ -105,6 +105,8 @@ class PolicyPhaseCTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = policyStore,
+            // R4-4: legacy no-consent callers; production keeps the fail-safe default.
+            requirePolicyWriteConsent = false,
             currentUserId = { userId },
             policyIoTimeoutMs = 500L,
             policyTxCoordinator = coordinator,

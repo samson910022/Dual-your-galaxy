@@ -131,6 +131,8 @@ class PolicyWriteCrossVmTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = policyStore,
+            // R4-4: legacy no-consent callers; production keeps the fail-safe default.
+            requirePolicyWriteConsent = false,
             currentUserId = { userId },
             policyIoTimeoutMs = policyIoTimeoutMs,
             policyTxCoordinator = policyTxCoordinator,
@@ -168,6 +170,8 @@ class PolicyWriteCrossVmTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = store,
+            // R4-4: legacy no-consent callers; production keeps the fail-safe default.
+            requirePolicyWriteConsent = false,
             currentUserId = { 0 },
             policyIoTimeoutMs = policyIoTimeoutMs,
             policyTxCoordinator = coord,
@@ -590,6 +594,8 @@ class PolicyWriteCrossVmTest {
                 hookDirectReads = { listOf(MarkerRead.Readable(null)) },
                 hookDiagnosticGateways = { emptyList() },
                 hookPolicyStore = store,
+                // R4-4: legacy no-consent requestPolicyWrite() caller in this test.
+                requirePolicyWriteConsent = false,
                 currentUserId = { 0 },
                 selectionStore = blockingSelection,
                 policyTxCoordinator = coord,

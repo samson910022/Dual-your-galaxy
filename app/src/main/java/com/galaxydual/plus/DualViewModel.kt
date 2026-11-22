@@ -759,6 +759,14 @@ class DualViewModel(
     // HookPolicyStore lambda 後端；null 表示無持久化 (所有政策操作退化為
     // 拒絕並說明，不碰裝置)。
     private val hookPolicyStore: HookPolicyStore? = null,
+    // R4-4 (PR #74 round 4): production safety default. Every public policy-write
+    // request seam (replacePolicyDraft / requestPolicyWrite /
+    // requestPolicyWriteForWarning / clearPolicyDraft / onClearPolicyButtonTap's
+    // CLEAR route) refuses a null consent, so a future UI caller cannot silently
+    // skip the D03 clone-membership fence at confirm/clear time. The production
+    // factory uses named args and inherits this fail-safe true. Only test
+    // factories for legacy no-consent callers may explicitly set false.
+    private val requirePolicyWriteConsent: Boolean = true,
     // Stage2:政策草稿寫入的 owner-user 門控。hook 讀 user 0 的 remote prefs
     // (此為 assertion,非實機證明,DEVICE-UNVERIFIED);非 owner 用戶實例寫入的
     // 是自己 user 的 group,hook 讀不到,故要求由 owner user 寫入。生產由
@@ -8721,6 +8729,13 @@ class DualViewModel(
         warningBinding: PolicyWarningBinding? = null,
         consent: PolicyWriteConsent? = null,
     ) {
+        // R4-4: consentless requests are refused before any gate/arm/store work.
+        if (requirePolicyWriteConsent && consent == null) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
         if (!policyWriteGatesPass()) return
         if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
             rejectStaleWarningBinding()
@@ -8738,6 +8753,13 @@ class DualViewModel(
         warningBinding: PolicyWarningBinding? = null,
         consent: PolicyWriteConsent? = null,
     ) {
+        // R4-4: consentless requests are refused before any gate/arm/store work.
+        if (requirePolicyWriteConsent && consent == null) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
         if (!policyWriteGatesPass()) return
         if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
             rejectStaleWarningBinding()
@@ -8774,6 +8796,13 @@ class DualViewModel(
         warningBinding: PolicyWarningBinding? = null,
         consent: PolicyWriteConsent? = null,
     ) {
+        // R4-4: consentless requests are refused before any gate/arm/store work.
+        if (requirePolicyWriteConsent && consent == null) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
         if (!policyWriteGatesPass()) return
         if (warningBinding != null && !isWarningBindingFresh(warningBinding)) {
             rejectStaleWarningBinding()
@@ -10315,6 +10344,14 @@ class DualViewModel(
         warningBinding: PolicyWarningBinding? = null,
         consent: PolicyWriteConsent? = null,
     ) {
+        // R4-4: consentless clear is refused before the owner gate, any blind-clear
+        // arm/disarm, or any store touch.
+        if (requirePolicyWriteConsent && consent == null) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
         // owner-user 門控 (defense-in-depth)：hook 只讀 user 0；非 owner 的
         // 清除不會被 hook 看到，故直接拒絕且不碰 store。Stage D：同步 disarm
         //（非 owner tap 不得殘留 arm，免切回 owner 後單步誤刪）。
@@ -12775,13 +12812,20 @@ class DualViewModel(
         warningBinding: PolicyWarningBinding? = null,
         consent: PolicyWriteConsent? = null,
     ) {
-        when (
-            clearPolicyButtonRoute(
-                _state.value.policyDraftKnown,
-                _state.value.policyDraftCorrupt,
-                isCorruptRepairArmed(),
-            )
-        ) {
+        val route = clearPolicyButtonRoute(
+            _state.value.policyDraftKnown,
+            _state.value.policyDraftCorrupt,
+            isCorruptRepairArmed(),
+        )
+        // R4-4: only the CLEAR route is a policy-write seam. REPAIR_CONFIRM /
+        // REPAIR_REQUEST have their own consent-free semantics and stay unchanged.
+        if (route == ClearPolicyButtonRoute.CLEAR && requirePolicyWriteConsent && consent == null) {
+            _state.update {
+                it.copy(msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)), msgKind = MsgKind.INVALID)
+            }
+            return
+        }
+        when (route) {
             ClearPolicyButtonRoute.REPAIR_CONFIRM -> confirmRepairCorruptDraft()
             ClearPolicyButtonRoute.REPAIR_REQUEST -> requestRepairCorruptDraft()
             ClearPolicyButtonRoute.CLEAR -> clearPolicyDraft(warningBinding = warningBinding, consent = consent)
