@@ -1156,8 +1156,12 @@ class PolicyPhaseCRequiredTest {
         return pending
     }
 
-    private fun consentTemplate(): PolicyWriteConsent = buildPolicyWriteConsent(
-        delta = setOf("com.b.app"),
+    // F04: the VM now RECOMPUTES the delta from the authoritative Known pre-read
+    // vs the real candidate and requires the DTO's delta to match. The replace
+    // tests below start from {a,b} and write {b}, so the real delta is {a} (NOT
+    // the candidate {b}). Clear tests pass the full old set explicitly.
+    private fun consentTemplate(delta: Set<String> = setOf("com.a.app")): PolicyWriteConsent = buildPolicyWriteConsent(
+        delta = delta,
         verifiedTarget = PreClearDualTarget(95, 7),
         installed = listOf("com.b.app"),
     )
@@ -1331,7 +1335,7 @@ class PolicyPhaseCRequiredTest {
         val store = atomicBackendStore(backend, saveCalls, clearCalls)
         val vm = makeVm(store, initialDraft = initial)
         vm.policyWriteConsentFenceForTests = { _ -> PreClearContinueOutcome.CloneMembershipChanged }
-        vm.clearPolicyDraft(consent = consentTemplate())
+        vm.clearPolicyDraft(consent = consentTemplate(delta = setOf("com.a.app", "com.b.app")))
         await { vm.state.value.msg == PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText() }
         assertEquals("clear count must be 0", 0, clearCalls.get())
         assertEquals("save count must be 0", 0, saveCalls.get())
@@ -1349,7 +1353,7 @@ class PolicyPhaseCRequiredTest {
         val store = atomicBackendStore(backend, saveCalls, clearCalls)
         val vm = makeVm(store, initialDraft = initial)
         vm.policyWriteConsentFenceForTests = { _ -> PreClearContinueOutcome.ProceedOk }
-        vm.clearPolicyDraft(consent = consentTemplate())
+        vm.clearPolicyDraft(consent = consentTemplate(delta = setOf("com.a.app", "com.b.app")))
         await { clearCalls.get() == 1 }
         await { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE }
         assertEquals("clear count must be 1", 1, clearCalls.get())

@@ -9629,8 +9629,10 @@ class DualViewModel(
                     // R04：Known 也不代表授權——若後端內容與警告時的 old 快照
                     // 不同（coordinator fence 未見的漂移），同樣 fail-closed
                     // 中止，避免整包覆寫使用者未曾被告知的刪除。
-                    // 僅警告綁定路徑執行（baseFreshGen != -1L）；legacy 直接注入
-                    // （baseFreshGen==-1L）跳過，保既有測試綠（新 UI 一律攜綁定）。
+                    // 僅警告綁定路徑（baseFreshGen != -1L）或攜帶 consent 的路徑執行；
+                    // legacy 直接注入（baseFreshGen==-1L && consent==null）跳過，保既有
+                    // 測試綠（新 UI 一律攜綁定）。F04：consent!=null 一律權威重讀，
+                    // 以便由 Known_old vs 真實候選重算 delta 核對 DTO 宣告值。
                     // R04 pre-read 與 D03b consent fence 共用同一 fail-closed 清理路徑：
                     // 清 in-flight、mark unknown、清 pending、回 IDLE、
                     // UNKNOWN_REFRESH/CHANNEL，零 store save、零 Tx claim。
@@ -9657,7 +9659,12 @@ class DualViewModel(
                             }
                         }
                     }
-                    if (pendingAtCall.baseFreshGen != -1L) {
+                    // F04: hoist consent + authoritative old snapshot so the DTO's
+                    // declared delta can be re-derived from the REAL Known pre-read
+                    // against the REAL (sanitized) candidate below.
+                    val consentAtCall = pendingAtCall.consent
+                    var authoritativeOld: Set<String>? = null
+                    if (pendingAtCall.baseFreshGen != -1L || consentAtCall != null) {
                         run {
                             val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
                             val preRead: LoadResult = try {
@@ -9686,6 +9693,8 @@ class DualViewModel(
                                     return@withLock
                                 }
                             }
+                            // Reached only on Known (Unknown / drift already aborted).
+                            authoritativeOld = (preRead as LoadResult.Known).packages
                         }
                     }
                     // D03b PART 2 — VM-side independent consent fence (defense in depth).
@@ -9696,11 +9705,25 @@ class DualViewModel(
                     // abortUnknownRefresh(false) (zero save, pending cleared, no Tx).
                     // consent==null is the legacy carve-out, skipped exactly like
                     // baseFreshGen==-1L (direct test injection / no warning capture).
-                    val consentAtCall = pendingAtCall.consent
                     if (consentAtCall != null) {
                         // Cheap BINDING guard only (requirement 5) — generation is NOT
                         // the freshness authority; the four gates below remain that.
                         if (consentAtCall.generation != pendingAtCall.generation) {
+                            abortUnknownRefresh(false)
+                            return@withLock
+                        }
+                        // F04 (defense-in-depth): the additive consent shortcut in
+                        // revalidatePolicyWriteConsent trusts the PUBLIC DTO's delta
+                        // + additiveNoRemoval fields. A forger can claim delta=∅ /
+                        // additive=true while the real Known old vs candidate is a
+                        // removal. Re-derive the delta from the AUTHORITATIVE Known
+                        // pre-read and the REAL sanitized candidate and require the
+                        // token to match. This gate is DELIBERATELY OUTSIDE
+                        // runPolicyWriteConsentFence (which policyWriteConsentFenceForTests
+                        // replaces wholesale) so negative tests cannot pass vacuously.
+                        // Only activates on consent != null — never on the caller-
+                        // controlled warningBinding / baseFreshGen alone.
+                        if (!consentDeltaMatchesAuthoritative(consentAtCall, authoritativeOld, sanitized)) {
                             abortUnknownRefresh(false)
                             return@withLock
                         }
@@ -10785,6 +10808,9 @@ class DualViewModel(
                             }
                         }
                     }
+                    // F04: hoist the AUTHORITATIVE Known old snapshot so the DTO's
+                    // declared delta can be re-derived for the clear path too.
+                    var authoritativeOld: Set<String>? = null
                     run {
                         val preJob = viewModelScope.async(Dispatchers.IO) { store.loadResult() }
                         val preRead: LoadResult = try {
@@ -10819,6 +10845,8 @@ class DualViewModel(
                             abortPrecommit(false, PolicyTextKind.UNKNOWN_REFRESH)
                             return@withLock
                         }
+                        // Reached only on Known (Unknown / drift already aborted).
+                        authoritativeOld = (preRead as LoadResult.Known).packages
                     }
                     // D03b PART 2 — same independent VM-side consent fence for the
                     // clear path, after its R04-equivalent pre-read and BEFORE
@@ -10829,6 +10857,17 @@ class DualViewModel(
                     // at the -1 sentinel for clear); the four gates remain the
                     // freshness authority, bounded and fail-closed.
                     if (consent != null) {
+                        // F04 (defense-in-depth): recompute the clear's real delta
+                        // from the AUTHORITATIVE Known pre-read vs the empty clear
+                        // candidate and require the public DTO's declared delta to
+                        // match, before trusting the additive shortcut in the fence.
+                        // Kept OUTSIDE runPolicyWriteConsentFence (the test seam
+                        // replaces that helper wholesale) so negative tests cannot
+                        // pass vacuously. Only active when consent != null.
+                        if (!consentDeltaMatchesAuthoritative(consent, authoritativeOld, emptySet())) {
+                            abortPrecommit(false, PolicyTextKind.UNKNOWN_REFRESH)
+                            return@withLock
+                        }
                         val consentOutcome: PreClearContinueOutcome = try {
                             withTimeout(minOf(policyIoTimeoutMs, 1_000L)) {
                                 runPolicyWriteConsentFence(consent)
@@ -15673,6 +15712,17 @@ internal fun clearPolicyButtonRoute(
 // - editorEmptyShouldGuide：編輯器空集導引（A 案：禁清到底，空集不警告、導引去 Main 清除）。
 // - shouldWarnForDelta：delta 安裝非空即警告（Activity probe Ok(non-empty) 才彈列表警告）。
 internal fun policyRemovalDelta(old: Set<String>, candidate: Set<String>): Set<String> = old - candidate
+
+// F04: pure, framework-free form of the VM's consent-delta integrity gate. The
+// public PolicyWriteConsent.delta (and additiveNoRemoval) are caller-controlled
+// DTO fields; trust them only if they equal the delta recomputed from the
+// AUTHORITATIVE Known pre-read snapshot and the REAL candidate. A null knownOld
+// (no authoritative Known was read) always fails closed.
+internal fun consentDeltaMatchesAuthoritative(
+    consent: PolicyWriteConsent,
+    knownOld: Set<String>?,
+    realCandidate: Set<String>,
+): Boolean = knownOld != null && consent.delta == policyRemovalDelta(knownOld, realCandidate)
 
 // R03 (PR #74) Phase 2：候選集合的確定性指紋。排序＋【每元素長度前綴】，
 // 故與迭代順序無關，且即使元素本身含分隔符也不會與另一集合碰撞（舊版只加
