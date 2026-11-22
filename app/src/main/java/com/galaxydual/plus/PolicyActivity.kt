@@ -662,12 +662,18 @@ class PolicyActivity : ComponentActivity() {
     }
 
     // D03b fixer M1/M3：fast path 用真實 seam 現場建 consent 後才執行 action。
-    private fun buildRealConsentThen(delta: Set<String>, action: (PolicyWriteConsent) -> Unit) {
+    // noRemovalKnown 排在 action 之前，保留既有 trailing-lambda 呼叫端（見 MainActivity）。
+    private fun buildRealConsentThen(
+        delta: Set<String>,
+        noRemovalKnown: Boolean = false,
+        action: (PolicyWriteConsent) -> Unit,
+    ) {
         lifecycleScope.launch {
             val consent = buildFastPathConsent(
                 delta = delta,
                 resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
                 reprobe = { pkgs, uid -> probeDualApps(pkgs, uid) },
+                noRemovalKnown = noRemovalKnown,
             )
             if (isFinishing || isDestroyed) return@launch
             pendingWarningConsent = consent

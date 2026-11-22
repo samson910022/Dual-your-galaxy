@@ -6127,12 +6127,19 @@ class MainActivity : ComponentActivity() {
 
     // D03b fixer M1/M3：fast path 用真實 seam 現場建 consent，再執行 action。
     // 不再讓任何會安裝 pending／清除的路徑帶著 null consent 進入 final confirm。
-    private fun buildRealConsentThen(delta: Set<String>, action: (PolicyWriteConsent) -> Unit) {
+    // noRemovalKnown 必須排在 action 之前，讓既有 `buildRealConsentThen(delta) { ... }`
+    // trailing-lambda 呼叫端仍綁到 action（R4-1 才會帶值進來）；default false 不改現有行為。
+    private fun buildRealConsentThen(
+        delta: Set<String>,
+        noRemovalKnown: Boolean = false,
+        action: (PolicyWriteConsent) -> Unit,
+    ) {
         lifecycleScope.launch {
             val consent = buildFastPathConsent(
                 delta = delta,
                 resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
                 reprobe = { pkgs, uid -> probeDualApps(pkgs, uid) },
+                noRemovalKnown = noRemovalKnown,
             )
             if (isFinishing || isDestroyed) return@launch
             pendingWarningConsent = consent
@@ -8272,6 +8279,14 @@ internal suspend fun revalidatePolicyWriteConsent(
         preClearLog("policy-write consent aborted: warning probe failed (force-proceed)")
         return PreClearContinueOutcome.CannotDetermine
     }
+    // R4 (E02)：可證明不移除的 Known 新增操作（無 verified target／null identity）沒有可
+    // 還原的身份也沒有被移除的分身，identity／membership 四道關卡對它不適用。fence 自行
+    // 交叉檢查 delta.isEmpty()，故即使 flag 被偽造，破壞性（非空 delta）consent 仍會落到
+    // 下方完整四道關卡，不會 bypass。此 branch 必須在身份重建之前、且從失敗探測檢查之後。
+    if (consent.additiveNoRemoval && consent.delta.isEmpty()) {
+        preClearLog("policy-write consent: additive no-removal (no identity/membership fence needed)")
+        return PreClearContinueOutcome.ProceedOk
+    }
     val userId = consent.capturedUserId
     val serial = consent.capturedSerial?.toIntOrNull()
     if (userId == null || consent.capturedSerial == null || serial == null) {
@@ -8296,17 +8311,26 @@ internal suspend fun revalidatePolicyWriteConsent(
 // 現場建出一個「真的」consent，讓 final-confirm fence 能誠實通過或 fail closed。
 // delta 可為空：probeDualApps(empty) 兩次皆回 Ok(empty) ⇒ membership 相等 ⇒ ProceedOk。
 // 身份 null 或 probe Failed ⇒ fromFailedProbe／null identity ⇒ fence fail closed（不放寬）。
+// R4 (E02)：noRemovalKnown（KNOWN snapshot 且操作保證不移除任何分身，由 R4-1 call site 提供）
+// 時，若 delta 為空且無 verified target，這是「可證明不移除」的新增操作：field 與 fence
+// 交叉檢查 delta.isEmpty()，故偽造旗標永遠不能越過四道關卡。default false = 既有路徑不變。
 internal suspend fun buildFastPathConsent(
     delta: Set<String>,
     resolveLiveTarget: () -> PreClearDualTarget?,
     reprobe: suspend (Set<String>, Int?) -> DualProbeResult,
+    noRemovalKnown: Boolean = false,
 ): PolicyWriteConsent {
     val target: PreClearDualTarget? = try {
         resolveLiveTarget()
     } catch (_: Exception) {
         null
     }
+    // 三條件同時成立才算 additive/no-removal；target==null 時沒有可還原的 FRESH 身份，
+    // 故 identity／membership 比對對此類操作不適用（沒有東西被移除）。
+    val noTargetAdditive = noRemovalKnown && delta.isEmpty() && target == null
     val probe: DualProbeResult = try {
+        // 保留 probe seam 呼叫做可觀測性；結果仍捕獲，但不讓 Failed 把 additive 路徑
+        // 誤標成 fromFailedProbe。
         reprobe(delta, target?.userId)
     } catch (e: CancellationException) {
         throw e
@@ -8323,8 +8347,9 @@ internal suspend fun buildFastPathConsent(
         capturedUserId = target?.userId,
         capturedSerial = target?.serial?.toString(),
         capturedInstalled = capturedInstalled,
-        fromFailedProbe = probe is DualProbeResult.Failed,
+        fromFailedProbe = probe is DualProbeResult.Failed && !noTargetAdditive,
         rootVerifiedEmpty = false,
+        additiveNoRemoval = noTargetAdditive,
     )
 }
 

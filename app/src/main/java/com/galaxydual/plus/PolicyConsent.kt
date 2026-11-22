@@ -49,6 +49,15 @@ package com.galaxydual.plus
  *   comparison; live + fresh (id,serial) identity checks are STILL enforced,
  *   and it is never a "ROOT => ProceedOk" shortcut. Default false; the non-ROOT
  *   Positive button never sets it.
+ * - [additiveNoRemoval] (R4, E02): marks a *provably non-removing* Known operation
+ *   for which there is no verified dual target (null identity) and no warning
+ *   probe result to rely on. It is set ONLY by [buildFastPathConsent] when all
+ *   three conditions hold: `noRemovalKnown && delta.isEmpty() && target == null`.
+ *   The fence cross-checks `delta.isEmpty()` before honoring it, so a forged /
+ *   stale flag on a destructive (non-empty-delta) consent must NEVER bypass the
+ *   four gates. It is NEVER set for an Unknown snapshot (noRemovalKnown=false),
+ *   which always falls back to fail-closed. Default false keeps every legacy /
+ *   positional constructor source-compatible.
  */
 data class PolicyWriteConsent(
     val generation: Long,
@@ -58,4 +67,5 @@ data class PolicyWriteConsent(
     val capturedInstalled: Set<String>,
     val fromFailedProbe: Boolean = false,
     val rootVerifiedEmpty: Boolean = false,
+    val additiveNoRemoval: Boolean = false,
 )

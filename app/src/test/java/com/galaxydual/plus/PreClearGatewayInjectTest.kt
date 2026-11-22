@@ -396,8 +396,9 @@ class PreClearGatewayInjectTest {
         delta: Set<String> = setOf("com.a.app"),
         fromFailedProbe: Boolean = false,
         rootVerifiedEmpty: Boolean = false,
+        additiveNoRemoval: Boolean = false,
     ): PolicyWriteConsent = PolicyWriteConsent(
-        -1L, delta, userId, serial, installed, fromFailedProbe, rootVerifiedEmpty,
+        -1L, delta, userId, serial, installed, fromFailedProbe, rootVerifiedEmpty, additiveNoRemoval,
     )
 
     @Test
@@ -856,6 +857,92 @@ class PreClearGatewayInjectTest {
         assertTrue(outcome is PreClearContinueOutcome.CannotDetermine)
         assertEquals(0, h.reprobeCalls)
         assertEquals(0, h.storeWrites)
+    }
+
+    // ---- R4 (E02)：additive/no-removal 與破壞性操作的 fences 分離 ----
+
+    @Test
+    fun buildFastPathConsent_additiveNoTarget_fenceProceeds() = runBlocking {
+        // KNOWN 不移除 + 空 delta + 無 verified target ⇒ additiveNoRemoval；
+        // 即使 fast-path reprobe 回 Failed 也不標 fromFailedProbe。fence 兩條件守衛
+        // 直接放行（identity/membership 對可證明不移除的操作不適用）：零 reprobe、一次寫入。
+        var buildProbeCalls = 0
+        val consent = buildFastPathConsent(
+            delta = emptySet(),
+            resolveLiveTarget = { null },
+            reprobe = { _, _ ->
+                buildProbeCalls++
+                DualProbeResult.Failed("exec-failed")
+            },
+            noRemovalKnown = true,
+        )
+        assertTrue(consent.additiveNoRemoval)
+        assertFalse(consent.fromFailedProbe)
+        assertNull(consent.capturedUserId)
+        assertEquals(1, buildProbeCalls) // probe seam 保留做可觀測性
+
+        val h = FenceHarness(reprobe = DualProbeResult.Ok(listOf("com.a.app")))
+        val outcome = h.consentCheck(consent)
+        assertTrue(outcome is PreClearContinueOutcome.ProceedOk)
+        assertEquals(1, h.storeWrites)
+        assertEquals(0, h.reprobeCalls)
+    }
+
+    @Test
+    fun buildFastPathConsent_unknownSnapshot_neverAdditive_evenWhenDeltaEmpty() = runBlocking {
+        // 對照組：noRemovalKnown=false（Unknown snapshot）⇒ 永不 additive；
+        // fast-path reprobe Failed ⇒ fromFailedProbe=true ⇒ fence CannotDetermine，零寫入。
+        val consent = buildFastPathConsent(
+            delta = emptySet(),
+            resolveLiveTarget = { null },
+            reprobe = { _, _ -> DualProbeResult.Failed("exec-failed") },
+            noRemovalKnown = false,
+        )
+        assertFalse(consent.additiveNoRemoval)
+        assertTrue(consent.fromFailedProbe)
+        val h = FenceHarness(reprobe = DualProbeResult.Ok(listOf("com.a.app")))
+        val outcome = h.consentCheck(consent)
+        assertTrue(outcome is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, h.storeWrites)
+        assertEquals(0, h.reprobeCalls)
+    }
+
+    @Test
+    fun consent_additiveFlagOnDestructiveDelta_neverBypassesFence() = runBlocking {
+        // 偽造旗標防禦：破壞性（非空）delta 即使帶 additiveNoRemoval=true，
+        // fence 交叉檢查 delta.isEmpty() 失敗 ⇒ 仍走完整四道關卡；installed 集合
+        // 改變 ⇒ CloneMembershipChanged，零寫入。
+        val h = FenceHarness(reprobe = DualProbeResult.Ok(listOf("com.b.app")))
+        val outcome = h.consentCheck(
+            testConsent(delta = setOf("com.a.app"), additiveNoRemoval = true, fromFailedProbe = false)
+        )
+        assertTrue(outcome is PreClearContinueOutcome.CloneMembershipChanged)
+        assertEquals(0, h.storeWrites)
+        assertEquals(1, h.reprobeCalls)
+    }
+
+    @Test
+    fun consent_additiveFlag_ignoredWhenRootOverrideSet() = runBlocking {
+        // 明確優先序：additive 分支在 fromFailedProbe 之後、身份重建之前，故
+        // additiveNoRemoval + rootVerifiedEmpty 同設且 delta 空 ⇒ additive 先放行
+        //（ProceedOk、零 reprobe），root 覆寫未被動用到（沒有新的 bypass）。
+        val h1 = FenceHarness(reprobe = DualProbeResult.Ok(listOf("com.b.app")))
+        val out1 = h1.consentCheck(
+            testConsent(delta = emptySet(), additiveNoRemoval = true, rootVerifiedEmpty = true)
+        )
+        assertTrue(out1 is PreClearContinueOutcome.ProceedOk)
+        assertEquals(0, h1.reprobeCalls)
+        assertEquals(1, h1.storeWrites)
+
+        // 破壞性 delta 時 additive 旗標被忽略，root 覆寫仍「只」跳 membership，
+        // 身分失配照樣 TargetChanged ⇒ 旗標組合沒有產生新 bypass。
+        val h2 = FenceHarness(live = PreClearDualTarget(96, 7))
+        val out2 = h2.consentCheck(
+            testConsent(delta = setOf("com.a.app"), additiveNoRemoval = true, rootVerifiedEmpty = true)
+        )
+        assertTrue(out2 is PreClearContinueOutcome.TargetChanged)
+        assertEquals(0, h2.proceedCalls)
+        assertEquals(0, h2.storeWrites)
     }
 
     @Test
