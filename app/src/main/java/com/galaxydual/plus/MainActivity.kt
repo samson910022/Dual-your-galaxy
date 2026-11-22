@@ -6154,15 +6154,19 @@ class MainActivity : ComponentActivity() {
     // snapshot may release it and re-enter ONE fresh warning. Corrupt/still-
     // Unknown settles show non-recursive guidance with NO restart.
     private fun retryUnknownWarning() {
+        // R6-1 (G01): capture the token at the Retry tap, BEFORE the refresh.
+        val token = warningRetryOneShot.capture()
         vm.refreshPolicyDraftForWarningRetry { settled ->
             applyWarningRetryDecision(
                 decision = policyWarningRetryDecision(settled),
                 hostAlive = !isFinishing && !isDestroyed,
                 onContinue = {
-                    if (refreshRetryReentered.compareAndSet(false, true)) {
+                    if (warningRetryOneShot.tryConsume(token)) {
                         setPendingClearConfirm(false)
                         pendingWarningRestart?.invoke()
                     } else {
+                        // LOG-ONLY: a benign duplicate/late settle is not a
+                        // guidance event — do not toast here.
                         preClearLog("unknown retry re-entry already consumed; dropping")
                     }
                 },
@@ -6193,12 +6197,12 @@ class MainActivity : ComponentActivity() {
     // 不是自動重啟，不應消耗／重置可用性上限。真正的入口點擊才會重置（fromUserTap=true）。
     private var pendingWarningRestart: (() -> Unit)? = null
 
-    // R5-0 (F01): one re-entry per genuine Unknown-Refresh tap. The flag is
-    // set BEFORE releasing pendingClearConfirm and invoking the restart seam,
-    // and is reset ONLY on a real entry tap (fromUserTap=true). A settled
-    // refresh therefore cannot restart the warning more than once, and a
-    // late/duplicate settle cannot re-enter at all.
-    private val refreshRetryReentered = AtomicBoolean(false)
+    // R6-1 (G01): one re-entry per INSTALLED WARNING (not per Activity). The
+    // token is captured at the Retry tap and consumed only by that warning's
+    // settled-Known callback; installing a new warning — a genuine entry tap OR
+    // an auto re-entry — re-arms it, so a second cycle in one action is allowed
+    // while a late/duplicate settle from an older warning is still ignored.
+    private val warningRetryOneShot = WarningRetryOneShot()
 
     // D03b fixer M5：confirm 重入防護（double-tap）——第一段 enter 成功才 launch。
     private val consentConfirmInFlight = InFlightGuard()
@@ -6282,8 +6286,9 @@ class MainActivity : ComponentActivity() {
     private fun startWriteWarning(fromUserTap: Boolean = true) {
         if (fromUserTap) {
             autoRestartCount.set(0)
-            refreshRetryReentered.set(false)
         }
+        // R6-1 (G01): re-arm on EVERY installed warning, including auto re-entry.
+        warningRetryOneShot.onWarningInstalled()
         val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, frozen ->
             vm.requestPolicyWriteForWarning(frozen, binding, consent = pendingWarningConsent)
         }
@@ -6296,8 +6301,9 @@ class MainActivity : ComponentActivity() {
     private fun startClearWarning(fromUserTap: Boolean = true) {
         if (fromUserTap) {
             autoRestartCount.set(0)
-            refreshRetryReentered.set(false)
         }
+        // R6-1 (G01): re-arm on EVERY installed warning, including auto re-entry.
+        warningRetryOneShot.onWarningInstalled()
         val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, _ ->
             confirmClearWithConsent(binding)
         }

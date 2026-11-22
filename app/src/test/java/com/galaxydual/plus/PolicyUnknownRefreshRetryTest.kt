@@ -327,6 +327,120 @@ class PolicyUnknownRefreshRetryTest {
     }
 
     // ---------------------------------------------------------------------
+    // R6-1 (G01): per-warning one-shot token (framework-free).
+    // ---------------------------------------------------------------------
+
+    @Test
+    fun warningRetryOneShot_secondWarningRetryable_duplicateSettleIgnored() {
+        val oneShot = WarningRetryOneShot()
+        assertEquals(0, oneShot.currentGeneration)
+
+        // Warning #1 installed at the entry tap and consumed by its settle.
+        oneShot.onWarningInstalled()
+        val t1 = oneShot.capture()
+        assertEquals(1, t1.generation)
+        assertFalse(t1.consumed)
+        assertTrue(oneShot.tryConsume(t1))
+        assertFalse(oneShot.tryConsume(t1)) // duplicate settle for warning #1
+
+        // Auto re-entry installs warning #2: generation advances and re-arms.
+        oneShot.onWarningInstalled()
+        val t2 = oneShot.capture()
+        assertEquals(2, oneShot.currentGeneration)
+        assertTrue("new token must differ from the consumed one", t2 != t1)
+        assertEquals(2, t2.generation)
+        assertFalse(t2.consumed)
+
+        // A late settle from warning #1 must be ignored even after generation moved.
+        assertFalse(oneShot.tryConsume(t1))
+        // A second re-entry in the same action is allowed.
+        assertTrue(oneShot.tryConsume(t2))
+        // A duplicate settle for warning #2 is ignored; no generation bump.
+        assertFalse(oneShot.tryConsume(t2))
+        assertEquals(2, oneShot.currentGeneration)
+        assertTrue(oneShot.capture().consumed)
+    }
+
+    @Test
+    fun unknownRefreshRetry_twoCyclesInOneAction_secondReentryProceeds_duplicateIgnored() {
+        val fake = FakePolicyStore()
+        fake.saved = null
+        val vm = unknownVm(fake)
+        val oneShot = WarningRetryOneShot()
+
+        val releases = AtomicInteger(0)
+        val restarts = AtomicInteger(0)
+
+        // Initial Unknown warning installed at the entry tap (generation 1).
+        oneShot.onWarningInstalled()
+        val tA = oneShot.capture()
+
+        // Cycle A: store becomes Known, settle consumes tA, then the proceed's
+        // pendingWarningRestart installs a NEW warning (generation 2).
+        fake.saved = setOf("com.KNOWN_A")
+        vm.refreshPolicyDraftForWarningRetry { settled ->
+            applyWarningRetryDecision(
+                decision = policyWarningRetryDecision(settled),
+                hostAlive = true,
+                onContinue = {
+                    if (oneShot.tryConsume(tA)) {
+                        releases.incrementAndGet()
+                        restarts.incrementAndGet()
+                        oneShot.onWarningInstalled() // pendingWarningRestart -> startWarning
+                    }
+                },
+                onCorrupt = { },
+                onUnavailable = { },
+            )
+        }
+        await { releases.get() == 1 }
+        assertEquals(1, releases.get())
+        assertEquals(1, restarts.get())
+        await { !refreshRetryGuardHeld(vm) }
+
+        // Auto re-entry is the warning just installed (generation 2); its Retry
+        // captures a fresh tB. Flip the store back to Unknown first.
+        val tB = oneShot.capture()
+        assertTrue("cycle B must use a fresh token", tB != tA)
+        assertEquals(2, tB.generation)
+        fake.saved = null
+        vm.refreshPolicyDraft { }
+        await { !vm.state.value.policyDraftKnown && !vm.state.value.loading }
+
+        // Cycle B: second re-entry settles Known again and must proceed, then
+        // its proceed installs warning #3 (generation 3).
+        fake.saved = setOf("com.KNOWN_B")
+        vm.refreshPolicyDraftForWarningRetry { settled ->
+            applyWarningRetryDecision(
+                decision = policyWarningRetryDecision(settled),
+                hostAlive = true,
+                onContinue = {
+                    if (oneShot.tryConsume(tB)) {
+                        releases.incrementAndGet()
+                        restarts.incrementAndGet()
+                        oneShot.onWarningInstalled() // pendingWarningRestart -> startWarning
+                    }
+                },
+                onCorrupt = { },
+                onUnavailable = { },
+            )
+        }
+        await { releases.get() == 2 }
+        assertEquals(2, releases.get())
+        assertEquals(2, restarts.get())
+        await { !refreshRetryGuardHeld(vm) }
+
+        // Duplicate settle with the current token and a stale one: both ignored.
+        assertFalse(oneShot.tryConsume(tB))
+        assertFalse(oneShot.tryConsume(tA))
+        assertEquals(2, releases.get())
+        assertEquals(2, restarts.get())
+        assertEquals(0, fake.clearCalls.get())
+        assertEquals(0, fake.saveCalls.get())
+        assertEquals(3, oneShot.currentGeneration)
+    }
+
+    // ---------------------------------------------------------------------
     // Pure decision model (no Activity / no dialogs).
     // ---------------------------------------------------------------------
 

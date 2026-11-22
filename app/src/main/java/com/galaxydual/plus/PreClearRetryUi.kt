@@ -10,6 +10,8 @@
 // configuration that both Activities hand to the dialog.
 package com.galaxydual.plus
 
+import java.util.concurrent.atomic.AtomicReference
+
 /**
  * Single source of truth for opting a fast path into the additive/no-removal
  * consent flag (R4/E02).
@@ -110,4 +112,32 @@ internal fun applyWarningRetryDecision(
         PolicyWarningRetryDecision.CORRUPT_GUIDE -> onCorrupt()
         PolicyWarningRetryDecision.UNAVAILABLE_GUIDE -> onUnavailable()
     }
+}
+
+// R6-1 (G01): framework-free, Activity-scoped one-shot token that ties the
+// "re-entry allowed" decision to the SPECIFIC warning whose Retry tap earned
+// it. A settled retry may consume only the token captured at its own tap; a
+// late or duplicate settle for an older warning is ignored. Installing a new
+// warning (user tap OR auto re-entry) advances the generation and re-arms the
+// token, so a SECOND cycle within one action is allowed without weakening the
+// duplicate-settle guard. No android.* import on purpose (JVM-testable).
+internal data class WarningRetryToken(val generation: Int, val consumed: Boolean = false)
+
+internal class WarningRetryOneShot {
+    private val ref = AtomicReference(WarningRetryToken(generation = 0))
+
+    /** Install a new warning: advance the generation and re-arm the token. */
+    fun onWarningInstalled() {
+        ref.updateAndGet { it.copy(generation = it.generation + 1, consumed = false) }
+    }
+
+    /** Capture the token at Retry tap, BEFORE the authoritative refresh. */
+    fun capture(): WarningRetryToken = ref.get()
+
+    /** Single CAS covers BOTH a generation change and an already-consumed token. */
+    fun tryConsume(token: WarningRetryToken): Boolean =
+        ref.compareAndSet(token, token.copy(consumed = true))
+
+    /** Test accessor: the generation advances once per installed warning. */
+    val currentGeneration: Int get() = ref.get().generation
 }

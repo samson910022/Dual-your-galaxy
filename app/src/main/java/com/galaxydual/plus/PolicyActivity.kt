@@ -52,7 +52,6 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -153,9 +152,10 @@ class PolicyActivity : ComponentActivity() {
     // fromUserTap=false，autoRestartCount 不重置亦不遞增（重試非自動重啟）。
     private var pendingWarningRestart: (() -> Unit)? = null
 
-    // R5-0 (F01): one re-entry per genuine Unknown-Refresh tap (see MainActivity).
-    // Reset ONLY on a genuine entry tap (fromUserTap=true).
-    private val refreshRetryReentered = AtomicBoolean(false)
+    // R6-1 (G01): one re-entry per INSTALLED WARNING, not per Activity (see
+    // MainActivity). Re-armed whenever a new warning is installed, including an
+    // auto re-entry; a late/duplicate settle from an older warning is ignored.
+    private val warningRetryOneShot = WarningRetryOneShot()
 
     // D03b fixer M5/M3：confirm 重入防護 + abort 重啟警告 one-shot 排程 guard。
     private val consentConfirmInFlight = InFlightGuard()
@@ -186,15 +186,18 @@ class PolicyActivity : ComponentActivity() {
     // tap only on a settled Known snapshot; no destructive clear, no consent
     // manufacture, no restart for Corrupt/Unavailable.
     private fun retryUnknownWarning() {
+        // R6-1 (G01): capture the token at the Retry tap, BEFORE the refresh.
+        val token = warningRetryOneShot.capture()
         vm.refreshPolicyDraftForWarningRetry { settled ->
             applyWarningRetryDecision(
                 decision = policyWarningRetryDecision(settled),
                 hostAlive = !isFinishing && !isDestroyed,
                 onContinue = {
-                    if (refreshRetryReentered.compareAndSet(false, true)) {
+                    if (warningRetryOneShot.tryConsume(token)) {
                         setPendingClearConfirm(false)
                         pendingWarningRestart?.invoke()
                     } else {
+                        // LOG-ONLY: benign duplicates must not raise a toast.
                         preClearLog("unknown retry re-entry already consumed; dropping")
                     }
                 },
@@ -786,8 +789,9 @@ class PolicyActivity : ComponentActivity() {
     private fun startEditorWriteWarning(candidate: Set<String>, fromUserTap: Boolean = true) {
         if (fromUserTap) {
             autoRestartCount.set(0)
-            refreshRetryReentered.set(false)
         }
+        // R6-1 (G01): re-arm on EVERY installed warning, including auto re-entry.
+        warningRetryOneShot.onWarningInstalled()
         requestEditorWriteWarning(
             candidate = candidate,
             proceed = { binding, frozen -> performWritePolicy(binding, frozen) },
