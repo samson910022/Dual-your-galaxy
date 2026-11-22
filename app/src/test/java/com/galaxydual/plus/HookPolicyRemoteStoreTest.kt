@@ -74,6 +74,11 @@ class HookPolicyRemoteStoreTest {
         // -> Unavailable; versionTypeCorrupt -> ClassCastException -> Invalid.
         var versionContainsThrows = false
         var versionGetLongThrows = false
+        // E03: CE-throwing counterparts to the two flags above. A
+        // CancellationException from the version probe must propagate through
+        // save()/clear() rather than being folded into Unavailable -> false.
+        var versionContainsThrowsCe = false
+        var versionGetLongThrowsCe = false
         var versionTypeCorrupt = false
         // PR #74 G1: simulate a transient boolean read failure (binder/prefs
         // unavailable) to pin the default-true behavior on read errors.
@@ -108,6 +113,7 @@ class HookPolicyRemoteStoreTest {
         override fun getLong(key: String?, defValue: Long): Long {
             if (key == PolicySource.POLICY_KEY_EXTRA_VERSION) {
                 if (versionTypeCorrupt) throw ClassCastException("version key wrong type")
+                if (versionGetLongThrowsCe) throw kotlinx.coroutines.CancellationException("version getLong cancelled")
                 if (versionGetLongThrows) throw RuntimeException("version getLong failed")
             }
             return (data[key] as? Long) ?: defValue
@@ -118,8 +124,9 @@ class HookPolicyRemoteStoreTest {
             return (data[key] as? Boolean) ?: defValue
         }
         override fun contains(key: String?): Boolean {
-            if (versionContainsThrows && key == PolicySource.POLICY_KEY_EXTRA_VERSION) {
-                throw RuntimeException("version contains failed")
+            if (key == PolicySource.POLICY_KEY_EXTRA_VERSION) {
+                if (versionContainsThrowsCe) throw kotlinx.coroutines.CancellationException("version contains cancelled")
+                if (versionContainsThrows) throw RuntimeException("version contains failed")
             }
             return data.containsKey(key)
         }
@@ -2013,6 +2020,107 @@ class HookPolicyRemoteStoreTest {
             assertTrue(store.save(setOf("new2")))
             assertEquals(commitsBefore + 1, prefs.commitCalls)
             assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // E03: a CancellationException thrown by the version probe's `contains`
+    // must propagate through save()/clear() — it must NOT be swallowed into
+    // `probe = Unavailable -> return false` by the shared never-throw probe.
+    // The app writer captures the CE in its adapter and rethrows it after the
+    // probe returns. With poison published only at commit (D02), the CE reaches
+    // the outer catch with poisonToken == null: zero commit, no poison, no state
+    // mutation — and the prefs instance remains immediately recoverable.
+    @Test
+    fun versionContainsCancellationPropagatesFromSaveWithNoCommitAndNoPoisonBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionContainsThrowsCe = true
+            val store = remoteHookPolicyStore { prefs }
+            try {
+                store.save(setOf("new"))
+                org.junit.Assert.fail("save must rethrow CancellationException from probe contains")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // expected: CE propagated through save()
+            }
+            try {
+                store.clear()
+                org.junit.Assert.fail("clear must rethrow CancellationException from probe contains")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // expected: CE propagated through clear()
+            }
+
+            // Zero commit, no state mutation.
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            // No poison latched (D02): immediate Known read + a normal write succeeds.
+            prefs.versionContainsThrowsCe = false
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("new2"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // E03: same CE propagation via the probe's `getLong` (readVersion) leg.
+    @Test
+    fun versionGetLongCancellationPropagatesFromSaveAndClearBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionGetLongThrowsCe = true
+            val store = remoteHookPolicyStore { prefs }
+            try {
+                store.save(setOf("new"))
+                org.junit.Assert.fail("save must rethrow CancellationException from probe getLong")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // expected: CE propagated through save()
+            }
+            try {
+                store.clear()
+                org.junit.Assert.fail("clear must rethrow CancellationException from probe getLong")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // expected: CE propagated through clear()
+            }
+
+            // Restore the read fixture before inspecting prefs directly (getLong
+            // itself is what throws while the flag is set).
+            prefs.versionGetLongThrowsCe = false
+
+            // Zero commit, no state mutation.
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            // No poison latched (D02): immediate Known read + a normal write succeeds.
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("new2"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
         } finally {
             resetRemotePoisonForTests()
         }

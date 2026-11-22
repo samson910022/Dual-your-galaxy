@@ -1144,12 +1144,38 @@ fun remoteHookPolicyStore(
                         // that process; a HOOK RESTART is required for reliable
                         // application. This is a documented limitation, not a
                         // pass. Behavior below is intentionally unchanged.
+                        //
+                        // E03: probeVersion is a SHARED, never-throw contract — it
+                        // classifies every non-CCE Throwable (including a
+                        // CancellationException) as Unavailable. The hook reader
+                        // depends on that. The app writer must NOT let a CE be
+                        // swallowed into `probe = Unavailable -> return false`,
+                        // because save()/clear() promise to rethrow CE. So the
+                        // adapter below captures any CE in a slot, rethrows it
+                        // (probe still returns Unavailable), then we rethrow the
+                        // captured CE immediately after the probe returns — before
+                        // the Unavailable branch. It exits this synchronized block
+                        // with poisonToken == null (poison is published only at
+                        // commit, per D02), reaching the outer CE catch: ZERO
+                        // commit, NO poison, NO state mutation, CE propagated.
+                        val probeCancellation = AtomicReference<CancellationException?>()
                         val probe = probeVersion(object : VersionPrefsView {
                             override fun containsVersion(): Boolean =
-                                prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+                                try {
+                                    prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+                                } catch (ce: CancellationException) {
+                                    probeCancellation.set(ce)
+                                    throw ce
+                                }
                             override fun readVersion(defValue: Long): Long =
-                                prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, defValue)
+                                try {
+                                    prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, defValue)
+                                } catch (ce: CancellationException) {
+                                    probeCancellation.set(ce)
+                                    throw ce
+                                }
                         })
+                        probeCancellation.get()?.let { throw it }
                         if (probe is VersionProbeResult.Unavailable) {
                             return@synchronized false
                         }
