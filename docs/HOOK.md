@@ -353,6 +353,8 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 
 **round-5 三臂冷啟動對照（已執行／2026-11-23）**：同日後續於同一已備份授權裝置完成 A/B/C 三臂（BBC ON 非空注入／gate 確認 OFF 且無注入／移除本模組 scope 使 BBC hook 完全缺席），三臂皆出現同一 system-uid DELETE 且早於任何 BBC 回調——**opt-out is NOT a deletion guard** 的強關聯證據；DELETE 前決策輸入與 F00/F06 仍 **UNMEASURED／NOT a pass**、P0 合併閘門未關閉，詳 `docs/ACCEPTANCE.md` §「2026-11-23 三臂冷啟動對照」。
 
+**round-6 誠實註記（G03／G04；更新而非取代 round-2+3+4+5）**：G03 下修 SSAID 因果 certainty——直接存取未發現，但間接路徑（Samsung provisioning／clone 生命週期／狀態相依）未確立亦未排除，SSAID 根因 UNKNOWN；此為文件誠實性修正，非新 hook 缺陷。G04：512-entry IPC／15ms gate 真實 Binder 延遲／TTL 與 30 分鐘 sticky failover（含活躍 user-95 clone）／Scope A warning／ROOT dialog 仍 **UNMEASURED／NOT a pass**；2026-11-23 三臂 A/B/C 僅為負向控制關聯，且各臂 App build 不同、`pm install-existing` 不還原 prior user data，不能替代效能／UI／安全驗收；Android CI #334 手動模擬器矩陣略過。**F00／F06 與 G00／G04 維持 UNMEASURED／NOT a pass，P0 合併閘門未關閉，opt-out is NOT a deletion guard**（issue #75）。不提出任何 SSAID／`settings_ssaid.xml`／ABX 修補。
+
 > **round-2+3 合併閘門（N01／D01、D06、D08、N09／D08；UNMEASURED／NOT a pass）**：本輪獨立審查未跑 Gradle 裝置測試；2026-11-23 曾在 Samsung 裝置做**唯讀**觀察（未執行任何破壞性臂／冷啟動），已文件化或 JVM／CI 全綠皆**不是**通過。必要裝置證據與同基線三臂對照見 `docs/ACCEPTANCE.md` §6「11-21／11-22 round-2+3 待實機驗收」小節：
 > - **N01／D01**：P0 冷啟動 DELETE 因果未證實；須先完成**同一 installed-state 基線三臂對照**（default BBC／confirmed-off runtime gate／Samsung baseline），缺一即不得宣稱安全或因果成立。runtime opt-out **不是刪除防護**（issue #75；DELETE 早於回調且回調非空）。
 > - **D06**：opt-out gate 讀取已有專屬零隊列 bounded executor 與 15ms 可調上限（JVM 已證主線路 wall-time 有界，timeout fail-open）（已確認 OFF 且仍在 30 分鐘內時維持關閉）；阻塞 provider >200ms 時主線路返回上界，但真實 Binder 延遲與 DAAgent UI／ANR 仍 **UNMEASURED／NOT a pass**。

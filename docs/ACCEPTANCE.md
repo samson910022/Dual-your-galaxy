@@ -145,6 +145,8 @@ BBC6 注意事項（unified build）：
 
 > **round-5 更新（2026-11-23，F00–F06；更新而非取代 round-2+3+4）**：本輪 F01–F04 僅為 JVM／UI 契約修正（F01 Unknown 警告的重新整理改為權威 `refreshPolicyDraft()` 並 await、盲清正式撤回停用；F02 修復提示 app-scoped 跨 VM 在 Main＋Editor 可見；F03 繼承 `Confirmed(value)` 時同步 CheckBox；F04 VM 對非 null consent 重算移除 delta）。**F00（＝D01/N01 P0 冷啟動 DELETE）與 F06（＝D06 gate 延遲／D08 512-entry IPC／sticky／Scope A dialog）維持 UNMEASURED／NOT a pass**；P0 合併門檻未關閉。**三臂同基線對照（default BBC／confirmed-off runtime gate／Samsung baseline）與備份＋明確授權＋持有人同意前提完全不變**；不得因 JVM／UI 全綠而宣稱任何裝置閘門通過。**opt-out is NOT a deletion guard**（issue #75）。
 
+> **round-6 更新（2026-11-23，G03／G04；更新而非取代 round-2+3+4+5）**：G03 僅下修 SSAID 因果用語（直接存取未發現；間接貢獻未確立亦未排除；根因 UNKNOWN）；G04 僅要求效能／UI／安全驗收門檻維持 **UNMEASURED／NOT a pass**。**F00／F06 與 G00／G04 一律 UNMEASURED／NOT a pass；P0 合併門檻維持開啟**；三臂 A/B/C 僅為重要負向控制關聯，不是安全通過或根因定論。JVM／CI 全綠與破壞性 A/B/C 皆不構成通過；任何涉及分身刪除或 user-95 資料清除的步驟仍須明確授權＋備份＋持有人同意後親自執行（issue #75）。runtime opt-out 不是刪除防護。此輪為純文件誠實性修正，不涉及禁止的 SSAID／Scope B 修改，亦不宣稱任何程式碼修正關閉 P0。
+
 **Scope A dialog（issue #73）**：PreClear warning dialog 從未在裝置上觸發或擷錄，維持 **UNMEASURED／NOT a pass／device verification pending（backup+consent）**。
 
 擷錄指引：
@@ -165,7 +167,7 @@ BBC6 注意事項（unified build）：
 
 > **定位**：以下為觸發場景重建（correlated observation／排除法），**不是根因證明**。SSAID 根因位於 Scope B 硬禁止區，本輪未讀、未修補；本分析亦**不關閉 P0 因果問題**。
 
-- **一句話**：崩潰事实為 **CONFIRMED**；「崩潰與系統有無自動解除安裝是兩條不同的軸」為**推論（LIKELY）**、非直接量測。觸發為 u95 分身（uid 9510431／`effectiveUid=9510431`）啟動時讀 `android_id`，`SettingsProvider.generateSsaidLocked` 拋 `IllegalStateException: Ssaid settings not accessible`；4/4 次啟動崩潰（01:45:45、01:45:47、01:48:23、01:50:02；pid 7130／7425／8240／9082），u0 本體（pid 13642）正常。
+- **一句話**：崩潰**事實**為 **CONFIRMED（觀測）**；「崩潰與系統有無自動解除安裝是兩條不同的軸」為**推論（LIKELY）**、非直接量測。觸發為 u95 分身（uid 9510431／`effectiveUid=9510431`）啟動時讀 `android_id`，`SettingsProvider.generateSsaidLocked` 拋 `IllegalStateException: Ssaid settings not accessible`；4/4 次啟動崩潰（01:45:45、01:45:47、01:48:23、01:50:02；pid 7130／7425／8240／9082），u0 本體（pid 13642）正常。此些觀測**不構成** PR 無因果路徑的負向證明；SSAID 崩潰軸與系統 DELETE 軸維持分離。
 
 - **再現場景（preconditions → action → failure）**：
   - 前提：u95 clone 已安裝（4 APK path、`installed=true`、data dir 在、`firstInstallTime=2026-11-21 03:37:34`）；自 11-18 22:25 無 reboot；非空政策 ＋ hook 正常（`installed=1`、nonempty、merged +1）——後兩者與崩潰**無 differential**。
@@ -178,26 +180,29 @@ BBC6 注意事項（unified build）：
   - **就連人為完整 DELETE＋重裝都清不掉（CONFIRMED，log 旁證）**：`01:50:02` 全新 pid 9082 啟動仍崩。這是比「單純 toggle 重裝無效」更強的證據，且**獨立於尚未解決的冷啟動 DELETE 問題**。
   - 歷史「重裝就好」本身也不可靠：11-18 當天 17:55 立即重裝也崩（pid 15625 起），是後來 **reboot ＋ 22:26 toggle** 才恢復（唯一有 artifact 的恢復）；11-20/21「不崩」僅口述、無重裝後 log，而現在崩的正是 11-21 03:37 裝的那個。**reboot 是唯一有 artifact 的恢復要素（LIKELY 相關、因果 UNKNOWN）**；非空政策不是 DELETE 防護（11-20/21 非空仍被刪，DELETE 早於 callback 116–144ms）。
   - 持有人回憶（**UNKNOWN，文件無記錄**）：過去「系統自動移除／關閉 → 再次重 hook → 重開系統雙開開關 → 可正常啟動」的程序中，持有人記得有「重 hook」一步，但無法確認具體操作；該次觀察階段**確定沒有重開機**。repo 事故文件唯一有 device artifact 的恢復要素是 11-18 的 **reboot + toggle ON**；此回憶不作為已證事實，也不改變上述信心分級。
-  - **2026-11-23 新增觀察（CONFIRMED，唯讀）**：持有人其後對裝置做**軟重開機**，出現「密碼正確仍無法進桌面」；logcat 顯示 `LockSettingsService.doVerifyCredential → SyntheticPasswordManager.unwrapSyntheticPasswordBlob` 因 `UnrecoverableKeyException`（Keystore code 4）失敗，`com.android.systemui` 連續 4 次 crash，底層 keymint 反覆報 `km_check_key_os_version_patchlevels failed / Failed to deserialize key`。持有人接著做**完整硬重開機**後，u0/u95 皆 `deviceLocked=0`、Launcher 在前景、最近 5000 行 log 無上述 keymint／SSAID／SystemUI crash —— **密碼驗證與桌面恢復（觀察，非根因證明、非永久修復）**。其後持有人明確授權一次**非破壞性**啟動 u95 分身並唯讀抓 log：02:25 啟動後分身進程存活（u95_a431 pid 18230，ELAPSED 00:43）、視窗聚焦於 `com.openai.chatgpt/.MainActivity`，最近 1500 行 log 中 `Ssaid settings not accessible` 計數 **0**（重開前為 4/4 啟動崩潰）——**本次唯讀覆查下 SSAID 崩潰未再現（CONFIRMED 觀察，非永久修復、非根因證明）**。持有人明確回報：**11/18 之後的每次成功啟動都是成功觀察**（該些成功案例多無 log 擷錄），故「成功」並非只有這一次；此回報與本次 log 覆查一致，但仍不等於根因或永久性。另 10 分鐘唯讀監控共 80 次取樣：02:24 仍短暫出現 `km_check_key_os_version_patchlevels failed / Failed to deserialize key`，而 02:25 分身啟動成功、02:28 取樣已無該錯誤 —— **keymint 失敗為間歇性，非重開後全部消失**（誠實揭露，不宣稱已根除）。上述再次支持「reboot 是唯一有 artifact 的恢復要素」（支持度提升，因果仍 UNKNOWN）。仍**未執行任何冷啟動 DELETE**，F00 三臂對照維持 UNMEASURED。證據：`/mnt/seagate500g/opencode_tmp/device_evidence/r5_reboot_recovery_record.md`、`r5_ssaid_after_hard_reboot_result.md`、`r5_reboot_monitor.log`（不入 repo）。
+  - **2026-11-23 新增觀察（CONFIRMED，唯讀）**：持有人其後對裝置做**軟重開機**，出現「密碼正確仍無法進桌面」；logcat 顯示 `LockSettingsService.doVerifyCredential → SyntheticPasswordManager.unwrapSyntheticPasswordBlob` 因 `UnrecoverableKeyException`（Keystore code 4）失敗，`com.android.systemui` 連續 4 次 crash，底層 keymint 反覆報 `km_check_key_os_version_patchlevels failed / Failed to deserialize key`。持有人接著做**完整硬重開機**後，u0/u95 皆 `deviceLocked=0`、Launcher 在前景、最近 5000 行 log 無上述 keymint／SSAID／SystemUI crash —— **密碼驗證與桌面恢復（觀察，非根因證明、非永久修復）**。其後持有人明確授權一次**非破壞性**啟動 u95 分身並唯讀抓 log：02:25 啟動後分身進程存活（u95_a431 pid 18230，ELAPSED 00:43）、視窗聚焦於 `com.openai.chatgpt/.MainActivity`，最近 1500 行 log 中 `Ssaid settings not accessible` 計數 **0**（重開前為 4/4 啟動崩潰）——**本次唯讀覆查下 SSAID 崩潰未再現（CONFIRMED 觀察，非永久修復、非根因證明）**。亦**不排除** PR 的間接貢獻；此為單次唯讀覆查，非負向因果證明。持有人明確回報：**11/18 之後的每次成功啟動都是成功觀察**（該些成功案例多無 log 擷錄），故「成功」並非只有這一次；此回報與本次 log 覆查一致，但仍不等於根因或永久性。另 10 分鐘唯讀監控共 80 次取樣：02:24 仍短暫出現 `km_check_key_os_version_patchlevels failed / Failed to deserialize key`，而 02:25 分身啟動成功、02:28 取樣已無該錯誤 —— **keymint 失敗為間歇性，非重開後全部消失**（誠實揭露，不宣稱已根除）。上述再次支持「reboot 是唯一有 artifact 的恢復要素」（支持度提升，因果仍 UNKNOWN）。仍**未執行任何冷啟動 DELETE**，F00 三臂對照維持 UNMEASURED。證據：`/mnt/seagate500g/opencode_tmp/device_evidence/r5_reboot_recovery_record.md`、`r5_ssaid_after_hard_reboot_result.md`、`r5_reboot_monitor.log`（不入 repo）。
 
-- **與 PR #74 關係（CONFIRMED）**：`.kt` 原始碼中 `Settings.Secure`／`SSAID`／`android_id`／`generateSsaid` **0 命中**；LSPosed scope 只含 `system;com.samsung.android.da.daagent`（明確排除 `com.android.settings`）；BBC 只對 daagent 唯讀清單做 union-only append；logcat `avc: denied` **0 命中**。PR 沒有任何路徑造成或惡化此 SSAID 失敗。
+- **與 PR #74 關係（直接路徑未發現；間接因果未確立亦未排除）**：就已查證的**直接存取面**：`.kt` 原始碼中 `Settings.Secure`／`SSAID`／`android_id`／`generateSsaid` **0 命中**；LSPosed scope 只含 `system;com.samsung.android.da.daagent`（明確排除 `com.android.settings`）；BBC 只對 daagent 唯讀清單做 union-only append；logcat `avc: denied` **0 命中**。以上僅足以排除直接呼叫／直接修改 SSAID 設定，**不足以排除** Samsung provisioning／clone 生命週期／狀態相依的間接貢獻；SSAID 根因仍 **UNKNOWN**，本 PR 的間接因果貢獻**未確立、亦未排除**，機制未證實。此為證據誠實性降級，非新發現的 hook 缺陷。
 
 - **信心分級表**：
 
   | 等級 | 項目 |
   | --- | --- |
-  | **CONFIRMED** | 崩潰觸發（SSAID 讀取失敗／4/4 啟動）／人為完整 DELETE＋重裝後仍崩／01:49:52 DELETE 是人為非系統自動／PR 無因果路徑 |
+  | **CONFIRMED（觀測）** | 崩潰觸發（SSAID 讀取失敗／4/4 啟動）／人為完整 DELETE＋重裝後仍崩／01:49:52 DELETE 是人為非系統自動。以上皆為觀測，**不推論 PR 因果** |
+  | **未確立／未排除** | PR 無直接 SSAID 存取或 Settings scope（已查證）；間接路徑（Samsung provisioning／clone 生命週期／狀態相依）未觀測、未排除 |
   | **LIKELY** | 壞層在 u95 雙開供給層（排除法＋11-18 dump）／reboot 是恢復要素 |
   | **HYPOTHESIS** | SSAID registry 鍵配置（11-18 dump 理論，未重讀）／Samsung 只對白名單雙開 app 播種 |
-  | **UNKNOWN** | 11-21→11-23 狀態變化／現在冷啟動是否 DELETE／SSAID 內部狀態（Scope B 硬禁令，未讀） |
+  | **UNKNOWN** | 11-21→11-23 狀態變化／現在冷啟動是否 DELETE／SSAID 內部狀態（Scope B 硬禁令，未讀）／PR 對 SSAID 失敗的間接因果貢獻（直接存取未發現；未確立亦未排除） |
 
 - **Hard prohibition 重申**：不提出任何 SSAID／`settings_ssaid.xml`／ABX 修補；不宣稱 P0 根因已證明；opt-out **不是**刪除防護（issue #75）。
+
+> **round-6 G03 語境（2026-11-23）**：本節「與 PR #74 關係」已由「PR 無因果路徑 CONFIRMED」下修為「直接存取未發現；間接貢獻未確立亦未排除；SSAID 根因 UNKNOWN」。崩潰觀測（4/4、重啟後未再現）不等於負向因果證明；系統 DELETE 軸與 SSAID 崩潰軸分開處理。此為證據誠實性修正，非新 hook 缺陷，亦不涉及任何禁止的 SSAID／Scope B 修改。
 
 ### 2026-11-23 三臂冷啟動對照（已執行；F00 決策輸入仍 UNMEASURED）
 
 > **定位（先讀）**：本節記錄**已完成**的三臂冷啟動對照結果，是重要的裝置關聯證據，**不是**任何驗收通過。上一節「2026-11-23 實機唯讀觀察」為執行前的唯讀快照，其中「三臂未執行」僅對該次觀察有效，已由本節後續的實際執行取代。不得據此宣稱任何合併閘門通過、或 BBC 預設設定安全；合併閘門仍待驗收 owner 裁決。**opt-out 不是刪除防護**（issue #75）。
 >
-> 三臂皆在同一台已備份且明確授權的 S23 Ultra（SM-S9180）執行；**Arm B/C 使用本機 `:app:assembleDebug` 於 02:59 安裝的目前 HEAD build**（APK byte grep 見 `bbc_injection_enabled` 執行期開關）；**Arm A（02:44）在此安裝之前，使用的是裝置上較舊的 app build**（該舊 APK 無 gate 開關，見 `latest_build_verification.md`）——此差異如實揭露，起點為同一 user-95 installed-state，由 sole device executor 完成。全程未嘗試 Scope B／SSAID／ABX 修補、未查詢 user 150、未平行 adb、未修改 repo。
+> 三臂皆在同一台已備份且明確授權的 S23 Ultra（SM-S9180）執行；**Arm B/C 使用本機 `:app:assembleDebug` 於 02:59 安裝的目前 HEAD build**（APK byte grep 見 `bbc_injection_enabled` 執行期開關）；**Arm A（02:44）在此安裝之前，使用的是裝置上較舊的 app build**（該舊 APK 無 gate 開關，見 `latest_build_verification.md`）——此差異如實揭露，起點為同一 user-95 installed-state，由 sole device executor 完成。全程未嘗試 Scope B／SSAID／ABX 修補、未查詢 user 150、未平行 adb、未修改 repo。**三臂使用不同 App build（Arm A 為較舊 build、Arm B/C 為目前 HEAD）且每臂後以 `pm install-existing --user 95` 還原，只恢復套件存在、不恢復 user-95 原有資料；故三臂並非「相同先前使用者資料」的嚴格對照，僅為 installed-state 起點的負向控制關聯。**
 
 | 臂 | 條件（gate／hook） | 系統 DELETE（`START DELETE PACKAGE`） | BBC 回調／時序 | 結果 |
 | --- | --- | --- | --- | --- |
@@ -206,11 +211,11 @@ BBC6 注意事項（unified build）：
 | **C｜本模組 BBC hook 完全缺席** | 僅移除本模組 2 條 LSPosed scope row；無硬重開機，以 `setprop ctl.restart zygote` 軟重開機套用；新 daagent pid 4523 **零** BBC log 行，framework／其他模組仍正常 | 03:29:30.206；同樣 caller／uid／user | 無 BBC 回調 → D−C 無法計算；D−E 以 process-start 為代理、**低精度**（無 hook 行），僅記 +103 ms 代理值 | clone ＋ 資料清除；available list 僅 Samsung 原生 5 個 app |
 
 **誠實解讀**：
-- **強關聯證據（ASSOCIATION，非因果證明）**：Samsung system-uid 的 DELETE 在 BBC 注入 ON、執行期 gate 確認 OFF、以及完全沒有 BBC hook 三種條件下**皆發生**，且一律早於任何 BBC 回調。這支持「刪除決策位於 Samsung `system_server`、與本模組 BBC 注入無關」的推論（issue #75），並**確認執行期 opt-out 不是刪除防護**。
+- **強關聯證據（ASSOCIATION，非因果證明）**：Samsung system-uid 的 DELETE 在 BBC 注入 ON、執行期 gate 確認 OFF、以及完全沒有 BBC hook 三種條件下**皆發生**，且一律早於任何 BBC 回調。這支持「刪除決策位於 Samsung `system_server`、與本模組 BBC 注入無關」的推論（issue #75），並**確認執行期 opt-out 不是刪除防護**。此為 negative-control association，**不是**已完成的安全根因研究，亦不構成任何合併閘門通過。
 - **DELETE 前的決策輸入仍 UNMEASURED**：三臂完成本身**不證明** P0 風險已排除、**不證明** BBC 預設設定安全、也不證明根因已定論；adb 無法讀取 `system_server` 內的 pre-DELETE 決策輸入，關聯與時序不等於因果。合併閘門仍待驗收 owner 裁決；本節不作任何通過或安全性的結論。
-- **F06 與其他未測項仍 UNMEASURED**：p50/p95/max、512 IPC／Binder 次數、真實 15 ms gate 延遲、sticky／TTL／fresh process、Scope A dialog（backup+consent）皆未量測；CI 手動模擬器矩陣略過。
+- **F06／其餘未測項仍 UNMEASURED／NOT a pass**：DAAgent UI callback 中 512 次 package-manager 查詢的 p50/p95/max 與 Binder IPC 次數（含 cold process）、15ms opt-out gate 的真實 Binder 延遲、政策 TTL／30 分鐘 sticky 在活躍 user-95 clone 下的 failover、Samsung Scope A warning／ROOT dialog，全部 **UNMEASURED／NOT a pass**；Android CI #334 手動模擬器矩陣略過。2026-11-23 破壞性 A/B/C 對照**不能替代**上述效能／UI／安全測試。
 
-**還原與重開機**：每個破壞性臂後皆以 `pm install-existing --user 95` 還原 baseline；Arm C 後另以 narrow restore 只回補本模組 2 條 scope row（共 19 條，其他模組未動），lspd 重啟 ＋ 軟重開機後 hook 重新生效（新 pid 4219 `installed=1`），clone 健康（SSAID=0）、gate ON、root 保留。**全程未使用硬重開機**（無 `adb reboot`／power cycle）。Scope B／SSAID／ABX 修補從未嘗試。
+**還原與重開機**：每個破壞性臂後皆以 `pm install-existing --user 95` 還原 baseline；Arm C 後另以 narrow restore 只回補本模組 2 條 scope row（共 19 條，其他模組未動），lspd 重啟 ＋ 軟重開機後 hook 重新生效（新 pid 4219 `installed=1`），clone 健康（SSAID=0）、gate ON、root 保留。**全程未使用硬重開機**（無 `adb reboot`／power cycle）。Scope B／SSAID／ABX 修補從未嘗試。還原僅限套件存在；user-95 資料於各破壞性臂皆已清除且未還原，故不聲稱回到相同 prior-data 基線。
 
 **證據（外部、不入 repo）**：`/mnt/seagate500g/opencode_tmp/device_evidence/r5_v2_coldstart_20261123_024013/` — 關鍵檔：`armA_result.md`／`armA_delete_chain.txt`／`armA_bbc_lines.txt`、`armB_result.md`／`armB2_delete_chain.txt`／`armB2_bbc_lines.txt`、`armC_result.md`／`armC_11_delete_chain.txt`／`armC_11_bbc_lines.txt`／`armC_restore_record.md`／`armC_20_bbc_lines.txt`／`armC_16_final.db`、`latest_build_verification.md`、`gate_log.md`；authorization／scope／soft-reboot 授權檔亦在該目錄。原始 logcat／verbose log／截圖／DB 快照留該目錄，依慣例不入 repo。
 
