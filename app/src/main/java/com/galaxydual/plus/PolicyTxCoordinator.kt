@@ -54,7 +54,12 @@ data class PolicySettled(
 // tryInsertClaimTombstone）。top-level internal：coordinator 與測試共用單一常數。
 internal const val CLAIM_TOMBSTONE_MAX = 512
 
-class PolicyTxCoordinator {
+class PolicyTxCoordinator(
+    // PR #74 R6-2 (G02):app-private 維修提示持久化 store。
+    // null (預設) = 純記憶體行為,保持既有 60+ 測試呼叫點完全不變；
+    // 生產由 GalaxyApp 注入 SharedPreferences-backed store。
+    private val repairHintStore: RepairHintStore? = null,
+) {
     // 跨 VM 唯一真相：仍在途的逾時交易（null=無在途交易）。
     // VM handoverTx 登記時同步寫入本地 activePolicyTx＋本欄；終態發布前先經
     // tryClaim（見 DualViewModel.tryClaimTxForPublish）做 settle-CAS 先行、
@@ -91,17 +96,74 @@ class PolicyTxCoordinator {
     // a later unrelated successful write never lowers it, and VM recreation /
     // Activity navigation never clears it. This is app-local ADVICE ONLY — never
     // proof that the hook process applied the repaired policy (DEVICE-UNVERIFIED).
+    // PR #74 R6-2 (G02): the marker is mirrored into app-private prefs; a NEW
+    // coordinator in a restarted app process seeds this live StateFlow from the
+    // persisted marker AT CONSTRUCTION (before any VM attaches). No hook PID /
+    // high-water re-derivation is attempted (no IPC surface; DEVICE-UNVERIFIED).
     private val _repairHint = MutableStateFlow(false)
     val repairHint: StateFlow<Boolean> = _repairHint.asStateFlow()
 
-    /** Raise the app-scoped hint after a successful Invalid->v1 repair commit. Idempotent. */
-    fun markRepairHint() {
-        _repairHint.value = true
+    // In-process mirror of the persisted marker. generation is monotonic across
+    // process restarts; repairedVersion records the version the repair commit wrote
+    // (-1 when the caller does not supply one, as in current production).
+    private var persisted: RepairHintState = RepairHintState(false, 0L, -1L)
+
+    init {
+        val loaded = try {
+            repairHintStore?.load()
+        } catch (_: Throwable) {
+            null
+        }
+        if (loaded != null) {
+            persisted = loaded
+            if (loaded.active) _repairHint.value = true
+        }
     }
 
-    /** Explicit user acknowledgement. The ONLY thing that lowers the hint. */
+    // JVM-test seam: inspect the persisted marker without an injected store.
+    internal val repairHintPersistedState: RepairHintState get() = persisted
+
+    /**
+     * Raise the app-scoped hint after a successful Invalid->v1 repair commit.
+     * Idempotent: an already-active marker never bumps [RepairHintState.generation].
+     */
+    fun markRepairHint(repairedVersion: Long = -1L) {
+        if (persisted.active) {
+            // Already active: keep the live truth raised, no generation bump.
+            _repairHint.value = true
+            return
+        }
+        applyRepairHint(
+            RepairHintState(
+                active = true,
+                generation = persisted.generation + 1L,
+                repairedVersion = repairedVersion,
+            ),
+        )
+    }
+
+    /** Explicit user acknowledgement. The ONLY production clear. */
     fun acknowledgeRepairHint() {
-        _repairHint.value = false
+        applyRepairHint(persisted.copy(active = false))
+    }
+
+    // TEST-ONLY / FUTURE-IPC SEAM. Deliberately NEVER called in production.
+    // A future binder contract would have to supply VERIFIED hook identity before
+    // an identity-based auto-clear could be justified; nothing here claims any
+    // on-device verification or observes the hook process's PID / high-water.
+    internal fun clearOnVerifiedHookRebirth() {
+        applyRepairHint(persisted.copy(active = false))
+    }
+
+    private fun applyRepairHint(next: RepairHintState) {
+        persisted = next
+        _repairHint.value = next.active
+        try {
+            repairHintStore?.save(next)
+        } catch (_: Throwable) {
+            // Best effort: the in-process live state stays authoritative for this
+            // process (fail-safe bias toward repeating the warning).
+        }
     }
 
     // Stage H1：App-scoped 單寫者鎖（fail-fast 經 tryLock，不排隊）。
@@ -1557,6 +1619,15 @@ class PolicyTxCoordinator {
         try {
             lastKnownPolicyDraft.set(null)
         } catch (_: Exception) {
+        }
+        // PR #74 R6-2 (G02): reset the repair marker too, so JVM tests stay isolated
+        // (generation back to 0, repairedVersion back to -1, live hint false).
+        try {
+            persisted = RepairHintState(false, 0L, -1L)
+            _repairHint.value = false
+            repairHintStore?.save(persisted)
+        } catch (_: Exception) {
+            // Best effort.
         }
         try {
             if (commitMutex.isLocked) {

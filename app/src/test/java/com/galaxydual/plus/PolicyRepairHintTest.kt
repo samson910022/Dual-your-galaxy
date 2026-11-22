@@ -24,6 +24,7 @@ import kotlinx.coroutines.test.setMain
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -31,11 +32,18 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class PolicyRepairHintTest {
+    // Passive fake of the hook side. App writes never touch it; the R6-2 tests
+    // assert it is UNCHANGED to prove no PID/high-water-based auto-clear exists.
+    private data class FakeHookRuntime(var pid: Int = 777, var highWater: Long = 50L)
+
     private class FakeStore(
         initialDraft: Set<String>? = setOf("com.a.app"),
         private val saveOk: Boolean = true,
+        initialVersion: Long = 50L,
     ) {
         var saved: Set<String>? = initialDraft
+        var version: Long = initialVersion
+            private set
         val store: HookPolicyStore = HookPolicyStore(
             loadRaw = { saved },
             saveRaw = { raw ->
@@ -43,15 +51,38 @@ class PolicyRepairHintTest {
                     false
                 } else {
                     saved = if (raw == null) emptySet() else HashSet(raw)
+                    // Mirror production saveRaw's version bump: Invalid(0) -> v1,
+                    // otherwise monotonic +1. Models "Present v50 -> v51" and
+                    // "Invalid -> v1" for the R6-2 persistence tests.
+                    version = if (version <= 0L) 1L else version + 1L
                     true
                 }
             },
         )
 
         fun armRepairSignal() {
+            // Simulate the Invalid version key that the next successful commit repairs.
+            version = 0L
             val f = HookPolicyStore::class.java
                 .getDeclaredField("invalidVersionRepaired").apply { isAccessible = true }
             (f.get(store) as AtomicBoolean).set(true)
+        }
+    }
+
+    // Map-backed fake mirroring the production SharedPreferences keys. Two
+    // coordinators sharing ONE instance model an App process restart (new
+    // coordinator, same app-private prefs file).
+    private class FakeRepairHintStore : RepairHintStore {
+        private val map = HashMap<String, Any>()
+        override fun load(): RepairHintState = RepairHintState(
+            active = map[REPAIR_HINT_KEY_ACTIVE] as? Boolean ?: false,
+            generation = map[REPAIR_HINT_KEY_GENERATION] as? Long ?: 0L,
+            repairedVersion = map[REPAIR_HINT_KEY_REPAIRED_VERSION] as? Long ?: -1L,
+        )
+        override fun save(state: RepairHintState) {
+            map[REPAIR_HINT_KEY_ACTIVE] = state.active
+            map[REPAIR_HINT_KEY_GENERATION] = state.generation
+            map[REPAIR_HINT_KEY_REPAIRED_VERSION] = state.repairedVersion
         }
     }
 
@@ -194,9 +225,12 @@ class PolicyRepairHintTest {
         assertTrue("sticky across a clean write", coord.repairHint.value)
         assertTrue(vm.repairHintFromApp.value)
 
-        // Explicit acknowledgement clears both app signal and the VM mirror.
+        // Explicit acknowledgement clears both app signal and the VM mirror
+        // (and the persisted marker; generation stays monotonic).
         vm.acknowledgeRepairHint()
         assertFalse(coord.repairHint.value)
+        assertFalse(coord.repairHintPersistedState.active)
+        assertEquals(1L, coord.repairHintPersistedState.generation)
         assertFalse(vm.repairHintFromApp.value)
         assertFalse(vm.state.value.policyRepairNeedsHookRestart)
 
@@ -241,5 +275,145 @@ class PolicyRepairHintTest {
         assertTrue(shouldShowRepairHint(true, false))
         assertTrue(shouldShowRepairHint(false, true))
         assertTrue(shouldShowRepairHint(true, true))
+    }
+
+    // ---- PR #74 R6-2 (G02): persistence across App process restart ----
+
+    @Test
+    fun repairHintSurvivesAppProcessRestartWhenHookPidUnchanged() {
+        // Hook side: pid 777, version high-water 50. The app's repaired v1 write
+        // does NOT make the hook reload; nothing in the fix observes this process.
+        val hook = FakeHookRuntime(pid = 777, highWater = 50L)
+        val hintStore = FakeRepairHintStore()
+
+        // Phase 1: Editor VM repairs an Invalid(v0) key -> v1 with a successful
+        // commit. The real VM write below drives the production ok && repaired
+        // path: DualViewModel calls no-arg markRepairHint(), so this exercises the
+        // inactive -> active persistence transition (the exact G02 scenario).
+        val coord1 = PolicyTxCoordinator(repairHintStore = hintStore)
+        val editorStore = FakeStore(setOf("com.a.app"))
+        editorStore.armRepairSignal()
+        val vm1 = makeVm(editorStore.store, coord1)
+        completeSuccessfulWrite(vm1, setOf("com.b.app"))
+        assertTrue(coord1.repairHint.value)
+        assertTrue(vm1.state.value.policyRepairNeedsHookRestart)
+        assertEquals(1L, editorStore.version)
+        val persisted1 = hintStore.load()
+        assertTrue("persisted active", persisted1.active)
+        assertEquals(1L, persisted1.generation)
+        assertEquals(-1L, persisted1.repairedVersion)
+
+        // Simulate App process restart: a NEW coordinator, same app-private prefs.
+        val coord2 = PolicyTxCoordinator(repairHintStore = hintStore)
+        assertTrue("hint live immediately at construction after restart", coord2.repairHint.value)
+
+        // Main VM: DIFFERENT store, no repair signal. It must warn from the
+        // coordinator alone, with its own mirror/signal still untouched.
+        val mainStore = FakeStore(setOf("com.x.app"))
+        val vm2 = makeVm(mainStore.store, coord2)
+        assertTrue(vm2.repairHintFromApp.value)
+        assertTrue(
+            "shouldShowRepairHint via app signal",
+            shouldShowRepairHint(vm2.state.value.policyRepairNeedsHookRestart, vm2.repairHintFromApp.value),
+        )
+        assertFalse("VM2 mirror stays false", vm2.state.value.policyRepairNeedsHookRestart)
+        assertFalse("VM2 store signal not consumed", mainStore.store.consumeInvalidVersionRepair())
+
+        // A second screen sharing coord2 warns too.
+        val vm3 = makeVm(FakeStore(setOf("com.y.app")).store, coord2)
+        assertTrue(vm3.repairHintFromApp.value)
+        assertTrue(shouldShowRepairHint(false, vm3.repairHintFromApp.value))
+
+        // No PID / high-water re-derivation: the hook side is untouched.
+        assertEquals(777, hook.pid)
+        assertEquals(50L, hook.highWater)
+    }
+
+    @Test
+    fun monotonicVersionConfirmationDoesNotRaiseRepairHint() {
+        val hintStore = FakeRepairHintStore()
+        val coord1 = PolicyTxCoordinator(repairHintStore = hintStore)
+        // Present v50 -> a normal monotonic write yields v51 (no repair signal).
+        val store1 = FakeStore(setOf("com.a.app"), initialVersion = 50L)
+        val vm1 = makeVm(store1.store, coord1)
+        completeSuccessfulWrite(vm1, setOf("com.b.app"))
+        assertEquals(51L, store1.version)
+        assertFalse(coord1.repairHint.value)
+        assertFalse(vm1.repairHintFromApp.value)
+        val p1 = hintStore.load()
+        assertFalse("persisted inactive", p1.active)
+        assertEquals("generation unchanged", 0L, p1.generation)
+
+        // Restart with the same prefs: still quiet, and another monotonic write
+        // must not raise it in either the old or the new flow.
+        val coord2 = PolicyTxCoordinator(repairHintStore = hintStore)
+        assertFalse(coord2.repairHint.value)
+        val store2 = FakeStore(setOf("com.b.app"), initialVersion = 51L)
+        val vm2 = makeVm(store2.store, coord2)
+        completeSuccessfulWrite(vm2, setOf("com.c.app"))
+        assertEquals(52L, store2.version)
+        assertFalse(coord2.repairHint.value)
+        assertFalse(vm2.repairHintFromApp.value)
+        assertFalse("old flow stays quiet", vm1.repairHintFromApp.value)
+        val p2 = hintStore.load()
+        assertFalse(p2.active)
+        assertEquals(0L, p2.generation)
+    }
+
+    @Test
+    fun acknowledgedRepairStaysClearedAcrossRestartAndCrossScreen() {
+        val hintStore = FakeRepairHintStore()
+        val coord1 = PolicyTxCoordinator(repairHintStore = hintStore)
+        val editorStore = FakeStore(setOf("com.a.app"))
+        editorStore.armRepairSignal()
+        val vm1 = makeVm(editorStore.store, coord1)
+        completeSuccessfulWrite(vm1, setOf("com.b.app"))
+        assertTrue(vm1.hasPolicyCoordinator)
+        assertTrue(coord1.repairHint.value)
+
+        // The ONLY production clear: explicit acknowledgement.
+        vm1.acknowledgeRepairHint()
+        assertFalse(coord1.repairHint.value)
+        assertFalse("persisted cleared", hintStore.load().active)
+        assertEquals("generation monotonic after ack", 1L, hintStore.load().generation)
+
+        // Restart + two screens sharing the new coordinator: all quiet.
+        val coord2 = PolicyTxCoordinator(repairHintStore = hintStore)
+        val vm2 = makeVm(FakeStore(setOf("com.x.app")).store, coord2)
+        val vm3 = makeVm(FakeStore(setOf("com.y.app")).store, coord2)
+        assertFalse(vm2.repairHintFromApp.value)
+        assertFalse(vm3.repairHintFromApp.value)
+        assertFalse(vm2.state.value.policyRepairNeedsHookRestart)
+        assertFalse(vm3.state.value.policyRepairNeedsHookRestart)
+
+        // A monotonic write after ack must not silently re-raise the hint.
+        completeSuccessfulWrite(vm2, setOf("com.z.app"))
+        assertFalse(coord2.repairHint.value)
+        assertFalse(vm2.repairHintFromApp.value)
+
+        // hasPolicyCoordinator masking: a stale per-VM mirror cannot resurrect it.
+        val masked2 = vm2.state.value.policyRepairNeedsHookRestart && !vm2.hasPolicyCoordinator
+        val masked3 = vm3.state.value.policyRepairNeedsHookRestart && !vm3.hasPolicyCoordinator
+        assertFalse(shouldShowRepairHint(masked2, vm2.repairHintFromApp.value))
+        assertFalse(shouldShowRepairHint(masked3, vm3.repairHintFromApp.value))
+    }
+
+    @Test
+    fun repairHintIsNotClearedByHookIdentityChangeWithoutAck() {
+        val hook = FakeHookRuntime(pid = 777, highWater = 50L)
+        val hintStore = FakeRepairHintStore()
+        val coord1 = PolicyTxCoordinator(repairHintStore = hintStore)
+        coord1.markRepairHint(repairedVersion = 1L)
+        assertTrue(coord1.repairHint.value)
+
+        // Only the fake hook identity changes; no acknowledgement anywhere.
+        // A new app coordinator must still warn (no PID-based auto-clear seam).
+        hook.pid = 999
+        hook.highWater = 1L
+        val coord2 = PolicyTxCoordinator(repairHintStore = hintStore)
+        assertTrue("new app coordinator still warns", coord2.repairHint.value)
+        val vm = makeVm(FakeStore(setOf("com.x.app")).store, coord2)
+        assertTrue(vm.repairHintFromApp.value)
+        assertTrue(hintStore.load().active)
     }
 }

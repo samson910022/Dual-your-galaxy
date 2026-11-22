@@ -519,9 +519,10 @@ data class UiState(
     // E07 (PR #74 R4): sticky UI hint that a SUCCESSFUL write repaired an
     // Invalid version key (v1) while a hook may still hold a higher version
     // high-water and reject v1 as a replay. Sourced solely from the app-local
-    // one-shot HookPolicyStore signal; NOT proof of hook state. Once raised it
-    // stays true for this ViewModel's lifetime (a later clean write must never
-    // silently erase an honest warning); only a new ViewModel clears it.
+    // one-shot HookPolicyStore signal; NOT proof of hook state. Once raised the
+    // warning must never be silently erased by a later clean write: it is cleared
+    // only by explicit acknowledgement; deliberately persists across App process
+    // restart (R6-2: the app-scoped coordinator mirrors it into app-private prefs).
     val policyRepairNeedsHookRestart: Boolean = false,
     val pendingPolicyWrite: PendingPolicyWrite? = null,
     // Phase 3：政策寫入可觀測相位＋單一 epoch（唯一真相，render 只讀此二欄）。
@@ -7194,10 +7195,10 @@ class DualViewModel(
     // Invalid->v1 repair cannot be reported as an unqualified success. The
     // flag is deliberately STICKY: a later unrelated successful write that
     // returns no repair signal does not lower it — once the user has been
-    // warned, it is cleared only by an explicit user acknowledgement (tap the
-    // hint, via acknowledgeRepairHint()) or by a fresh ViewModel (process/VM
-    // restart). No claim about the hook's actual version is made here (no
-    // cross-process pass).
+    // warned, it is cleared only by explicit user acknowledgement (tap the
+    // hint, via acknowledgeRepairHint()); deliberately persists across App
+    // process restart (R6-2 app-private marker). No claim about the hook's
+    // actual version is made here (no cross-process pass).
     private fun noteInvalidVersionRepairAfterCommit(store: HookPolicyStore, ok: Boolean) {
         if (!ok) return
         val repaired = try {
