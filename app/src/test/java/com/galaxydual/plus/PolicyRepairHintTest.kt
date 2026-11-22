@@ -10,6 +10,7 @@
 // covered by HookPolicyRemoteStoreTest). This file only proves the signal is
 // plumbed into app-scoped state, is sticky until explicit acknowledgement, and
 // never rises on a failed or a normal monotonic write.
+// Real hint TextView rendering/tap in Main+Editor is DEVICE-UNVERIFIED.
 package com.galaxydual.plus
 
 import androidx.lifecycle.viewModelScope

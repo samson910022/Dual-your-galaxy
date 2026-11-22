@@ -10,6 +10,7 @@
 // from the authoritative Known pre-read vs the real candidate and requires the
 // token's delta to match, BEFORE the consent fence (and outside the test seam
 // that replaces the fence wholesale).
+// Pure JVM control-flow; no on-device consent-dialog path exercised (DEVICE-UNVERIFIED).
 package com.galaxydual.plus
 
 import androidx.lifecycle.viewModelScope

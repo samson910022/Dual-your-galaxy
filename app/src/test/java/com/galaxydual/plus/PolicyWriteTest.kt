@@ -2276,7 +2276,7 @@ class PolicyWriteTest {
     // R5-0 (F01): blind-clear disabled. Unknown → fail-closed refresh-first
     // guidance on EVERY tap: zero store touch, zero arm, no destructive path.
     @Test
-    fun clearPolicyDraft_unknownDraft_requiresDoubleConfirm() {
+    fun clearPolicyDraft_unknownDraft_failClosesNoDoubleConfirm() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -2441,7 +2441,8 @@ class PolicyWriteTest {
     }
 
     // VM↔binding 整合 (#3, Phase 2 兩步確認)：真實 store 鏈路 — commit 失敗 →
-    // FAILED+unknown；未知門控零寫入；翻轉成功旗標後 blind clear 需兩步
+    // FAILED+unknown；未知門控零寫入；blind clear 已撤回停用（Unknown 一律
+    // fail-closed，回 UNKNOWN_REFRESH，需先權威 refresh 至 Known，無兩步路徑）
     // （第一次告警、第二次執行；成功 clear 清 needsRefetch），再
     // refresh→Known→request+confirm 成功。
     @Test
@@ -2784,7 +2785,8 @@ class PolicyWriteTest {
 
     // Phase 2 VM：throw-provider transient（不設旗標）→ 恢復後 refresh 即 Known
     // (old) → request+confirm 直接成功無需 clear（與 1215 sticky 腿對照：該腿為
-    // commit-false 同實例，需 blind clear 兩步；本腿 load-only 恢復，無需 clear）。
+    // commit-false 同實例須先權威 refresh 至 Known（blind clear 已停用）；
+    // 本腿 load-only 恢復，無需 clear）。
     @Test
     fun throwProviderTransient_refreshRecoversThenSaveSucceedsWithoutClear() {
         val prefs = MinimalPrefs(commitSucceeds = true)
@@ -2825,7 +2827,7 @@ class PolicyWriteTest {
     // R5-0 (F01): failed-clear recovery now REQUIRES an explicit authoritative
     // refresh; no tap on clear from an Unknown snapshot may delete anything.
     @Test
-    fun failedClear_retrySucceedsAfterDoubleConfirm() {
+    fun failedClear_retryRequiresAuthoritativeRefresh() {
         val fake = FakePolicyStore()
         val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
         await { vm.state.value.policyDraftKnown }
@@ -2878,9 +2880,9 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyRefreshing)
     }
 
-    // Critical 3：stale-arm 洩漏迴歸——arm→Known→Unknown→單次 clear 必須僅告警。
-    // Known 成功路徑（refresh/confirm/clear）須同步 disarm，否則舊 arm 殘留會讓
-    // 下一次 Unknown 的單次 clear 直接執行（靜默刪除未見內容）。
+    // Critical 3（R5-0 後）：blind-clear 已停用，無 arm 可殘留；Known→Unknown
+    // 的 clear 一律 fail-closed（UNKNOWN_REFRESH、零 store 觸碰），不論先前的
+    // Known 成功路徑為何。本測試釘住此不變性（舊的 stale-arm 執行路徑已移除）。
     @Test
     fun staleArmClearedByKnown_singleClearAfterReUnknownOnlyWarns() {
         val fake = FakePolicyStore()
@@ -8262,7 +8264,7 @@ class PolicyWriteTest {
     // Both taps through the unified button route are fail-closed; only a real
     // refresh restoring Known opens the clear path.
     @Test
-    fun l4_clearButtonTap_unavailableKeepsBlindClear() {
+    fun l4_clearButtonTap_unavailableNeverClears() {
         var now = 10_000L
         var backing: Set<String>? = null
         var clearCalls = 0
@@ -11181,7 +11183,7 @@ class PolicyWriteTest {
     // destructive path. Every Unknown tap is fail-closed (no forced refresh,
     // no arm, no delete), even after repeated taps.
     @Test
-    fun s4_blindClear_lastKnownSet_refreshKeepsFailing_neverDeletes() {
+    fun s4_blindClearDisabled_lastKnownSet_refreshKeepsFailing_neverClears() {
         val fake = FakePolicyStore() // 初始 Known（setOf("com.seed")）
         val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
         await { vm.state.value.policyDraftKnown }
@@ -11324,7 +11326,7 @@ class PolicyWriteTest {
     // not change the Unknown contract: no tap deletes, no refresh is forced by
     // clear, and the coordinator still keeps its last-Known snapshot.
     @Test
-    fun s4_blindClear_vmReplacement_knownInherited_refreshFirstNeverDeletes() {
+    fun s4_blindClearDisabled_vmReplacement_knownInherited_refreshFirstNeverClears() {
         val coord = PolicyTxCoordinator()
         var backing: Set<String>? = setOf("com.seed")
         var clearCalls = 0
