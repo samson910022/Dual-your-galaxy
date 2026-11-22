@@ -539,6 +539,14 @@ class MainActivity : ComponentActivity() {
                 vm.state.collect { s -> render(s) }
             }
         }
+        // R5-1 (F02): a repair committed by the OTHER Activity's VM marks the
+        // App-scoped coordinator (no new UiState emission reaches this VM), so
+        // observe that flow too and re-render the last known state on change.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                vm.repairHintFromApp.collect { lastState?.let { s -> render(s) } ?: render(vm.state.value) }
+            }
+        }
         refreshShizukuPresenceCache()
         updateShizukuLine()
         // 冷啟動單一入口：初查由 onResume.onForeground() (probe+按需 refresh)
@@ -567,6 +575,10 @@ class MainActivity : ComponentActivity() {
         // B1 旋轉恢復：pkgInput 由 View 系統恢復（id=pkg_input）在 onRestoreInstanceState
         // 之後，render 可能已用空輸入跑過一次而卡 disabled；此處以後恢復文字重算一次。
         refreshManualEnablement()
+        // R5-1 (F02): re-read the app-scoped hint on foreground (the Editor VM
+        // may have marked it while this Activity was stopped; STARTED collector
+        // is also live, this is a belt-and-suspenders refresh after resume).
+        render(lastState ?: vm.state.value)
     }
 
     override fun onRestoreInstanceState(savedInstanceState: Bundle) {
@@ -1043,6 +1055,10 @@ class MainActivity : ComponentActivity() {
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
             visibility = View.GONE
             contentDescription = text
+            // R5-1 (F02): explicit acknowledgement is a TAP on this hint. The
+            // string already says "restart the Hook process" so no extra copy.
+            isClickable = true
+            setOnClickListener { vm.acknowledgeRepairHint() }
         }
         writePolicyBtn = Button(this).apply {
             text = getString(R.string.action_write_policy)
@@ -3355,12 +3371,21 @@ class MainActivity : ComponentActivity() {
         } catch (_: Exception) {
             // Best effort: render may run before buildUi in tests.
         }
-        // E07 (PR #74 R4): persistent hook-restart hint. The VM flag is
-        // sticky, so the hint stays visible across later unrelated status
-        // updates; it is NOT a claim that the hook has actually reloaded.
+        // E07 (PR #74 R4) / R5-1 (F02): persistent hook-restart hint. Visible
+        // if EITHER this VM's back-compat mirror OR the App-scoped signal is
+        // raised, so a repair done in the Editor VM shows here too. Both are
+        // sticky until explicit acknowledgement; neither is a claim that the
+        // hook has actually reloaded.
         try {
             if (::policyRepairHintView.isInitialized) {
-                val needHint = s.policyRepairNeedsHookRestart
+                // R5-1 fixer (Option A): the app signal is authoritative in
+                // production; the per-VM mirror only counts on the legacy
+                // no-coordinator path.
+                val vmFlag = s.policyRepairNeedsHookRestart && !vm.hasPolicyCoordinator
+                val needHint = shouldShowRepairHint(
+                    vmFlag = vmFlag,
+                    appFlag = vm.repairHintFromApp.value,
+                )
                 val wantVisibility = if (needHint) View.VISIBLE else View.GONE
                 if (policyRepairHintView.visibility != wantVisibility) {
                     policyRepairHintView.visibility = wantVisibility
@@ -7118,6 +7143,11 @@ internal fun WriteBlock.stringRes(): Int = when (kind) {
 internal fun Context.resolveBlockReason(reason: BlockReason): String = when (reason) {
     is BlockReason.Keyed -> getString(reason.block.stringRes(), *reason.block.args.toTypedArray())
 }
+
+// PR #74 R5-1 (F02): single source for the hook-restart hint visibility. The
+// per-VM flag is a back-compat mirror; the app-scoped flag is shared by both
+// Activities' VMs. Either one raising the hint is enough. Pure + JVM-testable.
+internal fun shouldShowRepairHint(vmFlag: Boolean, appFlag: Boolean): Boolean = vmFlag || appFlag
 
 // PR-6 P4 (#27 架構整理)：render() 的純字串拆分 (頂層 internal，JVM 可測)。
 // 有意變更 (非等價重構)，共四處，各有理由：

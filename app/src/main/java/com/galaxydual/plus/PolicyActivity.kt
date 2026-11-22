@@ -64,6 +64,7 @@ import kotlinx.coroutines.CancellationException
 class PolicyActivity : ComponentActivity() {
 
     private lateinit var statusView: TextView
+    private lateinit var policyRepairHintView: TextView
     private lateinit var counterView: TextView
     private lateinit var writeBarBtn: Button
     private lateinit var searchInput: EditText
@@ -78,6 +79,10 @@ class PolicyActivity : ComponentActivity() {
         object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
             override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                val injected = testViewModel
+                if (injected != null && modelClass.isAssignableFrom(DualViewModel::class.java)) {
+                    return injected as T
+                }
                 return DualViewModelFactory(applicationContext, packageName).create(modelClass)
             }
         }
@@ -392,6 +397,20 @@ class PolicyActivity : ComponentActivity() {
         }
         column.addView(statusView)
 
+        // R5-1 (F02): app-scoped hook-restart hint, near the status line. Reuses
+        // the existing string (no new copy). Tapping it is the explicit ack.
+        policyRepairHintView = TextView(this).apply {
+            text = getString(R.string.policy_repair_hook_restart_required)
+            textSize = 11f
+            setTextColor(getColor(R.color.oneui_warning_text))
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+            visibility = View.GONE
+            contentDescription = text
+            isClickable = true
+            setOnClickListener { vm.acknowledgeRepairHint() }
+        }
+        column.addView(policyRepairHintView)
+
         column.addView(TextView(this).apply {
             text = getString(R.string.policy_editor_intro)
             textSize = 11f
@@ -492,6 +511,7 @@ class PolicyActivity : ComponentActivity() {
                 vm.state.collect { s ->
                     policyDraftKnown = s.policyDraftKnown
                     applyStatus(s)
+                    applyRepairHint(s)
                     phaseIsIdle = s.policyWritePhase == PolicyWritePhase.IDLE
                     if (s.policyDraft != lastSyncedDraft) {
                         lastSyncedDraft = s.policyDraft
@@ -511,6 +531,15 @@ class PolicyActivity : ComponentActivity() {
                     } catch (_: Exception) {
                         // Best effort: sync 失敗不殺 collector。
                     }
+                }
+            }
+        }
+        // R5-1 (F02): a repair committed in the Main VM (or an ack there) changes
+        // only the App-scoped signal, so observe it directly as well.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                vm.repairHintFromApp.collect {
+                    try { applyRepairHint(vm.state.value) } catch (_: Exception) { /* Best effort. */ }
                 }
             }
         }
@@ -570,6 +599,26 @@ class PolicyActivity : ComponentActivity() {
                 getColor(R.color.oneui_text_secondary)
             },
         )
+    }
+
+    // R5-1 (F02): hint visibility = this VM's back-compat mirror OR the
+    // App-scoped signal. No stronger copy; tapping the view acknowledges both.
+    private fun applyRepairHint(s: UiState) {
+        if (!::policyRepairHintView.isInitialized) return
+        // R5-1 fixer (Option A): mask the mirror in production so an ack in the
+        // other Activity cannot be overridden by this VM's stale flag.
+        val vmFlag = s.policyRepairNeedsHookRestart && !vm.hasPolicyCoordinator
+        val need = shouldShowRepairHint(
+            vmFlag = vmFlag,
+            appFlag = vm.repairHintFromApp.value,
+        )
+        val want = if (need) View.VISIBLE else View.GONE
+        if (policyRepairHintView.visibility != want) {
+            policyRepairHintView.visibility = want
+            policyRepairHintView.accessibilityLiveRegion =
+                if (need) View.ACCESSIBILITY_LIVE_REGION_POLITE
+                else View.ACCESSIBILITY_LIVE_REGION_NONE
+        }
     }
 
     // Phase E 孤兒條目：ticks 中不在 catalog 的包名（已解除安裝／篩選剔除後殘留）。
@@ -1350,6 +1399,12 @@ class PolicyActivity : ComponentActivity() {
     }
 
     companion object {
+        // Minimal test seam (mirrors MainActivity): instrumentation may inject
+        // a fake-backed VM to drive the hint views without device writes.
+        // Null in production.
+        @Volatile
+        internal var testViewModel: DualViewModel? = null
+
         private const val MAX_LIST_ROWS = 200
     }
 }

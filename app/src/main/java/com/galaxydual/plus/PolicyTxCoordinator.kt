@@ -83,6 +83,27 @@ class PolicyTxCoordinator {
 
     fun nextTxId(): Long = globalTxId.incrementAndGet()
 
+    // PR #74 R5-1 (F02): app-scoped, process-local hook-restart hint owned by
+    // this App-scoped coordinator (GalaxyApp singleton in production), NOT by
+    // any per-Activity ViewModel. Set by DualViewModel.noteInvalidVersionRepairAfterCommit
+    // after a SUCCESSFUL commit repaired an Invalid version key (Invalid -> v1).
+    // Durable until an explicit user acknowledgement (tap the hint TextView):
+    // a later unrelated successful write never lowers it, and VM recreation /
+    // Activity navigation never clears it. This is app-local ADVICE ONLY — never
+    // proof that the hook process applied the repaired policy (DEVICE-UNVERIFIED).
+    private val _repairHint = MutableStateFlow(false)
+    val repairHint: StateFlow<Boolean> = _repairHint.asStateFlow()
+
+    /** Raise the app-scoped hint after a successful Invalid->v1 repair commit. Idempotent. */
+    fun markRepairHint() {
+        _repairHint.value = true
+    }
+
+    /** Explicit user acknowledgement. The ONLY thing that lowers the hint. */
+    fun acknowledgeRepairHint() {
+        _repairHint.value = false
+    }
+
     // Stage H1：App-scoped 單寫者鎖（fail-fast 經 tryLock，不排隊）。
     // - IO 在途（SAVING）期間持有，併發第二寫經 tryLock 失敗即 BUSY/
     //   IN_PROGRESS，不啟 IO（與 CAS 雙層：writeMutex 擋在途 IO，activeTx CAS

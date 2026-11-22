@@ -869,6 +869,33 @@ class DualViewModel(
     // Observable state for the UI; collected with lifecycleScope in F2.
     val state: StateFlow<UiState> = _state.asStateFlow()
 
+    // PR #74 R5-1 (F02): the app-scoped hook-restart hint (owned by the
+    // App-scoped coordinator, shared by Main/Editor VMs). Activities collect
+    // this so a repair commit in the OTHER Activity's VM shows up live here.
+    // A null coordinator (legacy single-VM JVM test path) keeps a constant
+    // false flow; the per-VM UiState flag remains the back-compat mirror.
+    val repairHintFromApp: StateFlow<Boolean> =
+        policyTxCoordinator?.repairHint ?: MutableStateFlow(false).asStateFlow()
+
+    // R5-1 fixer (reviewer 1, Option A): whether this VM shares the App-scoped
+    // coordinator. In production (coordinator present) the app signal is
+    // AUTHORITATIVE; a per-VM mirror left stale by an ack in the other Activity
+    // must not keep the hint visible. Only the legacy no-coordinator test path
+    // lets the mirror contribute. The mirror itself is still set (back-compat).
+    internal val hasPolicyCoordinator: Boolean get() = policyTxCoordinator != null
+
+    // PR #74 R5-1 (F02): explicit user acknowledgement (tapping the hint view).
+    // Clears BOTH the app-scoped signal and this VM's back-compat mirror so the
+    // hint hides immediately on whichever Activity was tapped. Never called on
+    // unrelated writes; the hint is only lowered by a genuine user action.
+    fun acknowledgeRepairHint() {
+        policyTxCoordinator?.acknowledgeRepairHint()
+        _state.update { cur ->
+            if (!cur.policyRepairNeedsHookRestart) cur
+            else cur.copy(policyRepairNeedsHookRestart = false)
+        }
+    }
+
     // Serializes probe/refresh/clone/remove (see class doc).
     private val opMutex = Mutex()
 
@@ -7166,8 +7193,10 @@ class DualViewModel(
     // Invalid->v1 repair cannot be reported as an unqualified success. The
     // flag is deliberately STICKY: a later unrelated successful write that
     // returns no repair signal does not lower it — once the user has been
-    // warned, only a fresh ViewModel (process/VM restart) clears it. No claim
-    // about the hook's actual version is made here (no cross-process pass).
+    // warned, it is cleared only by an explicit user acknowledgement (tap the
+    // hint, via acknowledgeRepairHint()) or by a fresh ViewModel (process/VM
+    // restart). No claim about the hook's actual version is made here (no
+    // cross-process pass).
     private fun noteInvalidVersionRepairAfterCommit(store: HookPolicyStore, ok: Boolean) {
         if (!ok) return
         val repaired = try {
@@ -7176,10 +7205,18 @@ class DualViewModel(
             false
         }
         if (repaired) {
+            // Per-VM back-compat mirror (existing JVM tests assert this flag).
             _state.update { cur ->
                 if (cur.policyRepairNeedsHookRestart) cur
                 else cur.copy(policyRepairNeedsHookRestart = true)
             }
+            // PR #74 R5-1 (F02): publish to the App-scoped coordinator so the
+            // OTHER Activity's VM (Main and Editor own different VMs) sees the
+            // same hint, and it survives this VM's recreation. App-local advice
+            // only, NOT proof the hook reloaded the repaired policy.
+            // Never reached from a failed commit (early return above) nor from
+            // a normal monotonic Present(v+1) write (no repair signal consumed).
+            policyTxCoordinator?.markRepairHint()
         }
     }
 
