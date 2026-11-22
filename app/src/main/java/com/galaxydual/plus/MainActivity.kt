@@ -652,14 +652,10 @@ class MainActivity : ComponentActivity() {
         // 銷毀後仍回呼 onRestored/onFailed（舊 CheckBox / Toast 已無效）。
         bbcToggleController?.dispose()
         bbcToggleController = null
-        // PR-74 A3：破壞性路徑的三個對話框 handle 逐一 best-effort dismiss + null
-        // （單一 handle 失敗不阻斷後續；dismissDialogHandle 為 JVM 可測純函式）。
-        destructiveDialogHandles.preClearWarning =
-            dismissDialogHandle(destructiveDialogHandles.preClearWarning) { it.dismiss() }
-        destructiveDialogHandles.rootConfirm =
-            dismissDialogHandle(destructiveDialogHandles.rootConfirm) { it.dismiss() }
-        destructiveDialogHandles.uninstallVerify =
-            dismissDialogHandle(destructiveDialogHandles.uninstallVerify) { it.dismiss() }
+        // PR-74 A3 / R4-5：破壞性路徑四個對話框 handle 單次 best-effort dismiss + null
+        // （含 probe-failed；單一 handle 失敗不阻斷後續。用 dismiss() 而非 cancel()，
+        // 避免快銷毀中的 Activity 仍觸發對話框的 onCancel 回呼）。
+        dismissAllDestructiveHandles(destructiveDialogHandles) { it.dismiss() }
         try {
             catalogJob?.cancel()
         } catch (_: Exception) {
@@ -6360,6 +6356,7 @@ class MainActivity : ComponentActivity() {
                     pendingWarningRestart?.invoke()
                 },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
+                dialogHandles = destructiveDialogHandles,
             )
             return
         }
@@ -6416,6 +6413,7 @@ class MainActivity : ComponentActivity() {
                             pendingWarningRestart?.invoke()
                         },
                         onCancel = { setPendingClearConfirm(false); onCancel() },
+                        dialogHandles = destructiveDialogHandles,
                     )
                     return@launch
                 }
@@ -6498,6 +6496,7 @@ class MainActivity : ComponentActivity() {
                     pendingWarningRestart?.invoke()
                 },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
+                dialogHandles = destructiveDialogHandles,
             )
             return
         }
@@ -6549,6 +6548,7 @@ class MainActivity : ComponentActivity() {
                             pendingWarningRestart?.invoke()
                         },
                         onCancel = { setPendingClearConfirm(false); onCancel() },
+                        dialogHandles = destructiveDialogHandles,
                     )
                     return@launch
                 }
@@ -8467,19 +8467,48 @@ internal fun canAutoRestart(previousCount: Int): Boolean = previousCount < MAX_A
 // fail-closed（carry-forward #2）。Activity 私欄位本身不可從 JVM 觀測，故此純函數鎖語義。
 internal fun consentResetAllowedForNewWarning(pendingClearConfirm: Boolean): Boolean = !pendingClearConfirm
 
-// PR-74 A3 (P3)：破壞性路徑對話框 handle 收集器（Activity 欄位持有，onDestroy 一次結清）。
-// showPreClearWarning 的警告／ROOT 二次確認與 showUninstallVerifyDialog 的驗證對話框
-// 先前 show() 後即丟棄 handle，銷毀時無法 dismiss → 舊 Activity window 洩漏；改由此
-// holder 統一持有，onDestroy 逐個 best-effort dismiss + null（不影響按鈕行為）。
-internal class DestructiveDialogHandles {
-    var preClearWarning: AlertDialog? = null
-    var rootConfirm: AlertDialog? = null
-    var uninstallVerify: AlertDialog? = null
+// PR-74 A3 (P3) / R4-5 (E05)：破壞性路徑對話框 handle 收集器（Activity 欄位持有，
+// onDestroy 一次結清）。showPreClearWarning 的警告／ROOT 二次確認、
+// showUninstallVerifyDialog 的驗證對話框，以及 R4-5 的 probe-failed 警告，
+// 先前 show() 後即丟棄 handle，銷毀時無法 dismiss → 舊 Activity window 洩漏；
+// 改由此 holder 統一持有，onDestroy 逐個 best-effort dismiss + null（不影響按鈕行為）。
+// R4-5：改為 framework-free generic slots（JVM 可用假 handle 驗證四個欄位全部釋放）；
+// AlertDialog 綁定留在子類別，Activity 呼叫端與 destructibleDialogHandles 型別不變。
+internal data class DestructiveHandleSlots<T>(
+    var preClearWarning: T? = null,
+    var rootConfirm: T? = null,
+    var uninstallVerify: T? = null,
+    var preClearProbeFailed: T? = null,
+)
+
+// Kotlin 不允許 open data class；typealias 保留 data class 本體，並讓既有
+// DestructiveDialogHandles() 呼叫端拿到同一個型別（活動欄位／函式簽名不變）。
+internal typealias DestructiveDialogHandles = DestructiveHandleSlots<AlertDialog>
+
+// PR-74 A3 / R4-5：best-effort 關閉「全部」slots 並逐欄回 null（純函式、JVM 可測：
+// dismiss lambda 可注入假物件）。任一欄位 dismiss 拋出皆吞掉並照樣清空該欄，
+// 且繼續處理後續欄位（與既有 onDestroy 的 try/catch 風格一致）；
+// 此函式不碰 activity lifecycle，也不呼叫 cancel()（cancel 會觸發 onCancel）。
+internal fun <T> dismissAllDestructiveHandles(s: DestructiveHandleSlots<T>, dismiss: (T) -> Unit) {
+    // 每欄各自吞掉 Throwable（含 Error），確保任一欄失敗都不阻斷其餘欄位釋放。
+    fun release(handle: T?): T? {
+        if (handle != null) {
+            try {
+                dismiss(handle)
+            } catch (_: Throwable) {
+                // Best effort: the window is going away anyway.
+            }
+        }
+        return null
+    }
+    s.preClearWarning = release(s.preClearWarning)
+    s.rootConfirm = release(s.rootConfirm)
+    s.uninstallVerify = release(s.uninstallVerify)
+    s.preClearProbeFailed = release(s.preClearProbeFailed)
 }
 
-// PR-74 A3：best-effort 關閉單一 handle 並回 null（純函式、JVM 可測：dismiss lambda
-// 可注入假物件）。即使 dismiss 拋出仍吞掉並照樣清空，避免第一個 handle 失敗阻斷
-// 後續 handle 的釋放（與既有 onDestroy 的 try/catch 風格一致）。
+// PR-74 A3：best-effort 關閉單一 handle 並回 null（保留給既有呼叫端／測試相容）。
+// 即使 dismiss 拋出仍吞掉並照樣清空，避免第一個 handle 失敗阻斷後續 handle 的釋放。
 internal fun <T> dismissDialogHandle(handle: T?, dismiss: (T) -> Unit): T? {
     if (handle != null) {
         try {
@@ -8829,10 +8858,13 @@ internal fun showPreClearProbeFailedWarning(
     config: ProbeFailedDialogConfig,
     onRetry: () -> Unit,
     onCancel: () -> Unit,
+    // R4-5 (E05)：無預設值——任何呼叫端都必須明確提供 holder，否則編譯失敗
+    // （與 showPreClearWarning 的 dialogHandles 同一個 fail-closed 編譯期約束）。
+    dialogHandles: DestructiveDialogHandles,
 ) {
     if (host.isFinishing || host.isDestroyed) { onCancel(); return }
     try {
-        AlertDialog.Builder(host)
+        val dialog = AlertDialog.Builder(host)
             .setTitle(config.titleRes)
             .setMessage(config.messageRes)
             .setCancelable(true)
@@ -8840,8 +8872,11 @@ internal fun showPreClearProbeFailedWarning(
             .setNegativeButton(config.cancelLabelRes) { _, _ -> onCancel() }
             .setOnCancelListener { onCancel() }
             .show()
+        // R4-5 (E05)：show() 的回傳 handle 立即入 slot，供 onDestroy 釋放；
+        // 不改變按鈕（retry/cancel）與 onCancel 行為。
+        dialogHandles.preClearProbeFailed = dialog
         // config.showProceed 恆為 false：builder 只接了 retry/cancel 兩個按鈕，
-        // 沒有任何 proceed affordance 可觸發（R4-5 才會加 dialog handle）。
+        // 沒有任何 proceed affordance 可觸發。
     } catch (e: RuntimeException) {
         preClearLog("pre-clear probe-failed warning failed to show", e)
         onCancel()

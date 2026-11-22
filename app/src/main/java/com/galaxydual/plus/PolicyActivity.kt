@@ -222,6 +222,7 @@ class PolicyActivity : ComponentActivity() {
                     pendingWarningRestart?.invoke()
                 },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
+                dialogHandles = destructiveDialogHandles,
             )
             return
         }
@@ -266,6 +267,7 @@ class PolicyActivity : ComponentActivity() {
                             pendingWarningRestart?.invoke()
                         },
                         onCancel = { setPendingClearConfirm(false); onCancel() },
+                        dialogHandles = destructiveDialogHandles,
                     )
                     return@launch
                 }
@@ -503,14 +505,10 @@ class PolicyActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         policyConfirmDialog = null
-        // PR-74 A3：破壞性路徑三個 handle 逐一 best-effort dismiss + null
-        // （與 MainActivity.onDestroy 同口徑；單一失敗不阻斷後續）。
-        destructiveDialogHandles.preClearWarning =
-            dismissDialogHandle(destructiveDialogHandles.preClearWarning) { it.dismiss() }
-        destructiveDialogHandles.rootConfirm =
-            dismissDialogHandle(destructiveDialogHandles.rootConfirm) { it.dismiss() }
-        destructiveDialogHandles.uninstallVerify =
-            dismissDialogHandle(destructiveDialogHandles.uninstallVerify) { it.dismiss() }
+        // PR-74 A3 / R4-5：破壞性路徑四個 handle 單次 best-effort dismiss + null
+        // （含 probe-failed；與 MainActivity.onDestroy 同口徑，單一失敗不阻斷後續。
+        // 用 dismiss() 而非 cancel()，避免快銷毀中的 Activity 仍觸發 onCancel 回呼）。
+        dismissAllDestructiveHandles(destructiveDialogHandles) { it.dismiss() }
         policyConfirmState.onPendingCleared()
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
