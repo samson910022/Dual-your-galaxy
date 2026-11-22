@@ -72,3 +72,42 @@ internal fun probeFailedDialogConfig(write: Boolean, unknown: Boolean): ProbeFai
         },
         cancelLabelRes = R.string.pre_clear_cancel,
     )
+
+// R5-0 (F01): framework-free decision model for the Unknown-warning Retry.
+// The retry is an authoritative re-read, NOT a destructive re-entry: only a
+// settled KNOWN snapshot may continue into a fresh warning. Corrupt and
+// still-unavailable snapshots get non-recursive guidance (no dialog restart).
+internal enum class PolicyWarningRetryDecision {
+    CONTINUE,
+    CORRUPT_GUIDE,
+    UNAVAILABLE_GUIDE,
+}
+
+internal fun policyWarningRetryDecision(settled: PolicyRefreshSettled): PolicyWarningRetryDecision =
+    if (settled.corrupt) {
+        PolicyWarningRetryDecision.CORRUPT_GUIDE
+    } else if (settled.known) {
+        PolicyWarningRetryDecision.CONTINUE
+    } else {
+        PolicyWarningRetryDecision.UNAVAILABLE_GUIDE
+    }
+
+/**
+ * Dispatches exactly one arm of [decision], and NEVER when the host is gone.
+ * In particular `CONTINUE` requires BOTH a Known settle AND a live host, so a
+ * late settle after Activity finish cannot re-enter the warning pipeline.
+ */
+internal fun applyWarningRetryDecision(
+    decision: PolicyWarningRetryDecision,
+    hostAlive: Boolean,
+    onContinue: () -> Unit,
+    onCorrupt: () -> Unit,
+    onUnavailable: () -> Unit,
+) {
+    if (!hostAlive) return
+    when (decision) {
+        PolicyWarningRetryDecision.CONTINUE -> onContinue()
+        PolicyWarningRetryDecision.CORRUPT_GUIDE -> onCorrupt()
+        PolicyWarningRetryDecision.UNAVAILABLE_GUIDE -> onUnavailable()
+    }
+}

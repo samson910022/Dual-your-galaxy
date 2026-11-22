@@ -614,6 +614,16 @@ data class UiState(
 // and only then runs repo.removeVerifiedExpected. cancelRemove() drops the
 // pending. Rapid double confirm executes at most once via the shared
 // inFlightWrites dedup.
+//
+// R5-0 (F01): outcome of an authoritative policy refresh, reported to the
+// Unknown-warning Retry path. Both bits are read from the settled UI state
+// (NOT from freshness-generation equality — late join bumps are legitimate).
+// `corrupt` takes precedence over `known` in the pure UI decision.
+internal data class PolicyRefreshSettled(
+    val known: Boolean,
+    val corrupt: Boolean,
+)
+
 class DualViewModel(
     private var repo: DualRepository,
     // Declared privilege of the gateway backing `repo`. F4a wires the real
@@ -4037,6 +4047,13 @@ class DualViewModel(
     // Phase 2 手動重新整理在途計數：policyRefreshing = count > 0（最後完成者清位，
     // 世代/版本丟棄的 stale 結果不提前清位，save bump 亦不洩漏）。
     private val policyRefreshInFlight = AtomicInteger(0)
+
+    // R5-0 (F01): Unknown-warning Retry is a one-shot per user tap. A double-tap
+    // on the Refresh button drops the second refresh instead of starting a
+    // second authoritative re-read (which could otherwise race the first and
+    // manufacture a misleading "settled" signal). The guard is released from
+    // the settled callback's finally, i.e. after the whole refresh has settled.
+    private val refreshRetryOneShot = AtomicBoolean(false)
 
     // Exposed for UI gating (policy confirm enablement) independent of the
     // global loading flag. True while a policy write/clear is queued OR its
@@ -8417,7 +8434,13 @@ class DualViewModel(
         }
     }
 
-    fun refreshPolicyDraft() {
+    // R5-0 (F01): [onSettled] is invoked EXACTLY ONCE from the `finally` of the
+    // launch body below, after the in-flight counter and state are settled,
+    // on Dispatchers.Main. It is called on every exit path (success, Unknown,
+    // Corrupt, stale-generation/late-join discard, cancellation) because the
+    // `finally` encloses all of them. The payload is sampled from `_state.value`
+    // at settle time — never from freshness-gen equality.
+    internal fun refreshPolicyDraft(onSettled: ((PolicyRefreshSettled) -> Unit)? = null) {
         viewModelScope.launch {
             policyRefreshInFlight.incrementAndGet()
             _state.update { it.copy(policyRefreshing = true) }
@@ -8739,7 +8762,52 @@ class DualViewModel(
                     policyRefreshInFlight.set(0)
                     _state.update { it.copy(policyRefreshing = false) }
                 }
+                if (onSettled != null) {
+                    val settled = _state.value.let { st ->
+                        PolicyRefreshSettled(st.policyDraftKnown, st.policyDraftCorrupt)
+                    }
+                    try {
+                        // NonCancellable keeps the "exactly once" promise even when
+                        // the surrounding launch was cancelled; the callback is the
+                        // UI's settle signal and must never be silently dropped.
+                        withContext(NonCancellable + Dispatchers.Main) {
+                            onSettled(settled)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                        // A misbehaving UI callback must not break refresh settlement.
+                    }
+                }
             }
+        }
+    }
+
+    // R5-0 (F01): Unknown-warning Retry entry point. Performs a REAL
+    // refreshPolicyDraft() and reports its settled outcome. The one-shot guard
+    // drops a second Refresh tap while the first authoritative re-read is still
+    // in flight; it is released only after the settled callback has run, so a
+    // later genuine tap (after a new warning is shown) still works.
+    internal fun refreshPolicyDraftForWarningRetry(onSettled: (PolicyRefreshSettled) -> Unit) {
+        if (!refreshRetryOneShot.compareAndSet(false, true)) return
+        var launchReturned = false
+        try {
+            refreshPolicyDraft { settled ->
+                try {
+                    onSettled(settled)
+                } finally {
+                    // The guard covers the WHOLE refresh (including the
+                    // callback), so a double-tap can never start a second
+                    // authoritative re-read.
+                    refreshRetryOneShot.set(false)
+                }
+            }
+            launchReturned = true
+        } finally {
+            // Defensive: only when the synchronous launch itself failed. The
+            // normal path SUSPENDS in refreshPolicyDraft (IO read), so the
+            // guard MUST stay held until the settled callback releases it.
+            if (!launchReturned) refreshRetryOneShot.set(false)
         }
     }
 
@@ -10452,83 +10520,27 @@ class DualViewModel(
             }
             return
         }
+        // R5-0 (F01): blind-clear is FORMALLY DISABLED (fail-closed). An Unknown
+        // snapshot can no longer reach ANY destructive path: no two-tap arm, no
+        // TTL/generation confirm, no S4 refresh-first delete. The arm/TTL
+        // helpers and strings (isBlindClearArmed/armBlindClearLocked,
+        // BLIND_CLEAR_TTL_MS/FIRST/EXPIRED) are kept but unreachable from a
+        // !Known state and are reserved for a follow-up deletion; the commit-
+        // time fences further down remain as defense-in-depth for the Known
+        // single-step path. The UI's Unknown Retry now performs a real
+        // refreshPolicyDraftForWarningRetry() instead.
+        // ZERO store touch on this path.
         if (hookPolicyStore != null && !_state.value.policyDraftKnown) {
-            if (!isBlindClearArmed()) {
-                // 第一次：僅告警，不執行（不清 pending，不碰 store）。
-                armBlindClearLocked()
-                _state.update {
-                    it.copy(
-                        msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST)),
-                        msgKind = MsgKind.CHANNEL,
-                    )
-                }
-                return
-            }
-            // 第二次：先判 TTL，再判世代（含 rev）；任一失敗即重 arm（視為新的第一次），
-            // 兩者皆過才 disarm 落到正常清除路徑。
-            val now = nowMonoMs()
-            val armedAt = blindClearArmedAtMs.get()
-            if (now - armedAt > BLIND_CLEAR_TTL_MS) {
-                armBlindClearLocked()
-                _state.update {
-                    it.copy(
-                        msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_EXPIRED)),
-                        msgKind = MsgKind.CHANNEL,
-                    )
-                }
-                return
-            }
-            val armedRev = blindClearArmedRev.get()
-            val curRev = try { observedSnapshot.get().rev } catch (_: Exception) { -1L }
-            if (blindClearArmedVersion.get() != policyDraftVersion.get() ||
-                blindClearArmedFreshGen.get() != policyFreshnessGen.get() ||
-                (armedRev != -1L && curRev != -1L && armedRev != curRev)
-            ) {
-                armBlindClearLocked()
-                _state.update {
-                    it.copy(
-                        msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST)),
-                        msgKind = MsgKind.CHANNEL,
-                    )
-                }
-                return
-            }
-            // Phase 2 S4：行程級曾觀察到 Known 草稿（coordinator 持有的行程級
-            // 「曾經 Known」歷史非空；跨 Activity 重建／重開不變，僅新行程解除）
-            // 但遠端目前未知 → 兩次點擊確認不再足夠：先強制一次權威重讀
-            // （refreshPolicyDraft），本次點擊不刪除任何內容；只有重讀恢復
-            // Known 後下一次清除才走一般 Known 單步路徑（新鮮重讀本身即為
-            // 證據）。重讀仍未知 → 中止，草稿維持未知，不盲刪（fail-closed）。
-            // SM (session permanence → process-lifetime, intentional): 一旦本行程
-            // 觀察過 Known，「refresh-first」狀態即對本行程餘下時間永久生效——
-            // 每次雙擊都只觸發重讀而永不盲刪，直到重讀恢復 Known。此為刻意的
-            // 行程級（process-lifetime）fail-closed 設計：同行程內 Activity
-            // 重開／VM 重建皆不解除（coordinator 持有，GalaxyApp 級生命週期）；
-            // 僅新行程（新 coordinator、lastKnown==null）即解除，回復到經典雙擊
-            // 盲清。不提供程式化的第三次確認（SM 約定：(a) 文案提供可行的補救、
-            // (b) 單測釘住「重讀失敗兩次仍不刪」語義）。
-            if (lastKnownDraftObserved()) {
-                // consume 本 arm（重新開始）；刷新成 Known 後下一次點擊走 Known 路徑。
-                disarmBlindClear()
-                try {
-                    refreshPolicyDraft()
-                } catch (_: Throwable) {
-                    // refreshPolicyDraft 為 best-effort；其自身失敗已在 state（msg/Known）揭露。
-                    // 本點擊本就不刪除任何內容，故此處不拋出（UI 呼叫路徑）。
-                }
-                _state.update { cur ->
-                    cur.copy(
-                        msg = policyText(PolicyText(PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST)),
-                        msgKind = MsgKind.CHANNEL,
-                    )
-                }
-                return
-            }
-            // 兩者皆過：consume 後落到正常清除路徑。
             disarmBlindClear()
-        } else {
-            disarmBlindClear()
+            _state.update {
+                it.copy(
+                    msg = policyText(PolicyText(PolicyTextKind.UNKNOWN_REFRESH)),
+                    msgKind = MsgKind.CHANNEL,
+                )
+            }
+            return
         }
+        disarmBlindClear()
         // Phase 2 O3 (S4): commit-time Known fence — a refresh landing between
         // the gate read and the actual store.clear() flips Known→false; the
         // arms below re-check this and abort like the Unknown path instead of

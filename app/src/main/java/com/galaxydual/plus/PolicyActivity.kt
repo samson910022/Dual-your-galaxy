@@ -52,6 +52,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -147,6 +148,10 @@ class PolicyActivity : ComponentActivity() {
     // fromUserTap=false，autoRestartCount 不重置亦不遞增（重試非自動重啟）。
     private var pendingWarningRestart: (() -> Unit)? = null
 
+    // R5-0 (F01): one re-entry per genuine Unknown-Refresh tap (see MainActivity).
+    // Reset ONLY on a genuine entry tap (fromUserTap=true).
+    private val refreshRetryReentered = AtomicBoolean(false)
+
     // D03b fixer M5/M3：confirm 重入防護 + abort 重啟警告 one-shot 排程 guard。
     private val consentConfirmInFlight = InFlightGuard()
     private val warningRestartGuard = OneShotRestartGuard()
@@ -159,6 +164,39 @@ class PolicyActivity : ComponentActivity() {
         pendingClearConfirm = value
         try { renderList() } catch (_: Exception) { /* Best effort. */ }
         try { updateCounter() } catch (_: Exception) { /* Best effort. */ }
+    }
+
+    // R5-0 (F01): non-recursive guidance after a settled-but-not-Known retry.
+    private fun showWarningRetryGuidance(msgRes: Int) {
+        setPendingClearConfirm(false)
+        if (!isFinishing && !isDestroyed) {
+            try {
+                android.widget.Toast.makeText(this, msgRes, android.widget.Toast.LENGTH_LONG).show()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // R5-0 (F01): Unknown Retry = real authoritative re-read + one re-entry per
+    // tap only on a settled Known snapshot; no destructive clear, no consent
+    // manufacture, no restart for Corrupt/Unavailable.
+    private fun retryUnknownWarning() {
+        vm.refreshPolicyDraftForWarningRetry { settled ->
+            applyWarningRetryDecision(
+                decision = policyWarningRetryDecision(settled),
+                hostAlive = !isFinishing && !isDestroyed,
+                onContinue = {
+                    if (refreshRetryReentered.compareAndSet(false, true)) {
+                        setPendingClearConfirm(false)
+                        pendingWarningRestart?.invoke()
+                    } else {
+                        preClearLog("unknown retry re-entry already consumed; dropping")
+                    }
+                },
+                onCorrupt = { showWarningRetryGuidance(R.string.policy_corrupt_detected) },
+                onUnavailable = { showWarningRetryGuidance(R.string.policy_refresh_failed) },
+            )
+        }
     }
 
     // Phase C A 案：編輯器空集導引（禁清到底）。
@@ -217,10 +255,7 @@ class PolicyActivity : ComponentActivity() {
             showPreClearProbeFailedWarning(
                 this@PolicyActivity,
                 config = probeFailedDialogConfig(write = true, unknown = true),
-                onRetry = {
-                    setPendingClearConfirm(false)
-                    pendingWarningRestart?.invoke()
-                },
+                onRetry = { retryUnknownWarning() },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
                 dialogHandles = destructiveDialogHandles,
             )
@@ -700,7 +735,10 @@ class PolicyActivity : ComponentActivity() {
 
     // fromUserTap=false 表示由 scheduleWarningRestart 的 post 呼叫：不得重置上限。
     private fun startEditorWriteWarning(candidate: Set<String>, fromUserTap: Boolean = true) {
-        if (fromUserTap) autoRestartCount.set(0)
+        if (fromUserTap) {
+            autoRestartCount.set(0)
+            refreshRetryReentered.set(false)
+        }
         requestEditorWriteWarning(
             candidate = candidate,
             proceed = { binding, frozen -> performWritePolicy(binding, frozen) },

@@ -499,7 +499,7 @@ class PolicyPhaseCRequiredTest {
         assertEquals(clearsBefore, clearCalls.get())
     }
 
-    // 4a. blindClear第二tap rev推進重arm＋BLIND_CLEAR_FIRST零clear。
+    // R5-0 (F01): blind-clear disabled — a rev advance cannot re-arm anything.
     @Test
     fun blindClear_revAdvance_rearmsWithFirstZeroClear() {
         var now = 10_000L
@@ -513,23 +513,24 @@ class PolicyPhaseCRequiredTest {
         await { !vm.state.value.policyDraftKnown }
         val observedBefore = vm.observedRevForTests()
         assertTrue(observedBefore != -1L)
-        // 第一tap arm。
+        // 第一 tap：fail-closed，零 arm。
         vm.clearPolicyDraft()
-        assertTrue(isBlindClearArmed(vm))
-        assertEquals(PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText(), vm.state.value.msg)
-        assertEquals(0, fake.clearCalls.get())
-        // rev推進（僅observed，不動version/freshGen，精確覆蓋rev門控）。
-        vm.markObservedKnownAt(observedBefore + 10L)
-        // TTL內第二tap：rev失配→重arm＋FIRST，零clear。
-        now = 10_000L + 1_000L
-        vm.clearPolicyDraft()
-        assertEquals(PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText(), vm.state.value.msg)
+        assertFalse(isBlindClearArmed(vm))
+        assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
         assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
         assertEquals(0, fake.clearCalls.get())
-        assertTrue(isBlindClearArmed(vm))
+        // rev推進（僅observed，不動version/freshGen）。
+        vm.markObservedKnownAt(observedBefore + 10L)
+        // TTL內第二tap：仍 fail-closed（沒有 rev 重 arm 路徑）。
+        now = 10_000L + 1_000L
+        vm.clearPolicyDraft()
+        assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(0, fake.clearCalls.get())
+        assertFalse(isBlindClearArmed(vm))
     }
 
-    // 4b. armedRev==-1旁路釘住：從未觀察（armed -1）時，cur推進不經rev重arm。
+    // R5-0 (F01): observed/rev bookkeeping no longer feeds any clear path.
     @Test
     fun blindClear_armedRevMinusOne_bypassesRevGate() {
         var now = 20_000L
@@ -542,20 +543,17 @@ class PolicyPhaseCRequiredTest {
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(-1L, vm.observedRevForTests())
         vm.clearPolicyDraft()
-        assertTrue(isBlindClearArmed(vm))
-        assertEquals(PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText(), vm.state.value.msg)
-        // 推進observed至非-1（僅rev，不動version/freshGen；armed仍-1）。
+        assertFalse(isBlindClearArmed(vm))
+        assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+        // 推進observed至非-1（僅rev，不動version/freshGen）。
         vm.markObservedKnownAt(5L)
         assertEquals(5L, vm.observedRevForTests())
         now = 20_000L + 1_000L
         vm.clearPolicyDraft()
-        // armedRev==-1旁路：不得因rev失配而重arm為FIRST；應落到正常清除路徑
-        // （Unknown＋lastKnownNull經典語義：pre-IO重讀仍Unknown→REFRESH_FAILED，中止零clear）。
-        // 關鍵釘住：msg不是BLIND_CLEAR_FIRST（證明rev未觸發重arm）。
-        // msg 由 pre-IO 重讀的非同步 coroutine 寫入；等待其收斂再判定，
-        // 避免與測試執行緒競爭造成假失敗（若 rev 確實誤觸發 re-arm，
-        // msg 會永久停留在 BLIND_CLEAR_FIRST，此 await 仍會超時失敗）。
-        await { vm.state.value.msg != PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText() }
+        // No rev bypass/re-arm: the Unknown tap stays fail-closed.
+        assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertFalse(isBlindClearArmed(vm))
         assertEquals(0, fake.clearCalls.get())
         assertTrue(vm.state.value.msg != PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText())
     }
@@ -788,12 +786,13 @@ class PolicyPhaseCRequiredTest {
         val coord = PolicyTxCoordinator()
         var now = 30_000L
         val vm = makeVm(fake.store, initialDraft = setOf("com.a.app"), coordinator = coord, nowMonoMs = { now })
-        // 先製造Unknown＋arm（blindClear第一tap）。
+        // 先製造 Unknown（clear 入口已 fail-closed，不再 arm）。
         fake.saved = null
         vm.refreshPolicyDraft()
         await { !vm.state.value.policyDraftKnown }
         vm.clearPolicyDraft()
-        assertTrue(isBlindClearArmed(vm))
+        assertFalse(isBlindClearArmed(vm))
+        assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
         // 推進修訂使舊綁定失配：取arm當下綁定後再bump。
         val staleBinding = PolicyWarningBinding(
             rev = vm.observedRevForTests(),
@@ -817,12 +816,12 @@ class PolicyPhaseCRequiredTest {
         val coord = PolicyTxCoordinator()
         var now = 40_000L
         val vm = makeVm(fake.store, initialDraft = setOf("com.a.app"), coordinator = coord, nowMonoMs = { now })
-        // 先Unknown＋arm。
+        // 先 Unknown（無 arm）；R5-0 後 blind-clear 已停用。
         fake.saved = null
         vm.refreshPolicyDraft()
         await { !vm.state.value.policyDraftKnown }
         vm.clearPolicyDraft()
-        assertTrue(isBlindClearArmed(vm))
+        assertFalse(isBlindClearArmed(vm))
         // 注入pending（模擬併發寫入在途），同時構造失配綁定。
         val pending = PendingPolicyWrite(setOf("com.b.app"), System.currentTimeMillis())
         val f = DualViewModel::class.java.getDeclaredField("_state").apply { isAccessible = true }
@@ -832,10 +831,10 @@ class PolicyPhaseCRequiredTest {
         val staleBinding = PolicyWarningBinding(rev = 9999L, draftVersion = 9999L, freshGen = 9999L)
         assertFalse(vm.isWarningBindingFresh(staleBinding))
         vm.clearPolicyDraft(staleBinding)
-        // BUSY優先：msg為BUSY而非UNKNOWN_REFRESH，pending保留，arm保留。
+        // BUSY優先：msg為BUSY而非UNKNOWN_REFRESH，pending保留；無 arm 可保留。
         assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
         assertNotNull(vm.state.value.pendingPolicyWrite)
-        assertTrue(isBlindClearArmed(vm))
+        assertFalse(isBlindClearArmed(vm))
         assertEquals(0, fake.clearCalls.get())
     }
 

@@ -6104,6 +6104,43 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // R5-0 (F01): non-recursive guidance for a settled retry that is still
+    // Unknown/Corrupt. Releases the UI freeze but never re-enters the warning
+    // pipeline — the user must tap the entry again if they want a new warning.
+    private fun showWarningRetryGuidance(msgRes: Int) {
+        setPendingClearConfirm(false)
+        if (!isFinishing && !isDestroyed) {
+            try {
+                Toast.makeText(this, msgRes, Toast.LENGTH_LONG).show()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // R5-0 (F01): the Unknown warning's Refresh now performs a REAL
+    // authoritative re-read and awaits its settle. pendingClearConfirm stays
+    // TRUE throughout the refresh (consent-reset guard); only a settled Known
+    // snapshot may release it and re-enter ONE fresh warning. Corrupt/still-
+    // Unknown settles show non-recursive guidance with NO restart.
+    private fun retryUnknownWarning() {
+        vm.refreshPolicyDraftForWarningRetry { settled ->
+            applyWarningRetryDecision(
+                decision = policyWarningRetryDecision(settled),
+                hostAlive = !isFinishing && !isDestroyed,
+                onContinue = {
+                    if (refreshRetryReentered.compareAndSet(false, true)) {
+                        setPendingClearConfirm(false)
+                        pendingWarningRestart?.invoke()
+                    } else {
+                        preClearLog("unknown retry re-entry already consumed; dropping")
+                    }
+                },
+                onCorrupt = { showWarningRetryGuidance(R.string.policy_corrupt_detected) },
+                onUnavailable = { showWarningRetryGuidance(R.string.policy_refresh_failed) },
+            )
+        }
+    }
+
     // R03 (PR #74) Phase 2：Main proceed 的候選新鮮度防禦檢查。
     // pendingClearConfirm（probe／對話框存活期凍結操作）是主要守衛；此檢查是
     // defense-in-depth——在真正持有 Main live 候選處重算 writeCandidateForWarning()
@@ -6124,6 +6161,13 @@ class MainActivity : ComponentActivity() {
     // 既不重置也不遞增（只由 scheduleWarningRestart 遞增）——重試是使用者主動點，
     // 不是自動重啟，不應消耗／重置可用性上限。真正的入口點擊才會重置（fromUserTap=true）。
     private var pendingWarningRestart: (() -> Unit)? = null
+
+    // R5-0 (F01): one re-entry per genuine Unknown-Refresh tap. The flag is
+    // set BEFORE releasing pendingClearConfirm and invoking the restart seam,
+    // and is reset ONLY on a real entry tap (fromUserTap=true). A settled
+    // refresh therefore cannot restart the warning more than once, and a
+    // late/duplicate settle cannot re-enter at all.
+    private val refreshRetryReentered = AtomicBoolean(false)
 
     // D03b fixer M5：confirm 重入防護（double-tap）——第一段 enter 成功才 launch。
     private val consentConfirmInFlight = InFlightGuard()
@@ -6205,7 +6249,10 @@ class MainActivity : ComponentActivity() {
     // D03b：Main 寫入入口 —— 記錄 restart callback 後發出警告（consent 由警告捕獲）。
     // fromUserTap=false 表示由 scheduleWarningRestart 的 post 呼叫：不得重置自動重啟上限。
     private fun startWriteWarning(fromUserTap: Boolean = true) {
-        if (fromUserTap) autoRestartCount.set(0)
+        if (fromUserTap) {
+            autoRestartCount.set(0)
+            refreshRetryReentered.set(false)
+        }
         val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, frozen ->
             vm.requestPolicyWriteForWarning(frozen, binding, consent = pendingWarningConsent)
         }
@@ -6216,7 +6263,10 @@ class MainActivity : ComponentActivity() {
     // D03b：Main 清除入口 —— 清除沒有 PendingPolicyWrite carrier，consent 由 Activity
     // 欄位攜帶，在真正清除確認前由 confirmClearWithConsent 做同一道 fail-closed fence。
     private fun startClearWarning(fromUserTap: Boolean = true) {
-        if (fromUserTap) autoRestartCount.set(0)
+        if (fromUserTap) {
+            autoRestartCount.set(0)
+            refreshRetryReentered.set(false)
+        }
         val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, _ ->
             confirmClearWithConsent(binding)
         }
@@ -6382,10 +6432,7 @@ class MainActivity : ComponentActivity() {
             showPreClearProbeFailedWarning(
                 this@MainActivity,
                 config = probeFailedDialogConfig(write = false, unknown = true),
-                onRetry = {
-                    setPendingClearConfirm(false)
-                    pendingWarningRestart?.invoke()
-                },
+                onRetry = { retryUnknownWarning() },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
                 dialogHandles = destructiveDialogHandles,
             )
@@ -6522,10 +6569,7 @@ class MainActivity : ComponentActivity() {
             showPreClearProbeFailedWarning(
                 this@MainActivity,
                 config = probeFailedDialogConfig(write = true, unknown = true),
-                onRetry = {
-                    setPendingClearConfirm(false)
-                    pendingWarningRestart?.invoke()
-                },
+                onRetry = { retryUnknownWarning() },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
                 dialogHandles = destructiveDialogHandles,
             )
