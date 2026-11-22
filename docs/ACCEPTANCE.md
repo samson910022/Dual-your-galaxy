@@ -121,7 +121,7 @@ BBC6 注意事項（unified build）：
 
 ### 11-21／11-22 round-2+3 待實機驗收（UNMEASURED／NOT a pass／不得據此合併）
 
-> **免責框架（先讀）**：本節所有列在產生實機證據前，一律標記為 **UNMEASURED／NOT a pass**；「已文件化」與「JVM／CI 全綠」皆**不是**通過。本輪獨立審查環境未執行 Gradle 裝置測試、未觸碰任何 Samsung 裝置。凡涉及分身刪除或 user-95 資料清除的步驟，必須在**明確授權且已備份**的裝置上、由持有人親自執行；未經授權**不得重跑破壞性實驗**（issue #75）。本節不得解讀為圓滿驗收，亦不得據以宣稱 P0 風險已關閉。
+> **免責框架（先讀）**：本節所有列在產生實機證據前，一律標記為 **UNMEASURED／NOT a pass**；「已文件化」與「JVM／CI 全綠」皆**不是**通過。本輪獨立審查環境未執行 Gradle 裝置測試；2026-11-23 曾在 Samsung 裝置做**唯讀**觀察（未執行任何破壞性臂／冷啟動）。凡涉及分身刪除或 user-95 資料清除的步驟，必須在**明確授權且已備份**的裝置上、由持有人親自執行；未經授權**不得重跑破壞性實驗**（issue #75）。本節不得解讀為圓滿驗收，亦不得據以宣稱 P0 風險已關閉。
 
 | 項目 | 狀態（round 2+3） | 未完成之必要裝置證據 |
 | --- | --- | --- |
@@ -150,6 +150,47 @@ BBC6 注意事項（unified build）：
 擷錄指引：
 - S23 Ultra：BBC-HOOK 行只出現在 LSPosed verbose mirror：`adb shell su -c 'grep -E "BBC-HOOK|BBC-SPIKE|RemotePreferences" /data/adb/lspd/log/verbose_*.log'`；logcat 僅見 `adb logcat -d -s GalaxyDualHook`（unified build 不再印 `RemotePreferences initial load/updated`，pool/TTL 模式無此行）。
 - 擷錄檔命名不含序號，存放於本機裝置證據目錄（私有，不入 repo），不入 repo；本節證據欄位僅記檔名。
+
+### 2026-11-23 實機唯讀觀察（F00/F06 仍 UNMEASURED／NOT a pass）
+
+> **誠實框架（先讀）**：本觀察為 round-5 的**唯讀**實機記錄，不是任何驗收通過。持有人於 G0 已備份並授權完整三臂（含破壞性冷啟動 DELETE 重現），但在最終閘門改口「只記錄，停止破壞性臂」；G1（force-stop ＋ daagent 冷啟動）**從未獲批**。executor 因此**未執行任何破壞性臂**，三臂 A/B/C 冷啟動對照**未執行**。F00／F06 維持 **UNMEASURED／NOT a pass**，P0 合併門檻未關閉；**opt-out 不是刪除防護**（issue #75）。
+
+- 裝置／環境：SM-S9180（S23 Ultra）、Android 17／SDK 37、KernelSU root、LSPosed active。全程僅唯讀 `pm`／`dumpsys`／`ps`／`logcat`／`su -c cat`／`screencap`，另有一次非破壞性的 App 啟動與 About 導航點擊（無寫入／無破壞性臂）；未查詢 user 150、未 force-stop／冷啟動／重開機、未寫政策或 DB；**Scope B `settings_ssaid.xml`／ABX／SSSAID 修補禁止、未嘗試**。
+- 政策狀態（LSPosed remote-prefs DB，唯讀）：非空 BBC 政策**已提交**（`dual_policy/extra_whitelist_packages` ＝ `{com.openai.chatgpt}`；另有 `galaxydual_policy/packages`）。執行期閘鍵 `bbc_injection_enabled` **缺席** → 依預設推斷為 **ON**；此為**由持久化狀態推斷，非 UI 確認**（「關於」對話框未抵達，toggle 狀態 UNMEASURED）。
+- u95 ChatGPT 分身：4 個 APK 路徑、`installed=true`、`ceDataInode=631837`、`firstInstallTime=2026-11-21 03:37:34`，但**已安裝卻故障**：啟動即崩潰 `IllegalStateException: Ssaid settings not accessible`（`SettingsProvider.generateSsaidLocked`）；持有人回報即使經 Samsung Dual Messenger toggle OFF→ON 重裝仍崩潰。資料大小 **UNMEASURED**（即使 `su -c` 下 `du`／`ls` 仍 Permission denied）。此 SSAID 崩潰與既有 incident 記錄一致，但**不證明亦不關閉 P0 因果問題**；根因位於硬禁止的 SSAID 區，**Scope B 修補禁止、未嘗試**。
+- F00（P0 冷啟動 DELETE）：**UNMEASURED** — 無冷啟動、無 DELETE chain／caller uid／時序／分身與資料存活數據。F06：**UNMEASURED** — 無延遲／IPC／sticky／Scope A 量測。三臂同基線對照（default BBC／confirmed-off runtime gate／Samsung baseline）仍是必要證據，缺一不可。
+- 證據（**不入 repo**，依本 repo 慣例）：目錄 `/mnt/seagate500g/opencode_tmp/device_evidence/`，共 54 檔（53 檔附 SHA-256 ＋ MANIFEST 自身）、約 81 MiB，含完整 LSPosed verbose log（181 行 BBC）、約 37 MB logcat dump（含崩潰堆疊）、截圖與 DB 快照；完整清單與每檔 SHA-256 見外部 `MANIFEST.md`，原始記錄為同目錄 `FINAL_device_observation.md`。
+
+#### 觸發場景分析（非根因；信心分級）
+
+> **定位**：以下為觸發場景重建（correlated observation／排除法），**不是根因證明**。SSAID 根因位於 Scope B 硬禁止區，本輪未讀、未修補；本分析亦**不關閉 P0 因果問題**。
+
+- **一句話**：崩潰事实為 **CONFIRMED**；「崩潰與系統有無自動解除安裝是兩條不同的軸」為**推論（LIKELY）**、非直接量測。觸發為 u95 分身（uid 9510431／`effectiveUid=9510431`）啟動時讀 `android_id`，`SettingsProvider.generateSsaidLocked` 拋 `IllegalStateException: Ssaid settings not accessible`；4/4 次啟動崩潰（01:45:45、01:45:47、01:48:23、01:50:02；pid 7130／7425／8240／9082），u0 本體（pid 13642）正常。
+
+- **再現場景（preconditions → action → failure）**：
+  - 前提：u95 clone 已安裝（4 APK path、`installed=true`、data dir 在、`firstInstallTime=2026-11-21 03:37:34`）；自 11-18 22:25 無 reboot；非空政策 ＋ hook 正常（`installed=1`、nonempty、merged +1）——後兩者與崩潰**無 differential**。
+  - 動作：啟動 u95 clone → app 讀 `Settings.Secure.getString(ANDROID_ID)`。
+  - 失敗：`SettingsProvider.call → getSecureSetting → getSsaidSettingLocked → generateSsaidLocked(:4653)` 拋錯 → `Force finishing activity` → 崩潰。
+
+- **關鍵對比（直接回答 owner 問題：「過去系統自動解除安裝 → toggle ON 重裝就好；這次沒有自動清除但 app 打不開」）**：
+  - **本輪 DELETE 是人為，不是系統自動（CONFIRMED）**：01:49:52 的 `START DELETE PACKAGE … user{95} caller{1000}` 是持有人**手動把 Samsung「雙開應用」開關切 OFF** 造成的，01:49:56 的 `START INSTALL-EXISTING` 是隨後**手動切 ON 重裝**；**不是** Samsung 自動冷啟動對帳。G1／daagent 冷啟動從未核准，本輪**既未觀察到、也未測試、也未反證**系統自動 DELETE，該路徑維持 UNMEASURED（見上 F00）。
+  - **與歷史路徑不可直接比較**：owner 問題中「過去系統自動刪 → toggle ON 重裝就好」是**自動清除**路徑；本輪是**人為 DELETE → toggle ON 重裝**，兩者不是同一路徑，不能拿來對照。崩潰在**不同的軸**（SSAID provisioning），且於人為 DELETE＋重裝後仍存在。
+  - **就連人為完整 DELETE＋重裝都清不掉（CONFIRMED，log 旁證）**：`01:50:02` 全新 pid 9082 啟動仍崩。這是比「單純 toggle 重裝無效」更強的證據，且**獨立於尚未解決的冷啟動 DELETE 問題**。
+  - 歷史「重裝就好」本身也不可靠：11-18 當天 17:55 立即重裝也崩（pid 15625 起），是後來 **reboot ＋ 22:26 toggle** 才恢復（唯一有 artifact 的恢復）；11-20/21「不崩」僅口述、無重裝後 log，而現在崩的正是 11-21 03:37 裝的那個。**reboot 是唯一有 artifact 的恢復要素（LIKELY 相關、因果 UNKNOWN）**；非空政策不是 DELETE 防護（11-20/21 非空仍被刪，DELETE 早於 callback 116–144ms）。
+  - 持有人回憶（**UNKNOWN，文件無記錄**）：過去「系統自動移除／關閉 → 再次重 hook → 重開系統雙開開關 → 可正常啟動」的程序中，持有人記得有「重 hook」一步，但無法確認具體操作；本次 session **確定沒有重開機**。repo 事故文件唯一有 device artifact 的恢復要素是 11-18 的 **reboot + toggle ON**；此回憶不作為已證事實，也不改變上述信心分級。
+
+- **與 PR #74 關係（CONFIRMED）**：`.kt` 原始碼中 `Settings.Secure`／`SSAID`／`android_id`／`generateSsaid` **0 命中**；LSPosed scope 只含 `system;com.samsung.android.da.daagent`（明確排除 `com.android.settings`）；BBC 只對 daagent 唯讀清單做 union-only append；logcat `avc: denied` **0 命中**。PR 沒有任何路徑造成或惡化此 SSAID 失敗。
+
+- **信心分級表**：
+
+  | 等級 | 項目 |
+  | --- | --- |
+  | **CONFIRMED** | 崩潰觸發（SSAID 讀取失敗／4/4 啟動）／人為完整 DELETE＋重裝後仍崩／01:49:52 DELETE 是人為非系統自動／PR 無因果路徑 |
+  | **LIKELY** | 壞層在 u95 雙開供給層（排除法＋11-18 dump）／reboot 是恢復要素 |
+  | **HYPOTHESIS** | SSAID registry 鍵配置（11-18 dump 理論，未重讀）／Samsung 只對白名單雙開 app 播種 |
+  | **UNKNOWN** | 11-21→11-23 狀態變化／現在冷啟動是否 DELETE／SSAID 內部狀態（Scope B 硬禁令，未讀） |
+
+- **Hard prohibition 重申**：不提出任何 SSAID／`settings_ssaid.xml`／ABX 修補；不宣稱 P0 根因已證明；opt-out **不是**刪除防護（issue #75）。
 
 ### 2026-11-17 紀錄（pre-unification build，reference）
 

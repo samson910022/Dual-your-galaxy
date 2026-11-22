@@ -349,7 +349,9 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 
 **round-5 誠實註記（2026-11-23，F00–F06；更新而非取代 round-2+3+4）**：F01–F04 僅為 App／VM／UI 契約修正（Unknown 警告重新整理改為權威 `refreshPolicyDraft()` 並 await settle、仍 Unknown／Corrupt 給非遞迴引導，盲清正式撤回停用；Invalid→v1 修復提示 app-scoped 跨 VM 在 Main＋Editor 可見；BBC toggle CheckBox 於繼承 `Confirmed(value)` 時同步；VM 對非 null consent 重算移除 delta）。**F00（＝D01/N01 P0 冷啟動 DELETE）與 F06（＝D06 gate 延遲／D08 512-entry IPC／sticky／Scope A dialog）維持 UNMEASURED／NOT a pass**；P0 合併門檻未關閉。**三臂同基線對照（default BBC／confirmed-off runtime gate／Samsung baseline）與備份＋明確授權＋持有人同意前提完全不變**；JVM／UI 全綠不是通過。**opt-out is NOT a deletion guard**（issue #75）。Round-2 的 hybrid「confirmed OFF」語意、D03 consent fence 與 round-4 的三臂／備份＋同意框架皆未改變。
 
-> **round-2+3 合併閘門（N01／D01、D06、D08、N09／D08；UNMEASURED／NOT a pass）**：本輪獨立審查未跑 Gradle 裝置測試、未觸碰任何 Samsung 裝置；已文件化或 JVM／CI 全綠皆**不是**通過。必要裝置證據與同基線三臂對照見 `docs/ACCEPTANCE.md` §6「11-21／11-22 round-2+3 待實機驗收」小節：
+**round-5 實機唯讀觀察（2026-11-23）**：唯讀檢查發現非空政策已提交於 LSPosed remote-prefs DB、閘鍵缺席故推斷預設 ON（非 UI 確認），且 u95 分身啟動即 `Ssaid settings not accessible` 崩潰；未執行任何冷啟動／force-stop／破壞性臂，F00／F06 維持不變，**opt-out 不是刪除防護**（issue #75）；唯讀證據清單見外部 `/mnt/seagate500g/opencode_tmp/device_evidence/MANIFEST.md`（不入 repo）。**觸發場景分析（非根因；含信心分級）見 `docs/ACCEPTANCE.md` §「2026-11-23 實機唯讀觀察」，不在本文重複。**
+
+> **round-2+3 合併閘門（N01／D01、D06、D08、N09／D08；UNMEASURED／NOT a pass）**：本輪獨立審查未跑 Gradle 裝置測試；2026-11-23 曾在 Samsung 裝置做**唯讀**觀察（未執行任何破壞性臂／冷啟動），已文件化或 JVM／CI 全綠皆**不是**通過。必要裝置證據與同基線三臂對照見 `docs/ACCEPTANCE.md` §6「11-21／11-22 round-2+3 待實機驗收」小節：
 > - **N01／D01**：P0 冷啟動 DELETE 因果未證實；須先完成**同一 installed-state 基線三臂對照**（default BBC／confirmed-off runtime gate／Samsung baseline），缺一即不得宣稱安全或因果成立。runtime opt-out **不是刪除防護**（issue #75；DELETE 早於回調且回調非空）。
 > - **D06**：opt-out gate 讀取已有專屬零隊列 bounded executor 與 15ms 可調上限（JVM 已證主線路 wall-time 有界，timeout fail-open）（已確認 OFF 且仍在 30 分鐘內時維持關閉）；阻塞 provider >200ms 時主線路返回上界，但真實 Binder 延遲與 DAAgent UI／ANR 仍 **UNMEASURED／NOT a pass**。
 > - **D08／N08**：hot path 1/50/200/512 的 wall-time p50/p95/max 與 Binder IPC 次數（含 cold process）未量測；`BbcMergeTimingTest` 僅量純內存合併。須以 x-trace 量測並訂有界 fallback 與 measured go/no-go 閾值。
