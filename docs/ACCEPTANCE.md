@@ -177,7 +177,8 @@ BBC6 注意事項（unified build）：
   - **與歷史路徑不可直接比較**：owner 問題中「過去系統自動刪 → toggle ON 重裝就好」是**自動清除**路徑；本輪是**人為 DELETE → toggle ON 重裝**，兩者不是同一路徑，不能拿來對照。崩潰在**不同的軸**（SSAID provisioning），且於人為 DELETE＋重裝後仍存在。
   - **就連人為完整 DELETE＋重裝都清不掉（CONFIRMED，log 旁證）**：`01:50:02` 全新 pid 9082 啟動仍崩。這是比「單純 toggle 重裝無效」更強的證據，且**獨立於尚未解決的冷啟動 DELETE 問題**。
   - 歷史「重裝就好」本身也不可靠：11-18 當天 17:55 立即重裝也崩（pid 15625 起），是後來 **reboot ＋ 22:26 toggle** 才恢復（唯一有 artifact 的恢復）；11-20/21「不崩」僅口述、無重裝後 log，而現在崩的正是 11-21 03:37 裝的那個。**reboot 是唯一有 artifact 的恢復要素（LIKELY 相關、因果 UNKNOWN）**；非空政策不是 DELETE 防護（11-20/21 非空仍被刪，DELETE 早於 callback 116–144ms）。
-  - 持有人回憶（**UNKNOWN，文件無記錄**）：過去「系統自動移除／關閉 → 再次重 hook → 重開系統雙開開關 → 可正常啟動」的程序中，持有人記得有「重 hook」一步，但無法確認具體操作；本次 session **確定沒有重開機**。repo 事故文件唯一有 device artifact 的恢復要素是 11-18 的 **reboot + toggle ON**；此回憶不作為已證事實，也不改變上述信心分級。
+  - 持有人回憶（**UNKNOWN，文件無記錄**）：過去「系統自動移除／關閉 → 再次重 hook → 重開系統雙開開關 → 可正常啟動」的程序中，持有人記得有「重 hook」一步，但無法確認具體操作；該次觀察階段**確定沒有重開機**。repo 事故文件唯一有 device artifact 的恢復要素是 11-18 的 **reboot + toggle ON**；此回憶不作為已證事實，也不改變上述信心分級。
+  - **2026-11-23 新增觀察（CONFIRMED，唯讀）**：持有人其後對裝置做**軟重開機**，出現「密碼正確仍無法進桌面」；logcat 顯示 `LockSettingsService.doVerifyCredential → SyntheticPasswordManager.unwrapSyntheticPasswordBlob` 因 `UnrecoverableKeyException`（Keystore code 4）失敗，`com.android.systemui` 連續 4 次 crash，底層 keymint 反覆報 `km_check_key_os_version_patchlevels failed / Failed to deserialize key`。持有人接著做**完整硬重開機**後，u0/u95 皆 `deviceLocked=0`、Launcher 在前景、最近 5000 行 log 無上述 keymint／SSAID／SystemUI crash —— **密碼驗證與桌面恢復（觀察，非根因證明、非永久修復）**。重開後**未重新啟動 u95 分身**，故其 SSAID 崩潰狀態仍 **UNMEASURED／未關閉**；亦未執行任何冷啟動 DELETE。證據：`/mnt/seagate500g/opencode_tmp/device_evidence/r5_reboot_recovery_record.md`（不入 repo）。
 
 - **與 PR #74 關係（CONFIRMED）**：`.kt` 原始碼中 `Settings.Secure`／`SSAID`／`android_id`／`generateSsaid` **0 命中**；LSPosed scope 只含 `system;com.samsung.android.da.daagent`（明確排除 `com.android.settings`）；BBC 只對 daagent 唯讀清單做 union-only append；logcat `avc: denied` **0 命中**。PR 沒有任何路徑造成或惡化此 SSAID 失敗。
 
