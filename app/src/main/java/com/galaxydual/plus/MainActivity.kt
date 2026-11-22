@@ -2461,6 +2461,11 @@ class MainActivity : ComponentActivity() {
         bbcToggleController = BbcInjectionToggleController(
             coordinator = app.bbcToggleCoordinator,
             initialValue = initialChecked,
+            // F03: onRestored is intentionally used ONLY for inherited-confirmed
+            // sync — a rebuilt dialog with no tap of its own corrects a stale
+            // CheckBox when an app-scoped Confirmed(value) lands. It is NOT a
+            // failure rollback: D04 leaves the box at the user's intent on Unknown.
+            // The restoring guard keeps this programmatic set from re-firing onToggle.
             onRestored = { lastGood ->
                 restoring = true
                 toggle.isChecked = lastGood

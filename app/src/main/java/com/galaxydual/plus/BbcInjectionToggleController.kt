@@ -1,6 +1,6 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
-// PR #74 round 2 / N05 + round 3 / D05 + D04: BBC 開關連點併發收斂 / 失敗誠實.
+// PR #74 round 2 / N05 + round 3 / D05 + round 5 / F03 + D04: BBC 開關連點併發收斂 / 失敗誠實 / 重建同步.
 //
 // EN: rapid CheckBox taps used to launch one IO coroutine per tap, and round-2's
 // single per-controller actor still died on every dialog rebuild. D05 promotes
@@ -12,6 +12,9 @@
 // D04: a failed commit is UNKNOWN, not a rollback. Neither the local mMap nor
 // persistedValue is an authority after commit(false)/throw, so the CheckBox is
 // left at the user's last intent and onUnknown() marks the effect unverified.
+// F03: a rebuilt dialog that issued NO tap of its own syncs its stale CheckBox when
+// an app-scoped Confirmed(value) lands; Unknown/Provisional never sync (D04) and a
+// dialog WITH its own tap never syncs from an inherited Confirmed (D05).
 // This is NOT a Samsung cold-start deletion guard (issue #75).
 //
 // 中文：連點曾經每次點擊都起一條 IO coroutine；round-2 的單一 actor 又會在對話框
@@ -20,7 +23,9 @@
 // 順序。本控制器只保留 UI 狀態（lastGood / persistedValue / 本地序號柵欄），dispose
 // 只切斷 UI 回呼，不再取消進行中的提交。D04：提交失敗即 UNKNOWN，不得謊稱回滾；
 // 本地 mMap 與 persistedValue 都不可作為失敗後的權威，CheckBox 保持使用者最後意圖，
-// 由 onUnknown() 標示未驗證。此開關不是 Samsung 冷啟動刪除防護（issue #75）。
+// 由 onUnknown() 標示未驗證。F03：重建且本身沒有點擊的對話框收到 app 層級 Confirmed(value)
+// 時，會把過期 CheckBox 同步到該值；Unknown／Provisional 不同步（D04），已有自己點擊的
+// 對話框也不會被繼承的 Confirmed 覆蓋（D05）。此開關不是 Samsung 冷啟動刪除防護（issue #75）。
 //
 // Framework-free on purpose (no Android imports): only kotlinx.coroutines,
 // which the app already ships. Dispatchers are constructor seams so JVM tests
@@ -72,6 +77,13 @@ internal class BbcInjectionToggleController(
     @Volatile
     private var lastGood: Boolean = initialValue
 
+    // F03: the value the CheckBox is currently showing (seeded from the read at
+    // dialog open, updated to the tapped value in onToggle, and updated when an
+    // inherited Confirmed syncs a rebuilt dialog). Used only to avoid a
+    // redundant onRestored when the box already shows the confirmed value.
+    @Volatile
+    private var lastUiValue: Boolean = initialValue
+
     @Volatile
     private var persistedValue: Boolean = initialValue
 
@@ -103,7 +115,32 @@ internal class BbcInjectionToggleController(
         // emission so a dead View is never touched.
         uiScope.launch {
             coordinator.state.effectStatus.collect { status ->
-                if (alive) onEffectStatus?.invoke(status)
+                if (alive) {
+                    // App-level styling still sees EVERY status (Confirmed
+                    // clears the Unknown styling). The F03 sync below is additive.
+                    onEffectStatus?.invoke(status)
+                    // F03: a rebuilt dialog whose CheckBox was seeded from a stale
+                    // pre-commit read must correct it when an app-scoped Confirmed
+                    // arrives. lastSubmittedSequence == 0 means THIS dialog issued
+                    // no tap, so the Confirmed belongs to an inherited/foreign
+                    // commit — syncing is the only way to fix the stale box.
+                    // If this dialog DID tap (seq > 0), its box already shows the
+                    // user's latest intent and the global writer guarantees that
+                    // intent lands last: an older inherited Confirmed is stale and
+                    // must never overwrite it (D05 last-intent-wins).
+                    // D04: Unknown/Provisional never touch lastUiValue/lastGood and
+                    // never call onRestored — the box stays at the user's intent.
+                    // Confirmed means "persisted preference acknowledged", NEVER
+                    // "hook applied" (the cold-start caveat is unchanged).
+                    if (status is BbcEffectStatus.Confirmed &&
+                        lastSubmittedSequence == 0L &&
+                        status.value != lastUiValue
+                    ) {
+                        lastUiValue = status.value
+                        lastGood = status.value
+                        onRestored(status.value)
+                    }
+                }
             }
         }
     }
@@ -112,6 +149,9 @@ internal class BbcInjectionToggleController(
     fun onToggle(checked: Boolean) {
         if (!alive) return
         generation++
+        // F03: the CheckBox now shows the user's latest intent; the inherited
+        // Confirmed sync below must not overwrite it once a tap exists.
+        lastUiValue = checked
         // Sequence is assigned at USER-INTENT time from app-scoped state, so it
         // keeps increasing even when this controller is rebuilt.
         val seq = coordinator.state.nextSequence()

@@ -381,8 +381,8 @@ class BbcToggleConcurrencyTest {
     /** UI callbacks captured separately per controller so stale routing is visible. */
     private class UiLog {
         val restored = mutableListOf<Boolean>()
-        var failures = 0
-        var unknown = 0
+        @Volatile var failures = 0
+        @Volatile var unknown = 0
 
         fun isEmpty(): Boolean = restored.isEmpty() && failures == 0 && unknown == 0
     }
@@ -441,6 +441,36 @@ class BbcToggleConcurrencyTest {
         onFailed = { log.failures++ },
         onUnknown = { log.unknown++ },
         onEffectStatus = statusLog?.let { log -> { status -> log.add(status) } },
+    )
+
+    /**
+     * F03: thread-safe record of onRestored(value) sync callbacks. The sync runs
+     * on the app-level collector (inline on the IO consumer thread with
+     * Dispatchers.Unconfined), so the test thread needs a volatile snapshot —
+     * no wall-clock sleeps, just latch/state handshakes + withTimeout spins.
+     */
+    private class RestoredLog {
+        @Volatile
+        private var items: List<Boolean> = emptyList()
+        fun add(value: Boolean) { items = items + value }
+        fun snapshot(): List<Boolean> = items
+    }
+
+    /** F03 controller with a dedicated, thread-safe onRestored recorder. */
+    private fun syncedController(
+        coordinator: BbcToggleCoordinator,
+        initial: Boolean,
+        restored: RestoredLog,
+        statusLog: StatusLog? = null,
+        log: UiLog = UiLog(),
+    ): BbcInjectionToggleController = BbcInjectionToggleController(
+        coordinator = coordinator,
+        initialValue = initial,
+        main = Dispatchers.Unconfined,
+        onRestored = { restored.add(it) },
+        onFailed = { log.failures++ },
+        onUnknown = { log.unknown++ },
+        onEffectStatus = statusLog?.let { s -> { status -> s.add(status) } },
     )
 
     @Test
@@ -531,7 +561,12 @@ class BbcToggleConcurrencyTest {
             assertEquals(listOf("start:true", "end:true"), sink.snapshot())
             assertEquals(1L, coordinator.latestSequence()) // B submitted nothing
             assertTrue(aLog.isEmpty())
-            assertTrue(bLog.isEmpty()) // Confirmed is app-level, not per-intent
+            // F03: Confirmed is delivered app-level, but a rebuilt dialog with no
+            // tap now ALSO syncs a stale box. bLog stays empty here only because
+            // B's seeded initial (true) already equals the inherited Confirmed(true)
+            // — the sync short-circuits on value equality. The value-mismatch sync
+            // is pinned by rebuiltDialogSyncsCheckboxToInheritedConfirmedFalse.
+            assertTrue(bLog.isEmpty())
             a.dispose()
             b.dispose()
         } finally {
@@ -583,12 +618,14 @@ class BbcToggleConcurrencyTest {
                 sink.snapshot()) // A's commit completed before B's even started
             assertEquals(2L, coordinator.latestSequence())
             assertEquals(false, state.confirmedOrUnknown)
-            // Confirmed commits fire NO PER-INTENT callback (onRestored is dead
-            // and the Confirmed branch only writes lastGood), so the UiLog pins
-            // below stay valid. They ARE visible on the app-level statusLog:
+            // Confirmed commits fire NO PER-INTENT callback; the Confirmed branch
+            // only writes lastGood. They ARE visible on the app-level statusLog:
             // B's collector sees A's Confirmed(true) then its own Confirmed(false).
-            // currentLastGood() remains the per-intent observation: it advances
-            // only for a LIVE controller whose own intent is still current.
+            // F03: B taps seq 2, so its box already shows its own latest intent
+            // and the inherited Confirmed(true) must NOT sync it — the UiLog pin
+            // below holds by the D05 last-intent-wins rule, not because onRestored
+            // is unreachable. currentLastGood() stays the per-intent observation:
+            // it advances only for a LIVE controller whose own intent is current.
             assertEquals(
                 listOf<BbcEffectStatus>(
                     BbcEffectStatus.Provisional,
@@ -683,5 +720,163 @@ class BbcToggleConcurrencyTest {
         assertTrue("local generation is per controller, global sequence is not",
             c.currentGeneration() == 1L && coordinator.latestSequence() == 5L)
         c.dispose()
+    }
+
+    // --- F03: inherited-confirmed CheckBox sync on a rebuilt dialog -----------
+
+    @Test
+    fun rebuiltDialogSyncsCheckboxToInheritedConfirmedFalse() = runBlocking {
+        val io = newIoDispatcher()
+        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val sink = BlockingSink(initial = true)
+            val state = BbcToggleRuntimeState(initialConfirmed = true)
+            val coordinator = BbcToggleCoordinator(
+                scope = appScope, state = state, commit = { sink.commit(it) }, io = io,
+            )
+            val aLog = UiLog()
+            val aStatus = StatusLog()
+            val a = uiController(coordinator, initial = true, log = aLog, statusLog = aStatus)
+
+            a.onToggle(false) // seq 1: OFF enters a genuinely blocking commit
+            sink.awaitFirstStarted()
+            a.dispose() // UI-only; the in-flight commit is NOT cancelled
+            aStatus.clear() // a disposed dialog must receive nothing further
+
+            // B is rebuilt from a stale pre-commit read (true) and taps nothing.
+            val bRestored = RestoredLog()
+            val bStatus = StatusLog()
+            val b = syncedController(
+                coordinator, initial = true, restored = bRestored, statusLog = bStatus,
+            )
+            assertEquals("replay is still Provisional while A's commit is blocked",
+                listOf<BbcEffectStatus>(BbcEffectStatus.Provisional), bStatus.snapshot())
+
+            sink.releaseFirst()
+            sink.awaitFirstEnded()
+            withTimeout(5_000L) { while (state.confirmedOrUnknown != false) yield() }
+            withTimeout(5_000L) { while (BbcEffectStatus.Confirmed(false) !in bStatus.snapshot()) yield() }
+            withTimeout(5_000L) { while (false !in bRestored.snapshot()) yield() }
+
+            // B never submitted a tap: the inherited Confirmed(false) is the only
+            // authority for its stale box, so the sync must correct it.
+            assertEquals("B synced its stale box to the inherited Confirmed(false)",
+                listOf(false), bRestored.snapshot())
+            assertFalse("lastGood must follow the sync", b.currentLastGood())
+            assertTrue(BbcEffectStatus.Confirmed(false) in bStatus.snapshot())
+            assertEquals(1L, coordinator.latestSequence()) // B submitted no intent
+            assertEquals(listOf("start:false", "end:false"), sink.snapshot())
+            assertTrue("disposed A's UI must be cut", aLog.isEmpty())
+            assertTrue("disposed A must receive no status at all", aStatus.isEmpty())
+            a.dispose()
+            b.dispose()
+        } finally {
+            appScope.cancel()
+            io.close()
+        }
+    }
+
+    @Test
+    fun newerLocalIntentWinsOverStaleInheritedConfirmed() = runBlocking {
+        val io = newIoDispatcher()
+        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val sink = BlockingSink(initial = true)
+            val state = BbcToggleRuntimeState(initialConfirmed = true)
+            val coordinator = BbcToggleCoordinator(
+                scope = appScope, state = state, commit = { sink.commit(it) }, io = io,
+            )
+            val a = uiController(coordinator, initial = true, log = UiLog())
+            a.onToggle(true) // seq 1: ON enters a genuinely blocking commit
+            sink.awaitFirstStarted()
+            a.dispose() // UI-only; the stale commit survives
+
+            val bRestored = RestoredLog()
+            val bStatus = StatusLog()
+            val b = syncedController(
+                coordinator, initial = false, restored = bRestored, statusLog = bStatus,
+            )
+            b.onToggle(false) // seq 2: B's own NEWER intent; single writer still held by A
+            assertEquals("B must wait for the single writer",
+                listOf("start:true"), sink.snapshot())
+
+            sink.releaseFirst() // release A's stale commit LAST
+            sink.awaitSecondEnded()
+            withTimeout(5_000L) { while (state.confirmedOrUnknown != false) yield() }
+            withTimeout(5_000L) { while (BbcEffectStatus.Confirmed(false) !in bStatus.snapshot()) yield() }
+
+            // A's stale Confirmed(true) DID reach B's app-level collector, but B
+            // tapped seq 2: its box already shows false and D05 last-intent-wins
+            // forbids syncing from an inherited/older Confirmed.
+            assertTrue("stale inherited Confirmed(true) is still observed app-level",
+                BbcEffectStatus.Confirmed(true) in bStatus.snapshot())
+            assertFalse("stale inherited true must never sync B's CheckBox",
+                true in bRestored.snapshot())
+            assertFalse("B's own intent stays current", b.currentLastGood())
+            assertEquals(listOf("start:true", "end:true", "start:false", "end:false"),
+                sink.snapshot())
+            assertEquals(2L, coordinator.latestSequence())
+            a.dispose()
+            b.dispose()
+        } finally {
+            appScope.cancel()
+            io.close()
+        }
+    }
+
+    @Test
+    fun unknownNeverSyncsCheckboxAndStaysAtIntent() = runBlocking {
+        val io = newIoDispatcher()
+        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val sink = BlockingSink(initial = true)
+            val state = BbcToggleRuntimeState(initialConfirmed = true)
+            var firstCommit = true
+            val coordinator = BbcToggleCoordinator(
+                scope = appScope, state = state,
+                commit = { value ->
+                    val outcome = sink.commit(value)
+                    // D04: force the first commit to Unknown while keeping the
+                    // real blocking handshake (no sleeps, no cancelled commits).
+                    if (firstCommit) { firstCommit = false; BbcWriteOutcome.Unknown } else outcome
+                },
+                io = io,
+            )
+            val restored = RestoredLog()
+            val statuses = StatusLog()
+            val log = UiLog()
+            val c = syncedController(
+                coordinator, initial = true, restored = restored, statusLog = statuses, log = log,
+            )
+            assertEquals("replay is Provisional, not a confirmation",
+                listOf<BbcEffectStatus>(BbcEffectStatus.Provisional), statuses.snapshot())
+
+            c.onToggle(false) // seq 1 -> forced Unknown; D04 keeps box at tapped false
+            sink.awaitFirstStarted()
+            sink.releaseFirst()
+            sink.awaitFirstEnded()
+            withTimeout(5_000L) { while (BbcEffectStatus.Unknown !in statuses.snapshot()) yield() }
+            withTimeout(5_000L) { while (log.unknown == 0) yield() }
+
+            assertEquals("D04: Unknown never syncs the CheckBox", 0, restored.snapshot().size)
+            assertEquals(1, log.unknown) // per-intent Unknown still fires
+            assertEquals(true, c.currentLastGood()) // no rollback; lastGood stays confirmed
+            assertNull(state.confirmedOrUnknown) // Unknown clears app-level confirmation
+
+            // A later Confirmed from THIS dialog's OWN tap (seq 2) clears the
+            // Unknown styling but does not sync the box: a local intent exists,
+            // so D05 last-intent-wins suppresses inherited-confirmed sync.
+            c.onToggle(true) // seq 2
+            withTimeout(5_000L) { while (BbcEffectStatus.Confirmed(true) !in statuses.snapshot()) yield() }
+            withTimeout(5_000L) { while (state.confirmedOrUnknown != true) yield() }
+
+            assertEquals(0, restored.snapshot().size)
+            assertEquals(true, c.currentLastGood())
+            assertEquals(2L, coordinator.latestSequence())
+            c.dispose()
+        } finally {
+            appScope.cancel()
+            io.close()
+        }
     }
 }
