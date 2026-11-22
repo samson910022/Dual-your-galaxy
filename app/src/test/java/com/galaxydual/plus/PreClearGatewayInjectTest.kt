@@ -908,6 +908,40 @@ class PreClearGatewayInjectTest {
     }
 
     @Test
+    fun buildFastPathConsent_flagOnUnknownSnapshot_neverAdditive() = runBlocking {
+        // R4-1 (HARD CONSTRAINT) D03 fail-open regression: an Unknown snapshot
+        // computes delta=∅ only as an artifact of the failed re-read. The production
+        // call-site model is noRemovalAllowed = snapKnown && delta.isEmpty(), so it
+        // MUST refuse to opt in even though delta looks empty.
+        val snapKnown = false
+        val delta: Set<String> = emptySet() // Unknown-style seam: stale/empty draft, not authoritative
+        assertFalse(noRemovalAllowed(snapKnown, delta))
+        assertTrue(noRemovalAllowed(true, delta)) // Known control group with the same empty delta
+
+        // Candidate-empty pitfall (write path): candidate=∅ ⇒ delta=old, so a
+        // non-empty persisted draft is destructive and must never opt in merely
+        // because the candidate is empty.
+        assertFalse(noRemovalAllowed(true, setOf("com.a.app")))
+
+        // Feed the *gated* value into the real builder: no additive flag; the
+        // failed-path reprobe keeps fromFailedProbe=true and the fence fails closed.
+        val noRemovalKnown = noRemovalAllowed(snapKnown, delta)
+        val consent = buildFastPathConsent(
+            delta = delta,
+            resolveLiveTarget = { null },
+            reprobe = { _, _ -> DualProbeResult.Failed("exec-failed") },
+            noRemovalKnown = noRemovalKnown,
+        )
+        assertFalse(consent.additiveNoRemoval)
+        assertTrue(consent.fromFailedProbe)
+        val h = FenceHarness(reprobe = DualProbeResult.Ok(listOf("com.a.app")))
+        val outcome = h.consentCheck(consent)
+        assertTrue(outcome is PreClearContinueOutcome.CannotDetermine)
+        assertEquals(0, h.storeWrites)
+        assertEquals(0, h.reprobeCalls)
+    }
+
+    @Test
     fun consent_additiveFlagOnDestructiveDelta_neverBypassesFence() = runBlocking {
         // 偽造旗標防禦：破壞性（非空）delta 即使帶 additiveNoRemoval=true，
         // fence 交叉檢查 delta.isEmpty() 失敗 ⇒ 仍走完整四道關卡；installed 集合

@@ -148,6 +148,12 @@
     <string name="pre_clear_probe_failed_title">無法探測分身狀態 · 仍可能卸載分身</string>
     <string name="pre_clear_probe_failed_message">這台裝置沒有 Root 或環境不支援，無法安全判斷哪些已安裝的分身曾於 11-18 在清除／空政策時被 Samsung 一併刪除（含雙開分身資料，觸發機制未證實）。若不確定，請先到 Samsung 設定關閉雙開後再清除政策。11-20/11-21 於非空政策下亦發生冷啟動刪除，非空不保證安全；刪除後資料無法復原。</string>
     <string name="pre_clear_probe_failed_proceed">仍然清除</string>
+    <!-- R4-1 (E01)：Failed-probe／Unknown 對話框只有「重試探測／重新整理 + 取消」；冷啟動 DELETE 風險原文保留。 -->
+    <string name="pre_clear_probe_failed_retry">重試探測</string>
+    <string name="pre_clear_unknown_refresh_retry">重新整理</string>
+    <string name="pre_write_probe_failed_title">無法探測分身狀態 · 寫入草稿仍可能導致分身被卸載</string>
+    <string name="pre_write_probe_failed_message">寫入政策草稿前無法完成雙開探測，以下風險同樣適用。這台裝置沒有 Root 或環境不支援，無法安全判斷哪些已安裝的分身曾於 11-18 在清除／空政策時被 Samsung 一併刪除（含雙開分身資料，觸發機制未證實）。若不確定，請先到 Samsung 設定關閉雙開後再清除政策。11-20/11-21 於非空政策下亦發生冷啟動刪除，非空不保證安全；刪除後資料無法復原。</string>
+    <string name="pre_write_recheck_failed">雙開分身目標或已安裝分身在對話框期間已變更／無法確認，寫入已取消。請關閉對話框後重試。</string>
     <!-- Phase D：ROOT 卸載後驗證三選一（重跑 probe；殘留非空即失敗；失敗不默認 proceed）。 -->
     <string name="pre_clear_uninstall_verify_title">卸載後驗證 · 請明確選擇</string>
     <string name="pre_clear_uninstall_verify_success">卸載後重探雙開分身：已無殘留分身，可繼續清除政策。</string>

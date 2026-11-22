@@ -6077,6 +6077,11 @@ class MainActivity : ComponentActivity() {
 
     // D03b：最近一次警告要求的 re-trigger。fail-closed abort 後呼叫以強制一次
     // 全新警告（新 probe／新 consent）；Activity 重建後為 null（使用者須再點入口）。
+    // R4-1 (E01) 驗證：Failed-probe／Unknown 的 onRetry 先清 pendingClearConfirm，
+    // 再 invoke 此 seam ⇒ re-entry 通過 consentResetAllowedForNewWarning（=!pending）,
+    // 不會被 guard 擋住。此 seam 以 fromUserTap=false 重入，故 autoRestartCount
+    // 既不重置也不遞增（只由 scheduleWarningRestart 遞增）——重試是使用者主動點，
+    // 不是自動重啟，不應消耗／重置可用性上限。真正的入口點擊才會重置（fromUserTap=true）。
     private var pendingWarningRestart: (() -> Unit)? = null
 
     // D03b fixer M5：confirm 重入防護（double-tap）——第一段 enter 成功才 launch。
@@ -6088,11 +6093,13 @@ class MainActivity : ComponentActivity() {
 
     // D03b fixer M3：abort 後共用清理——清 consent、顯示既有 recheck 訊息，
     // 並以 main Handler.post + one-shot guard 排程新警告（不再同步 invoke 造成遞迴／死路）。
-    private fun consentAbortCleanup() {
+    // R4-1 (E01)：寫入路徑的 abort 必須說「寫入已取消」，不能沿用清除文案；
+    // 清除路徑沿用既有 pre_clear_continue_recheck_failed（default）。
+    private fun consentAbortCleanup(msgRes: Int = R.string.pre_clear_continue_recheck_failed) {
         pendingWarningConsent = null
         if (!isFinishing && !isDestroyed) {
             try {
-                Toast.makeText(this, R.string.pre_clear_continue_recheck_failed, Toast.LENGTH_LONG).show()
+                Toast.makeText(this, msgRes, Toast.LENGTH_LONG).show()
             } catch (_: Exception) {
             }
         }
@@ -6212,10 +6219,13 @@ class MainActivity : ComponentActivity() {
                     //（identity＋probe 照樣重驗），直接走 VM 既有 no-op 行為，不再觸發警告。
                     val snap = try { vm.snapshotPolicyForWarning() } catch (_: Exception) { null }
                     if (snap?.known == true && snap.draft.isEmpty()) {
+                        // R4-1 (E02)：snap.known==true 且草稿已驗證為空，delta 亦為空 ⇒
+                        // 可證明不移除；Unknown 時上面已在 else 分支 fail closed。
                         val real = buildFastPathConsent(
                             delta = emptySet(),
                             resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
                             reprobe = { p, uid -> probeDualApps(p, uid) },
+                            noRemovalKnown = noRemovalAllowed(snapKnown = snap.known, delta = emptySet()),
                         )
                         pendingWarningConsent = real
                         dispatchClearFence(binding, real)
@@ -6250,7 +6260,7 @@ class MainActivity : ComponentActivity() {
                 if (livePending == null || livePending.generation != pending.generation) {
                     preClearLog("policy-write consent aborted: pending gone/changed at confirm")
                     try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
-                    consentAbortCleanup()
+                    consentAbortCleanup(R.string.pre_write_recheck_failed)
                     return@launch
                 }
                 val consent = livePending.consent
@@ -6258,7 +6268,7 @@ class MainActivity : ComponentActivity() {
                     // carry-forward #4：Activity 重建／legacy 注入 ⇒ fail closed，零寫入。
                     preClearLog("policy-write consent aborted: missing at confirm")
                     try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
-                    consentAbortCleanup()
+                    consentAbortCleanup(R.string.pre_write_recheck_failed)
                     return@launch
                 }
                 val outcome: PreClearContinueOutcome = try {
@@ -6280,14 +6290,14 @@ class MainActivity : ComponentActivity() {
                 if (afterPending == null || afterPending.generation != pending.generation) {
                     preClearLog("policy-write consent aborted: pending changed after revalidation")
                     try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
-                    consentAbortCleanup()
+                    consentAbortCleanup(R.string.pre_write_recheck_failed)
                     return@launch
                 }
                 dispatchConsentGatedConfirm(
                     outcome = outcome,
                     confirm = { vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null) },
                     revoke = { try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { } },
-                    notify = { consentAbortCleanup() },
+                    notify = { consentAbortCleanup(R.string.pre_write_recheck_failed) },
                     hostAlive = { !isFinishing && !isDestroyed },
                 )
             } finally {
@@ -6321,15 +6331,19 @@ class MainActivity : ComponentActivity() {
         val delta = policyRemovalDelta(snap.draft, emptySet())
         // Phase C：Unknown 一律走 cannot-determine 對話框，不走空 fast-path。
         // stale 非空不得當授權依據；即使 stale 為空亦不可信（重讀前不得放行）。
+        // R4-1 (E01/E02)：舊的 force-proceed 已移除——這裡不再建造任何 consent／pending，
+        // 只提供「重新整理 snapshot + 取消」。若日後要在此建 consent，必須傳
+        // noRemovalKnown=false（Unknown 的 delta=∅ 是偽空，D03 fail-open）。
         if (!snap.known) {
             if (pendingClearConfirm) return
             setPendingClearConfirm(true)
+            pendingWarningConsent = null
             showPreClearProbeFailedWarning(
                 this@MainActivity,
-                onProceed = {
+                config = probeFailedDialogConfig(write = false, unknown = true),
+                onRetry = {
                     setPendingClearConfirm(false)
-                    // M1：force-proceed 也建真實 consent（真 probe 決定 fromFailedProbe）。
-                    buildRealConsentThen(delta) { proceed(warnedBinding, emptySet()) }
+                    pendingWarningRestart?.invoke()
                 },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
             )
@@ -6338,12 +6352,17 @@ class MainActivity : ComponentActivity() {
         val old = snap.draft
         // Known 空草稿：無刪可警，直接進 VM（VM 仍掌握 blind-clear 語義）。
         // M3：真 no-op 清除——建真實 consent 後直走 VM，不重觸發警告。
+        // R4-1 (E02)：snap.known 已驗證且 delta==old==∅ ⇒ 可證明不移除。
         if (old.isEmpty()) {
-            buildRealConsentThen(delta) { proceed(warnedBinding, emptySet()) }
+            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta)) {
+                proceed(warnedBinding, emptySet())
+            }
             return
         }
         if (delta.isEmpty()) {
-            buildRealConsentThen(delta) { proceed(warnedBinding, emptySet()) }
+            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta)) {
+                proceed(warnedBinding, emptySet())
+            }
             return
         }
         if (pendingClearConfirm) return
@@ -6369,29 +6388,31 @@ class MainActivity : ComponentActivity() {
                 setPendingClearConfirm(false)
                 return@launch
             }
-            // D03a：三種 probe outcome（Failed / Ok(empty) / Ok(non-empty)）都在這裡
-            // 凍結 consent；Failed 與 Ok(empty) 的 installed 皆為空（合法快照），
-            // capturedInstalled 絕不與「未捕獲」混為一談（身份 null 才是 fail-closed）。
-            pendingWarningConsent = buildPolicyWriteConsent(
-                delta = delta,
-                verifiedTarget = verifiedTarget,
-                installed = when (probe) {
-                    is DualProbeResult.Ok -> probe.installed
-                    is DualProbeResult.Failed -> emptyList()
-                },
-                // M6：警告 probe 失敗（force-proceed）標記 ⇒ fence 永遠 CannotDetermine。
-                fromFailedProbe = probe is DualProbeResult.Failed,
-            )
+            // R4-1 (E01)：consent 只在 probe Ok 時凍結。Failed 一律 pending=null ＋
+            // retry dialog，不再產生任何可攜進 confirm 的 consent（remove affordance，
+            // 不放寬 fence）。Ok(empty) 的 installed 空集合是合法快照，不可與「未捕獲」混用。
             when (probe) {
                 is DualProbeResult.Failed -> {
+                    pendingWarningConsent = null
                     showPreClearProbeFailedWarning(
                         this@MainActivity,
-                        onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
+                        config = probeFailedDialogConfig(write = false, unknown = false),
+                        onRetry = {
+                            setPendingClearConfirm(false)
+                            pendingWarningRestart?.invoke()
+                        },
                         onCancel = { setPendingClearConfirm(false); onCancel() },
                     )
                     return@launch
                 }
                 is DualProbeResult.Ok -> {
+                    pendingWarningConsent = buildPolicyWriteConsent(
+                        delta = delta,
+                        verifiedTarget = verifiedTarget,
+                        installed = probe.installed,
+                        // 只有 Ok 才到這裡，故永遠不是 failed-probe consent。
+                        fromFailedProbe = false,
+                    )
                     if (!shouldWarnForDelta(probe.installed)) {
                         setPendingClearConfirm(false)
                         proceed(warnedBinding, emptySet())
@@ -6449,16 +6470,18 @@ class MainActivity : ComponentActivity() {
         // M1/M3：delta 先算（Unknown / 空候選 snap.draft 為空 ⇒ delta 為空），
         // fast path 共用真實 consent 建造器；不再留下 consent=null 的寫入路徑。
         val delta = policyRemovalDelta(old, candidate)
+        // R4-1 (E01/E02)：Unknown 只提供「重新整理 + 取消」，不建造 consent／pending。
+        // 舊 force-proceed 若重建 consent，必須傳 noRemovalKnown=false（delta=∅ 為偽空）。
         if (!snap.known) {
             if (pendingClearConfirm) return
             setPendingClearConfirm(true)
+            pendingWarningConsent = null
             showPreClearProbeFailedWarning(
                 this@MainActivity,
-                onProceed = {
+                config = probeFailedDialogConfig(write = true, unknown = true),
+                onRetry = {
                     setPendingClearConfirm(false)
-                    buildRealConsentThen(delta) {
-                        if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
-                    }
+                    pendingWarningRestart?.invoke()
                 },
                 onCancel = { setPendingClearConfirm(false); onCancel() },
             )
@@ -6467,14 +6490,16 @@ class MainActivity : ComponentActivity() {
         // 空候選（空勾選／空 catalog／映射全捨）交由 VM 門控（EMPTY_SELECTION／
         // CATALOG_LOADING／CATALOG_MISSING），此處不警告直接進 VM。
         // M1：即便 VM 最終拒絕，也先建真實 consent，確保 pending 永不帶 null。
+        // R4-1 (E02)：候選為空時 delta==old，**不可**因 candidate.isEmpty() 就無條件
+        // 設 noRemovalKnown=true；old 非空仍為破壞性，只有 delta 為空才可證明不移除。
         if (candidate.isEmpty()) {
-            buildRealConsentThen(delta) {
+            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta)) {
                 if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
             }
             return
         }
         if (delta.isEmpty()) {
-            buildRealConsentThen(delta) {
+            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta)) {
                 if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
             }
             return
@@ -6497,31 +6522,30 @@ class MainActivity : ComponentActivity() {
                 setPendingClearConfirm(false)
                 return@launch
             }
-            // D03a：三種 probe outcome 都在這裡凍結 consent；delta=old−candidate，
-            // capturedInstalled 為 probe.installed 的防禦拷貝（空集合法）。
-            pendingWarningConsent = buildPolicyWriteConsent(
-                delta = delta,
-                verifiedTarget = verifiedTarget,
-                installed = when (probe) {
-                    is DualProbeResult.Ok -> probe.installed
-                    is DualProbeResult.Failed -> emptyList()
-                },
-                // M6：警告 probe 失敗（force-proceed）⇒ fence 永遠 CannotDetermine。
-                fromFailedProbe = probe is DualProbeResult.Failed,
-            )
+            // R4-1 (E01)：同上——Failed 不作廢任何 consent 以外的事情；不建 pending，
+            // 只給 retry dialog。consent 僅在 Ok 時以真實 probe.installed 凍結。
             when (probe) {
                 is DualProbeResult.Failed -> {
+                    pendingWarningConsent = null
                     showPreClearProbeFailedWarning(
                         this@MainActivity,
-                        onProceed = {
+                        config = probeFailedDialogConfig(write = true, unknown = false),
+                        onRetry = {
                             setPendingClearConfirm(false)
-                            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                            pendingWarningRestart?.invoke()
                         },
                         onCancel = { setPendingClearConfirm(false); onCancel() },
                     )
                     return@launch
                 }
                 is DualProbeResult.Ok -> {
+                    pendingWarningConsent = buildPolicyWriteConsent(
+                        delta = delta,
+                        verifiedTarget = verifiedTarget,
+                        installed = probe.installed,
+                        // 只有 Ok 才到這裡，故永遠不是 failed-probe consent。
+                        fromFailedProbe = false,
+                    )
                     if (!shouldWarnForDelta(probe.installed)) {
                         setPendingClearConfirm(false)
                         if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
@@ -8781,24 +8805,29 @@ internal fun showUninstallVerifyDialog(
     }
 }
 
-// 無 Root 或環境不支援時的探測失敗警告——告知使用者「無法判斷哪些分身會被刪除」，
-// 為防止靜默放行，只提供「仍然清除」（繼承 PolicyActivity 的「同意卸載分身」語義）與取消。
+// 無 Root／環境不支援（Failed probe）或快照 Unknown 時的警告——告知使用者
+// 「無法判斷哪些分身會被刪除」（冷啟動 DELETE 風險原文保留）。
+// R4-1 (E01)：原本的「仍然清除／寫入」Positive 已移除——該路徑在 Activity／VM fence
+// 永遠 CannotDetermine，是一個永遠無法完成的假承諾。現在 Positive 是「重試探測」／
+// 「重新整理」，Negative 是取消；此函式完全不建造 consent／pending、不呼叫 proceed。
 internal fun showPreClearProbeFailedWarning(
     host: ComponentActivity,
-    onProceed: () -> Unit,
+    config: ProbeFailedDialogConfig,
+    onRetry: () -> Unit,
     onCancel: () -> Unit,
-    proceedLabelRes: Int = R.string.pre_clear_probe_failed_proceed,
 ) {
     if (host.isFinishing || host.isDestroyed) { onCancel(); return }
     try {
         AlertDialog.Builder(host)
-            .setTitle(R.string.pre_clear_probe_failed_title)
-            .setMessage(R.string.pre_clear_probe_failed_message)
+            .setTitle(config.titleRes)
+            .setMessage(config.messageRes)
             .setCancelable(true)
-            .setPositiveButton(proceedLabelRes) { _, _ -> onProceed() }
-            .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
+            .setPositiveButton(config.retryLabelRes) { _, _ -> onRetry() }
+            .setNegativeButton(config.cancelLabelRes) { _, _ -> onCancel() }
             .setOnCancelListener { onCancel() }
             .show()
+        // config.showProceed 恆為 false：builder 只接了 retry/cancel 兩個按鈕，
+        // 沒有任何 proceed affordance 可觸發（R4-5 才會加 dialog handle）。
     } catch (e: RuntimeException) {
         preClearLog("pre-clear probe-failed warning failed to show", e)
         onCancel()
