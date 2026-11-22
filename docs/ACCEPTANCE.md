@@ -153,7 +153,7 @@ BBC6 注意事項（unified build）：
 
 ### 2026-11-23 實機唯讀觀察（F00/F06 仍 UNMEASURED／NOT a pass）
 
-> **誠實框架（先讀）**：本觀察為 round-5 的**唯讀**實機記錄，不是任何驗收通過。持有人於 G0 已備份並授權完整三臂（含破壞性冷啟動 DELETE 重現），但在最終閘門改口「只記錄，停止破壞性臂」；G1（force-stop ＋ daagent 冷啟動）**從未獲批**。executor 因此**未執行任何破壞性臂**，三臂 A/B/C 冷啟動對照**未執行**。F00／F06 維持 **UNMEASURED／NOT a pass**，P0 合併門檻未關閉；**opt-out 不是刪除防護**（issue #75）。
+> **誠實框架（先讀）**：本觀察為 round-5 的**唯讀**實機記錄，不是任何驗收通過。持有人於 G0 已備份並授權完整三臂（含破壞性冷啟動 DELETE 重現），但在最終閘門改口「只記錄，停止破壞性臂」；該次唯讀快照中 G1（force-stop ＋ daagent 冷啟動）**從未獲批**、 executor **未執行任何破壞性臂**、三臂 A/B/C 冷啟動對照**未執行**；**同日稍後已另外授權並完成三臂對照，見本節後「2026-11-23 三臂冷啟動對照」小節**。F00／F06 維持 **UNMEASURED／NOT a pass**，P0 合併門檻未關閉；**opt-out 不是刪除防護**（issue #75）。
 
 - 裝置／環境：SM-S9180（S23 Ultra）、Android 17／SDK 37、KernelSU root、LSPosed active。全程僅唯讀 `pm`／`dumpsys`／`ps`／`logcat`／`su -c cat`／`screencap`，另有一次非破壞性的 App 啟動與 About 導航點擊（無寫入／無破壞性臂）；未查詢 user 150、未 force-stop／冷啟動／重開機、未寫政策或 DB；**Scope B `settings_ssaid.xml`／ABX／SSSAID 修補禁止、未嘗試**。
 - 政策狀態（LSPosed remote-prefs DB，唯讀）：非空 BBC 政策**已提交**（`dual_policy/extra_whitelist_packages` ＝ `{com.openai.chatgpt}`；另有 `galaxydual_policy/packages`）。執行期閘鍵 `bbc_injection_enabled` **缺席** → 依預設推斷為 **ON**；此為**由持久化狀態推斷，非 UI 確認**（「關於」對話框未抵達，toggle 狀態 UNMEASURED）。
@@ -192,6 +192,27 @@ BBC6 注意事項（unified build）：
   | **UNKNOWN** | 11-21→11-23 狀態變化／現在冷啟動是否 DELETE／SSAID 內部狀態（Scope B 硬禁令，未讀） |
 
 - **Hard prohibition 重申**：不提出任何 SSAID／`settings_ssaid.xml`／ABX 修補；不宣稱 P0 根因已證明；opt-out **不是**刪除防護（issue #75）。
+
+### 2026-11-23 三臂冷啟動對照（已執行；F00 決策輸入仍 UNMEASURED）
+
+> **定位（先讀）**：本節記錄**已完成**的三臂冷啟動對照結果，是重要的裝置關聯證據，**不是**任何驗收通過。上一節「2026-11-23 實機唯讀觀察」為執行前的唯讀快照，其中「三臂未執行」僅對該次觀察有效，已由本節後續的實際執行取代。不得據此宣稱任何合併閘門通過、或 BBC 預設設定安全；合併閘門仍待驗收 owner 裁決。**opt-out 不是刪除防護**（issue #75）。
+>
+> 三臂皆在同一台已備份且明確授權的 S23 Ultra（SM-S9180）執行；**Arm B/C 使用本機 `:app:assembleDebug` 於 02:59 安裝的目前 HEAD build**（APK byte grep 見 `bbc_injection_enabled` 執行期開關）；**Arm A（02:44）在此安裝之前，使用的是裝置上較舊的 app build**（該舊 APK 無 gate 開關，見 `latest_build_verification.md`）——此差異如實揭露，起點為同一 user-95 installed-state，由 sole device executor 完成。全程未嘗試 Scope B／SSAID／ABX 修補、未查詢 user 150、未平行 adb、未修改 repo。
+
+| 臂 | 條件（gate／hook） | 系統 DELETE（`START DELETE PACKAGE`） | BBC 回調／時序 | 結果 |
+| --- | --- | --- | --- | --- |
+| **A｜BBC ON ＋ 非空注入** | BBC 注入 ON；非空政策注入；gate 鍵缺席 → **預設 ON 推斷**（非 UI 確認） | 02:44:41.255；`pkg{com.openai.chatgpt}, user{95}, caller{1000}` ／ `android.uid.system:1000`；`PACKAGE_FULLY_REMOVED` | `nonempty` ＋ `merged +1 total 7`；D−E=−83 ms、D−C=−99 ms（DELETE 早於回調） | clone 消失、u95 data dir 移除、資料清除 |
+| **B｜gate 確認 OFF** | About toggle 點 OFF ＋ DB 鍵 `bbc_injection_enabled=false`；新 daagent pid 4469 無 `nonempty`／無 merged，ChatGPT 不在 available list | 03:04:58.478；同樣 caller／uid／user | callback 空；D−E=−69 ms、D−C=−89 ms（DELETE 早於回調） | clone ＋ 資料清除 |
+| **C｜本模組 BBC hook 完全缺席** | 僅移除本模組 2 條 LSPosed scope row；無硬重開機，以 `setprop ctl.restart zygote` 軟重開機套用；新 daagent pid 4523 **零** BBC log 行，framework／其他模組仍正常 | 03:29:30.206；同樣 caller／uid／user | 無 BBC 回調 → D−C 無法計算；D−E 以 process-start 為代理、**低精度**（無 hook 行），僅記 +103 ms 代理值 | clone ＋ 資料清除；available list 僅 Samsung 原生 5 個 app |
+
+**誠實解讀**：
+- **強關聯證據（ASSOCIATION，非因果證明）**：Samsung system-uid 的 DELETE 在 BBC 注入 ON、執行期 gate 確認 OFF、以及完全沒有 BBC hook 三種條件下**皆發生**，且一律早於任何 BBC 回調。這支持「刪除決策位於 Samsung `system_server`、與本模組 BBC 注入無關」的推論（issue #75），並**確認執行期 opt-out 不是刪除防護**。
+- **DELETE 前的決策輸入仍 UNMEASURED**：三臂完成本身**不證明** P0 風險已排除、**不證明** BBC 預設設定安全、也不證明根因已定論；adb 無法讀取 `system_server` 內的 pre-DELETE 決策輸入，關聯與時序不等於因果。合併閘門仍待驗收 owner 裁決；本節不作任何通過或安全性的結論。
+- **F06 與其他未測項仍 UNMEASURED**：p50/p95/max、512 IPC／Binder 次數、真實 15 ms gate 延遲、sticky／TTL／fresh process、Scope A dialog（backup+consent）皆未量測；CI 手動模擬器矩陣略過。
+
+**還原與重開機**：每個破壞性臂後皆以 `pm install-existing --user 95` 還原 baseline；Arm C 後另以 narrow restore 只回補本模組 2 條 scope row（共 19 條，其他模組未動），lspd 重啟 ＋ 軟重開機後 hook 重新生效（新 pid 4219 `installed=1`），clone 健康（SSAID=0）、gate ON、root 保留。**全程未使用硬重開機**（無 `adb reboot`／power cycle）。Scope B／SSAID／ABX 修補從未嘗試。
+
+**證據（外部、不入 repo）**：`/mnt/seagate500g/opencode_tmp/device_evidence/r5_v2_coldstart_20261123_024013/` — 關鍵檔：`armA_result.md`／`armA_delete_chain.txt`／`armA_bbc_lines.txt`、`armB_result.md`／`armB2_delete_chain.txt`／`armB2_bbc_lines.txt`、`armC_result.md`／`armC_11_delete_chain.txt`／`armC_11_bbc_lines.txt`／`armC_restore_record.md`／`armC_20_bbc_lines.txt`／`armC_16_final.db`、`latest_build_verification.md`、`gate_log.md`；authorization／scope／soft-reboot 授權檔亦在該目錄。原始 logcat／verbose log／截圖／DB 快照留該目錄，依慣例不入 repo。
 
 ### 2026-11-17 紀錄（pre-unification build，reference）
 
