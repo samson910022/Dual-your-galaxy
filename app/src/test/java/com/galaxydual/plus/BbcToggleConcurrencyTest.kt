@@ -96,10 +96,25 @@ class BbcToggleConcurrencyTest {
         )
     }
 
+    /**
+     * E04: app-level status stream, deliberately separate from per-intent UiLog.
+     * Volatile snapshot so a status emitted on the blocking commit thread is
+     * safely visible to the test thread after the latch/state handshakes.
+     */
+    private class StatusLog {
+        @Volatile
+        private var items: List<BbcEffectStatus> = emptyList()
+        fun add(status: BbcEffectStatus) { items = items + status }
+        fun snapshot(): List<BbcEffectStatus> = items
+        fun clear() { items = emptyList() }
+        fun isEmpty(): Boolean = items.isEmpty()
+    }
+
     private fun TestScope.testController(
         coordinator: BbcToggleCoordinator,
         initial: Boolean,
         sink: Sink,
+        statusLog: StatusLog? = null,
     ): BbcInjectionToggleController = BbcInjectionToggleController(
         coordinator = coordinator,
         initialValue = initial,
@@ -107,6 +122,7 @@ class BbcToggleConcurrencyTest {
         onRestored = { sink.restored.add(it) },
         onFailed = { sink.failures++ },
         onUnknown = { sink.unknown++ },
+        onEffectStatus = statusLog?.let { log -> { status -> log.add(status) } },
     )
 
     @Test
@@ -414,6 +430,7 @@ class BbcToggleConcurrencyTest {
         coordinator: BbcToggleCoordinator,
         initial: Boolean,
         log: UiLog,
+        statusLog: StatusLog? = null,
     ): BbcInjectionToggleController = BbcInjectionToggleController(
         coordinator = coordinator,
         initialValue = initial,
@@ -421,7 +438,105 @@ class BbcToggleConcurrencyTest {
         onRestored = { log.restored.add(it) },
         onFailed = { log.failures++ },
         onUnknown = { log.unknown++ },
+        onEffectStatus = statusLog?.let { log -> { status -> log.add(status) } },
     )
+
+    @Test
+    fun controller_unknownThenConfirmed_sameControllerClearsStyling() = runTest {
+        val sink = Sink(initial = true)
+        sink.resultAt = { idx -> idx != 0 } // first commit fails -> Unknown
+        val coordinator = testCoordinator(sink, BbcToggleRuntimeState(initialConfirmed = true))
+        val statuses = StatusLog()
+        val c = testController(coordinator, initial = true, sink = sink, statusLog = statuses)
+        testScheduler.runCurrent() // let the StateFlow collector subscribe/replay
+
+        c.onToggle(false) // seq 1 -> Unknown
+        testScheduler.advanceUntilIdle()
+        assertEquals(
+            listOf<BbcEffectStatus>(BbcEffectStatus.Provisional, BbcEffectStatus.Unknown),
+            statuses.snapshot(),
+        )
+        assertEquals(0, sink.restored.size) // D04: no rollback
+        assertEquals(1, sink.unknown) // per-intent Unknown path still fires
+        assertEquals(1, sink.failures) // legacy toast path still fires once
+        assertNull(coordinator.state.confirmedOrUnknown)
+
+        c.onToggle(true) // seq 2 -> Confirmed(true), styling must clear
+        testScheduler.advanceUntilIdle()
+        assertEquals(
+            listOf<BbcEffectStatus>(
+                BbcEffectStatus.Provisional,
+                BbcEffectStatus.Unknown,
+                BbcEffectStatus.Confirmed(true),
+            ),
+            statuses.snapshot(),
+        )
+        // Per-intent toast counters stay at one: Confirmed only arrives on the
+        // app-level status flow, not as a second "effect unknown" toast.
+        assertEquals(1, sink.unknown)
+        assertEquals(1, sink.failures)
+        assertEquals(0, sink.restored.size)
+        assertEquals(true, c.currentLastGood())
+        assertEquals(true, coordinator.state.confirmedOrUnknown)
+        c.dispose()
+    }
+
+    @Test
+    fun controller_rebuildDuringBlockingCommit_newControllerReceivesCompletionStatus() = runBlocking {
+        val io = newIoDispatcher()
+        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val sink = BlockingSink(initial = false)
+            val state = BbcToggleRuntimeState(initialConfirmed = true)
+            val coordinator = BbcToggleCoordinator(
+                scope = appScope, state = state, commit = { sink.commit(it) }, io = io,
+            )
+            val aStatus = StatusLog()
+            val aLog = UiLog()
+            val a = uiController(coordinator, initial = false, log = aLog, statusLog = aStatus)
+            assertEquals("replay is Provisional, not a confirmation",
+                listOf<BbcEffectStatus>(BbcEffectStatus.Provisional), aStatus.snapshot())
+
+            a.onToggle(true) // seq 1: enters a genuinely blocking commit
+            sink.awaitFirstStarted()
+            a.dispose() // UI-only; the in-flight commit is NOT cancelled
+            aStatus.clear() // nothing may arrive after dispose
+
+            val bStatus = StatusLog()
+            val bLog = UiLog()
+            val b = uiController(coordinator, initial = true, log = bLog, statusLog = bStatus)
+            // B subscribed while A's commit is still blocked: replay gives it
+            // the last applied status, NOT the not-yet-existing Confirmed.
+            assertEquals(listOf<BbcEffectStatus>(BbcEffectStatus.Provisional), bStatus.snapshot())
+
+            sink.releaseFirst()
+            sink.awaitFirstEnded()
+            withTimeout(5_000L) { while (state.confirmedOrUnknown != true) yield() }
+            withTimeout(5_000L) {
+                while (BbcEffectStatus.Confirmed(true) !in bStatus.snapshot()) yield()
+            }
+
+            // B never submitted seq 1, yet it learns that commit's outcome from
+            // the app-scoped StateFlow; A's disposed collector stays silent.
+            assertEquals(
+                listOf<BbcEffectStatus>(
+                    BbcEffectStatus.Provisional,
+                    BbcEffectStatus.Confirmed(true),
+                ),
+                bStatus.snapshot(),
+            )
+            assertTrue("disposed A must receive no status at all", aStatus.isEmpty())
+            assertEquals(listOf("start:true", "end:true"), sink.snapshot())
+            assertEquals(1L, coordinator.latestSequence()) // B submitted nothing
+            assertTrue(aLog.isEmpty())
+            assertTrue(bLog.isEmpty()) // Confirmed is app-level, not per-intent
+            a.dispose()
+            b.dispose()
+        } finally {
+            appScope.cancel()
+            io.close()
+        }
+    }
 
     @Test
     fun rebuildDuringBlockingCommit_lastGlobalIntentWins() = runBlocking {
@@ -435,16 +550,21 @@ class BbcToggleConcurrencyTest {
                 scope = appScope, state = state, commit = { sink.commit(it) }, io = io,
             )
             val aLog = UiLog()
-            val a = uiController(coordinator, initial = false, log = aLog)
+            val aStatus = StatusLog()
+            val a = uiController(coordinator, initial = false, log = aLog, statusLog = aStatus)
+            assertEquals("replay is Provisional, not a confirmation",
+                listOf<BbcEffectStatus>(BbcEffectStatus.Provisional), aStatus.snapshot())
 
             a.onToggle(true) // seq 1: enters a genuinely blocking commit
             sink.awaitFirstStarted()
             assertEquals(listOf("start:true"), sink.snapshot())
 
             a.dispose() // UI-only; the in-flight commit is NOT cancelled
+            aStatus.clear() // nothing may arrive on the disposed collector
 
             val bLog = UiLog()
-            val b = uiController(coordinator, initial = true, log = bLog)
+            val bStatus = StatusLog()
+            val b = uiController(coordinator, initial = true, log = bLog, statusLog = bStatus)
             b.onToggle(false) // seq 2: same coordinator, new controller
             assertEquals("B must not commit while A's commit still holds the single writer",
                 listOf("start:true"), sink.snapshot())
@@ -461,11 +581,21 @@ class BbcToggleConcurrencyTest {
                 sink.snapshot()) // A's commit completed before B's even started
             assertEquals(2L, coordinator.latestSequence())
             assertEquals(false, state.confirmedOrUnknown)
-            // Confirmed commits fire NO UI callback (onRestored is dead and the
-            // Confirmed branch only writes lastGood), so the UiLog.isEmpty()
-            // pins below cannot see them. currentLastGood() is the real
-            // observation: it advances only for a LIVE controller whose own
-            // intent is still current (the alive + sequence guards).
+            // Confirmed commits fire NO PER-INTENT callback (onRestored is dead
+            // and the Confirmed branch only writes lastGood), so the UiLog pins
+            // below stay valid. They ARE visible on the app-level statusLog:
+            // B's collector sees A's Confirmed(true) then its own Confirmed(false).
+            // currentLastGood() remains the per-intent observation: it advances
+            // only for a LIVE controller whose own intent is still current.
+            assertEquals(
+                listOf<BbcEffectStatus>(
+                    BbcEffectStatus.Provisional,
+                    BbcEffectStatus.Confirmed(true),
+                    BbcEffectStatus.Confirmed(false),
+                ),
+                bStatus.snapshot(),
+            )
+            assertTrue("disposed A must receive no status after dispose", aStatus.isEmpty())
             assertEquals("B committed false while alive -> lastGood must follow",
                 false, b.currentLastGood())
             // A was disposed before its Confirmed(true) landed; its stale result
@@ -510,9 +640,10 @@ class BbcToggleConcurrencyTest {
             assertTrue(coordinator.isConsumerActive())
             // ...but the DISPOSED controller must NOT absorb the Confirmed(true)
             // result: c started at false and stayed disposed through the commit.
-            // currentLastGood() is the real observation (Confirmed fires no UI
-            // callback, so UiLog.isEmpty() below is only secondary): a LIVE
-            // controller would have advanced lastGood to the confirmed true,
+            // currentLastGood() is the real per-intent observation (Confirmed
+            // fires no per-intent callback; its app-level status delivery is
+            // covered by the sibling tests, so UiLog.isEmpty() is secondary):
+            // a LIVE controller would have advanced lastGood to true,
             // while the disposed one must stay at false. This pins the
             // alive/sequence-guard contract that protects UI state on dispose.
             assertFalse("disposed controller lastGood must stay at initial false",

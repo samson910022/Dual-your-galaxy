@@ -33,6 +33,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 
 internal class BbcInjectionToggleController(
@@ -48,6 +49,12 @@ internal class BbcInjectionToggleController(
     private val onFailed: (() -> Unit)? = null,
     /** D04: mark the CheckBox/row UNKNOWN; the effect cannot be verified here. */
     private val onUnknown: (() -> Unit)? = null,
+    /**
+     * E04: app-level effect status (StateFlow replay). Separate from the
+     * per-intent onUnknown/onFailed toast path: this only drives row styling.
+     * Defaults to null so existing call sites stay source-compatible.
+     */
+    private val onEffectStatus: ((BbcEffectStatus) -> Unit)? = null,
 ) {
     // lastGood = last value the store confirmed for a NON-stale intent (or the
     // initial read); a failed commit must never advance it. persistedValue is now
@@ -85,6 +92,21 @@ internal class BbcInjectionToggleController(
     private val parentJob: Job? = coordinator.scope.coroutineContext[Job]
     private val uiJob = SupervisorJob(parent = parentJob)
     private val uiScope = CoroutineScope(coordinator.scope.coroutineContext + uiJob + main)
+
+    init {
+        // E04: exactly ONE app-level collector per controller. StateFlow replays
+        // the latest applied mark on subscribe (so a rebuilt dialog learns the
+        // outcome of an earlier commit), then forwards every later mark — even
+        // one produced by a commit this controller never submitted. No "pending"
+        // value is ever emitted from submit()/onToggle(), so D05 ordering is
+        // untouched. dispose() cancels uiJob; the alive guard drops any racing
+        // emission so a dead View is never touched.
+        uiScope.launch {
+            coordinator.state.effectStatus.collect { status ->
+                if (alive) onEffectStatus?.invoke(status)
+            }
+        }
+    }
 
     /** Called from the CheckBox listener; order of calls is the user-intent order. */
     fun onToggle(checked: Boolean) {

@@ -2395,6 +2395,19 @@ class MainActivity : ComponentActivity() {
                 getString(R.string.settings_bbc_injection_summary)
             }
         }
+        // E04: the app-scoped StateFlow replays its last applied mark to this
+        // dialog and then delivers later marks, so a commit(false) -> Unknown
+        // styling is cleared by a subsequent Confirmed in the SAME open dialog,
+        // and a rebuilt dialog learns an in-flight commit's eventual outcome.
+        // Only the row presentation changes here: isChecked is never touched,
+        // so Unknown remains "not a rollback" (D04). Both summary strings carry
+        // the issue-#75 cold-start caveat.
+        fun renderEffect(status: BbcEffectStatus) {
+            val presentation = bbcEffectPresentationFor(status)
+            summary.text = getString(presentation.summaryRes)
+            toggle.alpha = if (presentation.dimmed) 0.6f else 1f
+            toggle.setTypeface(null, if (presentation.italic) Typeface.ITALIC else Typeface.NORMAL)
+        }
         // PR #74 R2 N05 + R3 D05：寫入序列化器現為 app 層級單例（跨對話框重建共用），
         // controller 只保留 UI 狀態。restoring 守衛仍必要：controller 的 onRestored
         // 會在 Main 設定 isChecked，不可再觸發一次 onToggle。
@@ -2405,10 +2418,10 @@ class MainActivity : ComponentActivity() {
 
         fun markEffectUnknown() {
             // Keep the CheckBox at the user's last intent — never silently flip
-            // it. Only the row presentation is downgraded to "unverified".
-            summary.text = getString(R.string.settings_bbc_injection_effect_unknown)
-            toggle.alpha = 0.6f
-            toggle.setTypeface(null, Typeface.ITALIC)
+            // it. Only the row presentation is downgraded to "unverified"; the
+            // app-level status flow renders the identical presentation, so this
+            // per-intent path is idempotent.
+            renderEffect(BbcEffectStatus.Unknown)
             if (!unknownToastShown && !isFinishing && !isDestroyed) {
                 unknownToastShown = true
                 Toast.makeText(
@@ -2429,6 +2442,7 @@ class MainActivity : ComponentActivity() {
             },
             onUnknown = { markEffectUnknown() },
             onFailed = { markEffectUnknown() }, // legacy failure Toast path, now the Unknown message
+            onEffectStatus = { renderEffect(it) },
         )
         toggle.setOnCheckedChangeListener { _, checked ->
             if (restoring) return@setOnCheckedChangeListener

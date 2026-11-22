@@ -7,6 +7,9 @@ package com.galaxydual.plus
 
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * App-process-local record of the BBC opt-out toggle's last write outcome.
@@ -54,6 +57,19 @@ internal class BbcToggleRuntimeState(
     private val state = AtomicReference(MarkedState(0L, initialConfirmed))
 
     /**
+     * E04: read-only, app-scoped projection of the last APPLIED mark for the UI.
+     * Seeded with [BbcEffectStatus.Provisional] so "Confirmed" still literally
+     * means a mark(Confirmed) happened. StateFlow replays the current value to a
+     * newly subscribed dialog, so a rebuilt dialog learns the outcome of an
+     * in-flight app-scoped commit; a live dialog sees every later mark.
+     *
+     * Emitted ONLY from [mark] (via [applyOutcome]), never from submit()/tap
+     * paths: D05's global serialization stays the single ordering authority.
+     */
+    private val _effectStatus = MutableStateFlow<BbcEffectStatus>(BbcEffectStatus.Provisional)
+    val effectStatus: StateFlow<BbcEffectStatus> = _effectStatus.asStateFlow()
+
+    /**
      * `null` means UNKNOWN. The getter reads the value from the latest state
      * successfully committed by [mark].
      */
@@ -77,17 +93,8 @@ internal class BbcToggleRuntimeState(
      * @return true iff this outcome was applied; the caller uses that to decide
      *   whether to deliver the result callback.
      */
-    fun mark(outcome: BbcWriteOutcome, sequence: Long): Boolean {
-        val value = when (outcome) {
-            is BbcWriteOutcome.Confirmed -> outcome.value
-            BbcWriteOutcome.Unknown -> null
-        }
-        while (true) {
-            val cur = state.get()
-            if (sequence <= cur.sequence) return false
-            if (state.compareAndSet(cur, MarkedState(sequence, value))) return true
-        }
-    }
+    fun mark(outcome: BbcWriteOutcome, sequence: Long): Boolean =
+        applyOutcome(outcome, sequence)
 
     /**
      * Compatibility overload for legacy callers with no intent sequence. It
@@ -97,14 +104,40 @@ internal class BbcToggleRuntimeState(
      *
      * @return always true.
      */
-    fun mark(outcome: BbcWriteOutcome): Boolean {
+    fun mark(outcome: BbcWriteOutcome): Boolean = applyOutcome(outcome, null)
+
+    /**
+     * Single CAS applier shared by both [mark] overloads: the sequence fence
+     * and value still move together in the existing atomic state, and only a
+     * CAS winner publishes the UI projection. A stale outcome returns false
+     * before publishing, so a late/duplicate failure can never grey out the UI
+     * and a late success can never falsely clear it.
+     *
+     * @param targetSequence non-null for the sequence-aware overload; `null`
+     *   for the legacy overload, which leaves the fence untouched.
+     */
+    @Synchronized // keep the CAS state and the UI projection in one critical section
+    private fun applyOutcome(outcome: BbcWriteOutcome, targetSequence: Long?): Boolean {
         val value = when (outcome) {
             is BbcWriteOutcome.Confirmed -> outcome.value
             BbcWriteOutcome.Unknown -> null
         }
+        val status = when (outcome) {
+            is BbcWriteOutcome.Confirmed -> BbcEffectStatus.Confirmed(outcome.value)
+            BbcWriteOutcome.Unknown -> BbcEffectStatus.Unknown
+        }
         while (true) {
             val cur = state.get()
-            if (state.compareAndSet(cur, MarkedState(cur.sequence, value))) return true
+            val next = if (targetSequence == null) {
+                MarkedState(cur.sequence, value)
+            } else {
+                if (targetSequence <= cur.sequence) return false
+                MarkedState(targetSequence, value)
+            }
+            if (state.compareAndSet(cur, next)) {
+                _effectStatus.value = status
+                return true
+            }
         }
     }
 }
