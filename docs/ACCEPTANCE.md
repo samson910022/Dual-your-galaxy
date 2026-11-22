@@ -141,6 +141,8 @@ BBC6 注意事項（unified build）：
 
 > **round-3 更新（2026-11-22，D01–D08）**：本輪僅完成程式碼／文件修正（D02–D07 為 JVM／控制流程可推導缺陷的修正；D01、D06 裝置面、D08 仍為裝置驗收項目）。**P0 合併門檻（D01＝N01）維持開啟、未關閉**；D02–D07 即使 JVM／CI 全綠，**也不代表任何裝置閘門通過**。D06 的 opt-out gate 讀取雖已有 dedicated bounded executor（JVM 證明 wall-time 上界），真實 Binder 延遲與 DAAgent UI 延遲仍 **UNMEASURED／NOT a pass**；D08 的 512-entry IPC 耗時（1/50/200/512 的 p50/p95/max）、Binder 次數、30 分鐘 sticky 到期與 fresh process fallback 仍 **UNMEASURED／NOT a pass**。三臂同基線對照（default BBC／confirmed-off runtime gate／Samsung baseline）仍是 N01 的必要證據，缺一不得宣稱安全或因果成立。凡涉及分身刪除或 user-95 資料清除的步驟，須在**已備份且明確授權、持有人同意**的裝置上親自執行；未經授權不得重跑破壞性實驗（issue #75）。runtime opt-out **不是**刪除防護。
 
+> **round-4 更新（2026-11-22，E00–E08）**：本輪僅完成 E01–E07 的程式碼／UI 契約修正（E01/E02 政策操作流程、E03 CancellationException 透傳、E04 toggle 的 Unknown→Confirmed UI 恢復、E05 探測失敗對話框生命週期 handle、E06 VM 生產寫入 seam 強制非 null consent、E07 Invalid→v1 需重啟的 UI 提示）；epoch/generation 修復不在本輪範圍。**E00（P0 冷啟動 DELETE）與 E08（512 條目 IPC／15ms 真實 Binder 延遲／sticky 30 分鐘／Scope A dialog）維持 UNMEASURED／NOT a pass，三臂同基線對照要求與備份＋授權前提完全不變**；不得因 E01–E07 的 JVM／UI 修正而宣稱任何裝置閘門通過。E07 的 UI 提示僅為誠實告知（修復可能尚未生效、需重新啟動 Hook 行程後驗證、不代表新政策已套用），不代表跨行程立即生效。**opt-out is NOT a deletion guard**（issue #75）；runtime opt-out 仍非刪除防護。
+
 **Scope A dialog（issue #73）**：PreClear warning dialog 從未在裝置上觸發或擷錄，維持 **UNMEASURED／NOT a pass／device verification pending（backup+consent）**。
 
 擷錄指引：
