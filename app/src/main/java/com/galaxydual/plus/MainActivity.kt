@@ -49,6 +49,7 @@ import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.os.Bundle
+import android.app.Activity
 import android.app.AlertDialog
 import android.os.Build
 import android.os.Handler
@@ -350,6 +351,17 @@ class MainActivity : ComponentActivity() {
     private lateinit var heroCategoryView: TextView
     private lateinit var heroTitleView: TextView
     private lateinit var heroSubtitleView: TextView
+
+    // PR #74 R7b-2 (M1)：持續可見的短風險提示＋詳細風險入口（唯讀瀏覽永不彈窗）。
+    private lateinit var riskNoticeView: TextView
+    private lateinit var riskDetailsEntryView: TextView
+    // 一次性風險 gate 的 app-private store（單一實例；R7b-1 共用 API）。
+    private val riskAckStore: RiskAckStore by lazy {
+        getSharedPreferences(RISK_ACK_PREFS_NAME, MODE_PRIVATE).riskAckStore()
+    }
+    // 風險對話框 handle：onDestroy best-effort dismiss，避免舊 Activity window 洩漏／BadToken。
+    private var riskDialog: AlertDialog? = null
+
     private lateinit var statusPillText: TextView
     private lateinit var statusPillDot: ImageView
     private lateinit var statusPillContainer: LinearLayout
@@ -663,6 +675,14 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         settingsDialog = null
+        // PR #74 R7b-2 (M1)：風險 gate／詳細說明對話框 handle best-effort 釋放
+        // （舊 Activity window 洩漏／BadToken 防護；與上面既有 dialog 同一語義）。
+        try {
+            riskDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        riskDialog = null
         // PR #74 R2 N05：終止 BBC 開關係統的單一 consumer，避免它在 Activity
         // 銷毀後仍回呼 onRestored/onFailed（舊 CheckBox / Toast 已無效）。
         bbcToggleController?.dispose()
@@ -733,6 +753,78 @@ class MainActivity : ComponentActivity() {
         background = getDrawable(R.drawable.divider_horizontal)
         layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
             setMargins(0, dp(topDp), 0, dp(bottomDp))
+        }
+    }
+
+    // ---- PR #74 R7b-2 (M1)：風險揭露 gate 與對話框 ----
+    // R7b-1 的共用 helper（showRiskDetailsDialog / showRiskAckGate）回傳 Unit，無法取得
+    // 對話框 handle。為在 onDestroy 釋放 handle 並讓 instrumentation 可觀測，於此以
+    // 完全相同的資源／語意建立對話框；決策仍走共用 shouldShowRiskGate + riskAckStore
+    // （單一來源、JVM 可測），取消（含返回鍵）恆為零寫入、零 ack。
+
+    private fun showRiskDetailsDialog(activity: Activity) {
+        if (activity.isFinishing || activity.isDestroyed) return
+        try {
+            val dlg = AlertDialog.Builder(activity)
+                .setTitle(R.string.risk_details_title)
+                .setMessage(R.string.risk_details_full)
+                .setPositiveButton(R.string.dialog_close, null)
+                .setCancelable(true)
+                .show()
+            riskDialog = dlg
+            dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
+        } catch (_: Exception) {
+            // fail-safe：不改變任何狀態。
+        }
+    }
+
+    private fun showRiskAckGate(activity: Activity, store: RiskAckStore, onContinue: () -> Unit) {
+        if (activity.isFinishing || activity.isDestroyed) return
+        try {
+            val dlg = AlertDialog.Builder(activity)
+                .setTitle(R.string.risk_details_title)
+                .setMessage(R.string.risk_details_full)
+                .setPositiveButton(R.string.risk_ack_positive) { _, _ ->
+                    store.markAcknowledged()
+                    onContinue()
+                }
+                .setNegativeButton(R.string.dialog_cancel, null)
+                .setCancelable(true)
+                .show()
+            riskDialog = dlg
+            dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
+        } catch (_: Exception) {
+            // fail-closed：show 失敗即不標記、不繼續。
+        }
+    }
+
+    // 點擊入口只做分流：shouldShowRiskGate(false)（未確認）才彈 gate，取消路徑零操作。
+    private fun onRiskDetailsClicked() {
+        showRiskDetailsDialog(this)
+    }
+
+    private fun onCloneClicked() {
+        val pkg = pkgInput.text.toString()
+        if (shouldShowRiskGate(riskAckStore.isAcknowledged())) {
+            showRiskAckGate(this, riskAckStore) { vm.clone(pkg) }
+        } else {
+            vm.clone(pkg)
+        }
+    }
+
+    private fun onBatchClicked() {
+        if (shouldShowRiskGate(riskAckStore.isAcknowledged())) {
+            showRiskAckGate(this, riskAckStore) { requestBatchConfirm() }
+        } else {
+            requestBatchConfirm()
+        }
+    }
+
+    private fun onWritePolicyEntryClicked() {
+        if (shouldShowRiskGate(riskAckStore.isAcknowledged())) {
+            showRiskAckGate(this, riskAckStore) { startWriteWarning() }
+        } else {
+            startWriteWarning()
         }
     }
 
@@ -811,7 +903,8 @@ class MainActivity : ComponentActivity() {
             setTextColor(getColorStateList(R.color.pill_button_text))
             typeface = Typeface.DEFAULT_BOLD
             minimumHeight = dp(48)
-            setOnClickListener { vm.clone(pkgInput.text.toString()) }
+            // PR #74 R7b-2 (M1)：首次手動建立前一次性風險 gate（取消即零寫入）。
+            setOnClickListener { onCloneClicked() }
         }
         removeBtn = Button(this).apply {
             id = R.id.remove_btn
@@ -1070,7 +1163,9 @@ class MainActivity : ComponentActivity() {
             // Phase C：寫入前先算 old-minus-candidate delta，對 installed user95 彈警告；
             // R03：proceed 攜「綁定＋警告前凍結候選」進 VM，寫入凍結集合而非
             // 從當下勾選重導；候選漂移／綁定失配皆作廢。
-            setOnClickListener { startWriteWarning() }
+            // PR #74 R7b-2 (M1)：首次 BBC 政策寫入前一次性風險 gate；
+            // 既有 probe 警告與政策確認對話框仍在 gate 之後原樣執行。
+            setOnClickListener { onWritePolicyEntryClicked() }
         }
         clearPolicyBtn = Button(this).apply {
             text = getString(R.string.action_clear_policy_draft)
@@ -1118,7 +1213,9 @@ class MainActivity : ComponentActivity() {
             minimumHeight = dp(48)
             contentDescription = resources.getQuantityString(R.plurals.batch_create_cd, 0, 0)
             // Stage1：點擊不直接 clone，先開「確認建立」對話框（見 requestBatchConfirm）。
-            setOnClickListener { requestBatchConfirm() }
+            // PR #74 R7b-2 (M1)：首次批次建立前一次性風險 gate；取消後既有
+            // 批次確認對話框仍照原流程執行（gate 為附加、不取代任何守衛）。
+            setOnClickListener { onBatchClicked() }
         }
         batchResultView = TextView(this).apply {
             textSize = 12f
@@ -1258,6 +1355,42 @@ class MainActivity : ComponentActivity() {
         statusBanner.addView(msgView)
         statusBanner.addView(writeBlockView)
         root.addView(statusBanner)
+
+        // PR #74 R7b-2 (M1)：持續可見的短風險提示＋詳細風險入口。
+        // 沿用 amber pill／warning text 既有樣式；ALWAYS visible，唯讀瀏覽不彈任何對話框。
+        val riskNoticeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = getDrawable(R.drawable.bg_pill_badge_amber)
+            val pad = dp(10)
+            setPadding(pad, dp(8), pad, dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                val h = dp(16)
+                setMargins(h, dp(2), h, dp(6))
+            }
+        }
+        riskNoticeView = TextView(this).apply {
+            tag = "risk_notice"
+            text = getString(R.string.risk_notice_short)
+            textSize = 11f
+            setTextColor(getColor(R.color.oneui_warning_text))
+        }
+        riskDetailsEntryView = TextView(this).apply {
+            tag = "risk_details_entry"
+            text = getString(R.string.risk_details_entry)
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_warning_text))
+            // ~48dp 觸控目標，便於再次開啟完整風險說明（不標記 acknowledgement）。
+            minimumHeight = dp(48)
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            setOnClickListener { onRiskDetailsClicked() }
+        }
+        riskNoticeRow.addView(riskNoticeView)
+        riskNoticeRow.addView(riskDetailsEntryView)
+        root.addView(riskNoticeRow)
 
         // Content Frame (Holds Tab 1 & Tab 2 ScrollViews)
         val contentFrame = FrameLayout(this).apply {

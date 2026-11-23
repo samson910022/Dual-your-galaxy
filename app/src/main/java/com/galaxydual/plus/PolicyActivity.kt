@@ -71,6 +71,11 @@ class PolicyActivity : ComponentActivity() {
     private lateinit var listContainer: LinearLayout
     private lateinit var countHintView: TextView
 
+    // PR #74 R7b-2 (M1)：與 MainActivity 共用同一個 app-private 一次性風險 ack store。
+    private val riskAckStore: RiskAckStore by lazy {
+        getSharedPreferences(RISK_ACK_PREFS_NAME, MODE_PRIVATE).riskAckStore()
+    }
+
     // Same acquisition pattern as MainActivity (internal DualViewModelFactory,
     // see MainActivity.kt): one VM per screen, fully identical wiring — same
     // dual_policy store, owner-user gates, policyText/plurals resolution.
@@ -422,6 +427,18 @@ class PolicyActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(8); bottomMargin = dp(10) }
+        })
+
+        // PR #74 R7b-2 (M1)：editor intro 已帶短風險；此處僅補一個可再次開啟完整風險的入口。
+        column.addView(TextView(this).apply {
+            tag = "risk_details_entry"
+            text = getString(R.string.risk_details_entry)
+            textSize = 12f
+            setTextColor(getColor(R.color.oneui_warning_text))
+            minimumHeight = dp(48)
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            setOnClickListener { showRiskDetailsDialog(this@PolicyActivity) }
         })
 
         counterView = TextView(this).apply {
@@ -863,24 +880,33 @@ class PolicyActivity : ComponentActivity() {
     }
 
     private fun onWritePolicyClicked() {
-        if (!phaseIsIdle || pendingClearConfirm) return
-        if (!policyDraftKnown) {
-            // Main-style Unknown guidance: 不寫入（fail-closed）；使用者先
-            // 在 MainActivity「重新整理草稿」後返回。
-            showInfo(getString(R.string.policy_unknown_refresh))
-            return
+        // PR #74 R7b-2 (M1)：首次政策寫入前一次性風險 gate（取消即零寫入、零 ack）。
+        // gate 為附加關卡，通過後原階段檢查／probe 警告／政策確認完整不變。
+        fun proceed() {
+            if (!phaseIsIdle || pendingClearConfirm) return
+            if (!policyDraftKnown) {
+                // Main-style Unknown guidance: 不寫入（fail-closed）；使用者先
+                // 在 MainActivity「重新整理草稿」後返回。
+                showInfo(getString(R.string.policy_unknown_refresh))
+                return
+            }
+            // Phase C A 案：編輯器禁清到底——空集連警告都不彈，導引去 Main 清除
+            // （改文案＋按鈕）；刪現有「警告＋恆拒」死路。
+            if (editorEmptyShouldGuide(ticks.isEmpty())) {
+                showEditorEmptyGuide()
+                return
+            }
+            // Phase C N→M：old-minus-candidate delta，對 installed user95 彈警告；
+            // R03：proceed 攜「綁定＋警告前凍結候選」，寫入時不再重讀 ticks。
+            val candidate = HashSet(ticks)
+            pendingWarningRestart = { startEditorWriteWarning(HashSet(ticks), fromUserTap = false) }
+            startEditorWriteWarning(candidate)
         }
-        // Phase C A 案：編輯器禁清到底——空集連警告都不彈，導引去 Main 清除
-        // （改文案＋按鈕）；刪現有「警告＋恆拒」死路。
-        if (editorEmptyShouldGuide(ticks.isEmpty())) {
-            showEditorEmptyGuide()
-            return
+        if (shouldShowRiskGate(riskAckStore.isAcknowledged())) {
+            showRiskAckGate(this, riskAckStore) { proceed() }
+        } else {
+            proceed()
         }
-        // Phase C N→M：old-minus-candidate delta，對 installed user95 彈警告；
-        // R03：proceed 攜「綁定＋警告前凍結候選」，寫入時不再重讀 ticks。
-        val candidate = HashSet(ticks)
-        pendingWarningRestart = { startEditorWriteWarning(HashSet(ticks), fromUserTap = false) }
-        startEditorWriteWarning(candidate)
     }
 
     private fun performWritePolicy(binding: PolicyWarningBinding?, candidate: Set<String>) {
