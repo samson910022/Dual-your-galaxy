@@ -206,7 +206,7 @@ BBC6 注意事項（unified build）：
 
 ### 2026-11-23 三臂冷啟動對照（已執行；F00 決策輸入仍 UNMEASURED）
 
-> **定位（先讀）**：本節記錄**已完成**的三臂冷啟動對照結果，是重要的裝置關聯證據，**不是**任何驗收通過。上一節「2026-11-23 實機唯讀觀察」為執行前的唯讀快照，其中「三臂未執行」僅對該次觀察有效，已由本節後續的實際執行取代。不得據此宣稱任何合併閘門通過、或 BBC 預設設定安全；依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是本 PR 合併門檻。**opt-out 不是刪除防護**（issue #75）。
+> **定位（先讀）**：本節記錄**已完成**的三臂冷啟動對照結果，是重要的裝置關聯證據，**不是**任何驗收通過。上一節「2026-11-23 實機唯讀觀察」為執行前的唯讀快照，其中「三臂未執行」僅對該次觀察有效，已由本節後續的實際執行取代。不得據此宣稱任何合併閘門通過、或 BBC 預設設定安全；依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是 PR #74 合併門檻。**opt-out 不是刪除防護**（issue #75）。
 >
 > 三臂皆在同一台已備份且明確授權的 S23 Ultra（SM-S9180）執行；**Arm B/C 使用本機 `:app:assembleDebug` 於 02:59 安裝的實驗當時 build（commit 未獨立確定；非 PR #74 final head `e102a5ef`，亦非本文件的裝置驗證）**（APK byte grep 見 `bbc_injection_enabled` 執行期開關）；**Arm A（02:44）在此安裝之前，使用的是裝置上較舊的 app build**（該舊 APK 無 gate 開關，見 `latest_build_verification.md`）——此差異如實揭露，起點為同一 user-95 installed-state，由 sole device executor 完成。全程未嘗試 Scope B／SSAID／ABX 修補、未查詢 user 150、未平行 adb、未修改 repo。**三臂使用不同 App build（Arm A 為較舊 build、Arm B/C 為當日 02:59 build）且每臂後以 `pm install-existing --user 95` 還原，只恢復套件存在、不恢復 user-95 原有資料；故三臂並非「相同先前使用者資料」的嚴格對照，僅為 installed-state 起點的負向控制關聯。**
 
@@ -218,7 +218,7 @@ BBC6 注意事項（unified build）：
 
 **誠實解讀**：
 - **強關聯證據（ASSOCIATION，非因果證明）**：Samsung system-uid 的 DELETE 在 BBC 注入 ON、執行期 gate 確認 OFF、以及完全沒有 BBC hook 三種條件下**皆發生**，且一律早於任何 BBC 回調。這支持「刪除決策位於 Samsung `system_server`、與本模組 BBC 注入無關」的推論（issue #75），並**確認執行期 opt-out 不是刪除防護**。此為 negative-control association，**不是**已完成的安全根因研究，亦不構成任何合併閘門通過。
-- **DELETE 前的決策輸入仍 UNMEASURED**：三臂完成本身**不證明** P0 風險已排除、**不證明** BBC 預設設定安全、也不證明根因已定論；adb 無法讀取 `system_server` 內的 pre-DELETE 決策輸入，關聯與時序不等於因果。依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是本 PR 合併門檻（不作任何通過或安全性的結論）。
+- **DELETE 前的決策輸入仍 UNMEASURED**：三臂完成本身**不證明** P0 風險已排除、**不證明** BBC 預設設定安全、也不證明根因已定論；adb 無法讀取 `system_server` 內的 pre-DELETE 決策輸入，關聯與時序不等於因果。依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是 PR #74 合併門檻（不作任何通過或安全性的結論）。
 - **F06／其餘未測項仍 UNMEASURED／NOT a pass**：DAAgent UI callback 中 512 次 package-manager 查詢的 p50/p95/max 與 Binder IPC 次數（含 cold process）、15ms opt-out gate 的真實 Binder 延遲、政策 TTL／30 分鐘 sticky 在活躍 user-95 clone 下的 failover、Samsung Scope A warning／ROOT dialog，全部 **UNMEASURED／NOT a pass**；Android CI #334 手動模擬器矩陣略過；PR 最終 run #45103347110 與 main merge 後 #45113206916 皆 SUCCESS（build／locale-instrumentation 通過，manual emulator matrix 仍 SKIPPED），JVM／CI 全綠不構成裝置通過。2026-11-23 破壞性 A/B/C 對照**不能替代**上述效能／UI／安全測試。
 
 > **M2 版本標記證據註記（round-7b）**：Scoped Review 審查基線 `3e86f9a2daca6f5d2b4c57ba4b2879f3b785cbbf`（PR 最終 head `e102a5ef`；Round 8 僅修正 androidTest；main merge commit `ecf42d7e`）之 BBC 主要效果標為 **EXPERIMENTAL／NOT DEVICE-VERIFIED ON THIS VERSION**。2026-11-17 pre-unification（已退役的 listener reader 模型）與 2026-11-18 unified-build 的正向證據皆早於 r1–r6 各輪，**不用於驗證目前 HEAD**；上列 A/B/C 是關於 Samsung 刪除的**負向控制關聯**，**不是** BBC 主要效果的正向驗證。本文不對一般有效性或資料安全作任何宣稱。
