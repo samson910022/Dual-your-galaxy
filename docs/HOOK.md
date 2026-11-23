@@ -355,7 +355,7 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 
 **round-6 誠實註記（G03／G04；更新而非取代 round-2+3+4+5）**：G03 下修 SSAID 因果 certainty——直接存取未發現，但間接路徑（Samsung provisioning／clone 生命週期／狀態相依）未確立亦未排除，SSAID 根因 UNKNOWN；此為文件誠實性修正，非新 hook 缺陷。**系統 DELETE 軸與 SSAID 崩潰軸維持分離（非同一因果路徑）。**G04：512-entry IPC／15ms gate 真實 Binder 延遲／TTL 與 30 分鐘 sticky failover（含活躍 user-95 clone）／Scope A warning／ROOT dialog 仍 **UNMEASURED／NOT a pass**；2026-11-23 三臂 A/B/C 僅為負向控制關聯，且各臂 App build 不同、`pm install-existing` 不還原 prior user data，不能替代效能／UI／安全驗收；Android CI #334 手動模擬器矩陣略過。**F00／F06 與 G00／G04 維持 UNMEASURED／NOT a pass，P0 合併閘門未關閉，opt-out is NOT a deletion guard**（issue #75）。不提出任何 SSAID／`settings_ssaid.xml`／ABX 修補。
 
-**round-7b 範圍收斂揭露（2026-11-23；依最新 Scoped Review，優先於上列 round-2～6 的合併閘門用語）**：目前 HEAD 之 BBC 主要效果為 **experimental／not device-verified on this version**；正向證據僅來自 2026-11-17（pre-unification，已退役的 listener reader 模型）與 2026-11-18 unified-build builds，早於 r1–r6 各輪，不用於驗證目前 HEAD。**Root/Shizuku 是操作路線；LSPosed BBC 是另一項實驗性能力，兩者不可混為一談。**Hook **可能早於首次 App UI 警告生效**（`BBC_AVAILABLE_APPS_INJECTION=true`、執行期偏好缺席視為啟用）；本 PR **不重新設計既有安裝的 Hook default/migration**，App checkbox／第一次對話框**不是**「Hook 在生效前取得同意」；真正的 pre-activation opt-in 與安全遷移另列 follow-up（不可未經確認就縮減舊政策）。依 round-7b 維護者決策，P0 已於誠實揭露後**接受為 experimental limitation**；**H01–H04 與 #75 為 follow-ups，非 blocker**。本文其餘 UNMEASURED／NOT a pass 用語維持為風險揭露與研究清單，非本 PR 合併門檻。
+**round-7b 範圍收斂揭露（2026-11-23；依最新 Scoped Review，優先於上列 round-2～6 的合併閘門用語）**：目前 HEAD 之 BBC 主要效果為 **experimental／not device-verified on this version**；正向證據僅來自 2026-11-17（pre-unification，已退役的 listener reader 模型）與 2026-11-18 unified-build builds，早於 r1–r6 各輪，不用於驗證目前 HEAD。**Root/Shizuku 是操作路線；LSPosed BBC 是另一項實驗性能力，兩者不可混為一談。**Hook **可能早於首次 App UI 警告生效**（`BBC_AVAILABLE_APPS_INJECTION=true`、執行期偏好缺席視為啟用）；PR #74 **不重新設計既有安裝的 Hook default/migration**，App checkbox／第一次對話框**不是**「Hook 在生效前取得同意」；真正的 pre-activation opt-in 與安全遷移另列 follow-up（不可未經確認就縮減舊政策）。依 round-7b 維護者決策，P0 已於誠實揭露後**接受為 experimental limitation**；**H01–H04 與 #75 為 follow-ups，非 blocker**。本文其餘 UNMEASURED／NOT a pass 用語維持為風險揭露與研究清單，非 PR #74 合併門檻。
 
 > **round-2+3 合併閘門（N01／D01、D06、D08、N09／D08；UNMEASURED／NOT a pass）**：本輪獨立審查未跑 Gradle 裝置測試；2026-11-23 曾在 Samsung 裝置做**唯讀**觀察（未執行任何破壞性臂／冷啟動），已文件化或 JVM／CI 全綠皆**不是**通過。必要裝置證據與同基線三臂對照見 `docs/ACCEPTANCE.md` §6「11-21／11-22 round-2+3 待實機驗收」小節：
 > - **N01／D01**：P0 冷啟動 DELETE 因果未證實；須先完成**同一 installed-state 基線三臂對照**（default BBC／confirmed-off runtime gate／Samsung baseline），缺一即不得宣稱安全或因果成立。runtime opt-out **不是刪除防護**（issue #75；DELETE 早於回調且回調非空）。
@@ -605,7 +605,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   non-scope processes get `detach()`.
 - **JVM tests prove pure decision/selection logic only** (not on-device class presence,
   signatures/return types, hook installation, callback interception, or that eligible overloads
-  are hit on Samsung DAAgent/LSPosed). The BBC effect seam is device-verified (2026-11-17, pre-unification evidence);
+  are hit on Samsung DAAgent/LSPosed). The BBC effect seam was device-verified on the 2026-11-17 (pre-unification) and 2026-11-18 builds only; it is experimental / not device-verified on the current HEAD;
   the Stage-1 gate stays sealed: a code-level gate (`PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`, default `false`) keeps
   `effective(...)` fail-closed (returns empty when closed) — this is a code gate, not device verification, and Stage 1 defaults remain unchanged;
   the fail-closed gate seam remains unit-tested.

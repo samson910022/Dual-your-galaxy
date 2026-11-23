@@ -8,9 +8,9 @@
 
 ## Round-7b 範圍收斂（2026-11-23；優先於本文 round-2～6 的合併閘門用語）
 
-> 依最新 Scoped Review，本文所有 N01/D01/E00/F00/G00、N08/D08、N09、D06、D07 及 Scope A 的 UNMEASURED／NOT a pass 列，全部是**風險揭露與後續研究清單**，**不是本 PR 的合併阻擋項**；唯一合併門檻為 **M1**（風險 UX）與 **M2**（主功能正確性），已於本 PR（r7b-1..3）實作。下文 round-2～6 的「P0 合併門檻維持開啟／未關閉」用語保留為歷史風險揭露記錄，由本節重新分類。
+> 依最新 Scoped Review，本文所有 N01/D01/E00/F00/G00、N08/D08、N09、D06、D07 及 Scope A 的 UNMEASURED／NOT a pass 列，全部是**風險揭露與後續研究清單**，**不是 PR #74 的合併阻擋項**；唯一合併門檻為 **M1**（風險 UX）與 **M2**（主功能正確性），已於 PR #74（r7b-1..3）實作。下文 round-2～6 的「P0 合併門檻維持開啟／未關閉」用語保留為歷史風險揭露記錄，由本節重新分類。
 >
-> P0（Samsung system-uid user95 DELETE）是**真實觀察，不是通過／不是已修復**：A/B/C 為負向控制關聯（各臂 App build 不同；`pm install-existing --user 95` 只還原套件存在、不還原 user-95 原有資料；根因未證實；原始私有 log 未由本 reviewer 獨立覆核）。依 round-7b 維護者決策，在 M1/M2 完成並誠實揭露後，**接受為 experimental limitation**——此為發布責任、風險資訊與操作保護的分離，**不是安全宣稱**。**H01–H04**（RepairHintStore durability／`commit(false)`、被拒絕重入的警告 generation、ack 的 SharedPreferences commit on UI、PM IPC／15ms gate／30min sticky／Samsung UI 矩陣）與 **#75**（DAAgent pre-DELETE 研究）為 **follow-ups，非 blocker**。本輪**零裝置工作、無破壞性重現**；CI #335 **SUCCESS**（build／locale-instrumentation 通過，manual emulator matrix **SKIPPED**）；JVM／CI 全綠不構成裝置通過。
+> P0（Samsung system-uid user95 DELETE）是**真實觀察，不是通過／不是已修復**：A/B/C 為負向控制關聯（各臂 App build 不同；`pm install-existing --user 95` 只還原套件存在、不還原 user-95 原有資料；根因未證實；原始私有 log 未由本 reviewer 獨立覆核）。依 round-7b 維護者決策，在 M1/M2 完成並誠實揭露後，**接受為 experimental limitation**——此為發布責任、風險資訊與操作保護的分離，**不是安全宣稱**。**H01–H04**（RepairHintStore durability／`commit(false)`、被拒絕重入的警告 generation、ack 的 SharedPreferences commit on UI、PM IPC／15ms gate／30min sticky／Samsung UI 矩陣）與 **#75**（DAAgent pre-DELETE 研究）為 **follow-ups，非 blocker**。PR #74 的 Round 7b/8 程式與 CI 驗證**未新增實機驗收**；另於 2026-11-23 依持有人授權在已備份裝置完成 A/B/C 破壞性對照（本節 §6，三臂皆清除 user-95 分身與資料，**不是安全通過**），原始私有 log 未由本次 review 獨立覆核；最終 run #45103347110（PR head）與 #45113206916（main merge 後）皆 **SUCCESS**（build／locale-instrumentation 通過，manual emulator matrix **SKIPPED**）；JVM／CI 全綠不構成裝置通過。
 
 ## 1. 版本錨定（每次驗收必填）
 
@@ -58,7 +58,7 @@
 
 ## 5. Harness 對照（免裝置可跑）
 
-Harness 共 27 個自動化測試（`app/src/androidTest`，8 個檔案 / 7 個 test class：20 個 JUnit4 `@Test` + 7 個 JUnit3 `test*` 方法；`HarnessFakes.kt` 僅提供 fake，不含測試）。
+Harness 共 60 個自動化測試（`app/src/androidTest`，16 個檔案 / 15 個 test class：52 個 JUnit4 `@Test` + 8 個 JUnit3 `test*` 方法；`HarnessFakes.kt` 僅提供 fake，不含測試）；與 CI locale-instrumentation 的 60 tests 一致。
 其中 `LocaleResourceSelectionTest`（locale-aware remove-confirm 標題/訊息）與 `RemoveConfirmationUiTest`（ack 詳情/busy/替換 + blocked-channel gating）為輔助 harness，未對應單一人工列。
 這些測試在每次 PR 的 `locale-instrumentation` job（API 29 emulator）自動執行，
 並於 `workflow_dispatch` 的 `instrumentation-manual` job（API 34 emulator）手動執行；
@@ -188,7 +188,7 @@ BBC6 注意事項（unified build）：
   - 持有人回憶（**UNKNOWN，文件無記錄**）：過去「系統自動移除／關閉 → 再次重 hook → 重開系統雙開開關 → 可正常啟動」的程序中，持有人記得有「重 hook」一步，但無法確認具體操作；該次觀察階段**確定沒有重開機**。repo 事故文件唯一有 device artifact 的恢復要素是 11-18 的 **reboot + toggle ON**；此回憶不作為已證事實，也不改變上述信心分級。
   - **2026-11-23 新增觀察（CONFIRMED，唯讀）**：持有人其後對裝置做**軟重開機**，出現「密碼正確仍無法進桌面」；logcat 顯示 `LockSettingsService.doVerifyCredential → SyntheticPasswordManager.unwrapSyntheticPasswordBlob` 因 `UnrecoverableKeyException`（Keystore code 4）失敗，`com.android.systemui` 連續 4 次 crash，底層 keymint 反覆報 `km_check_key_os_version_patchlevels failed / Failed to deserialize key`。持有人接著做**完整硬重開機**後，u0/u95 皆 `deviceLocked=0`、Launcher 在前景、最近 5000 行 log 無上述 keymint／SSAID／SystemUI crash —— **密碼驗證與桌面恢復（觀察，非根因證明、非永久修復）**。其後持有人明確授權一次**非破壞性**啟動 u95 分身並唯讀抓 log：02:25 啟動後分身進程存活（u95_a431 pid 18230，ELAPSED 00:43）、視窗聚焦於 `com.openai.chatgpt/.MainActivity`，最近 1500 行 log 中 `Ssaid settings not accessible` 計數 **0**（重開前為 4/4 啟動崩潰）——**本次唯讀覆查下 SSAID 崩潰未再現（CONFIRMED 觀察，非永久修復、非根因證明）**。亦**不排除** PR 的間接貢獻；此為單次唯讀覆查，非負向因果證明。持有人明確回報：**11/18 之後的每次成功啟動都是成功觀察**（該些成功案例多無 log 擷錄），故「成功」並非只有這一次；此回報與本次 log 覆查一致，但仍不等於根因或永久性。另 10 分鐘唯讀監控共 80 次取樣：02:24 仍短暫出現 `km_check_key_os_version_patchlevels failed / Failed to deserialize key`，而 02:25 分身啟動成功、02:28 取樣已無該錯誤 —— **keymint 失敗為間歇性，非重開後全部消失**（誠實揭露，不宣稱已根除）。上述再次支持「reboot 是唯一有 artifact 的恢復要素」（支持度提升，因果仍 UNKNOWN）。仍**未執行任何冷啟動 DELETE**，F00 三臂對照維持 UNMEASURED。證據：`/mnt/seagate500g/opencode_tmp/device_evidence/r5_reboot_recovery_record.md`、`r5_ssaid_after_hard_reboot_result.md`、`r5_reboot_monitor.log`（不入 repo）。
 
-- **與 PR #74 關係（直接路徑未發現；間接因果未確立亦未排除）**：就已查證的**直接存取面**：`.kt` 原始碼中 `Settings.Secure`／`SSAID`／`android_id`／`generateSsaid` **0 命中**；LSPosed scope 只含 `system;com.samsung.android.da.daagent`（明確排除 `com.android.settings`）；BBC 只對 daagent 唯讀清單做 union-only append；logcat `avc: denied` **0 命中**。以上僅足以排除直接呼叫／直接修改 SSAID 設定，**不足以排除** Samsung provisioning／clone 生命週期／狀態相依的間接貢獻；SSAID 根因仍 **UNKNOWN**，本 PR 的間接因果貢獻**未確立、亦未排除**，機制未證實。此為證據誠實性降級，非新發現的 hook 缺陷。
+- **與 PR #74 關係（直接路徑未發現；間接因果未確立亦未排除）**：就已查證的**直接存取面**：`.kt` 原始碼中 `Settings.Secure`／`SSAID`／`android_id`／`generateSsaid` **0 命中**；LSPosed scope 只含 `system;com.samsung.android.da.daagent`（明確排除 `com.android.settings`）；BBC 只對 daagent 唯讀清單做 union-only append；logcat `avc: denied` **0 命中**。以上僅足以排除直接呼叫／直接修改 SSAID 設定，**不足以排除** Samsung provisioning／clone 生命週期／狀態相依的間接貢獻；SSAID 根因仍 **UNKNOWN**，PR #74 的間接因果貢獻**未確立、亦未排除**，機制未證實。此為證據誠實性降級，非新發現的 hook 缺陷。
 
 - **信心分級表**：
 
@@ -206,9 +206,9 @@ BBC6 注意事項（unified build）：
 
 ### 2026-11-23 三臂冷啟動對照（已執行；F00 決策輸入仍 UNMEASURED）
 
-> **定位（先讀）**：本節記錄**已完成**的三臂冷啟動對照結果，是重要的裝置關聯證據，**不是**任何驗收通過。上一節「2026-11-23 實機唯讀觀察」為執行前的唯讀快照，其中「三臂未執行」僅對該次觀察有效，已由本節後續的實際執行取代。不得據此宣稱任何合併閘門通過、或 BBC 預設設定安全；依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是本 PR 合併門檻。**opt-out 不是刪除防護**（issue #75）。
+> **定位（先讀）**：本節記錄**已完成**的三臂冷啟動對照結果，是重要的裝置關聯證據，**不是**任何驗收通過。上一節「2026-11-23 實機唯讀觀察」為執行前的唯讀快照，其中「三臂未執行」僅對該次觀察有效，已由本節後續的實際執行取代。不得據此宣稱任何合併閘門通過、或 BBC 預設設定安全；依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是 PR #74 合併門檻。**opt-out 不是刪除防護**（issue #75）。
 >
-> 三臂皆在同一台已備份且明確授權的 S23 Ultra（SM-S9180）執行；**Arm B/C 使用本機 `:app:assembleDebug` 於 02:59 安裝的目前 HEAD build**（APK byte grep 見 `bbc_injection_enabled` 執行期開關）；**Arm A（02:44）在此安裝之前，使用的是裝置上較舊的 app build**（該舊 APK 無 gate 開關，見 `latest_build_verification.md`）——此差異如實揭露，起點為同一 user-95 installed-state，由 sole device executor 完成。全程未嘗試 Scope B／SSAID／ABX 修補、未查詢 user 150、未平行 adb、未修改 repo。**三臂使用不同 App build（Arm A 為較舊 build、Arm B/C 為目前 HEAD）且每臂後以 `pm install-existing --user 95` 還原，只恢復套件存在、不恢復 user-95 原有資料；故三臂並非「相同先前使用者資料」的嚴格對照，僅為 installed-state 起點的負向控制關聯。**
+> 三臂皆在同一台已備份且明確授權的 S23 Ultra（SM-S9180）執行；**Arm B/C 使用本機 `:app:assembleDebug` 於 02:59 安裝的實驗當時 build（commit 未獨立確定；非 PR #74 final head `e102a5ef`，亦非本文件的裝置驗證）**（APK byte grep 見 `bbc_injection_enabled` 執行期開關）；**Arm A（02:44）在此安裝之前，使用的是裝置上較舊的 app build**（該舊 APK 無 gate 開關，見 `latest_build_verification.md`）——此差異如實揭露，起點為同一 user-95 installed-state，由 sole device executor 完成。全程未嘗試 Scope B／SSAID／ABX 修補、未查詢 user 150、未平行 adb、未修改 repo。**三臂使用不同 App build（Arm A 為較舊 build、Arm B/C 為當日 02:59 build）且每臂後以 `pm install-existing --user 95` 還原，只恢復套件存在、不恢復 user-95 原有資料；故三臂並非「相同先前使用者資料」的嚴格對照，僅為 installed-state 起點的負向控制關聯。**
 
 | 臂 | 條件（gate／hook） | 系統 DELETE（`START DELETE PACKAGE`） | BBC 回調／時序 | 結果 |
 | --- | --- | --- | --- | --- |
@@ -218,10 +218,10 @@ BBC6 注意事項（unified build）：
 
 **誠實解讀**：
 - **強關聯證據（ASSOCIATION，非因果證明）**：Samsung system-uid 的 DELETE 在 BBC 注入 ON、執行期 gate 確認 OFF、以及完全沒有 BBC hook 三種條件下**皆發生**，且一律早於任何 BBC 回調。這支持「刪除決策位於 Samsung `system_server`、與本模組 BBC 注入無關」的推論（issue #75），並**確認執行期 opt-out 不是刪除防護**。此為 negative-control association，**不是**已完成的安全根因研究，亦不構成任何合併閘門通過。
-- **DELETE 前的決策輸入仍 UNMEASURED**：三臂完成本身**不證明** P0 風險已排除、**不證明** BBC 預設設定安全、也不證明根因已定論；adb 無法讀取 `system_server` 內的 pre-DELETE 決策輸入，關聯與時序不等於因果。依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是本 PR 合併門檻（不作任何通過或安全性的結論）。
-- **F06／其餘未測項仍 UNMEASURED／NOT a pass**：DAAgent UI callback 中 512 次 package-manager 查詢的 p50/p95/max 與 Binder IPC 次數（含 cold process）、15ms opt-out gate 的真實 Binder 延遲、政策 TTL／30 分鐘 sticky 在活躍 user-95 clone 下的 failover、Samsung Scope A warning／ROOT dialog，全部 **UNMEASURED／NOT a pass**；Android CI #334 手動模擬器矩陣略過；後續 #335 SUCCESS（build／locale-instrumentation 通過，manual emulator matrix 仍 SKIPPED），JVM／CI 全綠不構成裝置通過。2026-11-23 破壞性 A/B/C 對照**不能替代**上述效能／UI／安全測試。
+- **DELETE 前的決策輸入仍 UNMEASURED**：三臂完成本身**不證明** P0 風險已排除、**不證明** BBC 預設設定安全、也不證明根因已定論；adb 無法讀取 `system_server` 內的 pre-DELETE 決策輸入，關聯與時序不等於因果。依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是 PR #74 合併門檻（不作任何通過或安全性的結論）。
+- **F06／其餘未測項仍 UNMEASURED／NOT a pass**：DAAgent UI callback 中 512 次 package-manager 查詢的 p50/p95/max 與 Binder IPC 次數（含 cold process）、15ms opt-out gate 的真實 Binder 延遲、政策 TTL／30 分鐘 sticky 在活躍 user-95 clone 下的 failover、Samsung Scope A warning／ROOT dialog，全部 **UNMEASURED／NOT a pass**；Android CI #334 手動模擬器矩陣略過；PR 最終 run #45103347110 與 main merge 後 #45113206916 皆 SUCCESS（build／locale-instrumentation 通過，manual emulator matrix 仍 SKIPPED），JVM／CI 全綠不構成裝置通過。2026-11-23 破壞性 A/B/C 對照**不能替代**上述效能／UI／安全測試。
 
-> **M2 版本標記證據註記（round-7b）**：Scoped Review 審查基線 `3e86f9a2daca6f5d2b4c57ba4b2879f3b785cbbf`（本輪程式碼提交為 r7b-1..3，最後程式碼提交 `35cd495f`；目前 HEAD `096ef00f` 為純文件收斂）之 BBC 主要效果標為 **EXPERIMENTAL／NOT DEVICE-VERIFIED ON THIS VERSION**。2026-11-17 pre-unification（已退役的 listener reader 模型）與 2026-11-18 unified-build 的正向證據皆早於 r1–r6 各輪，**不用於驗證目前 HEAD**；上列 A/B/C 是關於 Samsung 刪除的**負向控制關聯**，**不是** BBC 主要效果的正向驗證。本文不對一般有效性或資料安全作任何宣稱。
+> **M2 版本標記證據註記（round-7b）**：Scoped Review 審查基線 `3e86f9a2daca6f5d2b4c57ba4b2879f3b785cbbf`（PR 最終 head `e102a5ef`；Round 8 僅修正 androidTest；main merge commit `ecf42d7e`）之 BBC 主要效果標為 **EXPERIMENTAL／NOT DEVICE-VERIFIED ON THIS VERSION**。2026-11-17 pre-unification（已退役的 listener reader 模型）與 2026-11-18 unified-build 的正向證據皆早於 r1–r6 各輪，**不用於驗證目前 HEAD**；上列 A/B/C 是關於 Samsung 刪除的**負向控制關聯**，**不是** BBC 主要效果的正向驗證。本文不對一般有效性或資料安全作任何宣稱。
 
 **還原與重開機**：每個破壞性臂後皆以 `pm install-existing --user 95` 還原 baseline；Arm C 後另以 narrow restore 只回補本模組 2 條 scope row（共 19 條，其他模組未動），lspd 重啟 ＋ 軟重開機後 hook 重新生效（新 pid 4219 `installed=1`），clone 健康（SSAID=0）、gate ON、root 保留。**全程未使用硬重開機**（無 `adb reboot`／power cycle）。Scope B／SSAID／ABX 修補從未嘗試。還原僅限套件存在；user-95 資料於各破壞性臂皆已清除且未還原，故不聲稱回到相同 prior-data 基線。
 
