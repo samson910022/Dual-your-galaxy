@@ -387,7 +387,7 @@
     <string name="engine_fallback_nobinder">Not connected</string>
     <!-- Phase C (a11y/i18n): localized settings dialog (dynamic version),
          resourced numbers/badges, bottom-nav selected state, Recents title. -->
-    <string name="app_name">Galaxy Dual Plus</string>
+    <string name="app_name">Dual your Galaxy</string>
     <string name="recents_title_format">%1$s (%2$s/%3$s)</string>
     <string name="settings_about_format">%1$s\nVersion %2$s (%3$s)\n\n• %4$s\n• %5$s\n\n%6$s</string>
     <string name="settings_about_feature">Zygote Hook &amp; Shizuku Gateway</string>

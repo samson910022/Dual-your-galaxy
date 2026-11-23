@@ -4,7 +4,7 @@
      (implicit-export is how accidental exports ship) ⇒ the gate must fail. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.samson910022.galaxydualplus.debug">
-    <application android:label="Galaxy Dual Plus">
+    <application android:label="Dual your Galaxy">
         <activity android:name="com.galaxydual.plus.MainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

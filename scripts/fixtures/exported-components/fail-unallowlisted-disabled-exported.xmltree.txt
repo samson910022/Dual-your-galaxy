@@ -11,7 +11,7 @@ N: android=http://schemas.android.com/apk/res/android (line=2)
   E: manifest (line=2)
     A: package="io.github.samson910022.galaxydualplus.debug" (Raw: "io.github.samson910022.galaxydualplus.debug")
       E: application (line=3)
-        A: http://schemas.android.com/apk/res/android:label(0x01010001)="Galaxy Dual Plus" (Raw: "Galaxy Dual Plus")
+        A: http://schemas.android.com/apk/res/android:label(0x01010001)="Dual your Galaxy" (Raw: "Dual your Galaxy")
           E: activity (line=4)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.galaxydual.plus.MainActivity" (Raw: "com.galaxydual.plus.MainActivity")
             A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true

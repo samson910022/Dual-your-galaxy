@@ -22,7 +22,7 @@ N: android=http://schemas.android.com/apk/res/android (line=4)
       E: uses-permission (line=32)
         A: http://schemas.android.com/apk/res/android:name(0x01010003)="moe.shizuku.manager.permission.API_V23" (Raw: "moe.shizuku.manager.permission.API_V23")
       E: application (line=38)
-        A: http://schemas.android.com/apk/res/android:label(0x01010001)="Galaxy Dual Plus" (Raw: "Galaxy Dual Plus")
+        A: http://schemas.android.com/apk/res/android:label(0x01010001)="Dual your Galaxy" (Raw: "Dual your Galaxy")
         A: http://schemas.android.com/apk/res/android:icon(0x01010002)=@0x7f080000
         A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.galaxydual.plus.GalaxyApp" (Raw: "com.galaxydual.plus.GalaxyApp")
         A: http://schemas.android.com/apk/res/android:debuggable(0x0101000f)=true
@@ -60,7 +60,7 @@ N: android=http://schemas.android.com/apk/res/android (line=4)
             A: http://schemas.android.com/apk/res/android:value(0x01010024)=102
           E: meta-data (line=95)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)="xposeddescription" (Raw: "xposeddescription")
-            A: http://schemas.android.com/apk/res/android:value(0x01010024)="Galaxy Dual Plus hook: Samsung Dual whitelist extension (MIT, no Knox access)" (Raw: "Galaxy Dual Plus hook: Samsung Dual whitelist extension (MIT, no Knox access)")
+            A: http://schemas.android.com/apk/res/android:value(0x01010024)="Dual your Galaxy hook: Samsung Dual whitelist extension (MIT, no Knox access)" (Raw: "Dual your Galaxy hook: Samsung Dual whitelist extension (MIT, no Knox access)")
           E: meta-data (line=98)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)="xposedscope" (Raw: "xposedscope")
             A: http://schemas.android.com/apk/res/android:value(0x01010024)="system;com.samsung.android.da.daagent" (Raw: "system;com.samsung.android.da.daagent")

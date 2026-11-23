@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="io.github.samson910022.galaxydualplus.debug">
-    <application android:label="Galaxy Dual Plus">
+    <application android:label="Dual your Galaxy">
         <activity android:name="com.galaxydual.plus.MainActivity" android:exported="true" />
         <provider
             tools:name="com.galaxydual.plus.GuardXposedProvider"

@@ -391,7 +391,7 @@
     <string name="engine_fallback_nobinder">未連線</string>
     <!-- Phase C (a11y/i18n)：設定對話框資源化（版本動態）、數字/角標資源化、
          底部導覽選中狀態、Recents 標題。英文見 values-en/（鍵集一致）。 -->
-    <string name="app_name">Galaxy Dual Plus</string>
+    <string name="app_name">Dual your Galaxy</string>
     <string name="recents_title_format">%1$s (%2$s/%3$s)</string>
     <string name="settings_about_format">%1$s\n版本 %2$s（%3$s）\n\n• %4$s\n• %5$s\n\n%6$s</string>
     <string name="settings_about_feature">Zygote Hook 與 Shizuku 閘道</string>

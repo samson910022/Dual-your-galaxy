@@ -127,8 +127,8 @@ android {
         applicationId = "io.github.samson910022.galaxydualplus"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 3
-        versionName = "0.1.0-beta.2"
+        versionCode = 4
+        versionName = "0.1.0-beta.3"
         // Phase P29 (issue #29): instrumentation harness runner.
         // connectedCheck needs a device/emulator (CI has none, so PR CI only
         // compiles androidTest via :app:assembleDebugAndroidTest); the runner

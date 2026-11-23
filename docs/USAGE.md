@@ -76,7 +76,7 @@ Clone／Remove／重新連線並更新／請求 Shizuku 授權按鈕＋四通道
 4. 安裝並開啟 **Shizuku**（GitHub 版），點選「經由無線調試啟動」→「配對」。
    - Shizuku 會顯示 6 位數配對碼；在系統跳出的「無線調試配對」對話框輸入配對碼。
    - 配對成功後回到 Shizuku 點「啟動」，看到版本號即表示 binder 已就緒。
-5. 在 Shizuku 的「授權應用」中找到 **Galaxy Dual Plus** 並允許。
+5. 在 Shizuku 的「授權應用」中找到 **Dual your Galaxy** 並允許。
 6. 回到本 App 點 `重新連線並更新`；F4a 接線後，已授權 binder 下 Factory 選 `ShizukuCmdGateway` 且 `ShizukuElevator` 探測通過時，標題列預期從 `(NONE/NOOP)` 變為 `(SHELL/SHIZUKU)`（標題列顯示實際執行身份＋已解析通道 `execIdentity/resolvedGateway`；選不到／探測未過則維持唯讀 fail-closed；此切換 [待實機驗證] DEVICE-UNVERIFIED，不可視為已可用）。
 
 > 每次重開機後需重複步驟 4（Shizuku 需重新啟動）；配對碼只需配對過一次，
@@ -179,7 +179,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 
 ## 4. 通道選擇與 LSPosed 模式（F4b-P1 picker＋P2 marker；ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
 
-- 已 ROOT + LSPosed 的裝置：到 LSPosed 管理器勾選 **Galaxy Dual Plus**，
+- 已 ROOT + LSPosed 的裝置：到 LSPosed 管理器勾選 **Dual your Galaxy**，
   作用域勾 `system`＋`com.samsung.android.da.daagent`（見 `docs/HOOK.md` §1.5／§2.2）後重啟；再到 App 內按 LSPosed 按鈕切到 LSPosed 模式：Hook 行顯示 marker 狀態（per-scope marker；`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，P1 四態見本節末段；file marker 存在性證據，僅顯示、永不授權；daagent 側因 SELinux 寫入失敗故 marker 恆缺 daagent，見 `docs/HOOK.md` §1.5）；LSPosed 通道為 NoOp 佔位、寫入一律拒絕（BBC 注入（非寫入通道）已於 2026-11-17 雙裝置實機驗證：Samsung 設定頁可見第三方 app 並可雙開，見 [docs/HOOK.md](docs/HOOK.md) §1.3a／§2.3；寫入通道仍為 NoOp 佔位，一律拒絕）。marker gateway-`cat` 顯示 [待實機驗證]，無實機證據。
 - AUTO 模式按 su→Shizuku→NoOp 解析執行通道（hook 永不被自動選中）；`channelReadyFor` 純函數 [已支援]（ROOT 需 su 探測、hook 訊號永不授權、NONE 永不就緒）；Auto probe 降級已實作（P25：首次探測即依 live probes 修正啟動猜測——su 存在但探測拒絕＋Shizuku 通過→SHIZUKU＋降級說明，雙通道皆失敗→NOOP 唯讀，暫態失敗後點 `重新連線並更新` 即重探恢復）；實機切換 [待實機驗證] DEVICE-UNVERIFIED。
 - LSPosed 模組 hook 雙開白名單**查詢**（Stage-1 封緘 `NON_EMPTY_POLICY_EFFECTIVE_GATE=false`，預設 observe-only、零行為變更）與 BBC 清單生成（效應閘 `BBC_AVAILABLE_APPS_INJECTION=true`，union-only 只增不減；BBC 路徑已於 2026-11-17 雙裝置實機驗證、unified build 已於 2026-11-18 重驗；見 `docs/HOOK.md` 第 1.1／1.3a 節），
@@ -285,7 +285,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 
 - Privilege routing (tested pure function + wired channels [DEVICE-UNVERIFIED]): manual `ChannelPreference` picker (AUTO default, `selectChannel` swaps gateway + re-probes; `channelReadyFor` pure gate, tested: ROOT needs su probe, hook signal never grants, NONE never ready), su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
   fallback, else read-only (NONE) with `NoOp` fail-closed. LSPosed mode is an explicit NoOp placeholder (writes refused); hook state comes from the F4b-P2 per-scope file marker (display-only, `HookStateProvider` direct + gateway-`cat` reads); marker gateway-`cat` display, Shizuku unauthorized/dead-guidance paths, first-time SHIZUKU selection are unverified (`pm path` is auxiliary only, never ground truth, see #22); BBC callback logs and non-empty policy are device-verified on 2026-11-17/18 builds; experimental / not device-verified on the current HEAD (S23 Ultra + Tab S7, 2026-11-17, **pre-unification build** — see `docs/ACCEPTANCE.md` §6; unified build re-verified 2026-11-18, BBC1–BBC3 re-verified; BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroyed the dual app (see BBC6_SSAID_INCIDENT.md)); in-app ROOT one-click, authorized-SHIZUKU one-click (installed-verify), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24.
-- Pair Shizuku via Wireless debugging (Android 11+, unverified flow), approve Galaxy Dual Plus, then Reconnect-and-refresh (single entry `reconnectAndRefresh()`: probe with Auto degrade + refresh; title syncs to `(SHELL/SHIZUKU)` only when the Shizuku probe passes, otherwise stays read-only NONE — switching itself is DEVICE-UNVERIFIED).
+- Pair Shizuku via Wireless debugging (Android 11+, unverified flow), approve Dual your Galaxy, then Reconnect-and-refresh (single entry `reconnectAndRefresh()`: probe with Auto degrade + refresh; title syncs to `(SHELL/SHIZUKU)` only when the Shizuku probe passes, otherwise stays read-only NONE — switching itself is DEVICE-UNVERIFIED).
 - Error-first (`combineWithDegradeNote`): refresh results + Auto degrade note with error priority — `CHANNEL`/`FAILED`/`NO_DUAL`/`VERIFY`/`INVALID` keep their kind (never downgraded to `INFO`) with the degrade reason appended (`;` join, recovery entry included); probe-pass ≠ PM-readable (`anyProbePassed` is **NOT** proof of PM readability; true readability = `pmReadable == true` + `writeReady`, fail-closed `CHANNEL` refusal when PM unreadable).
 - Clone with `pm install-existing --user <dualId> <pkg>`; verify with `pm list packages --user` ground truth (not `pm path` alone);
   remove with `pm uninstall --user`. Never touches Secure Folder (Knox).

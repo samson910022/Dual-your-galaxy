@@ -7,7 +7,7 @@
      gate must NOT need the enabled state to keep shipping surface honest. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.samson910022.galaxydualplus">
-    <application android:label="Galaxy Dual Plus">
+    <application android:label="Dual your Galaxy">
         <activity android:name="com.galaxydual.plus.MainActivity"
             android:enabled="false"
             android:exported="true">
