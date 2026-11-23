@@ -78,21 +78,24 @@ class BbcEffectStatusTest {
     }
 
     @Test
-    fun bbcEffectPresentation_confirmedRestoresCaveatBearingSummary() {
+    fun bbcEffectPresentation_unconfirmedRendersUnverifiedConfirmedKeepsCaveat() {
         val unknown = bbcEffectPresentationFor(BbcEffectStatus.Unknown)
         assertEquals(R.string.settings_bbc_injection_effect_unknown, unknown.summaryRes)
         assertTrue(unknown.dimmed)
         assertTrue(unknown.italic)
 
+        // A fresh/unconfirmed process is UNVERIFIED, never a confirmation: the
+        // Provisional seed renders identically to Unknown (dimmed + italic).
+        val provisional = bbcEffectPresentationFor(BbcEffectStatus.Provisional)
+        assertEquals(R.string.settings_bbc_injection_effect_unknown, provisional.summaryRes)
+        assertTrue(provisional.dimmed)
+        assertTrue(provisional.italic)
+
+        // Confirmed keeps its caveat-bearing summary (a persisted preference
+        // acknowledgement only, NOT an effect-success claim).
         val confirmed = bbcEffectPresentationFor(BbcEffectStatus.Confirmed(false))
         assertEquals(R.string.settings_bbc_injection_summary, confirmed.summaryRes)
         assertFalse(confirmed.dimmed)
         assertFalse(confirmed.italic)
-
-        // The seed renders normally but is still not a write confirmation.
-        val provisional = bbcEffectPresentationFor(BbcEffectStatus.Provisional)
-        assertEquals(R.string.settings_bbc_injection_summary, provisional.summaryRes)
-        assertFalse(provisional.dimmed)
-        assertFalse(provisional.italic)
     }
 }

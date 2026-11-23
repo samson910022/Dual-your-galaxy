@@ -402,6 +402,8 @@
     <string name="settings_bbc_injection_write_failed">BBC 注入偏好寫入失敗，請稍後重試。</string>
     <!-- PR #74 R3 D04: honest UNKNOWN state after a failed commit (no placeholders). -->
     <string name="settings_bbc_injection_effect_unknown">生效狀態未知——請重啟 Hook 行程（或開機）後再核對；此開關不是 Samsung 冷啟動刪除防護。</string>
+    <!-- PR #74 R7b-3: version-tagged experimental / not-device-verified label for the BBC main effect. -->
+    <string name="settings_bbc_injection_experimental_notice">實驗性：BBC 主要效果尚未於此版本（%1$s）實機確認；不保證普遍生效，也不保證資料安全。</string>
     <string name="settings_version_unknown">未知</string>
     <string name="badge_number_format">%1$d</string>
     <!-- Phase G (i18n): bullet/count prefixes as format resources (were

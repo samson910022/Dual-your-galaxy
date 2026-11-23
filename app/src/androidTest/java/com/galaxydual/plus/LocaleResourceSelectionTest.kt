@@ -67,4 +67,39 @@ class LocaleResourceSelectionTest : InstrumentationTestCase() {
         val full = buildRemoveLabelsMessage(resources.getString(R.string.remove_confirm_labels), label, label)
         assertTrue(full.contains("😀tail\\u{000A}\\u{202E}\u2069"))
     }
+
+    fun testExperimentalNoticeKeepsVersionPlaceholderInAllLocales() {
+        // PR #74 R7b-3: the version-tagged experimental/BBC-not-verified label
+        // must resolve non-empty and keep its %1$s placeholder in the default
+        // (values), English (values-en) and Traditional Chinese (values-b+zh+Hant)
+        // resources. "fr" has no matching locale dir, so it falls back to values/.
+        for (tags in arrayOf(
+            arrayOf("fr"),
+            arrayOf("en"),
+            arrayOf("zh-Hant"),
+        )) {
+            val context = instrumentation.targetContext
+            val config = Configuration(context.resources.configuration).apply {
+                setLocales(LocaleList(*tags.map(Locale::forLanguageTag).toTypedArray()))
+            }
+            val resources = context.createConfigurationContext(config).resources
+            val notice = resources.getString(R.string.settings_bbc_injection_experimental_notice)
+            assertTrue("${tags.joinToString()} notice must be non-empty", notice.isNotEmpty())
+            assertTrue("${tags.joinToString()} notice must keep %1\$s", notice.contains("%1\$s"))
+            // Honesty guard: a softened/verified claim with the placeholder intact must fail.
+            when (tags[0]) {
+                "en" -> {
+                    assertTrue(notice.contains("Experimental"))
+                    assertTrue(notice.contains("not device-verified"))
+                    assertTrue(notice.contains("No general effectiveness or data-safety guarantee"))
+                }
+                // "fr" resolves the default values/ (zh-Hant text); both share these tokens.
+                "fr", "zh-Hant" -> {
+                    assertTrue(notice.contains("實驗性"))
+                    assertTrue(notice.contains("實機確認"))
+                    assertTrue(notice.contains("不保證"))
+                }
+            }
+        }
+    }
 }

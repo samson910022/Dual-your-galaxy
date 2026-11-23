@@ -398,6 +398,8 @@
     <string name="settings_bbc_injection_write_failed">Failed to save the BBC injection preference. Please retry.</string>
     <!-- PR #74 R3 D04: honest UNKNOWN state after a failed commit (no placeholders). -->
     <string name="settings_bbc_injection_effect_unknown">Effect unknown — restart the hook process (or reboot) and verify. This switch is NOT a Samsung cold-start deletion guard.</string>
+    <!-- PR #74 R7b-3: version-tagged experimental / not-device-verified label for the BBC main effect. -->
+    <string name="settings_bbc_injection_experimental_notice">Experimental: the BBC main effect is not device-verified on this version (%1$s). No general effectiveness or data-safety guarantee.</string>
     <string name="settings_version_unknown">unknown</string>
     <string name="badge_number_format">%1$d</string>
     <!-- Phase G (i18n): bullet/count prefixes as format resources (were

@@ -2625,6 +2625,17 @@ class MainActivity : ComponentActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ))
+            // PR #74 R7b-3: static, version-tagged honesty label. The BBC main
+            // effect is experimental and has not been device-verified on this
+            // version; no general effectiveness or data-safety guarantee.
+            addView(TextView(this).apply {
+                text = getString(R.string.settings_bbc_injection_experimental_notice, appVersionName())
+                textSize = 11f
+                setTextColor(getColor(R.color.oneui_text_tertiary))
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(6) })
         }
     }
 
