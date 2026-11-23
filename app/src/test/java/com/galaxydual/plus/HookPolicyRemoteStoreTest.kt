@@ -57,11 +57,32 @@ class HookPolicyRemoteStoreTest {
             private set
         var getStringSetCalls = 0
             private set
+        // NEW-2: record the version committed by each successful commit so a
+        // concurrency test can assert distinct + monotonically increasing bump.
+        val committedVersions = java.util.Collections.synchronizedList(mutableListOf<Long>())
         // 測試開關:模擬 commit 失敗 / commit 拋出 / 型別錯亂 (見各專用測試)。
         var commitSucceeds = true
         var commitThrows = false
         var corruptType = false
         var cancelOnAll = false
+        // Phase A P0:模擬不支援 putLong 的 MinimalPrefs（舊 stub）：putLong 擲出，
+        // 驗證 save fail-closed（不 commit、不留部分狀態；N04/N07）。
+        var putLongThrows = false
+        // N04/N07: version-key probe failure fixtures. Each is version-key
+        // specific so other store reads (poison bookkeeping, backup, ...) are
+        // unaffected. versionContainsFailure -> Unavailable; versionGetLongFailure
+        // -> Unavailable; versionTypeCorrupt -> ClassCastException -> Invalid.
+        var versionContainsThrows = false
+        var versionGetLongThrows = false
+        // E03: CE-throwing counterparts to the two flags above. A
+        // CancellationException from the version probe must propagate through
+        // save()/clear() rather than being folded into Unavailable -> false.
+        var versionContainsThrowsCe = false
+        var versionGetLongThrowsCe = false
+        var versionTypeCorrupt = false
+        // PR #74 G1: simulate a transient boolean read failure (binder/prefs
+        // unavailable) to pin the default-true behavior on read errors.
+        var booleanReadThrows = false
         // A3-1: 備份 commit 成功後，getAll 回報的 BACKUP_KEY 與實際寫入不一致
         // （模擬讀回被外部污染/後備讀不一致）→ backup 讀回驗證必須失敗。
         var mismatchBackupOnRead = false
@@ -89,11 +110,26 @@ class HookPolicyRemoteStoreTest {
             return stored ?: defValues
         }
         override fun getInt(key: String?, defValue: Int): Int = (data[key] as? Int) ?: defValue
-        override fun getLong(key: String?, defValue: Long): Long = (data[key] as? Long) ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long {
+            if (key == PolicySource.POLICY_KEY_EXTRA_VERSION) {
+                if (versionTypeCorrupt) throw ClassCastException("version key wrong type")
+                if (versionGetLongThrowsCe) throw kotlinx.coroutines.CancellationException("version getLong cancelled")
+                if (versionGetLongThrows) throw RuntimeException("version getLong failed")
+            }
+            return (data[key] as? Long) ?: defValue
+        }
         override fun getFloat(key: String?, defValue: Float): Float = (data[key] as? Float) ?: defValue
-        override fun getBoolean(key: String?, defValue: Boolean): Boolean =
-            (data[key] as? Boolean) ?: defValue
-        override fun contains(key: String?): Boolean = data.containsKey(key)
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean {
+            if (booleanReadThrows) throw RuntimeException("boolean read failed")
+            return (data[key] as? Boolean) ?: defValue
+        }
+        override fun contains(key: String?): Boolean {
+            if (key == PolicySource.POLICY_KEY_EXTRA_VERSION) {
+                if (versionContainsThrowsCe) throw kotlinx.coroutines.CancellationException("version contains cancelled")
+                if (versionContainsThrows) throw RuntimeException("version contains failed")
+            }
+            return data.containsKey(key)
+        }
         override fun edit(): SharedPreferences.Editor = RecordingEditor()
         override fun registerOnSharedPreferenceChangeListener(
             listener: SharedPreferences.OnSharedPreferenceChangeListener?,
@@ -130,6 +166,7 @@ class HookPolicyRemoteStoreTest {
             }
 
             override fun putLong(key: String?, value: Long): SharedPreferences.Editor {
+                if (putLongThrows) throw UnsupportedOperationException("MinimalPrefs: no putLong")
                 pending[key!!] = value
                 removed.remove(key)
                 return this
@@ -168,6 +205,7 @@ class HookPolicyRemoteStoreTest {
             override fun commit(): Boolean {
                 flush()
                 commitCalls++
+                (data[PolicySource.POLICY_KEY_EXTRA_VERSION] as? Long)?.let { committedVersions.add(it) }
                 if (commitThrows) throw RuntimeException("commit binder dead")
                 return commitSucceeds
             }
@@ -698,14 +736,18 @@ class HookPolicyRemoteStoreTest {
             override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
                 private var pending: MutableSet<String>? = null
                 private var removed = false
+                private var pendingVersion: Long? = null
                 override fun putString(key: String?, value: String?): SharedPreferences.Editor =
                     throw UnsupportedOperationException()
                 override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor =
                     apply { pending = values?.toMutableSet(); removed = false }
                 override fun putInt(key: String?, value: Int): SharedPreferences.Editor =
                     throw UnsupportedOperationException()
+                // N04/N07: writer requires putLong to succeed (fail-closed on
+                // failure); stage the version so this test still reaches commit
+                // and exercises CancellationException propagation there.
                 override fun putLong(key: String?, value: Long): SharedPreferences.Editor =
-                    throw UnsupportedOperationException()
+                    apply { pendingVersion = value }
                 override fun putFloat(key: String?, value: Float): SharedPreferences.Editor =
                     throw UnsupportedOperationException()
                 override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor =
@@ -719,6 +761,9 @@ class HookPolicyRemoteStoreTest {
                     if (removed) data.remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
                     if (pending != null) {
                         data[PolicySource.POLICY_KEY_EXTRA_PACKAGES] = pending!!
+                    }
+                    if (pendingVersion != null) {
+                        data[PolicySource.POLICY_KEY_EXTRA_VERSION] = pendingVersion!!
                     }
                     return true
                 }
@@ -1741,5 +1786,695 @@ class HookPolicyRemoteStoreTest {
             testIdentityCheckHook = null
             resetRemotePoisonForTests()
         }
+    }
+
+    // Phase A P0 policy_version 原子寫入：save->ver1、save->ver2、clear->包缺席
+    // +ver3，且包集合與版本同一 commit 落盤（commitCalls 每次 +1、apply 0）。
+    @Test
+    fun versionAtomic_saveSaveClear_monotonicSameCommit() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.save(setOf("com.example.a")))
+            assertEquals(1, prefs.commitCalls)
+            assertEquals(0, prefs.applyCalls)
+            assertEquals(setOf("com.example.a"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+            assertEquals(1L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+
+            assertTrue(store.save(setOf("com.example.b")))
+            assertEquals(2, prefs.commitCalls)
+            assertEquals(0, prefs.applyCalls)
+            assertEquals(setOf("com.example.b"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+            assertEquals(2L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+
+            assertTrue(store.clear())
+            assertEquals(3, prefs.commitCalls)
+            assertEquals(0, prefs.applyCalls)
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+            assertEquals(3L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07 MinimalPrefs 相容（改為 fail-closed）：Editor.putLong 擲出時
+    // 整筆寫入中止、不 commit、不留部分狀態（包集合/版本皆不變）。
+    @Test
+    fun versionPutLongThrows_failsWriteWithoutCommitBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            prefs.putLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            // 非空包：putLong 失敗 → save=false，commit=0，鍵皆不存在。
+            assertFalse(store.save(setOf("com.example.a")))
+            assertEquals(0, prefs.commitCalls)
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION))
+            // 空包：同樣 fail-closed，不落盤空集合、不寫版本。
+            assertFalse(store.save(emptySet()))
+            assertEquals(0, prefs.commitCalls)
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+            assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: version probe 的 contains 失敗 (Unavailable) → 整筆 save 中止，
+    // 舊 v50 + 包集合保持 byte-identical，commit 次數不變。
+    @Test
+    fun versionContainsFailureAbortsWriteKeepsPersistedV50Bbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+            prefs.versionContainsThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            assertEquals(commitsBefore, prefs.commitCalls)
+            // contains 開關只擋 version 鍵，getLong 仍可讀回見證值。
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: version probe 的 getLong 失敗 (非 CCE → Unavailable) → 整筆 save 中止。
+    @Test
+    fun versionGetLongFailureAbortsWriteKeepsPersistedV50Bbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+            prefs.versionGetLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            assertEquals(commitsBefore, prefs.commitCalls)
+            prefs.versionGetLongThrows = false
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: version probe 讀失敗時 clear 亦須中止，不誤刪既有草稿。
+    @Test
+    fun versionReadFailureAbortsClearKeepsPersistedV50Bbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+            prefs.versionContainsThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.clear())
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: CCE-corrupt 版本鍵仍視為 Invalid → curVer=0 → 修復寫入 v1
+    // （保留舊版 CCE-corrupt 修復語意，不因 fail-closed 而遺失）。
+    @Test
+    fun versionTypeCorruptStillMigratesToV1Bbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            prefs.versionTypeCorrupt = true // getLong(version) 擲 CCE → Invalid
+            val store = remoteHookPolicyStore { prefs }
+            assertTrue(store.save(setOf("new")))
+            // E07: the successful Invalid->v1 repair raises the app-local
+            // one-shot signal; this is NOT a claim that any hook applied it.
+            assertTrue(store.consumeInvalidVersionRepair())
+            assertFalse(store.consumeInvalidVersionRepair())
+            prefs.versionTypeCorrupt = false
+            assertEquals(1L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("new"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // E07 (PR #74 R4): the Invalid->v1 repair signal is app-process-local and
+    // one-shot, set ONLY when the commit actually succeeded. A failed commit, a
+    // second consume, and a later normal (Present) monotonic write must all be
+    // false. There is no hook-state query here: a running hook may still reject
+    // v1 as a replay, so this signal must never be read as "hook applied".
+    @Test
+    fun invalidVersionRepairSetsOneShotSignalOnlyOnSuccessfulCommitBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            prefs.versionTypeCorrupt = true // getLong(version) throws CCE -> Invalid
+            val store = remoteHookPolicyStore { prefs }
+
+            prefs.commitSucceeds = false
+            assertFalse(store.save(setOf("new")))
+            assertFalse("failed commit must not signal a repair", store.consumeInvalidVersionRepair())
+
+            prefs.commitSucceeds = true
+            assertTrue(store.save(setOf("new")))
+            assertTrue("successful Invalid->v1 commit sets the signal", store.consumeInvalidVersionRepair())
+            assertFalse("one-shot signal must not fire twice", store.consumeInvalidVersionRepair())
+
+            prefs.versionTypeCorrupt = false // now reads the committed v1 as Present
+            assertEquals(1L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertTrue(store.save(setOf("later")))
+            assertFalse("normal monotonic write is not a repair", store.consumeInvalidVersionRepair())
+            assertEquals(2L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            // No new claim about hook state: the only observable is the
+            // app-local one-shot flag above; no cross-process pass is asserted.
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // N04/N07: clear 的 putLong 失敗時不得 commit，版本/包集合保持原樣。
+    @Test
+    fun clearWithExistingVersionAndPutLongThrowsFailsWithoutChangingStoreBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+            prefs.putLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.clear())
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // D02 (no-commit poison lockout): a version-probe abort must NOT latch poison.
+    // prePoison used to run unconditionally before the probe, so a probe failure
+    // (no editor, no commit) still poisoned this prefs instance forever: after the
+    // probe recovered, loadResult() stayed Unavailable even though v50 + packages
+    // were intact, and the VM refused all same-process writes. Poison must be
+    // published only at the commit point.
+    @Test
+    fun versionContainsAbortKeepsLoadKnownAndWritePossibleBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionContainsThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            // No commit attempted: store byte-identical, commit count unchanged.
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            prefs.versionContainsThrows = false
+            // No poison latched: immediate Known read + a same-process write works.
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("new2"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // D02: same recovery guarantee when probeVersion's getLong (non-CCE) fails.
+    @Test
+    fun versionGetLongAbortKeepsLoadKnownAndWritePossibleBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionGetLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            assertEquals(commitsBefore, prefs.commitCalls)
+            prefs.versionGetLongThrows = false
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // E03: a CancellationException thrown by the version probe's `contains`
+    // must propagate through save()/clear() — it must NOT be swallowed into
+    // `probe = Unavailable -> return false` by the shared never-throw probe.
+    // The app writer captures the CE in its adapter and rethrows it after the
+    // probe returns. With poison published only at commit (D02), the CE reaches
+    // the outer catch with poisonToken == null: zero commit, no poison, no state
+    // mutation — and the prefs instance remains immediately recoverable.
+    @Test
+    fun versionContainsCancellationPropagatesFromSaveWithNoCommitAndNoPoisonBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionContainsThrowsCe = true
+            val store = remoteHookPolicyStore { prefs }
+            try {
+                store.save(setOf("new"))
+                org.junit.Assert.fail("save must rethrow CancellationException from probe contains")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // expected: CE propagated through save()
+            }
+            try {
+                store.clear()
+                org.junit.Assert.fail("clear must rethrow CancellationException from probe contains")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // expected: CE propagated through clear()
+            }
+
+            // Zero commit, no state mutation.
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            // No poison latched (D02): immediate Known read + a normal write succeeds.
+            prefs.versionContainsThrowsCe = false
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("new2"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // E03: same CE propagation via the probe's `getLong` (readVersion) leg.
+    @Test
+    fun versionGetLongCancellationPropagatesFromSaveAndClearBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionGetLongThrowsCe = true
+            val store = remoteHookPolicyStore { prefs }
+            try {
+                store.save(setOf("new"))
+                org.junit.Assert.fail("save must rethrow CancellationException from probe getLong")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // expected: CE propagated through save()
+            }
+            try {
+                store.clear()
+                org.junit.Assert.fail("clear must rethrow CancellationException from probe getLong")
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                // expected: CE propagated through clear()
+            }
+
+            // Restore the read fixture before inspecting prefs directly (getLong
+            // itself is what throws while the flag is set).
+            prefs.versionGetLongThrowsCe = false
+
+            // Zero commit, no state mutation.
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            // No poison latched (D02): immediate Known read + a normal write succeeds.
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("new2"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // D02: putLong failure aborts before the poison/commit point. Staging only
+    // touches the editor's pending map (mMap stays byte-identical), so no poison
+    // must be latched and the instance must recover immediately after restore.
+    @Test
+    fun versionPutLongAbortKeepsLoadKnownAndWritePossibleBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.putLongThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.save(setOf("new")))
+            // Zero new commits; persisted v50 + {"old"} remain byte-identical.
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            prefs.putLongThrows = false
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // D02: same no-commit recovery for the clear() path — a probe abort must not
+    // leave the prefs instance permanently Unknown/locked out of writes.
+    @Test
+    fun versionProbeAbortOnClearKeepsLoadKnownBbc() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            assertTrue(prefs.edit()
+                .putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, 50L)
+                .putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, mutableSetOf("old"))
+                .commit())
+            val commitsBefore = prefs.commitCalls
+
+            prefs.versionContainsThrows = true
+            val store = remoteHookPolicyStore { prefs }
+            assertFalse(store.clear())
+            assertEquals(commitsBefore, prefs.commitCalls)
+            assertEquals(50L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+            assertEquals(setOf("old"), prefs.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, null)?.toSet())
+
+            prefs.versionContainsThrows = false
+            val result = store.loadResult()
+            assertTrue(result is LoadResult.Known)
+            assertEquals(setOf("old"), (result as LoadResult.Known).packages)
+            // A same-process write after the aborted clear must still succeed.
+            assertTrue(store.save(setOf("new2")))
+            assertEquals(commitsBefore + 1, prefs.commitCalls)
+            assertEquals(51L, prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // NEW-2 (P2): concurrent save() calls must each bump the version exactly
+    // once — distinct + monotonically increasing committed versions, no lost
+    // saves. Before the versionCommitLock, two threads could read the same
+    // curVer and commit duplicate versions (later rejected by the hook's gate).
+    @Test
+    fun concurrentSavesCommitDistinctMonotonicVersions() {
+        resetRemotePoisonForTests()
+        try {
+            val prefs = RecordingPrefs()
+            val store = remoteHookPolicyStore { prefs }
+            val n = 16
+            val start = java.util.concurrent.CountDownLatch(1)
+            val threads = (0 until n).map { i ->
+                Thread {
+                    start.await()
+                    assertTrue("save #$i must succeed", store.save(setOf("com.example.$i")))
+                }
+            }
+            threads.forEach { it.start() }
+            start.countDown()
+            threads.forEach { it.join(15_000) }
+            assertFalse("all writer threads finished", threads.any { it.isAlive })
+
+            val versions = prefs.committedVersions.toList()
+            assertEquals("one committed version per save", n, versions.size)
+            assertEquals("all committed versions distinct", n, versions.distinct().size)
+            assertEquals("committed versions monotonically increasing", versions.sorted(), versions)
+            assertEquals("versions are exactly 1..N", (1L..n.toLong()).toList(), versions)
+            assertEquals(n.toLong(), prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, -1L))
+        } finally {
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // --- PR #74 G1: runtime BBC injection opt-out (round-trip + default true) ---
+    // The toggle uses a separate boolean key in the SAME dual_policy group;
+    // these tests prove it never touches the packages/version commit.
+
+    @Test
+    fun bbcInjectionPreferenceDefaultsTrueWhenKeyAbsent() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        assertTrue(store.isBbcInjectionEnabled())
+        assertEquals(0, prefs.commitCalls) // read must not write anything
+    }
+
+    @Test
+    fun bbcInjectionPreferenceRoundTripUsesAtomicCommit() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        assertTrue(store.isBbcInjectionEnabled())
+
+        assertTrue(store.setBbcInjectionEnabled(false))
+        assertEquals(1, prefs.commitCalls)
+        assertEquals(0, prefs.applyCalls)
+        assertEquals(false, prefs.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true))
+        assertFalse(store.isBbcInjectionEnabled())
+        // New store instance over the same provider sees the persisted value.
+        assertFalse(remoteHookPolicyStore { prefs }.isBbcInjectionEnabled())
+
+        assertTrue(store.setBbcInjectionEnabled(true))
+        assertEquals(2, prefs.commitCalls)
+        assertTrue(remoteHookPolicyStore { prefs }.isBbcInjectionEnabled())
+        // Package draft + version untouched by the toggle writes.
+        assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_PACKAGES))
+        assertFalse(prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION))
+    }
+
+    @Test
+    fun bbcInjectionPreferenceFailuresAreBestEffortNeverThrow() {
+        val prefs = RecordingPrefs()
+        prefs.commitSucceeds = false
+        val store = remoteHookPolicyStore { prefs }
+        assertFalse(store.setBbcInjectionEnabled(false))
+        // D04: the tri-state view of this same failure MUST be Unknown — never
+        // Confirmed, and never "restored to the old value". A failed commit still
+        // flushes the optimistic mMap in RemotePreferences, so this process could
+        // read back the new value; neither that mMap nor a cached "persisted"
+        // value is an authority after the failure. Read failures default to true.
+        // The legacy Boolean best-effort contract above stays unchanged.
+        val triState = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue("failed commit must be tri-state Unknown", triState is BbcWriteOutcome.Unknown)
+        assertFalse("Unknown must NOT be treated as confirmed", triState is BbcWriteOutcome.Confirmed)
+        prefs.booleanReadThrows = true
+        assertTrue(store.isBbcInjectionEnabled())
+        prefs.booleanReadThrows = false
+
+        val absent = remoteHookPolicyStore { null }
+        assertTrue(absent.isBbcInjectionEnabled())
+        assertFalse(absent.setBbcInjectionEnabled(false))
+
+        val throwing = remoteHookPolicyStore { throw RuntimeException("service dead") }
+        assertTrue(throwing.isBbcInjectionEnabled())
+        assertFalse(throwing.setBbcInjectionEnabled(false))
+
+        // commit() itself throws (binder RemoteException): still best-effort
+        // false, never propagates out of the store API.
+        val throwingCommitPrefs = RecordingPrefs()
+        throwingCommitPrefs.commitThrows = true
+        val throwingCommitStore = remoteHookPolicyStore { throwingCommitPrefs }
+        assertFalse(throwingCommitStore.setBbcInjectionEnabled(false))
+    }
+
+    @Test(expected = kotlinx.coroutines.CancellationException::class)
+    fun bbcInjectionPreferencePropagatesCancellation() {
+        // resolvePrefs() must let CancellationException through instead of
+        // mapping it to the default-true / false failure values.
+        remoteHookPolicyStore { throw kotlinx.coroutines.CancellationException("cancelled") }
+            .isBbcInjectionEnabled()
+    }
+
+    // --- PR #74 R3-1: tri-state write outcome (no UI/preference semantics change) ---
+
+    @Test
+    fun bbcCommitFalse_returnsUnknown_notConfirmedOldValue() {
+        val prefs = RecordingPrefs()
+        prefs.commitSucceeds = false
+        val store = remoteHookPolicyStore { prefs }
+        assertTrue("precondition: persisted default is true", store.isBbcInjectionEnabled())
+
+        val outcome = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue("failed commit must be Unknown", outcome is BbcWriteOutcome.Unknown)
+        assertFalse("UNKNOWN must never be Confirmed(true) / restored-to-old",
+            outcome is BbcWriteOutcome.Confirmed && outcome.value)
+
+        // The fake remote prefs flush the optimistic mMap before commit(false),
+        // exactly like the real RemotePreferences: this process may now read the
+        // NEW value even though nothing was persisted. That is why `false` is
+        // UNKNOWN and not "the old value is still in force".
+        assertFalse(prefs.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true))
+    }
+
+    @Test
+    fun bbcCommitThrow_returnsUnknown_andDoesNotThrow() {
+        val prefs = RecordingPrefs()
+        prefs.commitThrows = true // binder RemoteException after the optimistic flush
+        val store = remoteHookPolicyStore { prefs }
+
+        val outcome = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue("throwing commit must map to Unknown without propagating",
+            outcome is BbcWriteOutcome.Unknown)
+    }
+
+    @Test
+    fun bbcCommitTrue_returnsConfirmed_andWrapperStillTrue() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+
+        val confirmedOff = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue(confirmedOff is BbcWriteOutcome.Confirmed)
+        assertEquals(false, (confirmedOff as BbcWriteOutcome.Confirmed).value)
+        assertFalse(store.isBbcInjectionEnabled())
+
+        val confirmedOn = store.setBbcInjectionEnabledDetailed(true)
+        assertEquals(BbcWriteOutcome.Confirmed(true), confirmedOn)
+
+        // Legacy Boolean callers (e.g. BbcInjectionToggleController via
+        // MainActivity) are source- and behavior-compatible: true on success,
+        // false on failure; the detailed seam adds knowledge, not new semantics.
+        assertTrue(store.setBbcInjectionEnabled(false))
+        prefs.commitSucceeds = false
+        assertFalse(store.setBbcInjectionEnabled(true))
+    }
+
+    @Test
+    fun bbcFailedCommit_doesNotLetReopenReadAuthoritativeOff() {
+        val prefs = RecordingPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        // App-scoped holder is seeded from the persisted preference, like
+        // GalaxyApp does; non-null here means a provisional confirmed seed.
+        val state = BbcToggleRuntimeState(initialConfirmed = true)
+
+        // Seed persisted ON via a SUCCESSFUL commit; the holder records Confirmed.
+        val confirmedOn = store.setBbcInjectionEnabledDetailed(true)
+        assertEquals(BbcWriteOutcome.Confirmed(true), confirmedOn)
+        assertTrue(state.mark(confirmedOn, state.nextSequence()))
+        assertTrue(store.isBbcInjectionEnabled())
+        assertEquals(true, state.confirmedOrUnknown)
+
+        // Failed write of OFF: the fake mirrors RemotePreferences' optimistic
+        // flush, so the local mMap now reads false even though nothing persisted.
+        prefs.commitSucceeds = false
+        val failedOff = store.setBbcInjectionEnabledDetailed(false)
+        assertTrue("failed OFF commit must be Unknown", failedOff is BbcWriteOutcome.Unknown)
+        assertFalse("UNKNOWN must never be Confirmed(OFF)", failedOff is BbcWriteOutcome.Confirmed)
+        assertTrue(state.mark(failedOff, state.nextSequence()))
+        assertNull("holder must report UNKNOWN after a failed commit", state.confirmedOrUnknown)
+        assertFalse("mMap is polluted with OFF", prefs.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true))
+
+        // Dialog rebuild: a NEW store over the SAME prefs reads the polluted mMap.
+        val reopened = remoteHookPolicyStore { prefs }
+        assertFalse("reopen reads false from the polluted mMap — not authoritative",
+            reopened.isBbcInjectionEnabled())
+        // The UI decision consults the app-scoped holder, not that read: Unknown
+        // means "effect unknown", NOT a confirmed OFF.
+        val uiDecision = if (state.confirmedOrUnknown == null) {
+            "effect unknown"
+        } else {
+            "confirmed ${state.confirmedOrUnknown}"
+        }
+        assertEquals("effect unknown", uiDecision)
+        assertFalse("polluted read must not be claimed as a confirmed OFF",
+            reopened.setBbcInjectionEnabledDetailed(false) is BbcWriteOutcome.Confirmed)
+
+        // A later successful Confirmed(true) clears the Unknown state.
+        prefs.commitSucceeds = true
+        val confirmedAgain = reopened.setBbcInjectionEnabledDetailed(true)
+        assertEquals(BbcWriteOutcome.Confirmed(true), confirmedAgain)
+        assertTrue(state.mark(confirmedAgain, state.nextSequence()))
+        assertEquals(true, state.confirmedOrUnknown)
+        assertTrue(reopened.isBbcInjectionEnabled())
+    }
+}
+
+// PR #74 R3-1: app-process-local state holder (no Android framework needed).
+internal class BbcToggleRuntimeStateTest {
+
+    @Test
+    fun runtimeState_confirmedUnknownTransitionsAndGlobalSequence() {
+        // Simulates first use after an app restart: initialized from the
+        // persisted preference (off here); null would mean Unknown.
+        val state = BbcToggleRuntimeState(initialConfirmed = false)
+        assertEquals(false, state.confirmedOrUnknown)
+
+        state.mark(BbcWriteOutcome.Confirmed(false))
+        assertEquals(false, state.confirmedOrUnknown)
+
+        state.mark(BbcWriteOutcome.Unknown)
+        assertNull("Unknown must never masquerade as restored-to-old", state.confirmedOrUnknown)
+
+        state.mark(BbcWriteOutcome.Confirmed(true))
+        assertEquals(true, state.confirmedOrUnknown)
+
+        // Two fake dialog/Activity rebuilds: they share the app-scoped holder,
+        // so the sequence keeps increasing instead of restarting at 1.
+        val beforeFirstRebuild = state.nextSequence()
+        val afterFirstRebuild = state.nextSequence()
+        val afterSecondRebuild = state.nextSequence()
+        assertTrue(afterFirstRebuild > beforeFirstRebuild)
+        assertTrue(afterSecondRebuild > afterFirstRebuild)
+        assertEquals(3L, afterSecondRebuild)
     }
 }

@@ -67,28 +67,35 @@ object PolicyRefreshBudget {
 
     // H5: the bounded-read logic lives in exactly ONE place per class of
     // executor: the gate (PolicyRefreshGate.readBoundedOrThrow) for the managed
-    // zero-queue path, and readBoundedOrThrow below for a caller-supplied
-    // ExecutorService. readBounded is a thin compatibility wrapper over
-    // readBoundedOrThrow (rejection -> null) so there is no second copy of the
+    // zero-queue path, and readBoundedValue below for a caller-supplied
+    // ExecutorService. readBoundedOrThrow / readBounded are thin compatibility
+    // wrappers over readBoundedValue so there is no second copy of the
     // submit/get/cancel logic to drift. Broad Throwable is intentional: the
     // reader runs hostile/framework code that may throw Error (not just
     // Exception), and submit/get may throw RejectedExecutionException/
     // InterruptedException on shutdown races. All map to null (failed-read) so
     // the caller falls back to seed/last-known-good; narrowing to Exception
     // would let an Error escape onto the hooked query thread.
-    // Caller contract for readBoundedOrThrow: rejection (all attempts busy)
-    // throws PolicyRefreshContentionException; everything else returns null
-    // (failed read). timeoutMs <= 0 never submits: fail-closed null.
-    fun readBoundedOrThrow(
-        reader: () -> Set<String>?,
-        timeoutMs: Long = DEFAULT_STALL_BUDGET_MS,
+    //
+    // D06 (PR#74 r3): generic bounded-value read. Mirrors the legacy
+    // readBoundedOrThrow contract EXACTLY, but is type-generic so a Boolean?
+    // reader can distinguish false (confirmed OFF) from null (failed read) —
+    // the Set<String>?-typed legacy helper cannot express that distinction.
+    // Contract: timeoutMs <= 0 -> null WITHOUT submitting; submit rejection ->
+    // PolicyRefreshContentionException; TimeoutException -> cancel(true) +
+    // null; any other Throwable -> cancel + null; InterruptedException (from
+    // get) preserves the caller's interrupt flag. Never lets a reader stall
+    // the caller beyond timeoutMs.
+    fun <T> readBoundedValue(
+        reader: () -> T,
+        timeoutMs: Long,
         executor: ExecutorService,
-    ): Set<String>? {
+    ): T? {
         // Zero/negative budget never submits: fail-closed null without
         // touching the executor (parity with PolicyRefreshGate 0ms guard).
         if (timeoutMs <= 0L) return null
-        val future: Future<Set<String>?> = try {
-            executor.submit(Callable<Set<String>?> { reader() })
+        val future: Future<T> = try {
+            executor.submit(Callable<T> { reader() })
         } catch (t: Throwable) {
             if (t is InterruptedException) try {
                 Thread.currentThread().interrupt()
@@ -118,6 +125,15 @@ object PolicyRefreshBudget {
             null
         }
     }
+
+    // Legacy Set<String>? contract, now a thin wrapper over readBoundedValue
+    // (byte-identical behavior: rejection still throws Contention, everything
+    // else returns null, timeoutMs <= 0 never submits).
+    fun readBoundedOrThrow(
+        reader: () -> Set<String>?,
+        timeoutMs: Long = DEFAULT_STALL_BUDGET_MS,
+        executor: ExecutorService,
+    ): Set<String>? = readBoundedValue(reader, timeoutMs, executor)
 
     // Thin wrapper: rejection -> null (legacy contract, kept for JVM tests).
     fun readBounded(

@@ -8,19 +8,72 @@
 package com.galaxydual.plus
 
 import android.app.Application
+import android.content.Context
 import android.content.SharedPreferences
 import android.os.Process
+import com.galaxydual.hook.PolicySource
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
     // Stage G2：App-scoped PolicyTxCoordinator（跨 VM 最小 coordinator；
     // MainActivity factory 經 applicationContext 取用；VM onCleared 不清除）。
-    val policyTxCoordinator = PolicyTxCoordinator()
+    // PR #74 R6-2 (G02): MUST stay lazy — Application field initializers run before
+    // attachBaseContext(), so getSharedPreferences() here would crash on device.
+    // The repair-hint marker lives in app-private prefs (NOT dual_policy remote
+    // prefs) and is seeded into the coordinator at construction, so a restarted
+    // app process immediately warns again until explicit acknowledgement. Any
+    // failure to obtain the prefs degrades to in-memory-only (fail-safe: a missed
+    // warning is preferable to crashing app startup; live hint still works).
+    val policyTxCoordinator: PolicyTxCoordinator by lazy {
+        val hintStore = try {
+            getSharedPreferences(REPAIR_HINT_PREFS_NAME, Context.MODE_PRIVATE).repairHintStore()
+        } catch (_: Throwable) {
+            null
+        }
+        PolicyTxCoordinator(repairHintStore = hintStore)
+    }
+
+    // PR #74 R3-1: app-process-local BBC toggle state (last KNOWN write outcome
+    // + monotonic intent sequence). Lazy because the XposedService binder is not
+    // bound yet in Application.onCreate(); first access reinitializes from the
+    // PERSISTED preference via the same remote store seam MainActivity uses
+    // (default true on read failure). Dialog/Activity rebuilds MUST reuse this
+    // instance. NOT persisted, NOT the hook process's bbcConfirmedOffAtMs, and
+    // NOT a Samsung cold-start deletion guard (issue #75).
+    internal val bbcToggleRuntimeState: BbcToggleRuntimeState by lazy {
+        BbcToggleRuntimeState(
+            initialConfirmed = remoteHookPolicyStore {
+                remotePreferences(PolicySource.POLICY_PREFS_NAME)
+            }.isBbcInjectionEnabled(),
+        )
+    }
+
+    // PR #74 R3 D05: the ONE BBC write serializer for this app process. Built
+    // once on the Application lifetime (NOT lifecycleScope) so a controller
+    // rebuilt by a later dialog/Activity shares the same single consumer: an
+    // old synchronous commit cannot be abandoned and land after a newer intent.
+    // The scope is never cancelled by UI teardown; it ends with the process.
+    // commit uses the SAME remote store seam MainActivity uses. NOT a Samsung
+    // cold-start deletion guard (issue #75).
+    internal val bbcToggleCoordinator: BbcToggleCoordinator by lazy {
+        BbcToggleCoordinator(
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            state = bbcToggleRuntimeState,
+            commit = { enabled ->
+                remoteHookPolicyStore {
+                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
+                }.setBbcInjectionEnabledDetailed(enabled)
+            },
+        )
+    }
 
     override fun onCreate() {
         super.onCreate()

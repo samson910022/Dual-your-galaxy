@@ -191,10 +191,11 @@ class StageJ5PolishTest {
     }
 
     // Stage L4 fix(a) 清除鈕路由 single source（純函數，統一謂詞 !(!known&&corrupt)）：
-    // 僅 !known&&corrupt 走修復（未 arm→REQUEST，已 arm→CONFIRM）；其餘一律 CLEAR
-    // （Known 單步／Unavailable 盲清；Known+Corrupt 殘留亦 CLEAR，與 VM
-    // onClearPolicyButtonTap 同一判定，防 corrupt-alone 與 !known&&corrupt 漂移）。
-    // 穷舉 known×corrupt×armed 八組合鎖定唯一謂詞。
+    // 僅 !known&&corrupt 走修復（未 arm→REQUEST，已 arm→CONFIRM）；其餘路由 CLEAR
+    // （Known 單步，含 Known+Corrupt 殘留；Unavailable 雖路由 CLEAR 但盲清已停用、
+    // clearPolicyDraft 對 Unknown fail-closed，與 VM onClearPolicyButtonTap 同一
+    // 判定，防 corrupt-alone 與 !known&&corrupt 漂移）。
+    // 窮舉 known×corrupt×armed 八組合鎖定唯一謂詞。
     @Test
     fun clearPolicyButtonRoute_corruptTwoTaps() {
         // Non-repair: Known 或 Unavailable 一律 CLEAR（armed 無關）。

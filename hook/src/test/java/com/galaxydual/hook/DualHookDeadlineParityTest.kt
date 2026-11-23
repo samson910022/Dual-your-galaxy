@@ -85,6 +85,17 @@ class DualHookDeadlineParityTest {
         )
     }
 
+    /**
+     * NON-BEHAVIORAL source-parity guard — NOT behavioral coverage.
+     *
+     * This test reads DualHook.kt as text (regex/indexOf) and pins only the
+     * structural contract that EffectivePolicyDeadlineTest's mirror assumes.
+     * It asserts nothing about runtime behavior, so do not count it as
+     * behavioral coverage for the deadline orchestration — that coverage lives
+     * in EffectivePolicyDeadlineTest. Keep these assertions intact when adding
+     * behavioral tests: their sole job is to fail loudly on source drift
+     * between production and the mirror.
+     */
     @Test
     fun dualHookDeadlineOrchestrationIsStructurallyPinned() {
         val file = locateDualHookSource()
@@ -152,8 +163,16 @@ class DualHookDeadlineParityTest {
             !resetFenceNegativeAdd.containsMatchIn(text),
         )
 
-        // --- effectivePolicy: t0 sample -> capability probe -> prefs read,
-        // in order, with the per-segment budget clamp and two deadline skip arms.
+        // --- effectivePolicy -> policyRead (the shared reader body, extracted
+        // 2026-11-18: used by effectivePolicy() for the whitelist query path
+        // AND by bbcPolicy() for the BBC injector path): t0 sample ->
+        // capability probe -> prefs read, in order, with the per-segment
+        // budget clamp and two deadline skip arms. The region markers below
+        // span "internal fun effectivePolicy" .. "    private fun readRemotePolicy"
+        // and therefore include policyRead(); require exactly 2
+        // deadlineExhaustedCount increments inside that region (one per
+        // skip-arm). The BBC path's own gate short-circuit never reaches
+        // these arms when its effect switch is closed.
         val regionStart = indexOfOrFail("internal fun effectivePolicy")
         val regionEnd = indexOfOrFail("    private fun readRemotePolicy")
         assertTrue(
@@ -166,7 +185,7 @@ class DualHookDeadlineParityTest {
         val effectivePolicyRegion = text.substring(regionStart, regionEnd)
 
         val sampleIdx = indexOfOrFail("DeadlineBudget.sampleClock()")
-        val notCapableIdx = indexOfOrFail("if (!capable) return@get emptySet()")
+        val notCapableIdx = indexOfOrFail("if (!capable) return emptySet()")
         val prefsGateIdx = indexOfOrFail("policyRefreshGate.readBoundedOrThrow")
         assertTrue(
             "DualHook.kt drifted: DeadlineBudget.sampleClock() must be sampled " +
@@ -189,7 +208,7 @@ class DualHookDeadlineParityTest {
         )
         assertTrue(
             "DualHook.kt drifted: missing the per-segment budget clamp " +
-                "minOf(PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS, rem) in effectivePolicy() " +
+                "minOf(PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS, rem) in the shared policyRead() body " +
                 "(the capability probe would no longer be clamped to the remaining budget)",
             text.contains("minOf(PolicyRefreshBudget.DEFAULT_STALL_BUDGET_MS, rem)"),
         )
@@ -198,7 +217,8 @@ class DualHookDeadlineParityTest {
             .count()
         assertTrue(
             "DualHook.kt drifted: deadlineExhaustedCount.incrementAndGet() occurs " +
-                "$exhaustedOccurrences time(s) inside effectivePolicy(); exactly 2 are required " +
+                "$exhaustedOccurrences time(s) inside the effectivePolicy()..readRemotePolicy region " +
+                "(the shared policyRead() body); exactly 2 are required " +
                 "(one per deadline-skip arm — capability and prefs); a different count means the " +
                 "skip-arm shape drifted and EffectivePolicyDeadlineTest's mirror can no longer be trusted",
             exhaustedOccurrences == 2,

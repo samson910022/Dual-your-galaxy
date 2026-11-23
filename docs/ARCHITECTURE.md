@@ -13,7 +13,7 @@ All code is original and MIT-licensed. Third-party projects are idea-only refere
 
 - `app`: UI layer, owns user actions and status display.
 - `core`: pure-Kotlin privilege routing, command gateway, and `pm` output parsing.
-- `hook`: LSPosed module (API 102), loaded only inside target Samsung processes.
+- `hook`: LSPosed module (API 102), loaded only inside target Samsung processes. BBC injector anchors `PmWrapper#getPossibleDualAppPackages` (union-only append of user-written policy items into Samsung's 「可用的應用程式」 list; PROTECTIVE / identity fast-path / fail-closed; device-verified 2026-11-17, pre-unification evidence); its effect switch is `BBC_AVAILABLE_APPS_INJECTION=true` — independent of, and not opening, the sealed Stage-1 `NON_EMPTY_POLICY_EFFECTIVE_GATE=false` (see `docs/HOOK.md` §1.3a／§1.4).
 
 ## GuardXposedProvider (policy provider parity)
 
@@ -56,9 +56,10 @@ val privilege: Privilege = when {
 > 回調觸發未觀察）；(3)marker 主路徑歷史 scope=system_server
 >（早於本次開機約 5.5h，歷史證據）；(5)App 一鍵：ROOT 一鍵 `cloned:`、
 > 已授權 SHIZUKU 一鍵（已安裝 verify 單次）。
-> 未驗 —— (3)callback 可驗日誌缺、(4)非空政策生效（政策來源已接線至 LSPosed
-> remote preferences，端到端未驗；靜態種子預設空，故預設 observe-only）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
+> 未驗 —— (3)callback 可驗日誌缺（`system_server`／daagent 查詢面）、(4)非空政策之白名單 Stage-1 查詢面 DEVICE-UNVERIFIED（sealed false，零行為變更 by design；BBC 注入面已於 2026-11-17 驗證——pre-unification build：`BBC-HOOK merged +1 packages (total 7, pid=21472)`；unified build 已驗 2026-11-18（BBC1–BBC3；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6 毀滅分身——不得標 ☑；）、寫後以 listing 為準（`pm path` 僅輔助，見 #22）、
 > 目標身分完整邊界（見 #21）、當前 source 可追溯部署。
+>
+> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 已於 2026-11-21 更正為非空回調；仍以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。上方 11-17/11-18 的 BBC 注入／裝置證據段皆受此更新節制；「回傳位元一致」僅指回傳物件，不代表裝置行為不變。
 > 路由 hook-neutral：`routePrivilegeFromProbes(hasShizuku, hasRoot)` 為兩探針純函數，
 > `hasLsposed` 參數已移除；`channelReadyFor` 忽略 hook 訊號；marker 僅顯示（F4b-P2，見 #19／#27）。
 
@@ -115,7 +116,8 @@ val privilege: Privilege = when {
 > | Emulator API 29（minSdk floor） | API 29 | CI `locale-instrumentation` job：`:app:connectedDebugAndroidTest` | 每 PR 自動執行 |
 > | Emulator API 34（compileSdk／targetSdk） | API 34 | `instrumentation-manual` job（`workflow_dispatch`）：同上 harness＋provenance | 手動執行 |
 > | Build baseline | compileSdk 34、minSdk 29、targetSdk 34、AGP 8.5.2、Gradle 8.7、JDK 17 | PR CI `build` job：JVM 單元測試＋lint＋honesty／Knox／GPL gates | `testDebugUnitTest` 全綠只保證語意，不替代上列裝置驗收 |
-> | 非空政策生效 gate（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` sealed 常閉） | —（code gate，非裝置驗證） | JVM 鎖定（`PolicySourceTest`／`EffectivePolicyCacheTest`）＋硬閘門見 `docs/HOOK.md` §1.4 | 常閉；JVM 綠燈不開 gate，開 gate 只認硬閘門裝置證據 |
+> | 非空政策生效 gate（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` sealed 常閉） | —（code gate，非裝置驗證） | JVM 鎖定（`PolicySourceTest`／`EffectivePolicyCacheTest`）＋硬閘門見 `docs/HOOK.md` §1.4 | 常閉；JVM 綠燈不開 gate，開 gate 只認硬閘門裝置證據；任何未來翻轉需另一份 SAMSUNG 階段 spec＋使用者明示授權 |
+> | BBC 注入效應開關（`BBC_AVAILABLE_APPS_INJECTION=true`） | —（code gate，非裝置驗證） | BBC merge 僅擴展 Dual Messenger「可用的應用程式」清單，PROTECTIVE／union-only／identity fast-path／fail-closed；裝置證據 2026-11-17（S23 Ultra／Tab S7，pre-unification build）；unified build 已驗 2026-11-18（BBC1/BBC2/BBC3 重驗 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載（❌ 不通過，不得標 ☑））；Stage-1 封緘不受影響 | 效應面僅限 BBC 清單可見性；設 `false` 時 BBC callback 回傳物件與 Samsung 原物件位元一致（僅指回傳物件，不代表裝置行為不變；冷啟動刪除見 `BBC_COLDSTART_DELETE_INCIDENT.md`）；2026-11-17 授權涵蓋僅 BBC 注入面 |
 > | 政策 Tx 結清／coordinator（Stage G1/G2） | —（VM 語義，非裝置驗證） | JVM 鎖定（`PolicyWriteTest`：settle helper／世代拆分／跨 VM 認領（auto-recheck 間接覆蓋）；reconciler 總預算 15 秒） | JVM 綠燈不等於裝置驗收；旋轉重建實機恢復未驗 |
 
 ## Executor (CmdGateway) — F4a 真通道已接線（五層第 5 層：App 一鍵部分已觀察，其餘未驗）
@@ -154,7 +156,11 @@ val privilege: Privilege = when {
   LSPosed maps to the NoOp placeholder with the picker UI + file-marker
   enable detection done in P2 (hook writes /data/system marker, app reads
   direct + gateway cat; whitelist policy source wired to LSPosed remote
-  preferences, end-to-end DEVICE-UNVERIFIED).
+  preferences — whole-set two-phase write (`HookPolicyStore`, group
+  `dual_policy`/key `extra_whitelist_packages`, owner-user write); hook read via
+  `EffectivePolicyCache` TTL poll. BBC injection effect is device-verified
+  (2026-11-17, pre-unification build; re-verified 2026-11-18 on the unified build, BBC1/BBC2/BBC3 only)
+  BBC4/BBC5 同 cycle 通過（2026-11-18 17:21/17:22，pid=3568）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroys the dual app — not untested, broken (see BBC6_SSAID_INCIDENT.md).
 
 ## PmOutputParser
 
@@ -187,14 +193,25 @@ val privilege: Privilege = when {
    #24 的 Main dispatcher heartbeat 與 instrumentation responsiveness 驗收為獨立追蹤階段（見 issue #24）。
    `app/src/androidTest/` harness 見 docs/ACCEPTANCE.md §5（CI 綠不斷言測試數，數量隨演進調整）；CI `locale-instrumentation` job 執行 `:app:connectedDebugAndroidTest`（emulator API 29），`build` job 執行 `:app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest`。Emulator instrumentation 驗證 UI/流程，不等於 S24 裝置驗收；JVM 語意與 CI 綠燈不替代 S24 實機驗收。
 
+### Gradle XML-writer flake（偶發基礎設施問題）
+
+- 定性：`Could not write XML test results` 為 Gradle test-result writer 偶發基礎設施 flake，非測試語意失敗；僅在單次「5 個重型 filter 併發」高負載下出現過一次，分開重跑即綠。
+- 實測（分支 `unify/bbc-on-main`，commit `fb8f59d1`，JDK 17.0.20.1，日期 2026-11-21 UTC；兩次均為單一樣本，只證明該次未復現，不證明該模式永不 flake）：
+  | # | 指令 | 結果 | XML writer flake |
+  | --- | --- | --- | --- |
+  | 1 | `./gradlew :app:testDebugUnitTest --no-parallel --rerun-tasks` | BUILD SUCCESSFUL in 5m 26s，53 tasks 全執行 | 無（輸出全文 grep `Could not write` = 0；`test-results/testDebugUnitTest/` 69 個 XML，0 個含 failures/errors） |
+  | 2 | `./gradlew :app:testDebugUnitTest --rerun-tasks`（預設 parallel，`org.gradle.parallel=true` 生效） | BUILD SUCCESSFUL in 4m 38s，53 tasks 全執行 | 無（輸出全文 grep `Could not write` = 0） |
+- CI 對照：CI 本來就跑在 `org.gradle.parallel=true` 下且持續全綠。CI 實際指令（`.github/workflows/android.yml:677`，`release.yml:180` 相同）為 `./gradlew :app:testDebugUnitTest :core:testDebugUnitTest :hook:testDebugUnitTest --no-daemon`——沒有 `--no-parallel`。`gh pr checks 74`：`build` pass（8m22s）、`locale-instrumentation` pass；最近 6 個 PR run（含 main push）全 success；最新成功 run（`44850468823`，2026-11-21T01:29Z）job log 關鍵字搜尋（`Could not write`／`no-parallel`／`XML.*result`）零命中。
+- 無出處結論：「`--no-parallel` 下仍有偶發」在 repo、docs、註解、issue／PR 留言中均無出處（repo 全文搜尋 `no-parallel` 零命中，僅 `gradle.properties:6` 有 `org.gradle.parallel=true`；`Could not write XML` 零命中；15 個 OPEN issue 逐一查留言與 `gh pr view 74 --comments` 均無相關留言），本次兩次實測亦均未復現——該說法無證據支撐，不應作為結論引用；如需主張，須先提出可重現的 log 證據。
+
 ## Policy draft flow (hook-policy-source P2-P4 semantics)
-- App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效，端到端 DEVICE-UNVERIFIED。
-- Hook 側新鮮度（Stage J5 修正，API 102.0.0 無推送）：hook 行程監聽器僅同行程有效，跨行程新鮮度為輪詢（`EffectivePolicyCache` TTL 60 秒重讀永久快取實例；`extra_whitelist_version` 版本序號 **規劃中／未實作**，新鮮度目前僅靠 TTL＋重啟語義，詳見 `docs/HOOK.md` §1.1）；熱路徑重讀經 `PolicyRefreshGate`（at-most-one guard＋stuck breaker）＋零隊列執行器＋50ms stall 預算，超時／爭用／拒收／熔斷一律回 seed／last-known-good（fail-closed）。
+- App 寫入 LSPosed remote preferences group `dual_policy`（與 hook 側同一 group/key，常數單一來源 `PolicySource`）；僅 owner user（user 0）寫入有效。BBC 注入面 2026-11-17 裝置已驗證（pre-unification build；`BBC-HOOK merged +1 packages (total 7, pid=21472)`）；unified build 讀者接線已於 2026-11-18 重驗（BBC1/BBC2/BBC3 重驗 OK；BBC4/BBC5 於同 cycle 通過（2026-11-18 17:21/17:22 安裝 + UI，pid=3568）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載）；白名單 Stage-1 查詢面 DEVICE-UNVERIFIED（`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘，零行為變更 by design）。
+- Hook 側新鮮度（Stage J5 修正，API 102.0.0 無推送）：hook 行程監聽器僅同行程有效，跨行程新鮮度為輪詢（`EffectivePolicyCache` TTL 60 秒重讀永久快取實例；底層 `mMap` 可能仍陳舊，不保證 60s 內或下一次 poll 看到新集合，重啟 hook 行程後才保證；`extra_whitelist_version` 單調版本序號 **PR #74 Phase 3 已實作**，hook 側 seqlock 自洽快照＋Good/Cleared 版本閘為可觀測新鮮度證據、非推送替代，新鮮度仍受 TTL＋重啟語義節制，詳見 `docs/HOOK.md` §1.1）；熱路徑重讀經 `PolicyRefreshGate`（at-most-one guard＋stuck breaker）＋零隊列執行器＋50ms stall 預算，超時／爭用／拒收／熔斷一律回 seed／last-known-good（fail-closed）。
 - 鎖外 IO：所有 store 讀寫經 `onIo`（`Dispatchers.IO`）切線程，confirm/clear 持 `opMutex` 橫跨有界超時（`POLICY_IO_TIMEOUT_MS` 10s，超時轉 `RECONCILING`＋`CHANNEL`（Unknown fence，pending 保留），由 reconciler 背景核對（不自動重送）；核對中 cancel 為 no-op（`QUEUED` 可取消回 `IDLE`，`SAVING`／`RECONCILING` 不可取消）；終態正常回 `IDLE`，唯有界讀耗盡／總預算超限（`POLICY_RECONCILE_TOTAL_BUDGET_MS` 15s）滯留 `RECONCILING`（`REFRESH_FAILED`／`CHANNEL`＋Known=false＋pending 保留，Tx 存活）。handover 登記給行程級 `PolicyTxCoordinator`（其 reconciler 跑在 coordinator 的 app-scoped 域，不隨 VM 死亡），負責把 Tx 收斂回 `IDLE`／終態；joinable（armed／已交接）Tx 由 init reclaim 的兄弟 VM 認領為 `RECONCILING` 並 join 同一 deferred；僅「owner 存活且 Tx 未 arm（PREPARING）」的兄弟 VM 見 `BUSY`，直到 owner 終態後自行收斂；不一律 `BUSY`；`RECONCILING` 相位的「稍後刷新」僅為手動 late-join 提示；`FAILED` 僅保留給已證明失敗（store 回 false/拋出））；主執行緒永不打 binder。
 - UID 收斂：owner-user 門控以 `Process.myUid()` 拆解 userId（`userIdFromUid`，負值回 -1 fail-closed），非 owner 拒絕且不建 pending；Guard 側 binder 門控另見上文。
 - Tx 結清（Stage G1，`decidePolicyTxSettle` 唯一真相）：deferred 已完成＋權威讀==預期→SUCCESS，deferred 已證失敗→FAILED＋Unknown（樂觀讀不得翻案），deferred 完成＋讀非預期→mismatch `REFRESHED`；deferred 未完成時任何 Known（A/B）皆 inconclusive 續留（Known(B) 永 inconclusive，Known(A) 不得 mismatch-settle）。世代拆分：顯示 `policyFreshnessGen` vs 所有權 `policyOwnershipGen`（reconciler／late-join 只比 version＋ownership）；Tx 存活期 refresh yielding 只推 freshness，不碰 phase/pending。
 - 跨 VM（Stage G2）：`PolicyTxCoordinator` App-scoped（`GalaxyApp` 單例），`activeTx` 跨 VM 唯一真相；handover 登記的 Tx 由 coordinator scope 上的 reconciler 接手（不隨 VM 死亡），VM 死亡不阻斷收斂；Tx 完成前建立的兄弟 VM：joinable（armed／已交接）者由 init reclaim 的兄弟 VM 認領為 `RECONCILING` 並 join 同一 deferred；僅「owner 存活且 Tx 未 arm（PREPARING）」的兄弟 VM 見 `BUSY`，直到 owner 終態後自行收斂；不一律 `BUSY`；Tx 攜 pending，新 VM init 認領（繼承 fence＋`RECONCILING`＋Unknown＋reconciler join 同一 deferred）；`deferred.invokeOnCompletion` 單次 auto-recheck（coordinator app-scoped 域＋`Dispatchers.IO` 共用 IO 池，`boundedReconcileRead` 為容量有界讀取 wrapper，非獨立 pool，不耗 reconciler 預算，Unknown→unresolved；此時無 ground truth，維持 `RECONCILING`，「稍後刷新」僅為手動 late-join 提示）；終態 `tryClaimCoordinatorPublish` CAS 勝者發布；reconciler 總預算 15 秒，超限誠實 unresolved 滯留（有 ground truth 則收斂至 `IDLE`；無 ground truth 則維持 `RECONCILING`，待手動 `refreshPolicyDraft` late-join）。terminal-publish arbitration（Stage P2）= Tx-scoped adoption-epoch fence：busy-waiter 與 async-init 認領在 commitMutex 內 bump 共享 `PolicyTx.adoptionEpoch`（sync-init 認領（joinable）不再於 init 內直接 bump：init 的 commitMutex tryLock 快照僅為「建議性」觀察，認領本身——本地 CAS＋adoptionEpoch bump＋RECONCILING fence flip——一律經 launchReclaimAsync 於 commitMutex 內線性化，與 busy-waiter 及 async-init 同臂，詳見 DualViewModel.kt sync-init 註記；三臂的 fence 皆於 claim 時與同一 mutex 內比對，為 fail-closed。attach 時快照，claim 時於同一 mutex 內比對，fence 失敗即 EPOCH_STALE（不消耗 claim、不 bump rev、不發布）；讀取橫跨認領的 worker retain 並讓位 adopter；舊 worker 在認領 bump 前線性化則合法勝出（linearization point = claim CAS inside commitMutex，順序以 mutex 到達為準）。兄弟 VM 可各自本地採納同一 Tx（coordinator.activeTx 不隨認領消費），恰好一次發布由 epoch fence＋claim 的 commitMutex 重新檢查保證。
-- 完整語義（pending 世代、TTL、fence、blind-clear 二次確認〈僅 Unavailable 瞬斷：TTL＋世代＋disarm，Corrupt 走修復流程〉）見 `docs/USAGE.md` §政策寫入流程（含同世代綁定說明與政策 TTL 對照表：App 側確認／blind-clear arm 5 分鐘、store IO 10 秒、reconciler 總預算 15 秒、auto-recheck 單次 vs hook 側快取 60 秒／失敗節流 5 秒）。
+- 完整語義（pending 世代、TTL、fence、所有非 Known 草稿皆 fail-closed：Unavailable 需先權威重整至 Known，Corrupt 走修復流程）見 `docs/USAGE.md` §政策寫入流程（含同世代綁定說明與政策 TTL 對照表：App 側確認 5 分鐘、VM 內部遺留 blind-clear arm 常數（UI 不可達／已停用）、store IO 10 秒、reconciler 總預算 15 秒、auto-recheck 單次 vs hook 側快取 60 秒／失敗節流 5 秒）。
 
 ### Poison 封裝（remote prefs 樂觀值隔離，`HookPolicyStore` 內部狀態）
 

@@ -76,6 +76,8 @@ class PolicyRepairAbortTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = store,
+            // R4-4: legacy no-consent callers; production keeps the fail-safe default.
+            requirePolicyWriteConsent = false,
             currentUserId = { 0 },
             policyIoTimeoutMs = 500L,
             policyTxCoordinator = coord,
@@ -552,6 +554,8 @@ class PolicyRepairAbortTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = store,
+            // R4-4: legacy no-consent clearPolicyDraft() caller in this test.
+            requirePolicyWriteConsent = false,
             currentUserId = { 0 },
             policyIoTimeoutMs = 500L,
             policyTxCoordinator = coord,

@@ -36,11 +36,38 @@ object PolicySource {
     // hook cache 60s / failure-cooldown 5s).
     const val NON_EMPTY_POLICY_EFFECTIVE_GATE: Boolean = false
 
+    // BBC 注入器效應開關（2026-11-17 裝置實機驗證後預設開）：只放寬 BBC 產生的
+    // 「Dual Messenger 可用的應用程式」清單（union-only append，fail-closed），
+    // 不影響 Stage-1 白名單查詢／system_server／<clinit> 路徑（封緘不變）。
+    // 這是 COMPILE-TIME DEFAULT；可在執行期由 dual_policy 的
+    // POLICY_KEY_BBC_INJECTION_ENABLED 覆蓋（Absent/讀取失敗 => 預設 true，
+    // 與此常數同值；false 才關閉 BBC 合併）。兩者 AND，設 false 即 BBC 零合併，
+    // 與 Stage-1 閘相互獨立（docs/HOOK.md §1.3a／§1.4）。
+    // 注意：關閉不是 Samsung 冷啟動刪除的防護（DELETE 早於 BBC 回調，issue #75）。
+    const val BBC_AVAILABLE_APPS_INJECTION: Boolean = true
+
     // Remote policy prefs group/key, single-sourced here and referenced by the
     // app-side writer and the hook-side reader. Renaming either abandons any
     // persisted draft (breaking change; review required).
     const val POLICY_PREFS_NAME = "dual_policy"
     const val POLICY_KEY_EXTRA_PACKAGES = "extra_whitelist_packages"
+    // Phase A P0 (BBC sticky last-good): explicit-empty version key. Written
+    // atomically with POLICY_KEY_EXTRA_PACKAGES by HookPolicyStore.save/clear
+    // (same commit, monotonic +1 per write). Hook side treats empty+version as
+    // intentional Cleared (shrink allowed); empty without version as Unknown
+    // (sticky, never shrink). Non-empty without version stays Good for old-
+    // draft backward compat (pre-version drafts still merge). Renaming either
+    // abandons persisted drafts (breaking change; review required).
+    const val POLICY_KEY_EXTRA_VERSION = "extra_whitelist_version"
+    // PR #74 G1: persisted owner-controlled BBC injection opt-out (same
+    // dual_policy group). App writes a boolean via HookPolicyStore; the hook
+    // reads it on the BBC path and ANDs it with BBC_AVAILABLE_APPS_INJECTION.
+    // DEFAULT TRUE (key absent or read failure) to preserve shipped behavior.
+    // This is a UI convenience, NOT a proven guard against Samsung's
+    // system-side cold-start deletion (DELETE precedes the BBC callback;
+    // issue #75 / docs/BBC_COLDSTART_DELETE_INCIDENT.md). Renaming abandons
+    // persisted preference (breaking change; review required).
+    const val POLICY_KEY_BBC_INJECTION_ENABLED = "bbc_injection_enabled"
 
     // Pluggable remote-policy reader (Stage H2-P1 seam; Phase 4 hardened).
     //
@@ -60,21 +87,34 @@ object PolicySource {
     @Volatile
     internal var remotePolicyReader: () -> Set<String>? = { emptySet() }
 
-    // CONTRACT (equality-only, S7): tokens accepted here are used ONLY for
-    // equality matching / set membership against the (seed ∪ sanitized remote)
-    // policy sets — never for anything else. This grammar is a deliberate
-    // SUPERSET of the Android package grammar (it admits '-', '..' and
-    // separator oddities such as "a-", "..", "com..x"), which is safe only
-    // because of that equality-only use: today no code path feeds a token to
-    // PackageManager, a URI, a file path, an Intent/ComponentName, logging,
-    // or display output on the strength of this check. ANY future reuse
-    // beyond equality matching (PackageManager lookup, logging, display,
-    // Intent/ComponentName/Uri/file paths) MUST re-validate against a real
-    // Android package grammar (e.g. dot-separated segments of
+    // CONTRACT (equality-only, S7): tokens are used for equality matching /
+    // set membership against the (seed ∪ sanitized remote) policy sets, and —
+    // since 2026-11-18 — for the BBC injector only: (a)
+    // PackageManager.getApplicationInfo name lookup (never a path/command/
+    // URI), and (b) a once-per-process, ≤4-token logcat diagnostic. This
+    // grammar is a deliberate SUPERSET of the Android package grammar (it
+    // admits '-', '..' and separator oddities such as "a-", "..", "com..x"),
+    // which is safe only under those two consumers and equality-only use —
+    // nothing else feeds a token to PackageManager, a URI, a file path, a
+    // shell, an Intent/ComponentName, or display output on the strength of
+    // this check. ANY future reuse beyond these MUST re-validate against a
+    // real Android package grammar (e.g. dot-separated segments of
     // [A-Za-z][A-Za-z0-9_]*) and MUST NOT rely on this regex. Do not loosen
     // it further without re-checking every consumer of effective()/sanitize().
     fun isValidPackage(pkg: String): Boolean =
         pkg.isNotEmpty() && PKG.matches(pkg)
+
+    // Strict Android package grammar for values that become SHELL ARGV TOKENS
+    // (pre-clear dual probe/uninstall builders in :app). Unlike isValidPackage
+    // (equality-only superset that admits '-', '..', "com..x", leading digits),
+    // this rejects anything that is not a dot-separated sequence of
+    // [A-Za-z][A-Za-z0-9_]* segments with at least one dot, and bounds the
+    // length to MAX_PACKAGE_LENGTH. Use this — never isValidPackage — for any
+    // token interpolated into a pm command or re-filtered out of probe output.
+    private val SHELL_PKG = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
+
+    fun isValidShellPackage(pkg: String): Boolean =
+        pkg.length <= MAX_PACKAGE_LENGTH && SHELL_PKG.matches(pkg)
 
     // Drops invalid tokens and any non-String element (defensively:
     // RemotePreferences snapshots cross process boundaries as Java collections,

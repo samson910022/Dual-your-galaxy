@@ -36,6 +36,9 @@ package com.galaxydual.plus
 import android.annotation.SuppressLint
 import android.content.SharedPreferences
 import com.galaxydual.hook.PolicySource
+import com.galaxydual.hook.VersionPrefsView
+import com.galaxydual.hook.VersionProbeResult
+import com.galaxydual.hook.probeVersion
 import java.lang.ref.WeakReference
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -138,6 +141,25 @@ internal class WeakPrefKey(referent: SharedPreferences) : WeakReference<SharedPr
 }
 
 internal val remotePoison = AtomicReference(PoisonState(emptyMap(), 0))
+
+// NEW-2 (P2): process-wide lock serializing the version
+// read->increment->putLong->commit in remoteHookPolicyStore.saveRaw. Without
+// it two concurrent save() calls can read the same current version and commit
+// duplicate versions; a duplicate later presented as Cleared is then rejected
+// by the hook's monotonic gate. Top-level (not per-store) because multiple
+// store instances share the same prefs/version key in one process.
+//
+// SINGLE-WRITER INVARIANT (Phase 3 review F4): in-process, saveRaw is the ONLY
+// writer of the version key, and it always does so under this lock — no other
+// code path in this tree writes that key. Cross-process, two writers can in
+// principle commit the same version, but duplicate/out-of-order versions are
+// bounded on the reader side by R06's monotonic version gate (rejects 0 /
+// duplicate / replay / downgrade, content-aware at equal version) plus R07's
+// seqlock (version-before == version-after around the defensive package-set
+// copy), so a torn or duplicate commit cannot replay a revoked package. A
+// duplicate writer is therefore not reachable as a correctness bug in this
+// tree; if a future writer of the version key is added, it MUST take this lock.
+internal val versionCommitLock = Any()
 
 // A3-8: overflow 閂每行程 log-once（永久 fail-closed 狀態必須可診斷；逐次讀
 // log 會污染 log buffer，故 once-per-process）。resetRemotePoisonForTests 重置。
@@ -640,7 +662,100 @@ class HookPolicyStore(
     // 直接注入後端預設 null → loadForRepair() 即 loadResult())。VM 修復 pre/final
     // 讀一律經 loadForRepair()，正常 refresh/save/clear 仍經 loadResult()。
     private val repairProbe: (() -> LoadResult)? = null,
+    // PR #74 G1: BBC injection opt-out (dual_policy/bbc_injection_enabled).
+    // SEPARATE from the packages/version single-commit and the poison/seqlock
+    // machinery: a boolean preference cannot corrupt the policy draft snapshot.
+    // The BBC key is outside the draft poison/commit fence on purpose.
+    // Direct-injected test backends default to "absent" (read => default true,
+    // write => false unless a backend is supplied).
+    //
+    // PR #74 R3-1: saveBbcEnabledRaw's Boolean is a WRITE ACK, not a value read:
+    // false => UNKNOWN (BbcWriteOutcome.Unknown), never "the old value is still
+    // in force" — the caller's local RemotePreferences mMap may be optimistically
+    // polluted with the new value even though the commit did not persist.
+    private val loadBbcEnabledRaw: () -> Boolean? = { null },
+    private val saveBbcEnabledRaw: (Boolean) -> Boolean = { false },
 ) {
+
+    // E07 (PR #74 R4): app-process-local, one-shot signal that a SUCCESSFUL
+    // version-key commit repaired a VersionProbeResult.Invalid key
+    // (Invalid -> curVer=0 -> newVer=1). Only the production saveRaw sets it
+    // (both save() and clear() route through saveRaw); no prefs key, no IPC
+    // and no epoch/generation are added.
+    //
+    // HONESTY CONTRACT: this is NOT proof of hook state. A hook already running
+    // with lastBbcSeenVersion > 1 treats the repaired v1 as a decreasing replay
+    // and keeps its previous sticky snapshot — a successful App commit does
+    // NOT prove the repair took effect in that process. The VM consumes this
+    // signal after a true save/clear result to show a hook-restart hint; no
+    // claim about the hook's actual version is made (DEVICE-UNVERIFIED).
+    private val invalidVersionRepaired = AtomicBoolean(false)
+
+    // Production wiring seam only (remoteHookPolicyStore's saveRaw lambda runs
+    // before the store instance exists). Never call from UI code.
+    internal fun noteInvalidVersionRepaired() {
+        invalidVersionRepaired.set(true)
+    }
+
+    // One-shot drain: true at most once per repaired commit, then false.
+    fun consumeInvalidVersionRepair(): Boolean = invalidVersionRepaired.getAndSet(false)
+
+    // PR #74 G1: persisted, owner-controlled BBC injection preference.
+    // Default TRUE when the key is absent or the read fails (preserve shipped
+    // behavior; "off" is not a safety guarantee — Samsung's cold-start deletion
+    // happens before the BBC callback, issue #75). CancellationException is
+    // propagated; all other throwables are swallowed (store never throws).
+    //
+    // PR #74 R3-1: this is only a READ of the persisted key; it cannot tell
+    // whether a write was confirmed. A failed write returns false/Unknown from
+    // the write seam even though this optimistic-local-process read may return
+    // the NEW value. Never reconstruct write confirmation from this Boolean.
+    fun isBbcInjectionEnabled(): Boolean = try {
+        loadBbcEnabledRaw() ?: true
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        true
+    }
+
+    // PR #74 G1: atomic single-key commit of the BBC preference. Best-effort:
+    // returns false on failure (provider absent / IPC failure), never throws
+    // except CancellationException. Does NOT touch packages/version or poison.
+    //
+    // PR #74 R3-1: `false` means UNKNOWN — NOT "still the old value". A remote
+    // prefs commit can flush the optimistic local mMap before the binder fails,
+    // so this process may read the NEW value back after a failed commit. There
+    // is no evidence that the previous value survived; callers needing that
+    // distinction must use setBbcInjectionEnabledDetailed(). The BBC key stays
+    // outside the packages/version atomic commit and the poison/commit fence.
+    fun setBbcInjectionEnabled(enabled: Boolean): Boolean =
+        setBbcInjectionEnabledDetailed(enabled) is BbcWriteOutcome.Confirmed
+
+    // PR #74 R3-1: tri-state write seam. Confirmed(value) = the daemon
+    // acknowledged the PERSISTED PREFERENCE (never an assertion about immediate
+    // hook behavior — the hook may read a cached value). Unknown = commit(false)
+    // or a throw; the local mMap may be optimistically polluted, and Unknown
+    // must NEVER be treated as "restored to the old value". The BBC opt-out is
+    // NOT a Samsung cold-start deletion guard (issue #75).
+    //
+    // Best-effort like the legacy wrapper: every Throwable other than
+    // CancellationException maps to Unknown and is swallowed. CancellationException
+    // is deliberately preserved as an interruption (not a write outcome); the
+    // app-scoped BbcToggleCoordinator runs under a SupervisorJob so a cancellation
+    // never surfaces as a failure toast. dispose() is UI-only (D05) and must not
+    // cancel the shared actor or an in-flight commit.
+    internal fun setBbcInjectionEnabledDetailed(enabled: Boolean): BbcWriteOutcome = try {
+        if (saveBbcEnabledRaw(enabled)) {
+            BbcWriteOutcome.Confirmed(enabled)
+        } else {
+            BbcWriteOutcome.Unknown
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcWriteOutcome.Unknown
+    }
+
     // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
     // fail-closed. Direct backends (repairProbe null) delegate to loadResult()
     // (no poison → already authoritative). Remote probe bypasses the poison
@@ -701,7 +816,8 @@ class HookPolicyStore(
         if (raw == null) LoadResult.Unavailable else LoadResult.Known(sanitizeHookPolicy(raw))
     } catch (_: ClassCastException) {
         // Stage J3:永不 auto-delete（見上）；保留舊快照，僅回 Corrupt。
-        // Stage L4: CCE 即 Corrupt（非 Unavailable），觸發修復流程而非盲清。
+        // Stage L4: CCE 即 Corrupt（非 Unavailable），觸發修復流程；
+        // 所有非 Known 草稿皆 fail-closed（盲清已停用）。
         LoadResult.Corrupt
     } catch (ce: CancellationException) {
         throw ce
@@ -899,6 +1015,11 @@ fun remoteHookPolicyStore(
     provider: () -> SharedPreferences?,
 ): HookPolicyStore {
     val storeIdentityRef = AtomicReference<SharedPreferences?>(null)
+    // E07: the saveRaw lambda below is constructed before the store instance
+    // exists, so it reaches this one-shot signal through this holder. Wired in
+    // the .also block immediately below; production callers can only invoke
+    // saveRaw after the factory has returned the fully wired store.
+    val invalidRepairTarget = AtomicReference<HookPolicyStore?>(null)
     fun resolvePrefs(): SharedPreferences? = try {
         provider()
     } catch (ce: CancellationException) {
@@ -966,7 +1087,8 @@ fun remoteHookPolicyStore(
                     } catch (cce: ClassCastException) {
                         // Stage L4: CCE 型別損壞即 Corrupt（非 Unavailable），加毒
                         // relatch 後重拋，由外層 loadResult 映射為 Corrupt；永不
-                        // 吞為 Unavailable（免損壞走盲清），永不自清。
+                        // 吞為 Unavailable（仍為 Unknown，清除 fail-closed、
+                        // 需先權威重整），永不自清。
                         // Stage N1 P1: 同時記錄 trusted corruption evidence (first-wins)，
                         // 供修復路徑在毒短路下仍能辨識 Corrupt vs transient。
                         try {
@@ -1007,45 +1129,185 @@ fun remoteHookPolicyStore(
                     notePrefsIdentity(prefs, storeIdentityRef)
                 } catch (_: Throwable) {
                 }
-                // 關 commit-vs-publish 窗:先 CAS 加毒再 commit,重疊讀必見 gen 變化。
-                val ownToken = prePoison(prefs)
+                // D02: poison is published ONLY at the commit point (see below).
+                // A no-commit abort (probe Unavailable / putLong failure) skips
+                // the CAS entirely: no poison latched, nothing to undo, and the
+                // prefs instance stays recoverable in the same process.
+                var poisonToken: Long? = null
+                // E07: true only when this write's probe classified an Invalid
+                // version key; combined with ok==true below it is the sole
+                // condition for raising the app-local hook-restart signal.
+                var repairedInvalidVersion = false
                 try {
-                    val ok: Boolean = if (raw == null) {
-                        prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES).commit()
-                    } else {
-                        prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
-                            .commit()
+                    // NEW-2 (P2): serialize the whole version
+                    // read->increment->putLong->commit under ONE process-wide
+                    // lock so two concurrent save() calls can never read the
+                    // same current version and commit duplicates (a duplicate
+                    // later presented as Cleared would be rejected by the hook's
+                    // monotonic gate). The lock includes the commit so packages
+                    // + version stay in the same atomic commit. The poison CAS is
+                    // intentionally performed INSIDE this lock, immediately before
+                    // commit(), to keep the commit-vs-publish fence unchanged; this
+                    // is deadlock-free because the poison primitives take no lock
+                    // (only an AtomicReference CAS, no re-entry into this lock).
+                    val ok: Boolean = synchronized(versionCommitLock) {
+                        // Phase A P0 policy_version 同步寫入（與包集合同一 commit
+                        // 原子落盤）：每次 save/clear 單調 +1。舊草稿遷移：版本鍵
+                        // 缺席視為 0（下次寫入即 1）；非空舊草稿無版本仍被 hook
+                        // 視為 Good（向後相容），空+無版本永不視為故意清除。
+                        // 版本鍵型別錯亂（CCE）視為 0 並以 putLong 覆寫修復。
+                        //
+                        // N04/N07 fail-closed version proof: probe via the shared
+                        // hook/app vocabulary (BbcVersionProbe.probeVersion). An
+                        // Unavailable result — `contains` threw, or `getLong`
+                        // failed for a non-CCE reason — means the probe itself
+                        // failed: ABORT THE WHOLE WRITE (no editor, no commit,
+                        // old store byte-identical). Absent/Invalid (CCE or
+                        // value < 1) still map to curVer=0 so the legacy
+                        // migration and the CCE-corrupt->v1 repair are preserved.
+                        //
+                        // D07 (PR#74 r3) KNOWN LIMITATION (cross-reference:
+                        // hook BbcStickyPolicyTest
+                        // .versionTypeCorruptRepairV1NeedsHookRestartDocumentedBbc):
+                        // repairing Invalid -> v1 is NOT guaranteed to take
+                        // effect in an already-running hook whose
+                        // lastBbcSeenVersion > 1 — the v1 Good is a decreasing
+                        // version and the hook's monotonic high-water rejects
+                        // it, keeping its previous sticky snapshot. A
+                        // successful App save does NOT prove BBC applied in
+                        // that process; a HOOK RESTART is required for reliable
+                        // application. This is a documented limitation, not a
+                        // pass. Behavior below is intentionally unchanged.
+                        //
+                        // E03: probeVersion is a SHARED, never-throw contract — it
+                        // classifies every non-CCE Throwable (including a
+                        // CancellationException) as Unavailable. The hook reader
+                        // depends on that. The app writer must NOT let a CE be
+                        // swallowed into `probe = Unavailable -> return false`,
+                        // because save()/clear() promise to rethrow CE. So the
+                        // adapter below captures any CE in a slot, rethrows it
+                        // (probe still returns Unavailable), then we rethrow the
+                        // captured CE immediately after the probe returns — before
+                        // the Unavailable branch. It exits this synchronized block
+                        // with poisonToken == null (poison is published only at
+                        // commit, per D02), reaching the outer CE catch: ZERO
+                        // commit, NO poison, NO state mutation, CE propagated.
+                        val probeCancellation = AtomicReference<CancellationException?>()
+                        val probe = probeVersion(object : VersionPrefsView {
+                            override fun containsVersion(): Boolean =
+                                try {
+                                    prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+                                } catch (ce: CancellationException) {
+                                    probeCancellation.set(ce)
+                                    throw ce
+                                }
+                            override fun readVersion(defValue: Long): Long =
+                                try {
+                                    prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, defValue)
+                                } catch (ce: CancellationException) {
+                                    probeCancellation.set(ce)
+                                    throw ce
+                                }
+                        })
+                        probeCancellation.get()?.let { throw it }
+                        if (probe is VersionProbeResult.Unavailable) {
+                            return@synchronized false
+                        }
+                        repairedInvalidVersion = probe is VersionProbeResult.Invalid
+                        val curVer: Long = when (probe) {
+                            is VersionProbeResult.Present -> probe.value
+                            VersionProbeResult.Absent, VersionProbeResult.Invalid -> 0L
+                            VersionProbeResult.Unavailable -> 0L // unreachable: aborted above
+                        }
+                        val newVer: Long = if (curVer >= Long.MAX_VALUE - 1L) 1L else curVer + 1L
+                        // N04/N07: 版本寫入改為 fail-closed（不再是 best-effort）。
+                        // putLong 若因非取消原因失敗，整筆寫入中止、不 commit，
+                        // 避免包集合落盤但版本缺席被 hook 讀成 Unknown。取消仍透傳。
+                        val ed = try {
+                            if (raw == null) {
+                                prefs.edit().remove(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
+                            } else {
+                                prefs.edit().putStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES, raw.toSet())
+                            }
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Throwable) {
+                            throw e
+                        }
+                        try {
+                            ed.putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, newVer)
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (_: Throwable) {
+                            // putLong 失敗（含測試 stub 的 UnsupportedOperationException）：
+                            // 整筆中止、不 commit、不留部分狀態。取消仍透傳。
+                            return@synchronized false
+                        }
+                        // D02: publish poison here, immediately before commit(), so
+                        // the optimistic mMap update inside commit() is always
+                        // fenced by a visible gen bump. No commit => no poison.
+                        poisonToken = prePoison(prefs)
+                        try {
+                            ed.commit()
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Throwable) {
+                            throw e
+                        }
                     }
                     if (ok) {
-                        val cleared = clearPoison(prefs, ownToken)
-                        if (cleared) {
-                            // Stage N1 P1:成功重同步即洗白 evidence (verified resync)。
-                            // Token 失配 (併發新毒) 則保留，不蓋掉併發診斷。
-                            try {
-                                clearCorruptEvidence(prefs)
-                            } catch (_: Exception) {
+                        poisonToken?.let { token ->
+                            val cleared = clearPoison(prefs, token)
+                            if (cleared) {
+                                // Stage N1 P1:成功重同步即洗白 evidence (verified resync)。
+                                // Token 失配 (併發新毒) 則保留，不蓋掉併發診斷。
+                                try {
+                                    clearCorruptEvidence(prefs)
+                                } catch (_: Exception) {
+                                }
                             }
                         }
-                    } else {
+                    } else if (poisonToken != null) {
+                        // A real commit was attempted (it returned false): the
+                        // optimistic mMap may be dirty, so keep the poison fence.
+                        // A no-commit abort leaves poisonToken == null: nothing
+                        // was published, so there is nothing to fence.
                         try {
                             ensurePoisoned(prefs)
                         } catch (_: Exception) {
                         }
                     }
+                    // E07: only a commit that ACTUALLY succeeded and repaired an
+                    // Invalid version key raises the signal. A false/aborted/
+                    // throwing commit (or a normal Present/Absent monotonic
+                    // write) never does. The hook may still reject v1 as a
+                    // replay; see the field KDoc (no claim about hook state).
+                    if (ok && repairedInvalidVersion) {
+                        try {
+                            invalidRepairTarget.get()?.noteInvalidVersionRepaired()
+                        } catch (_: Throwable) {
+                        }
+                    }
                     ok
                 } catch (ce: CancellationException) {
-                    try {
-                        ensurePoisoned(prefs)
-                    } catch (_: Exception) {
+                    // D02: only re-latch if a commit was actually attempted.
+                    if (poisonToken != null) {
+                        try {
+                            ensurePoisoned(prefs)
+                        } catch (_: Exception) {
+                        }
                     }
                     throw ce
                 } catch (e: Throwable) {
                     // 已拿到實例後的 edit/commit 拋出 (如 binder RemoteException
                     // 或 Error):樂觀更新可能已污染 mMap，加毒後重拋由
                     // HookPolicyStore.save/clear 統一轉 false (取消除外)。
-                    try {
-                        ensurePoisoned(prefs)
-                    } catch (_: Exception) {
+                    // D02: only re-latch if a commit was actually attempted.
+                    if (poisonToken != null) {
+                        try {
+                            ensurePoisoned(prefs)
+                        } catch (_: Exception) {
+                        }
                     }
                     throw e
                 }
@@ -1189,7 +1451,58 @@ fun remoteHookPolicyStore(
                 }
             }
         },
+        // PR #74 G1: BBC opt-out lives in the SAME dual_policy group but is a
+        // standalone boolean key — it never enters the packages/version atomic
+        // commit nor the poison/seqlock fence (those protect the draft snapshot
+        // only). service absent => read default true / write false. CE propagates.
+        //
+        // PR #74 R3-1: saveBbcEnabledRaw's false means UNKNOWN, not "the old
+        // value survived": RemotePreferences may have flushed the optimistic
+        // local mMap before the binder failed, so the caller can read back the
+        // new value even though nothing persisted. The tri-state mapping lives
+        // in HookPolicyStore.setBbcInjectionEnabledDetailed().
+        loadBbcEnabledRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    prefs.getBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, true)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        saveBbcEnabledRaw = { enabled ->
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                false
+            } else {
+                try {
+                    // Single-key atomic commit (never apply(): immediate
+                    // cross-process visibility of a user preference).
+                    // Defense in depth: serialize against the policy writer's
+                    // packages/version commit with the SAME process-wide lock.
+                    // A whole-map-commit libxposed implementation could
+                    // otherwise let a concurrent toggle commit drop the draft
+                    // (or vice versa). The policy writer itself is unchanged.
+                    synchronized(versionCommitLock) {
+                        prefs.edit()
+                            .putBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, enabled)
+                            .commit()
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+        },
     ).also { store ->
+        // E07: wire the one-shot repair signal back to the saveRaw lambda above.
+        invalidRepairTarget.set(store)
         // Stage N1 P1: evidence probe for hasCorruptEvidence() (zero-touch,
         // 僅查 evidence map，不碰 prefs getStringSet)。
         store.setCorruptEvidenceProbe {

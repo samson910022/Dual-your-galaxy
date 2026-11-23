@@ -38,6 +38,14 @@
             </intent-filter>
         </activity>
 
+        <!-- Dual Messenger「可用應用程式」清單（BBC 注入，見 docs/TAB7_BBC_INJECTION_PLAN.md）
+             政策編輯頁；由 MainActivity 核心引擎 tab 的 techCard 政策區
+             「編輯應用清單」按鈕以 Intent(this, PolicyActivity::class.java) 啟動。
+             Not exported, no intent-filter. -->
+        <activity
+            android:name=".PolicyActivity"
+            android:exported="false" />
+
         <!-- Shizuku binder provider; required for Shizuku API V2 to attach. -->
         <!-- Shizuku-mandated exported provider: the Shizuku manager binds this authority,
              access is gated by INTERACT_ACROSS_USERS_FULL plus the user's Shizuku grant;

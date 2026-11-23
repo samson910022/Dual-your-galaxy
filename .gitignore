@@ -21,3 +21,6 @@ release-key.properties
 local.defaults.properties
 .kotlin/
 __pycache__/
+
+# Local design assets (not for distribution)
+design/

@@ -26,6 +26,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -171,6 +172,8 @@ class PolicyWriteTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = policyStore,
+            // R4-4: legacy no-consent callers; production keeps the fail-safe default.
+            requirePolicyWriteConsent = false,
             currentUserId = { userId },
             nowMonoMs = nowMonoMs,
             selectionStore = selectionStore,
@@ -196,6 +199,20 @@ class PolicyWriteTest {
         // 在草稿載入期間已走完 (loading 變 false),那會等到 timeout。
         await { !vm.state.value.loading }
         return vm
+    }
+
+    // R5-0 (F01): blind-clear is disabled, so an arm must never be installed.
+    private fun blindClearArmAtMs(vm: DualViewModel): Long {
+        val f = DualViewModel::class.java.getDeclaredField("blindClearArmedAtMs").apply { isAccessible = true }
+        return (f.get(vm) as java.util.concurrent.atomic.AtomicLong).get()
+    }
+
+    // R5-0 (F01): the observable contract for any Unknown clear tap — CHANNEL
+    // refresh-first guidance and zero arm (store touch asserted at call sites).
+    private fun assertBlindClearDisabled(vm: DualViewModel, expectedMsg: String = PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText()) {
+        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertEquals(expectedMsg, vm.state.value.msg)
+        assertEquals(-1L, blindClearArmAtMs(vm))
     }
 
     private fun await(timeoutMs: Long = 5_000L, cond: () -> Boolean) {
@@ -580,7 +597,7 @@ class PolicyWriteTest {
 
         vm.requestPolicyWrite()
 
-        assertTrue(vm.state.value.msg.contains("已捨去 1 項不在來源清單的勾選"))
+        assertTrue(vm.state.value.msg.contains("已捨去 1 項不符合寫入條件的項目"))
         assertEquals(MsgKind.INFO, vm.state.value.msgKind)
         assertEquals(
             setOf("com.example.a"),
@@ -1664,7 +1681,7 @@ class PolicyWriteTest {
         try {
             requester.start()
             assertTrue(seamHit.await(5, java.util.concurrent.TimeUnit.SECONDS))
-            // 以反射註冊合成在途政策 op key（同 blindClear_busy_preservesArm 的
+            // 以反射註冊合成在途政策 op key（同 blindClearDisabled_busy_neverClears 的
             // 反射注入手法；不經 mutex，同步可觀測）。
             val f = DualViewModel::class.java.getDeclaredField("inFlightWrites").apply { isAccessible = true }
             @Suppress("UNCHECKED_CAST")
@@ -2256,10 +2273,10 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("已寫入政策草稿"))
     }
 
-    // Blind clear (Phase 2, Stage J3)：unknown draft → 第一次僅告警不執行（不清 pending、
-    // 不碰 store）；第二次重讀仍 Unknown→abort（不刪未見內容，clear 起始清 pending）。
+    // R5-0 (F01): blind-clear disabled. Unknown → fail-closed refresh-first
+    // guidance on EVERY tap: zero store touch, zero arm, no destructive path.
     @Test
-    fun clearPolicyDraft_unknownDraft_requiresDoubleConfirm() {
+    fun clearPolicyDraft_unknownDraft_failClosesNoDoubleConfirm() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -2276,29 +2293,24 @@ class PolicyWriteTest {
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(0, fake.clearCalls.get())
 
-        // 取消 pending 後回到盲清雙確認流程。本 VM 從未觀察到 Known 草稿
-        // （lastKnown==null），故 S4（強制重讀優先）不觸發，維持雙確認語義。
+        // 取消 pending 後回到 Unknown 清除入口——但已無任何盲清路徑。
         vm.cancelPolicyWrite(pending)
         assertNull(vm.state.value.pendingPolicyWrite)
         assertEquals(0, fake.clearCalls.get())
 
-        // 第一次：僅告警，不執行。
+        // 第一次：fail-closed refresh-first guidance，不 arm、不碰 store。
         vm.clearPolicyDraft()
-        // 同步 _state.update 警語（不經 IO），直接可斷言；pending 保持 null。
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
+        assertBlindClearDisabled(vm)
         assertFalse(vm.state.value.policyDraftKnown)
         assertNull(vm.state.value.pendingPolicyWrite)
         assertEquals(0, fake.clearCalls.get())
 
-        // 第二次：重讀仍 Unknown→abort，不執行、不耗 clear。
+        // 第二次：仍然 fail-closed（即使 lastKnown==null 亦無經典盲清）。
         vm.clearPolicyDraft()
-        Thread.sleep(300)
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
         assertNull(vm.state.value.pendingPolicyWrite)
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
     }
 
     // TOCTOU (#2):慢速 refresh 載入在途 → 成功 save 先提交 → 釋放舊載入不得覆寫。
@@ -2396,8 +2408,14 @@ class PolicyWriteTest {
             }
             override fun putInt(key: String?, value: Int): SharedPreferences.Editor =
                 throw UnsupportedOperationException()
-            override fun putLong(key: String?, value: Long): SharedPreferences.Editor =
-                throw UnsupportedOperationException()
+            // N04/N07: writer now requires putLong to succeed (fail-closed on
+            // failure). Stage into pending like putStringSet so real-store-chain
+            // tests that rely on successful saves keep passing.
+            override fun putLong(key: String?, value: Long): SharedPreferences.Editor {
+                pending[key!!] = value
+                removed.remove(key)
+                return this
+            }
             override fun putFloat(key: String?, value: Float): SharedPreferences.Editor =
                 throw UnsupportedOperationException()
             override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor =
@@ -2423,7 +2441,8 @@ class PolicyWriteTest {
     }
 
     // VM↔binding 整合 (#3, Phase 2 兩步確認)：真實 store 鏈路 — commit 失敗 →
-    // FAILED+unknown；未知門控零寫入；翻轉成功旗標後 blind clear 需兩步
+    // FAILED+unknown；未知門控零寫入；blind clear 已撤回停用（Unknown 一律
+    // fail-closed，回 UNKNOWN_REFRESH，需先權威 refresh 至 Known，無兩步路徑）
     // （第一次告警、第二次執行；成功 clear 清 needsRefetch），再
     // refresh→Known→request+confirm 成功。
     @Test
@@ -2454,22 +2473,19 @@ class PolicyWriteTest {
         assertEquals(commitsBeforeSecond, prefs.commitCalls)
         assertFalse(vm.state.value.policyDraftKnown)
 
-        // 3) Stage J3:翻轉成功旗標後，blind clear 仍不得刪未見內容——同實例毒旗標下
-        //    重讀仍 Unknown→abort（REFRESH_FAILED＋Unknown＋0 commit），不恢復 sticky。
-        //    （明確刪除亦須 Known；毒旗標須經新身份穿透或成功寫入恢復，同實例不清。）
+        // 3) R5-0 (F01): even after the poisoned commit flag flips back to
+        //    success, an Unknown clear stays fail-closed (refresh-first, zero
+        //    commit, zero arm). Recovery requires the new identity / VM below.
         prefs.commitSucceeds = true
         val commitsBeforeClear = prefs.commitCalls
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertBlindClearDisabled(vm)
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(commitsBeforeClear, prefs.commitCalls)
         vm.clearPolicyDraft()
-        Thread.sleep(300)
+        assertBlindClearDisabled(vm)
         assertEquals(commitsBeforeClear, prefs.commitCalls)
         assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
 
         // 4) 新身份恢復（DEVICE-UNVERIFIED 實驗路徑）：以乾淨 prefs
         //    新建 VM，refresh 即 Known，後續 request+confirm 成功（真實 store→VM 鏈）。
@@ -2769,7 +2785,8 @@ class PolicyWriteTest {
 
     // Phase 2 VM：throw-provider transient（不設旗標）→ 恢復後 refresh 即 Known
     // (old) → request+confirm 直接成功無需 clear（與 1215 sticky 腿對照：該腿為
-    // commit-false 同實例，需 blind clear 兩步；本腿 load-only 恢復，無需 clear）。
+    // commit-false 同實例須先權威 refresh 至 Known（blind clear 已停用）；
+    // 本腿 load-only 恢復，無需 clear）。
     @Test
     fun throwProviderTransient_refreshRecoversThenSaveSucceedsWithoutClear() {
         val prefs = MinimalPrefs(commitSucceeds = true)
@@ -2807,10 +2824,10 @@ class PolicyWriteTest {
         )
     }
 
-    // Phase 2 VM：failed-clear 重試恢復（clear-fail → Unknown → 重試 clear 成功
-    // → Known 空）。重試需經兩步確認（第一次告警不耗 store，第二次執行）。
+    // R5-0 (F01): failed-clear recovery now REQUIRES an explicit authoritative
+    // refresh; no tap on clear from an Unknown snapshot may delete anything.
     @Test
-    fun failedClear_retrySucceedsAfterDoubleConfirm() {
+    fun failedClear_retryRequiresAuthoritativeRefresh() {
         val fake = FakePolicyStore()
         val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
         await { vm.state.value.policyDraftKnown }
@@ -2823,23 +2840,20 @@ class PolicyWriteTest {
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
         assertEquals(1, fake.clearCalls.get())
 
-        // 重試：第二次 arm 後的第二次點擊（S4）會先強制權威重讀而不刪除；
-        // 重讀恢復 Known 後的清除才是 Known 一般單步清除。
+        // 重試：clear 入口一律 fail-closed（即使在清除失敗後曾見過 Known）。
         fake.clearSucceeds = true
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
+        assertBlindClearDisabled(vm)
         assertFalse(vm.state.value.policyDraftKnown)
         assertEquals(1, fake.clearCalls.get())
 
-        // S4：本 VM 曾見過 Known 草稿，armed 後點擊先強制 refreshPolicyDraft()，
-        // 本點擊不碰 store（refresh 異步執行）。
-        vm.clearPolicyDraft()
+        // 唯一恢復路徑：明確的權威重讀（即 Unknown Retry 所做的事）。
+        vm.refreshPolicyDraft()
         await { vm.state.value.policyDraftKnown }
         assertEquals(setOf("com.seed"), vm.state.value.policyDraft)
         assertEquals(1, fake.clearCalls.get())
 
-        // 重讀已恢復 Known → 下一次清除是一般 Known 單步清除。
+        // 重讀已恢復 Known → 清除是一般 Known 單步清除。
         vm.clearPolicyDraft()
         await { vm.state.value.policyDraft.isEmpty() && vm.state.value.msgKind == MsgKind.INFO }
         assertEquals(emptySet<String>(), vm.state.value.policyDraft)
@@ -2866,9 +2880,9 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyRefreshing)
     }
 
-    // Critical 3：stale-arm 洩漏迴歸——arm→Known→Unknown→單次 clear 必須僅告警。
-    // Known 成功路徑（refresh/confirm/clear）須同步 disarm，否則舊 arm 殘留會讓
-    // 下一次 Unknown 的單次 clear 直接執行（靜默刪除未見內容）。
+    // Critical 3（R5-0 後）：blind-clear 已停用，無 arm 可殘留；Known→Unknown
+    // 的 clear 一律 fail-closed（UNKNOWN_REFRESH、零 store 觸碰），不論先前的
+    // Known 成功路徑為何。本測試釘住此不變性（舊的 stale-arm 執行路徑已移除）。
     @Test
     fun staleArmClearedByKnown_singleClearAfterReUnknownOnlyWarns() {
         val fake = FakePolicyStore()
@@ -2877,9 +2891,9 @@ class PolicyWriteTest {
         await { !vm.state.value.loading }
         assertFalse(vm.state.value.policyDraftKnown)
 
-        // Unknown 下第一次 clear 僅 arm（不耗 store）。
+        // Unknown 下 clear 一律 fail-closed（不 arm、不耗 store）。
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
         // refresh Known 成功必須 disarm。
@@ -2893,10 +2907,9 @@ class PolicyWriteTest {
         vm.refreshPolicyDraft()
         await { !vm.state.value.policyDraftKnown }
 
-        // 單次 clear 必須僅告警（arm 已被 Known 清掉），不得執行。
+        // 再次 Unknown 後 clear 仍只給 refresh-first guidance，不得執行。
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
@@ -3950,11 +3963,10 @@ class PolicyWriteTest {
         assertNull(activeTxOf(vm))
     }
 
-    // Stage J3 blind-clear：Unknown 下第二 tap 亦須重讀＋abort（永不刪未見內容）。
-    // TTL 內第二 tap 因 store 仍 Unknown（null）而 abort，不耗 clear，需顯式 refresh
-    // Known 後方可清除。
+    // R5-0 (F01): no Unknown tap clears, regardless of TTL. Only an explicit
+    // authoritative refresh restoring Known opens the clear path again.
     @Test
-    fun blindClear_secondTapWithinTtl_executes() {
+    fun blindClearDisabled_secondTapWithinTtl_neverClears() {
         var now = 10_000L
         val fake = FakePolicyStore()
         fake.saved = null
@@ -3963,19 +3975,15 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
-        // Stage J3:第二 tap 重讀仍 Unknown→abort（REFRESH_FAILED＋Unknown＋IDLE），
-        // 不耗 clear、不刪未見內容。
+        // Second tap within TTL: still fail-closed (no arm/TTL path remains).
         now = 10_000L + DualViewModel.BLIND_CLEAR_TTL_MS - 1_000L
         vm.clearPolicyDraft()
-        Thread.sleep(300)
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("重新整理"))
 
         // 顯式 refresh Known（遠端恢復為確認空）後，單步清除即成功。
         fake.saved = emptySet()
@@ -3991,9 +3999,10 @@ class PolicyWriteTest {
         assertTrue(vm.state.value.msg.contains("已清除政策草稿"))
     }
 
-    // Stage D：延遲 tap（超過 TTL）→重 arm＋EXPIRED 文案，不執行。
+    // R5-0 (F01): with blind-clear disabled there is no TTL/EXPIRED/re-arm
+    // state machine; every late tap gives the same refresh-first guidance.
     @Test
-    fun blindClear_secondTapAfterTtl_showsExpiredAndRearms() {
+    fun blindClearDisabled_secondTapAfterTtl_neverClears() {
         var now = 20_000L
         val fake = FakePolicyStore()
         fake.saved = null
@@ -4002,27 +4011,24 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
         now = 20_000L + DualViewModel.BLIND_CLEAR_TTL_MS + 1L
         vm.clearPolicyDraft()
 
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("已逾時"))
-        assertTrue(vm.state.value.msg.contains("重新清除"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(
+        assertNotEquals(
             PolicyText(PolicyTextKind.BLIND_CLEAR_EXPIRED).defaultText(),
             vm.state.value.msg,
         )
     }
 
-    // Stage D：過期重 arm 後、TTL 內第三 tap 執行（重 arm 鏈）。
-    // Stage J3：第三 tap 重讀仍 Unknown→abort，不執行（0 clear）。
+    // R5-0 (F01): every tap in a 3-tap sequence is fail-closed; no re-arm chain.
     @Test
-    fun blindClear_expiredRearm_thirdTapWithinTtl_executes() {
+    fun blindClearDisabled_expiredRearm_thirdTap_neverClears() {
         var now = 30_000L
         val fake = FakePolicyStore()
         fake.saved = null
@@ -4030,24 +4036,26 @@ class PolicyWriteTest {
         await { !vm.state.value.loading }
 
         vm.clearPolicyDraft()
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
         now = 30_000L + DualViewModel.BLIND_CLEAR_TTL_MS + 1L
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("已逾時"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
-        // Stage J3:第三 tap（同世代、TTL 內）重讀仍 Unknown→abort，不執行。
+        // Third tap (same nominal generation/TTL): still fail-closed.
         now += 1_000L
         vm.clearPolicyDraft()
-        Thread.sleep(300)
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
-    // Stage D：斷開/重連 disarm——arm 後 reconnect，再次 clear 僅告警不執行。
+    // R5-0 (F01): reconnect cannot re-enable a destructive clear path; the
+    // fail-closed Unknown contract is identical before and after reconnect.
     @Test
-    fun blindClear_reconnect_disarms() {
+    fun blindClearDisabled_reconnect_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -4055,30 +4063,27 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
         vm.reconnectAndRefresh()
         await { !vm.state.value.loading }
 
         vm.clearPolicyDraft()
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        assertTrue(vm.state.value.msg.contains("清除將刪除未見內容"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
 
-        // Stage J3:重 arm 後第二 tap 重讀仍 Unknown→abort，不執行。
+        // Post-reconnect second tap: still fail-closed.
         vm.clearPolicyDraft()
-        Thread.sleep(300)
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
-    // Stage D：foreground disarm——arm 後 onForeground，再次 clear 僅告警。
-    // Stage J3:第二 tap 重讀仍 Unknown→abort，不執行。
+    // R5-0 (F01): foreground cannot re-enable blind-clear; fail-closed holds.
     @Test
-    fun blindClear_foreground_disarms() {
+    fun blindClearDisabled_foreground_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -4086,29 +4091,27 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
         vm.onForeground()
         await { !vm.state.value.loading }
 
         vm.clearPolicyDraft()
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
-        Thread.sleep(300)
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
-    // Stage D：世代失配重 arm——arm 後 unknown-gate confirm 推進版本，
-    // 第二 tap 視為新的第一次（FIRST，不執行），第三 tap 執行。
-    // Stage J3:第三 tap 重讀仍 Unknown→abort，不執行。
+    // R5-0 (F01): generation bumps no longer install/re-arm a blind clear;
+    // Unknown taps stay fail-closed even after an unknown-gate confirm.
     @Test
-    fun blindClear_generationMismatch_rearms() {
+    fun blindClearDisabled_generationMismatch_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -4116,7 +4119,7 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
         // unknown-gate confirm：不碰 store 但 bump 版本＋世代。
@@ -4126,28 +4129,27 @@ class PolicyWriteTest {
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(0, fake.saveCalls.get())
 
-        // 世代已變：第二 tap 重 arm（FIRST），不執行。
+        // 世代已變：第二 tap 仍 fail-closed（無 re-arm）。
         vm.clearPolicyDraft()
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertEquals(
+        assertBlindClearDisabled(vm)
+        assertNotEquals(
             PolicyText(PolicyTextKind.BLIND_CLEAR_FIRST).defaultText(),
             vm.state.value.msg,
         )
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
 
-        // 第三 tap（同世代、TTL 內）重讀仍 Unknown→abort，不執行。
+        // 第三 tap：仍然 fail-closed。
         vm.clearPolicyDraft()
-        Thread.sleep(300)
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
 
-    // Stage D：busy 保留 arm——inFlight 期間 clear 拒 BUSY 不耗 arm，
-    // 解除後第二 tap 仍執行（非重 arm）。
-    // Stage J3:解除後第二 tap 重讀仍 Unknown→abort，不執行。
+    // R5-0 (F01): BUSY precedence is unchanged, but there is no arm to
+    // preserve; after BUSY clears the Unknown tap is still fail-closed.
     @Test
-    fun blindClear_busy_preservesArm() {
+    fun blindClearDisabled_busy_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
@@ -4155,7 +4157,7 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
         // 以反射注入政策在途 key，模擬寫入進行中（不經 mutex，同步可觀測）。
@@ -4172,9 +4174,9 @@ class PolicyWriteTest {
             keys.remove("policy-write:fake-busy")
         }
 
-        // arm 被保留，但重讀仍 Unknown→abort，不執行。
+        // BUSY 解除後：仍然 fail-closed（沒有 arm 可供「保留」）。
         vm.clearPolicyDraft()
-        Thread.sleep(300)
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
     }
@@ -5261,6 +5263,8 @@ class PolicyWriteTest {
             hookDirectReads = { listOf(MarkerRead.Readable(null)) },
             hookDiagnosticGateways = { emptyList() },
             hookPolicyStore = store,
+            // R4-4: legacy no-consent callers; production keeps the fail-safe default.
+            requirePolicyWriteConsent = false,
             currentUserId = { 0 },
             policyIoTimeoutMs = policyIoTimeoutMs,
             policyTxCoordinator = coord,
@@ -6891,6 +6895,8 @@ class PolicyWriteTest {
                 hookDirectReads = { listOf(MarkerRead.Readable(null)) },
                 hookDiagnosticGateways = { emptyList() },
                 hookPolicyStore = fake.store,
+                // R4-4: legacy no-consent clearPolicyDraft() caller in this test.
+                requirePolicyWriteConsent = false,
                 currentUserId = { 0 },
                 selectionStore = blockingSelectionStore,
                 policyTxCoordinator = coord,
@@ -7476,8 +7482,8 @@ class PolicyWriteTest {
         assertEquals(setOf("com.example.a"), vm.state.value.policyDraft)
     }
 
-    // Stage J3-5 blind-clear-requires-Known：load→Unknown，TTL 內 double clear→
-    // store.clear 永不呼叫（不刪未見內容）。
+    // R5-0 (F01)：load→Unknown 後任何 double clear（含 TTL 內）皆零 store.clear
+    // （盲清已停用，所有非 Known 草稿 fail-closed，不刪未見內容）。
     @Test
     fun j3_blindClearRequiresKnown_doubleClearNeverCallsStore() {
         var now = 50_000L
@@ -7494,11 +7500,13 @@ class PolicyWriteTest {
         assertFalse(vm.state.value.policyDraftKnown)
 
         vm.clearPolicyDraft()
+        assertBlindClearDisabled(vm)
         assertEquals(0, clearCalls)
 
         now = 50_000L + DualViewModel.BLIND_CLEAR_TTL_MS - 1_000L
         vm.clearPolicyDraft()
         await(timeoutMs = 5_000L) { vm.state.value.policyWritePhase == PolicyWritePhase.IDLE && !vm.state.value.loading }
+        assertBlindClearDisabled(vm)
         assertEquals(0, clearCalls)
         assertFalse(vm.state.value.policyDraftKnown)
     }
@@ -8086,7 +8094,8 @@ class PolicyWriteTest {
         }
     }
 
-    // Stage L4 P2#3 corrupt double-clear 仍零 store 觸碰（盲清僅 Unavailable 專用）。
+    // Stage L4 / R5-0：corrupt double-clear 仍零 store 觸碰（盲清已停用，
+    // 所有非 Known 草稿皆 fail-closed）。
     @Test
     fun l4_corruptDoubleClear_stillZeroStoreCalls() {
         var clearCalls = 0
@@ -8251,12 +8260,11 @@ class PolicyWriteTest {
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
     }
 
-    // Stage L4 fix(a) 非 Corrupt 不變：Unavailable 下清除鈕仍走盲清雙確認
-    // （第一 tap arm＋BLIND_CLEAR_FIRST，零 store 觸碰；Corrupt 修復不介入）。
-    // 統一入口兩 tap：皆經 onClearPolicyButtonTap（與生產按鈕同一调用點），
-    // TTL/世代通過＋遠端恢復 Known 後第二 tap 執行盲清（clearCalls==1）。
+    // R5-0 (F01): Unavailable no longer has a reachable blind-clear UI path.
+    // Both taps through the unified button route are fail-closed; only a real
+    // refresh restoring Known opens the clear path.
     @Test
-    fun l4_clearButtonTap_unavailableKeepsBlindClear() {
+    fun l4_clearButtonTap_unavailableNeverClears() {
         var now = 10_000L
         var backing: Set<String>? = null
         var clearCalls = 0
@@ -8278,16 +8286,22 @@ class PolicyWriteTest {
         await(timeoutMs = 5_000L) { !vm.state.value.policyDraftKnown }
         assertFalse(vm.state.value.policyDraftCorrupt)
 
-        // 第一 tap（統一入口）：盲清 arm，零 store 觸碰。
+        // 第一 tap（統一入口）：fail-closed guidance，零 store 觸碰、零 arm。
         vm.onClearPolicyButtonTap()
-        assertTrue(vm.state.value.msg.contains("再次清除"))
+        assertBlindClearDisabled(vm)
         assertEquals(0, clearCalls)
         assertFalse(vm.isCorruptRepairArmed())
 
-        // 遠端恢復為確認空（不經 refresh，不 bump 版本/世代，TTL＋世代雙檢可過）。
+        // 第二 tap：遠端已恢復但 state 仍 Unknown → 仍不得清除。
         backing = emptySet()
         now = 10_000L + DualViewModel.BLIND_CLEAR_TTL_MS - 1_000L
-        // 第二 tap（同一統一入口）：TTL＋世代通過＋pre-read Known→執行盲清。
+        vm.onClearPolicyButtonTap()
+        assertBlindClearDisabled(vm)
+        assertEquals(0, clearCalls)
+
+        // 明確 refresh 恢復 Known 後，清除才走一般單步路徑。
+        vm.refreshPolicyDraft()
+        await { vm.state.value.policyDraftKnown }
         vm.onClearPolicyButtonTap()
         await(timeoutMs = 5_000L) { clearCalls == 1 && vm.state.value.msgKind == MsgKind.INFO }
         assertEquals(1, clearCalls)
@@ -11165,10 +11179,11 @@ class PolicyWriteTest {
         }
     }
 
-    // PR #60 (Phase 2 / R1(d) + SM): S4 盲清 — 本行程曾觀察到 Known；遠端轉未知後，
-    // 雙擊只強制重讀；重讀仍未知 → 不刪（BLIND_CLEAR_REFRESH_FIRST），第二次亦同。
+    // R5-0 (F01): a process-level observed-Known history no longer grants any
+    // destructive path. Every Unknown tap is fail-closed (no forced refresh,
+    // no arm, no delete), even after repeated taps.
     @Test
-    fun s4_blindClear_lastKnownSet_refreshKeepsFailing_neverDeletes() {
+    fun s4_blindClearDisabled_lastKnownSet_refreshKeepsFailing_neverClears() {
         val fake = FakePolicyStore() // 初始 Known（setOf("com.seed")）
         val vm = makeVm(fake.store, userId = 0, initialDraft = setOf("com.seed"))
         await { vm.state.value.policyDraftKnown }
@@ -11178,35 +11193,24 @@ class PolicyWriteTest {
         await(timeoutMs = 5_000L) { !vm.state.value.policyDraftKnown }
         assertNotNull(vm.lastKnownPolicyDraftForTests())
 
-        vm.clearPolicyDraft() // tap 1：arm＋BLIND_CLEAR_FIRST
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
+        vm.clearPolicyDraft() // tap 1：fail-closed
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
 
         val genBeforeTap2 = freshGenOf(vm)
-        vm.clearPolicyDraft() // tap 2：S4 refresh-first；重讀仍 Unknown → 不刪
-        await(timeoutMs = 5_000L) {
-            freshGenOf(vm) != genBeforeTap2 && !vm.state.value.policyRefreshing
-        }
+        vm.clearPolicyDraft() // tap 2：no forced refresh, no delete
         assertEquals(0, fake.clearCalls.get())
-        assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
-        assertTrue(
-            "tap2 後只能看到 refresh-first／refresh-failed（重讀仍未知）：" + vm.state.value.msg,
-            vm.state.value.msg == PolicyText(PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST).defaultText() ||
-                vm.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText(),
-        )
+        assertEquals(genBeforeTap2, freshGenOf(vm))
+        assertFalse(vm.state.value.policyRefreshing)
+        assertBlindClearDisabled(vm)
 
-        vm.clearPolicyDraft() // tap 3：重新 arm（上一 arm 已 consume；世代已穩定）
-        assertTrue(vm.state.value.msg.contains("遠端內容未知"))
-        // tap3 的 arm 快照於世代推進之後 → 檢查通過 → S4（第二次 refresh-first）→ 仍不刪
-        val genBeforeTap4 = freshGenOf(vm)
-        vm.clearPolicyDraft() // tap 4：第二次 refresh-first（第二次失敗）→ 仍不刪
-        await(timeoutMs = 5_000L) {
-            freshGenOf(vm) != genBeforeTap4 && !vm.state.value.policyRefreshing
-        }
+        vm.clearPolicyDraft() // tap 3
+        assertBlindClearDisabled(vm)
+        vm.clearPolicyDraft() // tap 4
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
+        assertEquals(genBeforeTap2, freshGenOf(vm))
         assertFalse(vm.state.value.policyDraftKnown)
-        assertEquals(MsgKind.CHANNEL, vm.state.value.msgKind)
     }
 
     // PR #60 (Phase 2 / SEC-M1): commit-time Known fence — the clear must
@@ -11282,61 +11286,52 @@ class PolicyWriteTest {
         assertEquals("store.clear() must never have run", 0, clearCalls)
     }
 
-    // PR #60 (Phase 2 / R1(d)): lastKnown==null 維持經典雙擊語義——pre-read 把關：
-    // 重讀 Unknown → REFRESH_FAILED 中止（不刪）；遠端恢復（state 仍 Unknown、
-    // lastKnown==null）→ 經典路徑允許刪除（既有行為保留）。
+    // R5-0 (F01): the "classic double tap" is GONE — lastKnown==null no longer
+    // grants a delete. Only an explicit authoritative refresh restoring Known
+    // can open the clear path.
     @Test
-    fun s4_blindClear_lastKnownNull_classicDoubleTapSemantics() {
+    fun s4_blindClearDisabled_lastKnownNull_neverClears() {
         val fake = FakePolicyStore()
         fake.saved = null
         val vm = makeVm(fake.store, userId = 0, initialDraft = null)
         await { !vm.state.value.loading }
         assertNull(vm.lastKnownPolicyDraftForTests())
 
-        vm.clearPolicyDraft() // tap 1：arm
+        vm.clearPolicyDraft() // tap 1：fail-closed
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
-        // 遠端仍 Unknown：tap 2 → pre-read Unknown → abort（不刪）
+        // 遠端仍 Unknown：tap 2 → 仍然 fail-closed（不刪）
         vm.clearPolicyDraft()
-        Thread.sleep(400)
+        assertBlindClearDisabled(vm)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vm.state.value.policyDraftKnown)
-        assertTrue(vm.state.value.msg.contains("重新整理"))
 
-        // 遠端恢復（saved 已有值；state 仍 Unknown、未重讀；lastKnown==null）：
-        // 下一次雙擊經典路徑允許刪除。
-        vm.clearPolicyDraft() // tap 3：重新 arm
+        // 遠端恢復但 state 仍 Unknown：tap 3/4 仍不清除（無經典雙擊）。
         fake.saved = emptySet()
-        vm.clearPolicyDraft() // tap 4：pre-read Known(empty) → 清除執行
+        vm.clearPolicyDraft()
+        assertBlindClearDisabled(vm)
+        vm.clearPolicyDraft()
+        assertBlindClearDisabled(vm)
+        assertEquals(0, fake.clearCalls.get())
+
+        // 明確 refresh 後才可清除。
+        vm.refreshPolicyDraft()
+        await { vm.state.value.policyDraftKnown }
+        vm.clearPolicyDraft()
         await(timeoutMs = 5_000L) { fake.clearCalls.get() == 1 }
         assertEquals(1, fake.clearCalls.get())
     }
 
-    // PR #60 r6 Phase 1 (Finding #1): VM 替換邊界——Activity 重開（同行程內新
-    // VM 實例）繼承 coordinator 持有的行程級 lastKnown 圍欄；遠端 Unknown 下
-    // 兩次點擊仍只觸發 refresh-first（fail-closed），絕不刪除。
+    // R5-0 (F01): VM replacement / inherited process-level Known history does
+    // not change the Unknown contract: no tap deletes, no refresh is forced by
+    // clear, and the coordinator still keeps its last-Known snapshot.
     @Test
-    fun s4_blindClear_vmReplacement_knownInherited_refreshFirstNeverDeletes() {
+    fun s4_blindClearDisabled_vmReplacement_knownInherited_refreshFirstNeverClears() {
         val coord = PolicyTxCoordinator()
-        // 自訂 store（FakePolicyStore 語義＋可阻斷 load）：VM-B 盲清 tap-2 的
-        // refresh-first 重讀會阻在 loadBlock（onIo IO 執行緒自旋），msg 停留在
-        // BLIND_CLEAR_REFRESH_FIRST。此測試鑑別的是「行程級圍欄全退回
-        // VM-local-only」的回歸（如 commit-time knownCommitFence 亦同步退回時）；
-        // 單獨還原 S4 refresh-first gate（9187）仍會被 coordinator-aware 的
-        // commit-time fence 接住（fail-closed，msg 亦為 BLIND_CLEAR_REFRESH_FIRST）
-        // ——兩層防禦互為掩護，此斷言只對「整體 rollback」確定性失手。
         var backing: Set<String>? = setOf("com.seed")
         var clearCalls = 0
-        val loadBlock = java.util.concurrent.atomic.AtomicBoolean(false)
         val store = HookPolicyStore(
-            loadRaw = {
-                while (loadBlock.get()) {
-                    try {
-                        Thread.sleep(10)
-                    } catch (_: InterruptedException) {
-                    }
-                }
-                backing
-            },
+            loadRaw = { backing },
             saveRaw = { raw ->
                 if (raw == null) {
                     clearCalls++
@@ -11347,66 +11342,37 @@ class PolicyWriteTest {
                 true
             },
         )
-        // VM-A：觀察過 Known → noteLastKnownDraft 同步寫入 coordinator 圍欄。
+        // VM-A：observes Known → coordinator records the process-level fence.
         val vmA = makeVm(store, userId = 0, initialDraft = setOf("com.seed"), policyTxCoordinator = coord)
         await { vmA.state.value.policyDraftKnown }
         await(timeoutMs = 5_000L) { coord.lastKnownPolicyDraft.get() != null }
-        // 遠端轉為未知：強制重讀（state → Unknown；行程級 lastKnown 保留）。
         backing = null
         vmA.refreshPolicyDraft()
         await(timeoutMs = 5_000L) { !vmA.state.value.policyDraftKnown }
-        // 模擬 Activity finish：dispose 後取消 scope（與 tearDown 同序；coordinator 存活）。
         finishActivityStyle(vmA)
-        // VM-B：同行程新 VM（等效 Activity 重開），同一 coordinator＋未知 store。
+        // VM-B: same process (same coordinator), Unknown store.
         val vmB = makeVm(store, userId = 0, initialDraft = null, policyTxCoordinator = coord)
         await(timeoutMs = 5_000L) { !vmB.state.value.loading && !vmB.state.value.policyDraftKnown }
 
-        vmB.clearPolicyDraft() // tap 1：arm＋BLIND_CLEAR_FIRST
+        vmB.clearPolicyDraft() // tap 1
+        assertBlindClearDisabled(vmB)
         assertEquals(0, clearCalls)
         assertEquals(setOf("com.seed"), coord.lastKnownPolicyDraft.get())
 
-        loadBlock.set(true) // 卡住 tap 2 的 refresh-first 重讀，使鑑別斷言確定性成立
-        try {
-            vmB.clearPolicyDraft() // tap 2：S4 refresh-first（行程級 lastKnown 繼承）→ 不刪
-            // 鑑別斷言（同步前綴）：refresh-first arm 在 clearPolicyDraft 內同步寫
-            // msg=BLIND_CLEAR_REFRESH_FIRST；回歸 bug（行程級圍欄全退回 VM-local-only、
-            // VM-B 無圍欄）則走 classic arm，此處 msg 不會是此值（且 loadBlock 卡住
-            // pre-IO 重讀）。單獨還原 S4 gate 而保留 coordinator-aware commit fence 時，
-            // 後者會 fail-closed 接管並發出相同 msg——見上方 loadBlock 說明。
-            assertEquals(
-                PolicyText(PolicyTextKind.BLIND_CLEAR_REFRESH_FIRST).defaultText(),
-                vmB.state.value.msg,
-            )
-            assertTrue(vmB.state.value.policyRefreshing)
-        } finally {
-            loadBlock.set(false)
-        }
-        await(timeoutMs = 5_000L) { !vmB.state.value.policyRefreshing }
+        vmB.clearPolicyDraft() // tap 2 — still fail-closed, no forced refresh
+        assertBlindClearDisabled(vmB)
         assertEquals(0, clearCalls)
+        assertFalse(vmB.state.value.policyRefreshing)
         assertNotNull(vmB.lastKnownPolicyDraftForTests())
         assertFalse(vmB.state.value.policyDraftKnown)
-        assertEquals(MsgKind.CHANNEL, vmB.state.value.msgKind)
-        // 重讀恢復未知 → refresh-first 後續 settle 為 REFRESH_FAILED（fail-closed，不刪）。
-        assertEquals(
-            PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText(),
-            vmB.state.value.msg,
-        )
     }
 
-    // PR #60 r6 Phase 1 (Finding #1): 新行程（全新 coordinator＝escape hatch）
-    // 不繼承行程級圍欄，回復經典雙擊語義。注意：暫時性未知且 store 仍不可讀時，
-    // 經典路徑本來就在 pre-IO 重讀中止（REFRESH_FAILED、零刪除，見
-    // s4_blindClear_lastKnownNull_classicDoubleTapSemantics）；只有狀態轉為
-    // 未知期間「誰曾是 Known」不再被行程級圍欄綁住——遠端恢復可讀後的下一次
-    // 雙擊即可刪除。共享 coordinator 的 VM（見 s4_blindClear_vmReplacement_...）
-    // 在同一未知 store 場景下永遠只觸發 refresh-first。
-    // 偏離說明（r6 修正輪）：spec 原寫「same unknown store；two taps → clearCalls
-    // == 1」，但現行 fail-closed 設計（StageJ3 pre-IO 重讀閘門）下，不可讀 store
-    // 的第二次點擊絕不刪除（與 s4_blindClear_lastKnownNull_classicDoubleTapSemantics
-    // 釘住的既有語義一致）；此測試改為 tap 1-2 驗證 0 刪除＋REFRESH_FAILED，
-    // 遠端恢復可讀後 tap 3-4 完成經典雙擊刪除並斷言 clearCalls == 1。
+    // R5-0 (F01): a new process (fresh coordinator, no inherited Known) does
+    // NOT restore the classic double-tap delete. Every Unknown tap is
+    // fail-closed; only an explicit authoritative refresh restoring Known
+    // opens the clear path (same contract as the inherited-Known case).
     @Test
-    fun s4_blindClear_newProcessCoordinator_classicDoubleTapSemantics() {
+    fun s4_blindClearDisabled_newProcessCoordinator_neverClears() {
         val coordA = PolicyTxCoordinator()
         val fake = FakePolicyStore() // 初始 Known（setOf("com.seed")）
         // VM-A：同前測，觀察過 Known 後以 Activity finish 語義銷毀。
@@ -11424,25 +11390,26 @@ class PolicyWriteTest {
         await(timeoutMs = 5_000L) { !vmB.state.value.loading && !vmB.state.value.policyDraftKnown }
         assertNull(vmB.lastKnownPolicyDraftForTests())
 
-        vmB.clearPolicyDraft() // tap 1：arm（0 刪除）
+        vmB.clearPolicyDraft() // tap 1：fail-closed（lastKnown==null 亦無經典雙擊）
+        assertBlindClearDisabled(vmB)
         assertEquals(0, fake.clearCalls.get())
-        // 圍欄不適用（新行程）→ 經典路徑；pre-read Unknown → REFRESH_FAILED 中止（0 刪除）
-        vmB.clearPolicyDraft() // tap 2
-        await(timeoutMs = 5_000L) {
-            vmB.state.value.msg == PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText()
-        }
+        vmB.clearPolicyDraft() // tap 2：仍然 fail-closed
+        assertBlindClearDisabled(vmB)
         assertEquals(0, fake.clearCalls.get())
         assertFalse(vmB.state.value.policyDraftKnown)
-        assertEquals(
-            PolicyText(PolicyTextKind.REFRESH_FAILED).defaultText(),
-            vmB.state.value.msg,
-        )
 
-        // 遠端恢復可讀（Known empty；state 仍 Unknown、未重讀、lastKnown==null）：
-        // 下一次雙擊走經典路徑，允許刪除。
-        vmB.clearPolicyDraft() // tap 3：重新 arm
+        // 遠端恢復可讀但 state 仍 Unknown：tap 3/4 仍不清除。
         fake.saved = emptySet()
-        vmB.clearPolicyDraft() // tap 4：pre-read Known(empty) → 清除執行
+        vmB.clearPolicyDraft()
+        assertBlindClearDisabled(vmB)
+        vmB.clearPolicyDraft()
+        assertBlindClearDisabled(vmB)
+        assertEquals(0, fake.clearCalls.get())
+
+        // 明確 refresh 後才能清除（唯一路徑）。
+        vmB.refreshPolicyDraft()
+        await { vmB.state.value.policyDraftKnown }
+        vmB.clearPolicyDraft()
         await(timeoutMs = 5_000L) { fake.clearCalls.get() == 1 }
         assertEquals(1, fake.clearCalls.get())
     }
