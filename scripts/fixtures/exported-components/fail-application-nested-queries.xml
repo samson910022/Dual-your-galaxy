@@ -7,7 +7,7 @@
      pass case.) -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.samson910022.galaxydualplus.debug">
-    <application android:label="Galaxy Dual Plus">
+    <application android:label="Dual your Galaxy">
         <queries>
             <activity android:name="com.example.Nested"
                 android:exported="true" />

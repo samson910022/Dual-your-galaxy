@@ -470,7 +470,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 ### 2.2 LSPosed 勾選（＋ App 內通道選擇）
 
-1. 打開 LSPosed 管理器 → 模組 → 勾選 **Galaxy Dual Plus Hook**（啟用）。
+1. 打開 LSPosed 管理器 → 模組 → 勾選 **Dual your Galaxy Hook**（啟用）。
 2. 作用域（Scope）勾選以下兩項（H4：自家包自報已退場，file marker 為唯一訊號）：
    - `system`（系統框架，必勾，否則 system_server hook 不生效）
    - `com.samsung.android.da.daagent`（三星雙開代理）

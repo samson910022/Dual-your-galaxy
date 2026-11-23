@@ -1,6 +1,6 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
-// Package-identity migration (v0.1.0-beta.2): fail-closed JVM gate for the
+// Package-identity migration (v0.1.0-beta.3): fail-closed JVM gate for the
 // applicationId / namespace / version / LSPosed module metadata. Reads repo
 // text only — no Android framework, no Gradle, no device, no CWD assumption.
 package com.galaxydual.plus
@@ -14,8 +14,8 @@ import java.io.File
 class ApplicationIdentityTest {
     companion object {
         private const val TARGET_ID = "io.github.samson910022.galaxydualplus"
-        private const val TARGET_VERSION = "0.1.0-beta.2"
-        private const val TARGET_CODE = "3"
+        private const val TARGET_VERSION = "0.1.0-beta.3"
+        private const val TARGET_CODE = "4"
         private const val OLD_ID = "com.galaxydual.plus"
         private const val SCOPE_EXACT = "system\ncom.samsung.android.da.daagent"
         private const val JAVA_INIT_EXACT = "com.galaxydual.hook.DualHook"

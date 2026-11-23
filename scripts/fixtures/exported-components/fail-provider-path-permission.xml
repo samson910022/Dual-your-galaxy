@@ -7,7 +7,7 @@
      android:permission on the child — ANY <path-permission> child fails.) -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.samson910022.galaxydualplus.debug">
-    <application android:label="Galaxy Dual Plus">
+    <application android:label="Dual your Galaxy">
         <activity android:name="com.galaxydual.plus.MainActivity"
             android:exported="true">
             <intent-filter>

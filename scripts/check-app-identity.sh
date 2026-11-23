@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fail-closed identity gate for the v0.1.0-beta.2 package-identity migration.
+# Fail-closed identity gate for the v0.1.0-beta.3 package-identity migration.
 # Verifies that app/build.gradle.kts (applicationId / namespace / versionCode /
 # versionName) and the LSPosed module metadata (module.prop id / version /
 # versionCode, scope.list, java_init.list) all agree on the NEW identity.
@@ -29,8 +29,8 @@ TARGET_ID="io.github.samson910022.galaxydualplus"
 # applicationId-only migration: namespace stays the Kotlin source package so
 # relative manifest component names still resolve to the real classes.
 SOURCE_PACKAGE="com.galaxydual.plus"
-TARGET_VERSION="0.1.0-beta.2"
-TARGET_CODE="3"
+TARGET_VERSION="0.1.0-beta.3"
+TARGET_CODE="4"
 OLD_ID="com.galaxydual.plus"
 EXPECTED_SCOPE='system
 com.samsung.android.da.daagent'

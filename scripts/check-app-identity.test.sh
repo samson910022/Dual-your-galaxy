@@ -21,8 +21,8 @@ SUITE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/check-app-identity-test.XXXXXX")" || {
 trap 'rm -rf "$SUITE_TMP"' EXIT
 
 TARGET_ID="io.github.samson910022.galaxydualplus"
-TARGET_VERSION="0.1.0-beta.2"
-TARGET_CODE="3"
+TARGET_VERSION="0.1.0-beta.3"
+TARGET_CODE="4"
 OLD_ID="com.galaxydual.plus"
 JAVA_INIT="com.galaxydual.hook.DualHook"
 

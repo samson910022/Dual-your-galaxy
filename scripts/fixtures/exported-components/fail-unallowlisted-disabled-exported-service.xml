@@ -8,7 +8,7 @@
      "add it disabled, enable it at runtime" bypasses. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.samson910022.galaxydualplus.debug">
-    <application android:label="Galaxy Dual Plus">
+    <application android:label="Dual your Galaxy">
         <activity android:name="com.galaxydual.plus.MainActivity"
             android:exported="true">
             <intent-filter>

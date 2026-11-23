@@ -8,10 +8,10 @@
 # managers that honour it and is ignored when unknown. system_server injection
 # only happens at boot, upgrades require a reboot (see docs/HOOK.md 2.3).
 id=io.github.samson910022.galaxydualplus
-version=0.1.0-beta.2
-versionCode=3
+version=0.1.0-beta.3
+versionCode=4
 author=samson910022
-description=Galaxy Dual Plus hook: Samsung Dual whitelist extension (MIT, no Knox access)
+description=Dual your Galaxy hook: Samsung Dual whitelist extension (MIT, no Knox access)
 minApiVersion=102
 targetApiVersion=102
 exceptionMode=protective
