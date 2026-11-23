@@ -559,10 +559,39 @@ object PmOutputParser {
     //   can never trigger ERROR_LINE. The label is display-only by contract
     //   (renames do not change authorization); only body lines carry
     //   error semantics. A genuine body `Failure [...]` line still fails.
+    // - Issue #65 new-format name strip: the same display-only rule is
+    //   applied to `N: id=.., name=.., type=..` lines via
+    //   sanitizeIdentityOutput(), so `name=Error` / `name=not found` (or a
+    //   comma/injected token inside the label) cannot trip ERROR_LINE. The
+    //   rest of each line is still scanned.
     // exit != 0 is always failure here (unlike isSuccess, where the
     // ALREADY_EXISTS exemption is checked before exit and can still report
     // success on a non-zero exit).
     private val IDENTITY_HEADER_STRIP = Regex("UserInfo\\{\\d+:[^}:\\r\\n]*:[^}\\r\\n]*\\}")
+
+    // Issue #65: the new-ROM `cmd user list -v` format has no UserInfo{...}
+    // header -- it emits `N: id=<id>, name=<label>, type=<token>, flags=...`.
+    // `name=` is a display-only label (user renames never change
+    // authorization), so its content must never be scanned for ERROR_LINE
+    // semantics. The greedy `(.*)` runs to the LAST `, type=`, neutralizing
+    // the whole label even when it contains a comma or an injected `type=`
+    // token. ONLY that segment is replaced: the real `type=` token and the
+    // rest of the line are left intact, so a genuine `Failure [...]` body
+    // line still fails the strict gate (no whole-line exemption).
+    private val NEW_VERBOSE_NAME_SEGMENT = Regex(
+        """^([ \t]*\d+:[ \t]*id=\d+,[ \t]*name=)(.*)(,[ \t]*type=[^\s,]+)""",
+        RegexOption.MULTILINE,
+    )
+
+    // Shared identity sanitizer: legacy display labels are removed by the
+    // header strip; new-format display labels are replaced by a neutral
+    // placeholder. Used by every strict identity gate.
+    private fun sanitizeIdentityOutput(output: String): String {
+        val withoutLegacyHeaders = IDENTITY_HEADER_STRIP.replace(output, "")
+        return NEW_VERBOSE_NAME_SEGMENT.replace(withoutLegacyHeaders) { m ->
+            m.groupValues[1] + "<display-name>" + m.groupValues[3]
+        }
+    }
 
     private fun checkStrictLines(output: String, exit: Int): Boolean {
         if (exit != 0) return false
@@ -574,15 +603,14 @@ object PmOutputParser {
         return true
     }
 
-    fun isIdentityChannelOk(output: String, exit: Int): Boolean {
-        val sanitized = IDENTITY_HEADER_STRIP.replace(output, "")
-        return checkStrictLines(sanitized, exit)
-    }
+    fun isIdentityChannelOk(output: String, exit: Int): Boolean =
+        checkStrictLines(sanitizeIdentityOutput(output), exit)
 
     // `pm list users` strict gate (Phase B P1-2, issue #21; owner re-review R3
     // blocking). Independent strict判定, no longer delegating to isSuccess:
     // exit-first (any non-zero exit fails), header-strip (same
-    // IDENTITY_HEADER_STRIP shape as isIdentityChannelOk, so a renamed label
+    // sanitizeIdentityOutput() shape as isIdentityChannelOk (legacy
+    // UserInfo headers AND new-format `name=` labels), so a renamed label
     // carrying error keywords stays display-only), then every non-blank body
     // line tested against ERROR_LINE with NO INSTALL_FAILED_ALREADY_EXISTS
     // exemption and NO EXEMPT_LINE filtering. A genuine body `Failure [...]`
@@ -596,10 +624,8 @@ object PmOutputParser {
     // header-strip, no exemptions) for the verified-identity channels
     // (`cmd user list -v` / `dumpsys user` / `getprop`), while this gate
     // serves only the `pm list users` channel.
-    fun isListUsersOutputOk(output: String, exit: Int): Boolean {
-        val sanitized = IDENTITY_HEADER_STRIP.replace(output, "")
-        return checkStrictLines(sanitized, exit)
-    }
+    fun isListUsersOutputOk(output: String, exit: Int): Boolean =
+        checkStrictLines(sanitizeIdentityOutput(output), exit)
 
     // Legacy entry point kept for compatibility: parses key=value token lines.
     // Example: "package:/data/app/xxx basePackage=com.foo userId=150 enabled=true".

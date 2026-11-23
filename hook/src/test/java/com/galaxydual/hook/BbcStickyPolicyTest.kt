@@ -144,7 +144,11 @@ class BbcStickyPolicyTest {
     }
 
     @Test
-    fun clockFailureKeepsLastGoodBbc() {
+    fun clockFailureFailsClosedWithoutTrustedClockBbc() {
+        // Without a trusted clock the 30-min sticky freshness cap cannot be
+        // proven, so fail closed to empty rather than serve an unverifiable
+        // snapshot. The gate-closed short-circuit / no-reader semantics stay
+        // unchanged (pinned below by assertFalse(readerCalled)).
         var throwing = false
         var time = 1_000L
         val cache = EffectivePolicyCache(
@@ -156,7 +160,8 @@ class BbcStickyPolicyTest {
         var readerCalled = false
         val unk = cache.getBbc(emptySet(), reader = { readerCalled = true; Pair(null, null) })
         assertTrue(unk is EffectivePolicyCache.BbcPolicy.Unknown)
-        assertEquals(setOf("com.good.a"), (unk as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertEquals(emptySet<String>(), (unk as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertEquals(1L, cache.bbcStickyExpiredCount.get())
         assertFalse(readerCalled)
     }
 
@@ -175,6 +180,20 @@ class BbcStickyPolicyTest {
         val (cache, time) = bbcCacheAt(1_000L)
         assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("com.good.a"), 1L) }) is EffectivePolicyCache.BbcPolicy.Good)
         time.set(1_000L + EffectivePolicyCache.BBC_STICKY_MAX_AGE_MS + 1L)
+        val unk = cache.getBbc(emptySet(), reader = { Pair(null, null) })
+        assertTrue(unk is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (unk as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertEquals(1L, cache.bbcStickyExpiredCount.get())
+    }
+
+    @Test
+    fun stickyClockSkewExpiresLastGoodBbc() {
+        // A backwards clock (now < lastGoodStickyAtMs) leaves a negative age,
+        // so the old forward-only check never expires the cap. Mirror the
+        // whitelist TTL rule (:420): treat skew as expired, fail closed.
+        val (cache, time) = bbcCacheAt(1_000L)
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("com.good.a"), 1L) }) is EffectivePolicyCache.BbcPolicy.Good)
+        time.set(900L)
         val unk = cache.getBbc(emptySet(), reader = { Pair(null, null) })
         assertTrue(unk is EffectivePolicyCache.BbcPolicy.Unknown)
         assertEquals(emptySet<String>(), (unk as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
