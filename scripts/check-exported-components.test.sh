@@ -11,6 +11,10 @@
 # and release manifests (debug- vs release-suffixed authorities); authorities
 # themselves are NOT validated by this gate (owned by check-provider-parity.py),
 # so no per-variant authority mapping is needed here.
+# Identity note (applicationId-only migration): the re-pin touches authority /
+# package-name assertions only. Component android:name values are Kotlin class
+# FQNs (com.galaxydual.plus.*), which are NOT applicationId-derived and stay
+# unchanged in both the checker's ALLOWLIST and these fixtures.
 #
 # Intentionally `set -u` (not -e): both pass and fail exit codes are asserted.
 set -u

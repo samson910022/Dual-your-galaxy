@@ -6,8 +6,8 @@
 # reason the fixture exists for (expected_reason(); a fail fixture whose
 # ::error:: output does not contain the mapped substring is a MISMATCH, not
 # a pass — no false-confidence fixtures). Debug fixtures are checked against
-# the debug authority (com.galaxydual.plus.debug.XposedService), release
-# fixtures against the release authority (com.galaxydual.plus.XposedService);
+# the debug authority (io.github.samson910022.galaxydualplus.debug.XposedService), release
+# fixtures against the release authority (io.github.samson910022.galaxydualplus.XposedService);
 # any fixture with "release" in its filename uses the release authority (so
 # fail-debug-authority-in-release exercises the cross-variant rejection).
 # Format comes from the extension: *.merged.xml -> --merged-xml,
@@ -20,8 +20,15 @@ cd "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 FIXTURE_DIR="scripts/fixtures/provider-parity"
 CHECKER="scripts/check-provider-parity.py"
-DEBUG_AUTHORITY="com.galaxydual.plus.debug.XposedService"
-RELEASE_AUTHORITY="com.galaxydual.plus.XposedService"
+
+SUITE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/check-provider-parity-test.XXXXXX")" || {
+  echo "::error::mktemp -d failed" >&2
+  exit 1
+}
+trap 'rm -rf "$SUITE_TMP"' EXIT
+DEBUG_AUTHORITY="io.github.samson910022.galaxydualplus.debug.XposedService"
+RELEASE_AUTHORITY="io.github.samson910022.galaxydualplus.XposedService"
+OLD_RELEASE_AUTHORITY="com.galaxydual.plus.XposedService"
 
 if [ ! -d "$FIXTURE_DIR" ]; then
   echo "::error::fixture directory missing: $FIXTURE_DIR" >&2
@@ -155,6 +162,37 @@ for fixture in "${fixtures[@]}"; do
     printf '%s\n' "$output" | sed 's/^/     /'
   fi
 done
+
+# --- negative case: the OLD (pre-migration) authority must be rejected ---
+# Generated inline, not added to the fixture corpus, so the EXPECTED_FIXTURE_COUNT
+# pin above still describes exactly the reviewed fixture set. The class FQN stays
+# com.galaxydual.plus.GuardXposedProvider (class names are not applicationId-derived);
+# only the authority is the stale pre-migration value.
+old_case_dir="$SUITE_TMP/old-authority"
+mkdir -p "$old_case_dir"
+cat > "$old_case_dir/old-release.merged.xml" <<EOF
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.samson910022.galaxydualplus">
+  <application>
+    <provider
+        android:name="com.galaxydual.plus.GuardXposedProvider"
+        android:authorities="$OLD_RELEASE_AUTHORITY"
+        android:exported="true" />
+  </application>
+</manifest>
+EOF
+total=$((total + 1))
+old_output="$(python3 "$CHECKER" --merged-xml "$old_case_dir/old-release.merged.xml" --authority "$RELEASE_AUTHORITY" 2>&1)" || old_rc=$?
+old_rc=${old_rc:-0}
+if [ "$old_rc" -eq 1 ] && printf '%s\n' "$old_output" | grep -qF "android:authorities is '$OLD_RELEASE_AUTHORITY'"; then
+  matched=$((matched + 1))
+  printf 'PASS negative case old-authority.merged.xml (old authority rejected, exit %d)\n' "$old_rc"
+else
+  mismatched=$((mismatched + 1))
+  printf 'FAIL negative case old-authority.merged.xml (expected exit 1 + old-authority reason, got exit %d)\n' "$old_rc"
+  printf '%s\n' "$old_output" | sed 's/^/     /'
+fi
 
 echo "----"
 printf 'summary: %d fixtures, %d as expected, %d mismatched\n' "$total" "$matched" "$mismatched"

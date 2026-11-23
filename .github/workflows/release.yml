@@ -104,7 +104,13 @@ jobs:
           MOD_VER=$(grep -oP '^version=\K.*' hook/src/main/resources/META-INF/xposed/module.prop | head -n 1 | tr -d ' \r')
           echo "app versionName=$APP_VER module.prop version=$MOD_VER"
           test "$APP_VER" = "$MOD_VER"
-          echo "PASS: scope parity + module fail-safe + version sync"
+          # Package-identity migration gate (source level): applicationId /
+          # namespace / versionCode / versionName and module.prop id / version /
+          # versionCode / scope.list / java_init.list must all agree on the new
+          # identity. Complement to the packaged-APK identity gate in
+          # scripts/verify-release-artifacts.sh (module.prop id == APK package).
+          sh scripts/check-app-identity.sh
+          echo "PASS: scope parity + module fail-safe + version sync + app identity"
       # H1 honesty gate: unverified features must never be claimed as working.
       - name: Honesty gate (no unverified claims)
         run: |

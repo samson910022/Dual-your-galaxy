@@ -148,6 +148,8 @@ jobs:
       # closed (wrong-element names, split name/authority, exported=false, an
       # unexpected android:permission, a foreign provider claiming the pinned
       # authority, and the debug/release authority pair).
+      - name: App identity checker self-test
+        run: bash scripts/check-app-identity.test.sh
       - name: Provider parity checker self-test
         run: bash scripts/check-provider-parity.test.sh
       - name: Exported-components checker self-test
@@ -385,7 +387,13 @@ jobs:
           MOD_VER=$(grep -oP '^version=\K.*' hook/src/main/resources/META-INF/xposed/module.prop | head -n 1 | tr -d ' \r')
           echo "app versionName=$APP_VER module.prop version=$MOD_VER"
           test "$APP_VER" = "$MOD_VER"
-          echo "PASS: scope parity + module fail-safe + version sync"
+          # Package-identity migration gate (source level): applicationId /
+          # namespace / versionCode / versionName and module.prop id / version /
+          # versionCode / scope.list / java_init.list must all agree on the new
+          # identity. Complement to the packaged-APK identity gate in
+          # scripts/verify-release-artifacts.sh (module.prop id == APK package).
+          sh scripts/check-app-identity.sh
+          echo "PASS: scope parity + module fail-safe + version sync + app identity"
       # Stage2 (hook-policy-source P1): the app-owned guard provider must replace
       # the libxposed service AAR's exported XposedProvider at the same authority.
       # Why: the AAR's provider is exported with no permission, so any app could
@@ -456,11 +464,11 @@ jobs:
           # XposedProvider nodes anywhere, and zero wrong-element name
           # occurrences. Nothing is enforced about any other authority.
           # NOTE (debug variant): this parity gate asserts the
-          # DEBUG variant authority (com.galaxydual.plus.debug.XposedService).
+          # DEBUG variant authority (io.github.samson910022.galaxydualplus.debug.XposedService).
           # The release invariant (release authority without the .debug suffix)
           # is enforced by the "Policy provider parity (release merged
           # manifest)" step below.
-          python3 scripts/check-provider-parity.py --merged-xml "$MERGED" --authority com.galaxydual.plus.debug.XposedService
+          python3 scripts/check-provider-parity.py --merged-xml "$MERGED" --authority io.github.samson910022.galaxydualplus.debug.XposedService
           echo "PASS: policy provider parity"
       # D4: release-variant parity for the policy provider (mirrors the debug
       # gate above). :app:processReleaseMainManifest only merges manifests — it
@@ -475,7 +483,7 @@ jobs:
       # processReleaseResources) — never for packaging or signing. The guard
       # stays fail-closed for actual release packaging tasks.
       # Release authority = ${applicationId}.XposedService =
-      # com.galaxydual.plus.XposedService (NO .debug suffix).
+      # io.github.samson910022.galaxydualplus.XposedService (NO .debug suffix).
       - name: Policy provider parity (release merged manifest)
         run: |
           set -e
@@ -541,9 +549,9 @@ jobs:
           # <provider> claiming the pinned authority, zero libxposed
           # XposedProvider nodes anywhere, zero wrong-element name occurrences.
           # Nothing is enforced about any other authority.
-          python3 scripts/check-provider-parity.py --merged-xml "$MERGED" --authority com.galaxydual.plus.XposedService
+          python3 scripts/check-provider-parity.py --merged-xml "$MERGED" --authority io.github.samson910022.galaxydualplus.XposedService
           # Release authority must NOT carry the debug applicationIdSuffix.
-          if grep -F 'com.galaxydual.plus.debug.XposedService' "$MERGED"; then
+          if grep -F 'io.github.samson910022.galaxydualplus.debug.XposedService' "$MERGED"; then
             echo "FAIL: release merged manifest carries the debug-suffixed authority"
             exit 1
           fi

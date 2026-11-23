@@ -4,7 +4,7 @@
      standing between any app and the Shizuku binder provider ⇒ the gate
      must fail. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.galaxydual.plus.debug">
+    package="io.github.samson910022.galaxydualplus.debug">
     <application android:label="Galaxy Dual Plus">
         <activity android:name="com.galaxydual.plus.MainActivity"
             android:exported="true">
@@ -15,12 +15,12 @@
         </activity>
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
-            android:authorities="com.galaxydual.plus.debug.shizuku"
+            android:authorities="io.github.samson910022.galaxydualplus.debug.shizuku"
             android:exported="true"
             android:multiprocess="false" />
         <provider
             android:name="com.galaxydual.plus.GuardXposedProvider"
-            android:authorities="com.galaxydual.plus.debug.XposedService"
+            android:authorities="io.github.samson910022.galaxydualplus.debug.XposedService"
             android:exported="true" />
         <receiver
             android:name="androidx.profileinstaller.ProfileInstallReceiver"
