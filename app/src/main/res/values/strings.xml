@@ -256,6 +256,13 @@
     <string name="copy_failed">複製失敗：%1$s</string>
     <string name="dialog_close">關閉</string>
     <string name="dialog_cancel">取消</string>
+    <!-- PR #74 R7b-1 (M1)：分身資料風險揭露（持續提示／詳細入口／一次性 acknowledgement）。
+         繁中預設與 b+zh+Hant 逐位元一致（RemoveConfirmMessageTest 契約）；英文見 values-en。 -->
+    <string name="risk_notice_short">⚠️ 實驗性分身功能：無法保證資料安全。Samsung 可能自動卸載分身並永久刪除分身內資料；今天正常不代表未來安全。請先備份重要資料，不要把唯一重要資料只存在分身。</string>
+    <string name="risk_details_entry">詳細風險 ›</string>
+    <string name="risk_details_title">分身資料風險（完整說明）</string>
+    <string name="risk_ack_positive">我已了解風險，繼續</string>
+    <string name="risk_details_full">⚠️ 實驗性分身功能：無法保證資料安全。Samsung 可能因開機、原生雙開設定、系統/One UI 更新或未知的內部規則，自動卸載第三方分身並永久刪除分身內資料。這種情形曾在 BBC 非空、注入關閉、甚至未掛載本模組 BBC Hook 的對照中出現；刪除根因仍未完全證實。Root／Shizuku 只提供操作能力，並非防刪保證；重新安裝或 pm install-existing 無法還原已刪除的聊天、登入資訊與私人檔案。不同裝置及 ROM 版本的行為可能不同，今天正常也不代表未來安全。請先透過各 App 的正式方式備份重要資料，不要把唯一重要資料只存在分身。\n\n請特別注意：\n(a) 本 App 主動執行卸載／移除分身，可能直接清除該分身資料；這類操作另有明確確認與目標核對，不會因為你已接受本風險而取消。\n(b) 上述 Samsung 日後自動清理分身，是已觀察到的風險，根因未證實，本 App 無法阻止或保證不會發生。\n(c) Shizuku／ADB shell 無法替其他 Profile 的 App 做通用私人資料備份。\n(d) 即使有 Root，也不等於 Android Keystore／私有資料可完整還原。\n(e) 「已安裝」「政策已存」「BBC ON/OFF」都不等於「資料安全」。\n\n預先 Hook 的現實限制：BBC_AVAILABLE_APPS_INJECTION 預設為 true、執行期偏好缺省視為啟用，因此 Hook 可能早於本 App 首次風險警告或確認生效。本 App 的勾選與首次確認對話框，不代表 Hook 在生效前已取得你的同意；若需要真正的生效前 opt-in，須另行設計新安裝與既有安裝的安全遷移（不可未經確認就縮減舊政策）。</string>
     <string name="remove_confirm_title">確認移除分身</string>
     <string name="remove_confirm_positive">確認移除</string>
     <string name="remove_confirm_message">警告：將刪除該分身的使用者資料且無法復原；僅影響分身（user %3$s），不影響主 profile。\nPackage：%2$s\n已驗證目標：user %3$s，serial %5$s\n應用：%1$s\nProfile：%4$s  [truncated] 表示標籤已截斷。\n須勾選下方確認框才會啟用「確認移除」。</string>
