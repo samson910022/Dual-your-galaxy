@@ -28,7 +28,7 @@
 
 - CI build／locale-instrumentation：**SUCCESS**（PR #74 最終 run #45103347110；main merge 後 #45113206916）；manual emulator matrix **SKIPPED**。
 - JVM：2292 tests（app 1401 / core 395 / hook 496），0 failures / errors / skipped。
-- Android instrumentation：60 tests 全通過（emulator job）。
+- Android instrumentation：60 tests 全通過（locale-instrumentation，API 29 emulator job）。
 - **不是**裝置零風險驗證；JVM／CI 全綠不等於 Samsung 端資料安全。
 - P0／H00：experiment limitation，UNMEASURED / NOT a pass。
 
