@@ -9,6 +9,7 @@ package com.galaxydual.plus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.io.File
 import javax.xml.parsers.DocumentBuilderFactory
@@ -150,6 +151,23 @@ class RiskDisclosureStringTest {
             val m = maps.getValue(locale)
             for (k in newKeys) {
                 assertFalse("$locale $k contains simplified 须", m.getValue(k).contains("须"))
+            }
+        }
+    }
+
+    @Test
+    fun riskStrings_apostrophesAreAaptEscaped() {
+        // aapt2 rejects unescaped ' in an unquoted <string> (e.g. "App's").
+        // XML textContent keeps the backslash, so we can guard it here instead
+        // of relying on a full resource merge in JVM tests.
+        for (locale in maps.keys) {
+            for (k in newKeys) {
+                val text = maps.getValue(locale).getValue(k)
+                for (i in text.indices) {
+                    if (text[i] == '\'' && (i == 0 || text[i - 1] != '\\')) {
+                        fail("$locale $k has an unescaped apostrophe at index $i (use \\')")
+                    }
+                }
             }
         }
     }
