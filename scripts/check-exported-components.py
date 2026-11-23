@@ -118,6 +118,14 @@ COMPONENT_KINDS = ("activity", "activity-alias", "service", "receiver", "provide
 # Component names must be merged-manifest ABSOLUTE (flat) fully-qualified
 # names — a relative name (".MainActivity") never matches and fails closed.
 #
+# Identity note (applicationId-only migration): these are Kotlin CLASS FQNs,
+# NOT applicationId-derived values. The v0.1.0-beta.2 identity change repins
+# android:authorities (<applicationId>.XposedService / <applicationId>.shizuku)
+# only; the Kotlin namespace/class FQNs stay com.galaxydual.plus.* and are
+# deliberately kept unchanged here (and in the fixtures). This gate does not
+# validate authorities at all — that belongs to check-provider-parity.py and
+# check-shizuku-provider.py.
+#
 #   1. activity  com.galaxydual.plus.MainActivity             exported, permission ABSENT
 #      (launcher entry point; exported so the launcher can reach it)
 #   2. receiver  androidx.profileinstaller.ProfileInstallReceiver

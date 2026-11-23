@@ -198,7 +198,7 @@ fun newHarnessViewModel(
         gatewayPrivilege = Privilege.ROOT,
         elevators = listOf(SuElevator(gw), ShizukuElevator(NoOpGateway())),
         preference = preference,
-        appPackageName = "com.galaxydual.plus.debug.test",
+        appPackageName = "io.github.samson910022.galaxydualplus.debug.test",
         persistPreference = null,
         suPresentCheck = { true },
         shizukuAuthCheck = { false },

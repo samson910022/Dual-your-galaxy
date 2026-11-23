@@ -9,8 +9,8 @@
 #   android:authorities EXACTLY the --authority passed by the caller
 #     (derived from the APK's ACTUAL applicationId via `aapt2 dump packagename`
 #     by the caller — never from the filename and never re-derived here;
-#     debug: com.galaxydual.plus.debug.shizuku; release:
-#     com.galaxydual.plus.shizuku; the mapping lives in the caller)
+#     debug: io.github.samson910022.galaxydualplus.debug.shizuku; release:
+#     io.github.samson910022.galaxydualplus.shizuku; the mapping lives in the caller)
 #   android:exported="true"
 #   android:multiprocess="false"
 #   android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
@@ -35,9 +35,11 @@
 # (--aapt2-xmltree/--authority argparse, --authority instead of a positional
 # argument) differs. The --authority value must be derived from the APK
 # itself (aapt2 dump packagename), never from hardcoded variant logic in a
-# caller — an APK whose package is neither com.galaxydual.plus.debug nor
-# com.galaxydual.plus is rejected by the caller before this script ever
-# runs.
+# caller — an APK whose package is neither
+# io.github.samson910022.galaxydualplus.debug nor
+# io.github.samson910022.galaxydualplus is rejected by the caller (and the OLD
+# id com.galaxydual.plus[.debug] fails closed as "old applicationId identity")
+# before this script ever runs.
 #
 # Exit 0 prints one line "FOUND ShizukuProvider in packaged manifest ...".
 # Exit 1 prints one "::error::<reason>" line. Any unexpected internal error

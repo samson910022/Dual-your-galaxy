@@ -75,6 +75,106 @@ else
   fail "version gate must PASS for parseable versionName (stderr mentions 'unable to parse versionName', exit $b_rc)" "$case_b/output.log"
 fi
 
+# --- identity arms: OLD applicationId fails closed; packaged module.prop id ---
+# Stub aapt2 (package-name probe) so the identity case map is exercised without
+# a real SDK/APK. ANDROID_HOME points at a non-existent dir so the verifier
+# falls back to `command -v aapt2`, i.e. the stub on PATH.
+write_aapt2_stub() {
+  cat > "$1" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "dump" ] && [ "${2:-}" = "packagename" ]; then
+  cat "${STUB_PACKAGE_FILE:?}"
+  exit 0
+fi
+printf 'stub aapt2: unexpected invocation: %s\n' "$*" >&2
+exit 1
+STUB
+  chmod +x "$1"
+}
+
+setup_identity_arm() {
+  # $1 = case dir, $2 = package id the stub aapt2 reports
+  mkdir -p "$1/app" "$1/bin"
+  printf 'versionName = "0.1.0-beta.2"\n' > "$1/app/build.gradle.kts"
+  printf '%s\n' "$2" > "$1/package.txt"
+  write_aapt2_stub "$1/bin/aapt2"
+  : > "$1/dummy.apk"
+}
+
+run_identity_arm() {
+  IDENTITY_RC=0
+  ( cd "$1" && ANDROID_HOME="$1/no-sdk" PATH="$1/bin:$PATH" \
+      STUB_PACKAGE_FILE="$1/package.txt" bash "$VERIFY" dummy.apk ) \
+      >"$1/output.log" 2>&1 || IDENTITY_RC=$?
+}
+
+# (c1) old release id -> "old applicationId identity"
+case_c1="$SUITE_TMP/case-old-release-id"
+setup_identity_arm "$case_c1" "com.galaxydual.plus"
+run_identity_arm "$case_c1"
+if [ "$IDENTITY_RC" -ne 0 ] && grep -F 'old applicationId identity' "$case_c1/output.log" >/dev/null; then
+  ok "old release id fails closed with 'old applicationId identity' (exit $IDENTITY_RC)"
+else
+  fail "old release id must exit non-zero with 'old applicationId identity' (got exit $IDENTITY_RC)" "$case_c1/output.log"
+fi
+
+# (c2) old debug id -> same guard
+case_c2="$SUITE_TMP/case-old-debug-id"
+setup_identity_arm "$case_c2" "com.galaxydual.plus.debug"
+run_identity_arm "$case_c2"
+if [ "$IDENTITY_RC" -ne 0 ] && grep -F 'old applicationId identity' "$case_c2/output.log" >/dev/null; then
+  ok "old debug id fails closed with 'old applicationId identity' (exit $IDENTITY_RC)"
+else
+  fail "old debug id must exit non-zero with 'old applicationId identity' (got exit $IDENTITY_RC)" "$case_c2/output.log"
+fi
+
+# (d) stale module.prop id -> fail with 'module.prop id'
+case_d="$SUITE_TMP/case-module-id-mismatch"
+setup_identity_arm "$case_d" "io.github.samson910022.galaxydualplus"
+cat > "$case_d/bin/unzip" <<'STUB'
+#!/usr/bin/env bash
+printf 'id=com.galaxydual.plus\nversion=0.1.0-beta.2\n'
+STUB
+chmod +x "$case_d/bin/unzip"
+run_identity_arm "$case_d"
+if [ "$IDENTITY_RC" -ne 0 ] && grep -F '::error::module.prop id' "$case_d/output.log" >/dev/null; then
+  ok "stale packaged module.prop id fails closed (exit $IDENTITY_RC)"
+else
+  fail "stale module.prop id must exit non-zero with 'module.prop id' (got exit $IDENTITY_RC)" "$case_d/output.log"
+fi
+
+# (e) matching module.prop id -> identity gate PASSES (failure happens later)
+case_e="$SUITE_TMP/case-module-id-match"
+setup_identity_arm "$case_e" "io.github.samson910022.galaxydualplus"
+cat > "$case_e/bin/unzip" <<'STUB'
+#!/usr/bin/env bash
+printf 'id=io.github.samson910022.galaxydualplus\nversion=0.1.0-beta.2\n'
+STUB
+chmod +x "$case_e/bin/unzip"
+run_identity_arm "$case_e"
+if [ "$IDENTITY_RC" -ne 0 ] && ! grep -F '::error::module.prop id' "$case_e/output.log" >/dev/null; then
+  ok "matching module.prop id passes the identity gate (exit $IDENTITY_RC; fails later as expected)"
+else
+  fail "identity gate must PASS for matching module.prop id (::error::module.prop id present, exit $IDENTITY_RC)" "$case_e/output.log"
+fi
+
+# (f) debug APK package + release-id module.prop -> identity gate PASSES.
+#     The debug applicationId has a ".debug" suffix while module.prop always
+#     carries the release id; the gate must strip the suffix before comparing.
+case_f="$SUITE_TMP/case-module-id-match-debug-suffix"
+setup_identity_arm "$case_f" "io.github.samson910022.galaxydualplus.debug"
+cat > "$case_f/bin/unzip" <<'STUB'
+#!/usr/bin/env bash
+printf 'id=io.github.samson910022.galaxydualplus\nversion=0.1.0-beta.2\n'
+STUB
+chmod +x "$case_f/bin/unzip"
+run_identity_arm "$case_f"
+if [ "$IDENTITY_RC" -ne 0 ] && ! grep -F '::error::module.prop id' "$case_f/output.log" >/dev/null; then
+  ok "release module.prop id passes identity gate for .debug APK (exit $IDENTITY_RC; fails later as expected)"
+else
+  fail "identity gate must PASS for release module.prop id with .debug APK (::error::module.prop id present, exit $IDENTITY_RC)" "$case_f/output.log"
+fi
+
 echo "----"
 printf 'summary: %d fixtures, %d as expected, %d mismatched\n' "$total" "$matched" "$mismatched"
 if [ "$mismatched" -ne 0 ]; then

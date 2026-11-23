@@ -60,21 +60,47 @@ for apk in "$@"; do
   # from the APK itself (aapt2 dump packagename), never from the filename — a
   # renamed *-debug*.apk built from release code must not slip the debug
   # authority past the release gate. The mapping is exact and anything else
-  # fails closed: com.galaxydual.plus.debug -> debug authorities;
-  # com.galaxydual.plus -> release authorities (everything else: hard fail).
+  # fails closed: io.github.samson910022.galaxydualplus.debug -> debug authorities;
+  # io.github.samson910022.galaxydualplus -> release authorities. The legacy ids
+  # com.galaxydual.plus / com.galaxydual.plus.debug fail closed as "old
+  # applicationId identity"; everything else: hard fail.
   if ! APK_PACKAGE="$("$AAPT2" dump packagename "$apk" 2>/dev/null)"; then
     fail "aapt2 dump packagename failed for $apk"
   fi
   APK_PACKAGE="$(printf '%s' "$APK_PACKAGE" | tr -d '[:space:]')"
   case "$APK_PACKAGE" in
-    com.galaxydual.plus.debug)
-      EXPECTED_AUTHORITY="com.galaxydual.plus.debug.XposedService"
-      EXPECTED_AUTHORITY_SHIZUKU="com.galaxydual.plus.debug.shizuku" ;;
-    com.galaxydual.plus)
-      EXPECTED_AUTHORITY="com.galaxydual.plus.XposedService"
-      EXPECTED_AUTHORITY_SHIZUKU="com.galaxydual.plus.shizuku" ;;
-    *) fail "unsupported APK package name '$APK_PACKAGE' in $apk (expected exactly 'com.galaxydual.plus.debug' or 'com.galaxydual.plus')" ;;
+    io.github.samson910022.galaxydualplus.debug)
+      EXPECTED_AUTHORITY="io.github.samson910022.galaxydualplus.debug.XposedService"
+      EXPECTED_AUTHORITY_SHIZUKU="io.github.samson910022.galaxydualplus.debug.shizuku" ;;
+    io.github.samson910022.galaxydualplus)
+      EXPECTED_AUTHORITY="io.github.samson910022.galaxydualplus.XposedService"
+      EXPECTED_AUTHORITY_SHIZUKU="io.github.samson910022.galaxydualplus.shizuku" ;;
+    com.galaxydual.plus|com.galaxydual.plus.debug)
+      # Pre-migration identity: never let a stale/pre-migration APK through the
+      # release gate just because its authorities happen to parse. Fail closed.
+      fail "old applicationId identity '$APK_PACKAGE' in $apk (migrated id is io.github.samson910022.galaxydualplus[.debug])" ;;
+    *) fail "unsupported APK package name '$APK_PACKAGE' in $apk (expected exactly 'io.github.samson910022.galaxydualplus.debug' or 'io.github.samson910022.galaxydualplus'; the old id com.galaxydual.plus[.debug] is rejected above)" ;;
   esac
+
+  # 0b. Packaged identity parity: module.prop id must equal the APK's RELEASE
+  #     identity (applicationId with a trailing ".debug" stripped). This is the artifact-level
+  #     companion to scripts/check-app-identity.sh (which pins the source tree):
+  #     a stale module.prop baked into the APK with the OLD id must not pass the
+  #     release gate even when the source has been migrated. Fail closed on a
+  #     missing/empty or mismatched id. Placed before the manifest dump so a
+  #     wrong identity is rejected cheaply and unambiguously.
+  MOD_ID="$(unzip -p "$apk" META-INF/xposed/module.prop 2>/dev/null | sed -n 's/^id=//p' | head -n 1 | tr -d ' \r' || true)"
+  # module.prop always carries the RELEASE id. A debug APK's applicationId has
+  # the ".debug" suffix (app/build.gradle.kts applicationIdSuffix), so compare
+  # against the release identity derived by stripping that suffix.
+  EXPECTED_MOD_ID="${APK_PACKAGE%.debug}"
+  if [ -z "$MOD_ID" ]; then
+    fail "module.prop id missing in $apk (expected '$EXPECTED_MOD_ID')"
+  fi
+  if [ "$MOD_ID" != "$EXPECTED_MOD_ID" ]; then
+    fail "module.prop id ($MOD_ID) != APK release identity ($EXPECTED_MOD_ID, APK applicationId $APK_PACKAGE) in $apk"
+  fi
+  echo "FOUND module.prop id == APK release identity ($MOD_ID)"
   MANIFEST_DUMP_FILE="$PROVIDER_PARITY_TMP/$(basename -- "$apk").xmltree.txt"
   if ! "$AAPT2" dump xmltree "$apk" --file AndroidManifest.xml > "$MANIFEST_DUMP_FILE" 2>/dev/null; then
     fail "aapt2 dump of AndroidManifest.xml failed for $apk"
@@ -87,8 +113,8 @@ for apk in "$@"; do
   #    the full element-scoped contract (all five on the SAME element):
   #      android:name EXACTLY "rikka.shizuku.ShizukuProvider"
   #      android:authorities EXACTLY "<applicationId>.shizuku"
-  #        (debug: com.galaxydual.plus.debug.shizuku; release:
-  #         com.galaxydual.plus.shizuku — derived from the actual
+  #        (debug: io.github.samson910022.galaxydualplus.debug.shizuku; release:
+  #         io.github.samson910022.galaxydualplus.shizuku — derived from the actual
   #         applicationId, same way EXPECTED_AUTHORITY is derived; the debug
   #         authority shows up verbatim in the merged debug manifest)
   #      android:exported="true"
@@ -149,16 +175,16 @@ for apk in "$@"; do
   #     *-debug*.apk built from release code must not slip the debug
   #     authority past the release gate (PR CI invokes this on the debug
   #     APK, whose applicationIdSuffix=.debug; the release APK carries
-  #     com.galaxydual.plus, no .debug). The mapping is exact and anything
-  #     else fails closed: com.galaxydual.plus.debug -> debug authority;
-  #     com.galaxydual.plus -> release authority (and only a release-
+  #     io.github.samson910022.galaxydualplus, no .debug). The mapping is exact and anything
+  #     else fails closed: io.github.samson910022.galaxydualplus.debug -> debug authority;
+  #     io.github.samson910022.galaxydualplus -> release authority (and only a release-
   #     expected APK carrying the .debug authority fails the leak guard).
   if ! python3 "$SCRIPT_DIR/check-provider-parity.py" --aapt2-xmltree "$MANIFEST_DUMP_FILE" --authority "$EXPECTED_AUTHORITY"; then
     fail "GuardXposedProvider provider parity check failed for $apk"
   fi
-  if [ "$EXPECTED_AUTHORITY" = "com.galaxydual.plus.XposedService" ] \
-    && grep -qF 'com.galaxydual.plus.debug.XposedService' "$MANIFEST_DUMP_FILE"; then
-    fail "release-expected APK carries the debug authority (com.galaxydual.plus.debug.XposedService): $apk"
+  if [ "$EXPECTED_AUTHORITY" = "io.github.samson910022.galaxydualplus.XposedService" ] \
+    && grep -qF 'io.github.samson910022.galaxydualplus.debug.XposedService' "$MANIFEST_DUMP_FILE"; then
+    fail "release-expected APK carries the debug authority (io.github.samson910022.galaxydualplus.debug.XposedService): $apk"
   fi
   echo "FOUND single GuardXposedProvider at $EXPECTED_AUTHORITY; no libxposed XposedProvider reference"
 

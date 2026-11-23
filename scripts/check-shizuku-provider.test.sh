@@ -6,8 +6,8 @@
 # reason the fixture exists for (expected_reason(); a fail fixture whose
 # ::error:: output does not contain the mapped substring is a MISMATCH, not
 # a pass — no false-confidence fixtures). Debug fixtures are checked against
-# the debug authority (com.galaxydual.plus.debug.shizuku), release fixtures
-# against the release authority (com.galaxydual.plus.shizuku); any fixture
+# the debug authority (io.github.samson910022.galaxydualplus.debug.shizuku), release fixtures
+# against the release authority (io.github.samson910022.galaxydualplus.shizuku); any fixture
 # with "release" in its filename uses the release authority.
 #
 # Intentionally `set -u` (not -e): both pass and fail exit codes are asserted.
@@ -17,8 +17,15 @@ cd "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 FIXTURE_DIR="scripts/fixtures/shizuku-provider"
 CHECKER="scripts/check-shizuku-provider.py"
-DEBUG_AUTHORITY="com.galaxydual.plus.debug.shizuku"
-RELEASE_AUTHORITY="com.galaxydual.plus.shizuku"
+
+SUITE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/check-shizuku-provider-test.XXXXXX")" || {
+  echo "::error::mktemp -d failed" >&2
+  exit 1
+}
+trap 'rm -rf "$SUITE_TMP"' EXIT
+DEBUG_AUTHORITY="io.github.samson910022.galaxydualplus.debug.shizuku"
+RELEASE_AUTHORITY="io.github.samson910022.galaxydualplus.shizuku"
+OLD_RELEASE_AUTHORITY="com.galaxydual.plus.shizuku"
 
 if [ ! -d "$FIXTURE_DIR" ]; then
   echo "::error::fixture directory missing: $FIXTURE_DIR" >&2
@@ -107,6 +114,27 @@ for fixture in "${fixtures[@]}"; do
     printf '%s\n' "$output" | sed 's/^/     /'
   fi
 done
+
+# --- negative case: the OLD (pre-migration) authority must be rejected ---
+# Generated inline from the reviewed pass fixture (only the authority is swapped),
+# so the EXPECTED_FIXTURE_COUNT pin above still describes exactly the reviewed
+# fixture set. This is the authority-only regression: the old applicationId's
+# shizuku authority must not pass the new pinned authority.
+old_case_dir="$SUITE_TMP/old-authority"
+mkdir -p "$old_case_dir"
+sed "s|$RELEASE_AUTHORITY|$OLD_RELEASE_AUTHORITY|g" \
+  "$FIXTURE_DIR/pass-release.xmltree.txt" > "$old_case_dir/old-release.xmltree.txt"
+total=$((total + 1))
+old_output="$(python3 "$CHECKER" --aapt2-xmltree "$old_case_dir/old-release.xmltree.txt" --authority "$RELEASE_AUTHORITY" 2>&1)" || old_rc=$?
+old_rc=${old_rc:-0}
+if [ "$old_rc" -eq 1 ] && printf '%s\n' "$old_output" | grep -qF "android:authorities is '$OLD_RELEASE_AUTHORITY'"; then
+  matched=$((matched + 1))
+  printf 'PASS negative case old-authority.xmltree.txt (old authority rejected, exit %d)\n' "$old_rc"
+else
+  mismatched=$((mismatched + 1))
+  printf 'FAIL negative case old-authority.xmltree.txt (expected exit 1 + old-authority reason, got exit %d)\n' "$old_rc"
+  printf '%s\n' "$old_output" | sed 's/^/     /'
+fi
 
 echo "----"
 printf 'summary: %d fixtures, %d as expected, %d mismatched\n' "$total" "$matched" "$mismatched"

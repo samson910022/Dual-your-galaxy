@@ -63,6 +63,12 @@ import sys
 import xml.etree.ElementTree as ET
 
 ANDROID_NS = "http://schemas.android.com/apk/res/android"
+# Class FQN, NOT an applicationId-derived value: the v0.1.0-beta.2 migration
+# changes the identity (applicationId / android:authorities, supplied via
+# --authority) only. Kotlin class FQNs stay com.galaxydual.plus.* under the
+# applicationId-only strategy, so this pin (and the merged-manifest fixtures'
+# android:name values) deliberately remain unchanged. Re-pinning this to the
+# new applicationId would break the gate against the real merged manifest.
 EXPECTED_PROVIDER = "com.galaxydual.plus.GuardXposedProvider"
 
 E_RE = re.compile(r"^(\s*)(?:\d+\s*)?E: ([^\s()]+)")

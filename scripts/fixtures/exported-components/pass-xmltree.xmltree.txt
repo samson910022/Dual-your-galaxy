@@ -6,7 +6,7 @@
 # not matching the E:/A: grammar are ignored by the parser.
 N: android=http://schemas.android.com/apk/res/android (line=2)
   E: manifest (line=2)
-    A: package="com.galaxydual.plus.debug" (Raw: "com.galaxydual.plus.debug")
+    A: package="io.github.samson910022.galaxydualplus.debug" (Raw: "io.github.samson910022.galaxydualplus.debug")
       E: application (line=3)
         A: http://schemas.android.com/apk/res/android:label(0x01010001)="Galaxy Dual Plus" (Raw: "Galaxy Dual Plus")
           E: activity (line=4)
@@ -22,15 +22,15 @@ N: android=http://schemas.android.com/apk/res/android (line=2)
             A: http://schemas.android.com/apk/res/android:permission(0x01010006)="android.permission.INTERACT_ACROSS_USERS_FULL" (Raw: "android.permission.INTERACT_ACROSS_USERS_FULL")
             A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
             A: http://schemas.android.com/apk/res/android:multiprocess(0x01010013)=false
-            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="com.galaxydual.plus.debug.shizuku" (Raw: "com.galaxydual.plus.debug.shizuku")
+            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="io.github.samson910022.galaxydualplus.debug.shizuku" (Raw: "io.github.samson910022.galaxydualplus.debug.shizuku")
           E: provider (line=19)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)="com.galaxydual.plus.GuardXposedProvider" (Raw: "com.galaxydual.plus.GuardXposedProvider")
             A: http://schemas.android.com/apk/res/android:exported(0x01010010)=true
-            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="com.galaxydual.plus.debug.XposedService" (Raw: "com.galaxydual.plus.debug.XposedService")
+            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="io.github.samson910022.galaxydualplus.debug.XposedService" (Raw: "io.github.samson910022.galaxydualplus.debug.XposedService")
           E: provider (line=24)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)="androidx.startup.InitializationProvider" (Raw: "androidx.startup.InitializationProvider")
             A: http://schemas.android.com/apk/res/android:exported(0x01010010)=false
-            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="com.galaxydual.plus.debug.androidx-startup" (Raw: "com.galaxydual.plus.debug.androidx-startup")
+            A: http://schemas.android.com/apk/res/android:authorities(0x01010018)="io.github.samson910022.galaxydualplus.debug.androidx-startup" (Raw: "io.github.samson910022.galaxydualplus.debug.androidx-startup")
           E: receiver (line=30)
             A: http://schemas.android.com/apk/res/android:name(0x01010003)="androidx.profileinstaller.ProfileInstallReceiver" (Raw: "androidx.profileinstaller.ProfileInstallReceiver")
             A: http://schemas.android.com/apk/res/android:permission(0x01010006)="android.permission.DUMP" (Raw: "android.permission.DUMP")

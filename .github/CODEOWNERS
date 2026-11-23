@@ -38,6 +38,8 @@
 /gradlew.bat @samson910022
 /scripts/parse-apksigner-output.sh @samson910022
 /scripts/parse-apksigner-output.test.sh @samson910022
+/scripts/check-app-identity.sh @samson910022
+/scripts/check-app-identity.test.sh @samson910022
 /scripts/check-provider-parity.test.sh @samson910022
 /scripts/check-exported-components.test.sh @samson910022
 /scripts/check-shizuku-provider.py @samson910022
