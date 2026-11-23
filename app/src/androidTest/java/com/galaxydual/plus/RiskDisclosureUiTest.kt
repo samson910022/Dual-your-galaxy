@@ -179,6 +179,9 @@ class RiskDisclosureUiTest {
             prepareWritable(vm)
             MainActivity.testViewModel = vm
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                scenario.onActivity { activity ->
+                    activity.findViewById<EditText>(R.id.pkg_input).setText("com.example.chat")
+                }
                 awaitButtonEnabled(scenario, R.id.clone_btn)
 
                 // 第一次：gate 出現 → 取消 → 零寫入、不標記。
