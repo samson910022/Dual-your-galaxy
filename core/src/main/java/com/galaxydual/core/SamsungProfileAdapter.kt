@@ -44,8 +44,15 @@ object SamsungProfileAdapter {
     // type token. The display index before `:` is NOT the id and is
     // ignored; the remainder of the line after the type token carries the
     // flags/parent tail.
+    // Issue #65 (display-name comma/type injection): group 2 is deliberately
+    // GREEDY `(.*)` so it consumes up to the LAST `, type=`. A user-renamed
+    // label may legally contain commas or even a `type=` substring
+    // (`name=foo, type=profile.CLONE, type=full.SYSTEM`); the authorization
+    // token must be the real trailing `type=full.SYSTEM`, never the
+    // display-only text smuggled into `name=`. A non-greedy `[^,]*` used to
+    // stop at the first comma and hand the injected CLONE token to group 3.
     private val NEW_VERBOSE_LINE =
-        Regex("""^\s*\d+:\s*id=(\d+),\s*name=([^,]*),\s*type=([^\s,]+)""")
+        Regex("""^\s*\d+:\s*id=(\d+),\s*name=(.*),\s*type=([^\s,]+)""")
 
     // A user-type token meaning Samsung/clone profile. Matches
     // `profile.CLONE` with a tolerant separator (`.`, `_`, `-`, space/Tab) so
@@ -455,10 +462,12 @@ object SamsungProfileAdapter {
 
     // New-ROM `cmd user list -v` line parser (PR-33 D2, S24 實機): one claim
     // per `N: id=<id>, name=<label>, type=<type>, ...` line. The label is
-    // taken from `name=` only; the body searched for type/parent/serial is
-    // the `type=` token plus the flag/parent tail, so the label can never
-    // leak into the authorization-relevant userType (same guarantee as the
-    // UserInfo body-only rule above). `type=profile.CLONE` classifies CLONE
+    // taken from `name=` only (up to the LAST `, type=`, so a comma/`type=`
+    // inside a display name cannot spoof the type); the body searched for
+    // type/parent/serial is the real `type=` token plus the flag/parent
+    // tail, so the label can never leak into the authorization-relevant
+    // userType (same guarantee as the UserInfo body-only rule above).
+    // `type=profile.CLONE` classifies CLONE
     // via CLONE_MARKER; any other explicit type (profile.PRIVATE,
     // full.SYSTEM, ...) classifies OTHER via the shared classifier; a line
     // without a type token is UNKNOWN. `parentId=N` in the tail yields the

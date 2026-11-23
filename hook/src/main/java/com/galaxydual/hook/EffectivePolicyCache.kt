@@ -106,8 +106,9 @@ class EffectivePolicyCache(
         // Past the cap the sticky snapshot expires to empty (fail-closed) so a
         // dead daemon cannot hide a policy clear indefinitely. 30 min >> 60s
         // TTL so normal polls never hit it; only a sustained failure storm
-        // (no successful read for 30 min) expires. Retunable without breaking
-        // the contract as long as it stays >> TTL + cooldown.
+        // (no successful read for 30 min) expires. Clock skew or a dead clock
+        // fails closed (discards sticky) instead of widening the cap.
+        // Retunable without breaking the contract as long as it stays >> TTL + cooldown.
         const val BBC_STICKY_MAX_AGE_MS = 30L * 60L * 1000L
     }
 
@@ -244,13 +245,35 @@ class EffectivePolicyCache(
         }
     }
 
+    // A dead clock suppresses noteBbcFallback entirely (no throttle bypass),
+    // so the untrusted-clock sticky discard gets its own CLOCK-FREE, once-per-
+    // process diagnostic line. Counters are the primary signal on every hit.
+    private val untrustedClockDiscardLogged = AtomicLong(0L)
+    private fun noteUntrustedClockDiscard() {
+        if (!untrustedClockDiscardLogged.compareAndSet(0L, 1L)) return
+        try {
+            onLog(
+                "BBC sticky fallback (clock-untrusted-sticky-discarded): " +
+                    "stickyFallback=${bbcStickyFallbackCount.get()} " +
+                    "stickyExpired=${bbcStickyExpiredCount.get()} " +
+                    "unknown=${bbcUnknownCount.get()}",
+            )
+        } catch (_: Throwable) {
+            // Diagnostics only.
+        }
+    }
+
     // Phase A P0: sticky helpers. Must be called under [lock].
     // Returns the sticky snapshot if present and within the cap; expires it
     // (fail-closed to null) past BBC_STICKY_MAX_AGE_MS with a counted +
-    // throttled log so a clear can never hide indefinitely.
+    // throttled log so a clear can never hide indefinitely. A backwards clock
+    // (now < lastGoodStickyAtMs) yields a negative age and would otherwise
+    // never expire — mirror the whitelist TTL rule (:420) and treat skew as
+    // expired. The 30-min cap is therefore never widened by a time jump.
     private fun stickyIfValidLocked(now: Long): Set<String>? {
         val g = lastGoodSticky ?: return null
-        if (now >= lastGoodStickyAtMs && now - lastGoodStickyAtMs >= BBC_STICKY_MAX_AGE_MS) {
+        val age = now - lastGoodStickyAtMs
+        if (age >= BBC_STICKY_MAX_AGE_MS || age < 0L) {
             lastGoodSticky = null
             try {
                 bbcStickyExpiredCount.incrementAndGet()
@@ -876,6 +899,8 @@ class EffectivePolicyCache(
     // Only Good(non-empty) and Cleared(empty+version) update the sticky
     // snapshot; Unknown never shrinks. TTL expiry / invalidate never discard
     // sticky (only BBC_STICKY_MAX_AGE_MS expires it, counted + throttled).
+    // A backwards sample (clock skew) or an unreadable clock fails closed and
+    // discards sticky: freshness is then unprovable, so the cap is not widened.
     // Gate-closed short-circuits to Cleared(-1) with zero IPC/state (BBC
     // injection disabled => empty, no Unknown log). N06(b): the gate is a LAZY
     // provider evaluated after now0 so a slow read is charged to the same
@@ -900,18 +925,20 @@ class EffectivePolicyCache(
                 false
             }
             if (gateClosed) return BbcPolicy.Cleared(-1L)
-            val sticky: Set<String>? = synchronized(lock) { lastGoodSticky }
-            if (sticky != null) {
-                try {
-                    bbcStickyFallbackCount.incrementAndGet()
-                } catch (_: Throwable) {
+            // Without a trusted clock the sticky snapshot's freshness cannot be
+            // proven against the 30-min cap, so fail closed instead of serving
+            // an unverifiable value. Drop it once (so a later call cannot
+            // resurrect it) and count it as an expiry for observability.
+            val hadSticky = synchronized(lock) {
+                val present = lastGoodSticky != null
+                if (present) {
+                    lastGoodSticky = null
+                    try {
+                        bbcStickyExpiredCount.incrementAndGet()
+                    } catch (_: Throwable) {
+                    }
                 }
-                try {
-                    bbcUnknownCount.incrementAndGet()
-                } catch (_: Throwable) {
-                }
-                noteBbcFallback("clock")
-                return BbcPolicy.Unknown(sticky)
+                present
             }
             try {
                 bbcStickyFallbackCount.incrementAndGet()
@@ -921,7 +948,9 @@ class EffectivePolicyCache(
                 bbcUnknownCount.incrementAndGet()
             } catch (_: Throwable) {
             }
-            noteBbcFallback("clock-no-sticky")
+            // noteBbcFallback() cannot log with a dead clock (by design: no
+            // throttle bypass), so use the clock-free once-per-process line.
+            if (hadSticky) noteUntrustedClockDiscard() else noteBbcFallback("clock-no-sticky")
             return BbcPolicy.Unknown(emptySet())
         }
         // N06(b): gate read happens AFTER now0/deadline sampling, inside the
