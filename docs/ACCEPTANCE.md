@@ -8,9 +8,9 @@
 
 ## Round-7b 範圍收斂（2026-11-23；優先於本文 round-2～6 的合併閘門用語）
 
-> 依最新 Scoped Review，本文所有 N01/D01/E00/F00/G00、N08/D08、N09、D06、D07 及 Scope A 的 UNMEASURED／NOT a pass 列，全部是**風險揭露與後續研究清單**，**不是本 PR 的合併阻擋項**；唯一合併門檻為 **M1**（風險 UX）與 **M2**（主功能正確性），已於本 PR（r7b-1..3）實作。下文 round-2～6 的「P0 合併門檻維持開啟／未關閉」用語保留為歷史風險揭露記錄，由本節重新分類。
+> 依最新 Scoped Review，本文所有 N01/D01/E00/F00/G00、N08/D08、N09、D06、D07 及 Scope A 的 UNMEASURED／NOT a pass 列，全部是**風險揭露與後續研究清單**，**不是 PR #74 的合併阻擋項**；唯一合併門檻為 **M1**（風險 UX）與 **M2**（主功能正確性），已於 PR #74（r7b-1..3）實作。下文 round-2～6 的「P0 合併門檻維持開啟／未關閉」用語保留為歷史風險揭露記錄，由本節重新分類。
 >
-> P0（Samsung system-uid user95 DELETE）是**真實觀察，不是通過／不是已修復**：A/B/C 為負向控制關聯（各臂 App build 不同；`pm install-existing --user 95` 只還原套件存在、不還原 user-95 原有資料；根因未證實；原始私有 log 未由本 reviewer 獨立覆核）。依 round-7b 維護者決策，在 M1/M2 完成並誠實揭露後，**接受為 experimental limitation**——此為發布責任、風險資訊與操作保護的分離，**不是安全宣稱**。**H01–H04**（RepairHintStore durability／`commit(false)`、被拒絕重入的警告 generation、ack 的 SharedPreferences commit on UI、PM IPC／15ms gate／30min sticky／Samsung UI 矩陣）與 **#75**（DAAgent pre-DELETE 研究）為 **follow-ups，非 blocker**。PR #74 **全程零裝置工作、無破壞性重現**；最終 run #45103347110（PR head）與 #45113206916（main merge 後）皆 **SUCCESS**（build／locale-instrumentation 通過，manual emulator matrix **SKIPPED**）；JVM／CI 全綠不構成裝置通過。
+> P0（Samsung system-uid user95 DELETE）是**真實觀察，不是通過／不是已修復**：A/B/C 為負向控制關聯（各臂 App build 不同；`pm install-existing --user 95` 只還原套件存在、不還原 user-95 原有資料；根因未證實；原始私有 log 未由本 reviewer 獨立覆核）。依 round-7b 維護者決策，在 M1/M2 完成並誠實揭露後，**接受為 experimental limitation**——此為發布責任、風險資訊與操作保護的分離，**不是安全宣稱**。**H01–H04**（RepairHintStore durability／`commit(false)`、被拒絕重入的警告 generation、ack 的 SharedPreferences commit on UI、PM IPC／15ms gate／30min sticky／Samsung UI 矩陣）與 **#75**（DAAgent pre-DELETE 研究）為 **follow-ups，非 blocker**。PR #74 的 Round 7b/8 程式與 CI 驗證**未新增實機驗收**；另於 2026-11-23 依持有人授權在已備份裝置完成 A/B/C 破壞性對照（本節 §6，三臂皆清除 user-95 分身與資料，**不是安全通過**），原始私有 log 未由本次 review 獨立覆核；最終 run #45103347110（PR head）與 #45113206916（main merge 後）皆 **SUCCESS**（build／locale-instrumentation 通過，manual emulator matrix **SKIPPED**）；JVM／CI 全綠不構成裝置通過。
 
 ## 1. 版本錨定（每次驗收必填）
 
@@ -208,7 +208,7 @@ BBC6 注意事項（unified build）：
 
 > **定位（先讀）**：本節記錄**已完成**的三臂冷啟動對照結果，是重要的裝置關聯證據，**不是**任何驗收通過。上一節「2026-11-23 實機唯讀觀察」為執行前的唯讀快照，其中「三臂未執行」僅對該次觀察有效，已由本節後續的實際執行取代。不得據此宣稱任何合併閘門通過、或 BBC 預設設定安全；依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是本 PR 合併門檻。**opt-out 不是刪除防護**（issue #75）。
 >
-> 三臂皆在同一台已備份且明確授權的 S23 Ultra（SM-S9180）執行；**Arm B/C 使用本機 `:app:assembleDebug` 於 02:59 安裝的目前 HEAD build**（APK byte grep 見 `bbc_injection_enabled` 執行期開關）；**Arm A（02:44）在此安裝之前，使用的是裝置上較舊的 app build**（該舊 APK 無 gate 開關，見 `latest_build_verification.md`）——此差異如實揭露，起點為同一 user-95 installed-state，由 sole device executor 完成。全程未嘗試 Scope B／SSAID／ABX 修補、未查詢 user 150、未平行 adb、未修改 repo。**三臂使用不同 App build（Arm A 為較舊 build、Arm B/C 為目前 HEAD）且每臂後以 `pm install-existing --user 95` 還原，只恢復套件存在、不恢復 user-95 原有資料；故三臂並非「相同先前使用者資料」的嚴格對照，僅為 installed-state 起點的負向控制關聯。**
+> 三臂皆在同一台已備份且明確授權的 S23 Ultra（SM-S9180）執行；**Arm B/C 使用本機 `:app:assembleDebug` 於 02:59 安裝的實驗當時 build（commit 未獨立確定；非 PR #74 final head `e102a5ef`，亦非本文件的裝置驗證）**（APK byte grep 見 `bbc_injection_enabled` 執行期開關）；**Arm A（02:44）在此安裝之前，使用的是裝置上較舊的 app build**（該舊 APK 無 gate 開關，見 `latest_build_verification.md`）——此差異如實揭露，起點為同一 user-95 installed-state，由 sole device executor 完成。全程未嘗試 Scope B／SSAID／ABX 修補、未查詢 user 150、未平行 adb、未修改 repo。**三臂使用不同 App build（Arm A 為較舊 build、Arm B/C 為當日 02:59 build）且每臂後以 `pm install-existing --user 95` 還原，只恢復套件存在、不恢復 user-95 原有資料；故三臂並非「相同先前使用者資料」的嚴格對照，僅為 installed-state 起點的負向控制關聯。**
 
 | 臂 | 條件（gate／hook） | 系統 DELETE（`START DELETE PACKAGE`） | BBC 回調／時序 | 結果 |
 | --- | --- | --- | --- | --- |

@@ -13,7 +13,10 @@
 // - RiskAckStore 介面與 shouldShowRiskGate 為純 Kotlin seam (無 Android 型別)，
 //   JVM 可用 Map-backed fake 直接測試；Android framework 僅出現在 SharedPreferences
 //   綁定 (以下以完整名稱限定，不進 import) 與兩個對話框函式。
-// - MainActivity / PolicyActivity 已透過本 helper 進行風險揭露 UI wiring（PR #74 r7b-2）。
+// - 風險揭露 UI wiring 的共用部分是 RiskAckStore／shouldShowRiskGate 等純 seam。
+//   MainActivity 自行持有對話框 handle 並以同名 private helper 建構；
+//   PolicyActivity 呼叫本檔的全域對話框 helper。兩者對話框建構／生命週期
+//   尚未統一（追蹤於 issue #78）；本檔 helper 亦不回傳 handle。
 package com.galaxydual.plus
 
 import android.app.Activity
