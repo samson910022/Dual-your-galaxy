@@ -6,6 +6,8 @@
 > 凡標【口述】者，為對話事實、無逐字擷錄留存。
 > 裝置未再觸碰；logcat 全文 36 MB 僅引用行號，不貼全文。
 
+> **round-7b 收斂註記（2026-11-23）**：本文為歷史事故記錄；Samsung user95 DELETE 已於誠實揭露後**接受為 experimental limitation，不是 pass／不是未解決的 P0 blocker**；A/B/C 為負向控制關聯、根因未證實，H01–H04／#75 為 follow-ups。以下事實與擷錄記錄列維持不變。
+
 ## 0. 事件一句話
 
 非空 BBC 政策（`installed=1`／`callback(nonempty)`／`merged +1 total 7`，pid=12644）之下，
