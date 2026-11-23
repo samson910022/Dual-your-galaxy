@@ -80,6 +80,33 @@ jobs:
                   ok = False
           sys.exit(0 if ok else 1)
           PY
+      # Fail-closed gate self-tests (mirror android.yml): run every scripts/*.test.sh
+      # that pins a release-critical checker before any source gate, unit test or
+      # signing step. `set -e` preserves fail-fast — a broken checker (or a weakened
+      # fixture) fails the release job before any release bytes are produced.
+      # Excluded: ci-retry-guard.test.sh (release job does not use the retry guard
+      # around gradle invocations). All other release-critical checkers are run.
+      - name: Release gate self-tests (fail-fast)
+        run: |
+          set -e
+          echo "== DEX class_def checker self-test =="
+          bash scripts/check-dex-classdefs.test.sh
+          echo "== Artifact verifier self-test =="
+          bash scripts/verify-release-artifacts.test.sh
+          echo "== Shizuku-provider checker self-test =="
+          bash scripts/check-shizuku-provider.test.sh
+          echo "== Provider parity checker self-test =="
+          bash scripts/check-provider-parity.test.sh
+          echo "== Exported-components checker self-test =="
+          bash scripts/check-exported-components.test.sh
+          echo "== App identity checker self-test =="
+          bash scripts/check-app-identity.test.sh
+          echo "== APK signer parser self-test =="
+          bash scripts/parse-apksigner-output.test.sh
+          echo "== Release signer certificate gate self-test =="
+          bash scripts/verify-release-apk-signers.test.sh
+          echo "== SHA256SUMS gate self-test =="
+          bash scripts/verify-release-sha256sums.test.sh
       # H1 scope parity: scope.list <-> HookScopes/DualHook <-> manifest.
       - name: Scope parity (hook scopes)
         run: |
