@@ -6,6 +6,7 @@
 package com.galaxydual.plus
 
 import android.app.AlertDialog
+import android.content.Context
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -13,6 +14,7 @@ import android.widget.CheckBox
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
 import com.galaxydual.plus.R
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -26,6 +28,17 @@ class BatchConfirmDialogTest {
 
     private fun field(target: Any, name: String): Any? =
         target.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(target)
+
+    private fun riskPrefs() = InstrumentationRegistry.getInstrumentation().targetContext
+        .getSharedPreferences(RISK_ACK_PREFS_NAME, Context.MODE_PRIVATE)
+
+    private fun setRiskAckTrue() {
+        riskPrefs().edit().putBoolean(RISK_ACK_KEY, true).commit()
+    }
+
+    private fun clearRiskAck() {
+        riskPrefs().edit().clear().commit()
+    }
 
     private fun checkbox(view: View): CheckBox? {
         if (view is CheckBox) return view
@@ -134,6 +147,7 @@ class BatchConfirmDialogTest {
 
     @Test
     fun open_ack_cancel_zeroWrite_and_rotationPreservesAck() {
+        setRiskAckTrue()
         val gw = FakeHarnessGateway(dualId = 95)
         val vm = newHarnessViewModel(gw)
         try {
@@ -232,6 +246,7 @@ class BatchConfirmDialogTest {
             }
         } finally {
             MainActivity.testViewModel = null
+            clearRiskAck()
             vm.dispose()
         }
     }
@@ -240,6 +255,7 @@ class BatchConfirmDialogTest {
     // 先停至 CREATED 再改 live freshness，確保 crossing 發生於儲存/還原之間（非舊 Activity 同畫面 sync 消費）。
     @Test
     fun freshnessFreshToStale_recreate_clearsAck_andDisablesPositive() {
+        setRiskAckTrue()
         val gw = FakeHarnessGateway(dualId = 95)
         val vm = newHarnessViewModel(gw)
         try {
@@ -289,6 +305,7 @@ class BatchConfirmDialogTest {
             }
         } finally {
             MainActivity.testViewModel = null
+            clearRiskAck()
             vm.dispose()
         }
     }
@@ -298,6 +315,7 @@ class BatchConfirmDialogTest {
     // 停至 CREATED 後改回 FRESH 再 recreate，證明 crossing 發生於儲存/還原之間。
     @Test
     fun freshnessStaleToFresh_recreate_clearsAck_andDisablesPositive() {
+        setRiskAckTrue()
         val gw = FakeHarnessGateway(dualId = 95)
         val vm = newHarnessViewModel(gw)
         try {
@@ -351,6 +369,7 @@ class BatchConfirmDialogTest {
             }
         } finally {
             MainActivity.testViewModel = null
+            clearRiskAck()
             vm.dispose()
         }
     }
@@ -358,6 +377,7 @@ class BatchConfirmDialogTest {
     // Review #4：live freshness 已變但 render 尚未同步時，positive click 必須 fail-closed（零寫入）。
     @Test
     fun freshnessChangesBeforeRenderSync_positiveClick_failClosed_zeroWrite() {
+        setRiskAckTrue()
         val gw = FakeHarnessGateway(dualId = 95)
         val vm = newHarnessViewModel(gw)
         try {
@@ -395,6 +415,7 @@ class BatchConfirmDialogTest {
             }
         } finally {
             MainActivity.testViewModel = null
+            clearRiskAck()
             vm.dispose()
         }
     }
