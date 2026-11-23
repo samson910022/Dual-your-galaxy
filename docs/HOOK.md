@@ -605,7 +605,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   non-scope processes get `detach()`.
 - **JVM tests prove pure decision/selection logic only** (not on-device class presence,
   signatures/return types, hook installation, callback interception, or that eligible overloads
-  are hit on Samsung DAAgent/LSPosed). The BBC effect seam is device-verified (2026-11-17, pre-unification evidence);
+  are hit on Samsung DAAgent/LSPosed). The BBC effect seam was device-verified on the 2026-11-17 (pre-unification) and 2026-11-18 builds only; it is experimental / not device-verified on the current HEAD;
   the Stage-1 gate stays sealed: a code-level gate (`PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`, default `false`) keeps
   `effective(...)` fail-closed (returns empty when closed) — this is a code gate, not device verification, and Stage 1 defaults remain unchanged;
   the fail-closed gate seam remains unit-tested.
