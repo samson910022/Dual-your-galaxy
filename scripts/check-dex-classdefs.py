@@ -37,6 +37,25 @@
 # and class_defs_size=0. There is deliberately NO grep/raw-byte fallback —
 # that fallback is exactly the false positive above.
 #
+# Version policy: exactly 035, 037, 038, 039, 040. Version 036 is NOT in the
+# allowlist: ART skips it, so accepting it would let a positive DEX with magic
+# `dex\n036\0` false-pass this gate. 034 and 041+ are likewise rejected; no
+# container/041 support is attempted here.
+#
+# Two further fail-closed bounds (round-2 review): (1) every non-empty fixed
+# table (string_ids, type_ids, class_defs) must end at or before data_off —
+# checking the tables only against each other and against file_size let a
+# header-only data_off/data_size mutation make them overlap the data section
+# undetected; (2) a nonzero map_off must lie entirely inside the declared data
+# section [data_off, data_end), not merely inside the file and aligned. A
+# map_off just before data_end with fewer than four bytes left is rejected.
+#
+# Scope disclaimer: this is a parser-level structural gate only. It does NOT
+# parse map_list contents, verify any checksum/signature, decode bytecode, or
+# perform ART/dex2oat verification. A DEX accepted here is not necessarily a
+# DEX the runtime will load; the gate only proves a real class_def_item for
+# the requested descriptor exists in a structurally consistent header/tables.
+#
 # Importable API (used by scripts/check-dex-classdefs.test.sh):
 #   count_class_defs(dex_bytes, descriptor) -> int
 #   parse_class_def_descriptors(dex_bytes) -> list[str]
@@ -52,7 +71,9 @@ ENDIAN_BIG = 0x78563412     # tag read little-endian -> big-endian tables
 PRIMARY_DEX = "classes.dex"
 SECONDARY_DEX_RE = re.compile(r"classes(1[0-9]+|[2-9][0-9]*)\.dex")
 ANY_CLASSES_DEX_RE = re.compile(r"classes[0-9]*\.dex")
-DEX_VERSIONS = frozenset(f"{version:03d}".encode("ascii") for version in range(35, 41))
+# ART skips 036, so it must not be accepted even though 035..040 is a contiguous
+# numeric range. Keep this explicit; do not regenerate it from range().
+DEX_VERSIONS = frozenset((b"035", b"037", b"038", b"039", b"040"))
 
 # DEX header field offsets (byte positions).
 OFF_FILE_SIZE = 0x20
@@ -98,8 +119,14 @@ def _uleb128(data, offset, limit, label):
                    "(more than 5 bytes)")
 
 
-def _read_table(data, file_size, endian, size_off, off_off, entry_size, label, regions):
-    """Validate one DEX table header; record its byte range for overlap checks."""
+def _read_table(data, file_size, data_off, endian, size_off, off_off, entry_size,
+                label, regions):
+    """Validate one DEX table header; record its byte range for overlap checks.
+
+    Fixed tables live before the data section: validating them only against
+    file_size and against each other let a header-only data_off mutation hide
+    an overlap, so `end` must also stay at or before data_off.
+    """
     size = _u32(data, size_off, endian, file_size)
     offset = _u32(data, off_off, endian, file_size)
     if size == 0:
@@ -113,6 +140,9 @@ def _read_table(data, file_size, endian, size_off, off_off, entry_size, label, r
     if end > file_size:
         raise DexError(f"{label} table out of bounds: offset {offset} + "
                        f"{size} * {entry_size} > file_size {file_size}")
+    if end > data_off:
+        raise DexError(f"{label} table [{offset}, {end}) must end at or before "
+                       f"data_off {data_off}")
     for other_label, other_start, other_end in regions:
         if offset < other_end and other_start < end:
             raise DexError(f"overlapping DEX tables: {label} [{offset}, {end}) "
@@ -236,7 +266,7 @@ def parse_class_def_descriptors(dex_bytes):
     version = data[4:7]
     if version not in DEX_VERSIONS:
         raise DexError(f"invalid DEX magic version {version!r} "
-                       "(expected 035..040, NUL-terminated)")
+                       "(expected 035, 037, 038, 039, 040; NUL-terminated)")
 
     # The endian tag bytes are 78 56 34 12 in a little-endian DEX and
     # 12 34 56 78 in a big-endian one. Read it little-endian first:
@@ -276,15 +306,22 @@ def parse_class_def_descriptors(dex_bytes):
             raise DexError(f"map_off {map_off} outside DEX [{HEADER_SIZE}, {file_size})")
         if map_off % 4:
             raise DexError(f"misaligned map_off {map_off} (must be 4-byte aligned)")
+        # The map_list lives in the data section. Whole-file range + alignment
+        # alone accepted a pointer into the tables or one with <4 bytes left.
+        if not (data_off <= map_off and map_off + 4 <= data_end):
+            raise DexError(f"map_off {map_off} outside data section "
+                           f"[{data_off}, {data_end})")
 
     regions = []
-    string_size, string_off = _read_table(data, file_size, endian, OFF_STRING_IDS_SIZE,
-                                          OFF_STRING_IDS_OFF, 4, "string_ids", regions)
-    type_size, type_off = _read_table(data, file_size, endian, OFF_TYPE_IDS_SIZE,
-                                      OFF_TYPE_IDS_OFF, 4, "type_ids", regions)
-    class_size, class_off = _read_table(data, file_size, endian, OFF_CLASS_DEFS_SIZE,
-                                        OFF_CLASS_DEFS_OFF, CLASS_DEF_ITEM_SIZE,
-                                        "class_defs", regions)
+    string_size, string_off = _read_table(data, file_size, data_off, endian,
+                                          OFF_STRING_IDS_SIZE, OFF_STRING_IDS_OFF,
+                                          4, "string_ids", regions)
+    type_size, type_off = _read_table(data, file_size, data_off, endian,
+                                      OFF_TYPE_IDS_SIZE, OFF_TYPE_IDS_OFF,
+                                      4, "type_ids", regions)
+    class_size, class_off = _read_table(data, file_size, data_off, endian,
+                                        OFF_CLASS_DEFS_SIZE, OFF_CLASS_DEFS_OFF,
+                                        CLASS_DEF_ITEM_SIZE, "class_defs", regions)
     # Issue #67: a descriptor string/type reference with no class_def is NOT
     # a class. Reject the whole DEX rather than reporting a count of 0.
     #

@@ -11,6 +11,7 @@ binary fixtures.
 
 Importable API:
   build_dex(strings, types=None, class_idxs=None, **mutations) -> bytes
+  patch_u32(dex_bytes, field_offset, value) -> bytes  # header-only field patch
   write_apk(path, members) -> None            # members: [(name, bytes|str), ...]
   xposed_members(...) -> list[(name, bytes)]   # integration APK metadata
   build_all(outdir) -> list[str]               # the standard fixture set
@@ -137,6 +138,20 @@ def layout_offsets(dex_bytes):
     """Return (string_ids_off, type_ids_off, class_defs_off, data_off) from a DEX."""
     return tuple(struct.unpack_from("<I", dex_bytes, off)[0] for off in (
         OFF_STRING_IDS_OFF, OFF_TYPE_IDS_OFF, OFF_CLASS_DEFS_OFF, OFF_DATA_OFF))
+
+
+def patch_u32(dex_bytes, field_offset, value, endian="<"):
+    """Return a copy of a DEX with ONE header uint32 patched, no re-layout.
+
+    Used for header-only mutations (e.g. data_off/data_size/map_off) where the
+    payload and every other header field must stay byte-for-byte identical so
+    the resulting failure can be pinned to the single changed field.
+    """
+    out = bytearray(dex_bytes)
+    if field_offset < 0 or field_offset + 4 > len(out):
+        raise ValueError(f"uint32 offset {field_offset} outside DEX byte length {len(out)}")
+    struct.pack_into(endian + "I", out, field_offset, value)
+    return bytes(out)
 
 
 def build_dex(strings, types=None, class_idxs=None, *, version=b"035", magic=None,
@@ -353,6 +368,8 @@ def build_all(outdir):
     bad_index = dex("bad-index.dex", [TARGET], class_idxs=[999])
     bad_magic = dex("bad-magic.dex", [TARGET], version=b"xyz")
     bad_version = dex("bad-version.dex", [TARGET], version=b"041")
+    # ART skips 036: the contiguous 035..040 range used to accept it.
+    bad_version_036 = dex("bad-version-036.dex", [TARGET], version=b"036")
     bad_header = dex("bad-header-size.dex", [TARGET], header_size=0x71)
     file_small = dex("file-size-small.dex", [TARGET], file_size=len(positive) - 1)
     file_large = dex("file-size-large.dex", [TARGET], file_size=len(positive) + 1)
@@ -485,6 +502,7 @@ def build_all(outdir):
 
     apk("bad-magic.apk", [("classes.dex", bad_magic)])
     apk("bad-version.apk", [("classes.dex", bad_version)])
+    apk("bad-version-036.apk", [("classes.dex", bad_version_036)])
     apk("file-size-small.apk", [("classes.dex", file_small)])
     apk("file-size-large.apk", [("classes.dex", file_large)])
     apk("bad-header-size.apk", [("classes.dex", bad_header)])
@@ -506,6 +524,28 @@ def build_all(outdir):
         ("table-out-of-bounds", table_out_of_bounds),
     ):
         apk(name + ".apk", [("classes.dex", payload)])
+
+    # R2b: HEADER-ONLY mutations of the valid positive DEX (no data re-layout).
+    # Baseline positive layout: len 188, string_ids [112,116), type_ids
+    # [116,120), class_defs [120,152), data [152,188), map_off 0.
+    #
+    # data_off@0x6C <- 120 and data_size@0x68 <- 68 keeps data_end at 188 while
+    # making the class_defs table [120,152) overlap the declared data section.
+    apk("data-overlaps-classdefs.apk",
+        [("classes.dex", patch_u32(patch_u32(positive, OFF_DATA_OFF, base_defs),
+                                   OFF_DATA_SIZE, 68))])
+    # map_off 120 is aligned and inside the file, but points into class_defs.
+    apk("map-off-outside-data.apk",
+        [("classes.dex", patch_u32(positive, OFF_MAP_OFF, base_defs))])
+    # A 187-byte DEX with 2 raw trailer bytes and no pad: data [152,187), so
+    # map_off 184 is aligned and inside the file but leaves only 3 bytes.
+    crosses_end = build_dex([TARGET], trailer=b"\x00\x00", pad_data=False)
+    apk("map-off-crosses-data-end.apk",
+        [("classes.dex", patch_u32(crosses_end, OFF_MAP_OFF, len(crosses_end) - 3))])
+    # Positive control: nonzero map_off exactly at data_off is legitimate and
+    # must NOT be rejected (it is what real ART-emitted DEXes carry).
+    apk("nonzero-map-off-valid.apk",
+        [("classes.dex", patch_u32(positive, OFF_MAP_OFF, base_data))])
 
     # --- integration APKs with the xposed metadata members ----------------
     # Both canonical targets present, split across two DEXes.

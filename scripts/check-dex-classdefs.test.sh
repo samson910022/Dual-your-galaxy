@@ -213,7 +213,7 @@ assert_case "NUL byte in primary ZIP member name" \
 # canonical classes.dex is present.
 assert_case "NUL byte in secondary ZIP member name" \
   "$SUITE_TMP/nul-secondary-with-primary.apk" 1 \
-  "NUL byte in ZIP member name" "$TARGET"
+  "NUL byte in ZIP member name" --no-found "$TARGET"
 
 # --- strict DEX structural validation --------------------------------------
 assert_case "bad magic version xyz" "$SUITE_TMP/bad-magic.apk" 1 \
@@ -221,6 +221,47 @@ assert_case "bad magic version xyz" "$SUITE_TMP/bad-magic.apk" 1 \
 
 assert_case "unsupported magic version 041" "$SUITE_TMP/bad-version.apk" 1 \
   "invalid DEX magic version b'041'" "$TARGET"
+
+# ART skips 036; a contiguous range(35,41) allowlist used to accept it.
+assert_case "unsupported magic version 036 (ART skips it)" \
+  "$SUITE_TMP/bad-version-036.apk" 1 \
+  "invalid DEX magic version b'036'" "$TARGET"
+
+# One compact unit assertion for the full ACCEPTED set: 035, 037, 038, 039 and
+# 040 must each resolve the target class_def. (Rejection of 036, 041 and xyz is
+# pinned by the dedicated APK cases; 034 is checked in separate verification.)
+cat > "$SUITE_TMP/version_matrix.py" <<'PYVER'
+import importlib.util
+import sys
+
+checker, builder_dir, target = sys.argv[1:4]
+sys.path.insert(0, builder_dir)
+import dex_builder as builder
+
+spec = importlib.util.spec_from_file_location("check_dex_classdefs_versions", checker)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+problems = []
+for version in (b"035", b"037", b"038", b"039", b"040"):
+    dex = builder.build_dex([target], version=version)
+    try:
+        descriptors = module.parse_class_def_descriptors(dex)
+    except module.DexError as exc:
+        problems.append(f"{version!r} rejected: {exc}")
+    else:
+        if descriptors != [target]:
+            problems.append(f"{version!r} resolved to {descriptors!r}")
+print("OK" if not problems else "PROBLEMS: " + " | ".join(problems))
+PYVER
+version_rc=0
+version_output="$(python3 "$SUITE_TMP/version_matrix.py" \
+  "$CHECKER" "$REPO_ROOT/scripts/fixtures" "$TARGET" 2>&1)" || version_rc=$?
+if [ "$version_rc" -eq 0 ] && [ "$version_output" = "OK" ]; then
+  pass_case "DEX version allowlist 035/037/038/039/040 all resolve the target (exit 0)"
+else
+  bad_case "every allowlisted version must resolve the target (got exit $version_rc)" "$version_output"
+fi
 
 assert_case "file_size too small" "$SUITE_TMP/file-size-small.apk" 1 \
   "DEX file_size 187 != DEX member byte length 188" "$TARGET"
@@ -279,6 +320,27 @@ assert_case "overlapping DEX tables" "$SUITE_TMP/overlapping-tables.apk" 1 \
 
 assert_case "table out of bounds" "$SUITE_TMP/table-out-of-bounds.apk" 1 \
   "class_defs table out of bounds" "$TARGET"
+
+# --- R2b: table/data overlap and map_off data-section bounds -----------------
+# All four are HEADER-ONLY mutations of the valid positive DEX; no payload or
+# table bytes move. The old checker accepted all of them (false passes).
+assert_case "class_defs table crossing into data section" \
+  "$SUITE_TMP/data-overlaps-classdefs.apk" 1 \
+  "class_defs table [120, 152) must end at or before data_off 120" "$TARGET"
+
+assert_case "map_off inside file but outside data section" \
+  "$SUITE_TMP/map-off-outside-data.apk" 1 \
+  "map_off 120 outside data section [152, 188)" "$TARGET"
+
+assert_case "map_off with fewer than 4 bytes left in data section" \
+  "$SUITE_TMP/map-off-crosses-data-end.apk" 1 \
+  "map_off 184 outside data section [152, 187)" "$TARGET"
+
+# Positive control: a nonzero map_off at data_off is legitimate (real DEXes
+# carry one), so the new bounds check must not reject it.
+assert_case "nonzero map_off at data_off accepted" \
+  "$SUITE_TMP/nonzero-map-off-valid.apk" 0 \
+  "FOUND class_def $TARGET in classes.dex (count=1)" "$TARGET"
 
 assert_case "duplicate descriptor across DEXes" "$SUITE_TMP/dup-descriptor-across.apk" 1 \
   "defined in multiple DEX entries" "$TARGET"
