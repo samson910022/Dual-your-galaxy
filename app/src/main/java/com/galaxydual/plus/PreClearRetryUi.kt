@@ -10,6 +10,7 @@
 // configuration that both Activities hand to the dialog.
 package com.galaxydual.plus
 
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -162,4 +163,208 @@ internal fun tryAcceptWarning(
     if (!newWarningAllowed) return false
     oneShot.onWarningInstalled()
     return true
+}
+
+// ---------------------------------------------------------------------------
+// Follow-up A (PR #89): identity-bound warning restart / retry controller.
+// ---------------------------------------------------------------------------
+//
+// The old Activities kept ONE mutable `pendingWarningRestart: (() -> Unit)?`
+// slot, written at `start*Warning` ENTRY (before the re-entry guard) and read
+// later at Handler delivery and from Retry callbacks. That made a late settle
+// for an old action invoke a NEW action's callback: tap WRITE -> Unknown
+// warning (gen G) -> Retry refresh in flight -> tap CLEAR (entry overwrites the
+// slot, guard rejects) -> refresh settles Known -> the consumed token invokes
+// the CLEAR callback, i.e. a destructive clear during a write retry.
+//
+// This controller removes the slot entirely. Every live restart is a
+// [WarningRestartRequest] with a MONOTONIC id, installed ONLY at the accept
+// seam (after `tryAcceptWarning` succeeds). Installing a new request bumps the
+// token id and clears the scheduled state, so an already-posted restart token
+// from the previous action can never deliver again. Both auto restarts and
+// Retry taps are bound to the captured request id + a live host.
+//
+// IMPORTANT: [WarningRequestIdentity.generation] is the generation of the
+// WarningRetryOneShot at the moment the warning was ACCEPTED. It is NOT the
+// WarningRetryOneShot generation itself: that one advances once per installed
+// warning and guards the one retry token per warning, whereas this generation
+// is copied into the immutable request identity for correlation/diagnostics.
+// No android.* import on purpose (fully JVM-testable).
+
+/** Which destructive entry installed the request (used only for correlation). */
+internal enum class WarningRestartAction { WRITE, CLEAR, EDITOR_WRITE }
+
+internal data class WarningRequestIdentity(
+    val id: Long,
+    val action: WarningRestartAction,
+    val candidateKey: String?,
+    val generation: Int,
+)
+
+internal data class WarningRestartRequest(
+    val identity: WarningRequestIdentity,
+    val callback: () -> Unit,
+)
+
+internal class WarningRestartController {
+    private data class State(
+        val request: WarningRestartRequest? = null,
+        /** Bumped on every install/clear so an older token is stale by construction. */
+        val tokenId: Long = 0L,
+        val scheduledTokenId: Long? = null,
+        val scheduledRequestId: Long? = null,
+        val autoRestartsUsed: Int = 0,
+        val consumedRetryRequestId: Long? = null,
+    )
+
+    private val nextRequestId = AtomicLong(0L)
+    private val state = AtomicReference(State())
+
+    /** Test/telemetry accessor: the currently live request identity, if any. */
+    val currentIdentity: WarningRequestIdentity? get() = state.get().request?.identity
+
+    /** Test/telemetry accessor: the currently scheduled token, if any. */
+    val scheduledTokenId: Long? get() = state.get().scheduledTokenId
+
+    /**
+     * Install a new live request. MUST be called only at an accept seam — a
+     * request rejected by `consentResetAllowedForNewWarning` must not call
+     * this, otherwise it would steal the previous action's restart identity.
+     * Any previously queued token is invalidated (token id bumped, scheduled
+     * state cleared) and the new request gets a fresh Retry token.
+     *
+     * [resetBudget] is `true` ONLY for a genuine user entry tap. Auto-restart
+     * delivery and Retry re-entry pass `false`: they still install a NEW
+     * identity (so a settled token from the old request cannot be reused), but
+     * they CARRY OVER the consumed auto-restart budget. Without that carry-over
+     * an auto-restart would re-install with a fresh budget and defeat
+     * [MAX_AUTO_WARNING_RESTARTS], producing an unbounded re-prompt loop.
+     */
+    fun install(
+        action: WarningRestartAction,
+        candidateKey: String?,
+        generation: Int,
+        callback: () -> Unit,
+        resetBudget: Boolean,
+    ): WarningRestartRequest {
+        val request = WarningRestartRequest(
+            identity = WarningRequestIdentity(
+                id = nextRequestId.incrementAndGet(),
+                action = action,
+                candidateKey = candidateKey,
+                generation = generation,
+            ),
+            callback = callback,
+        )
+        while (true) {
+            val current = state.get()
+            val next = State(
+                request = request,
+                tokenId = current.tokenId + 1L,
+                autoRestartsUsed = if (resetBudget) 0 else current.autoRestartsUsed,
+            )
+            if (state.compareAndSet(current, next)) return request
+        }
+    }
+
+    /**
+     * Capture the current request + a fresh token and hand an invokable body to
+     * [post]. Fails (without posting) when there is no live request, the host is
+     * dying, or this request has already used its auto-restart budget. The
+     * budget is consumed here, at schedule time, so repeated aborts for the
+     * same warning cannot loop forever; a new accepted request resets it.
+     *
+     * The posted [body] closes over the host-liveness snapshot taken here; the
+     * Activity also re-checks `isFinishing/isDestroyed` immediately before
+     * invoking it, so a host that dies in between never delivers.
+     */
+    fun schedule(
+        hostAlive: Boolean,
+        maxRestarts: Int,
+        post: (tokenId: Long, requestId: Long, body: () -> Unit) -> Unit,
+    ): Boolean {
+        if (!hostAlive || maxRestarts <= 0) return false
+        var capturedRequest: WarningRestartRequest
+        var tokenId: Long
+        while (true) {
+            val current = state.get()
+            val request = current.request ?: return false
+            // Same semantics as canAutoRestart(previousCount): one auto restart
+            // per accepted request; ONLY a genuine entry tap re-arms via
+            // install(resetBudget = true). Re-entry from a posted restart or a
+            // Retry tap installs with resetBudget = false and carries this count.
+            if (current.autoRestartsUsed >= maxRestarts) return false
+            tokenId = current.tokenId + 1L
+            capturedRequest = request
+            val next = current.copy(
+                tokenId = tokenId,
+                scheduledTokenId = tokenId,
+                scheduledRequestId = request.identity.id,
+                autoRestartsUsed = current.autoRestartsUsed + 1,
+            )
+            if (state.compareAndSet(current, next)) break
+        }
+        val aliveAtSchedule = hostAlive
+        post(tokenId, capturedRequest.identity.id) {
+            deliver(tokenId, capturedRequest.identity.id, aliveAtSchedule)
+        }
+        return true
+    }
+
+    /**
+     * Deliver a posted auto restart. The callback runs ONLY when the token is
+     * the currently scheduled one, the request id still matches the live
+     * request, and the host is alive. A new user tap (install) or [clear]
+     * invalidates the token, so a stale post is a silent no-op.
+     */
+    fun deliver(tokenId: Long, requestId: Long, hostAlive: Boolean): Boolean {
+        var callback: () -> Unit
+        while (true) {
+            val current = state.get()
+            val request = current.request
+            if (request == null || request.identity.id != requestId) return false
+            if (current.scheduledTokenId != tokenId || current.scheduledRequestId != requestId) return false
+            callback = request.callback
+            // Consume the token even when the host is gone: a dead-host
+            // delivery must not remain resumable by a later call.
+            val next = current.copy(scheduledTokenId = null, scheduledRequestId = null)
+            if (state.compareAndSet(current, next)) break
+        }
+        if (!hostAlive) return false
+        callback()
+        return true
+    }
+
+    /** Request id to capture at a Retry tap (or when installing a dialog). */
+    fun retryRequestId(): Long? = state.get().request?.identity?.id
+
+    /**
+     * Identity-bound equivalent of [deliver] for Retry taps: the captured id
+     * must still be the live request, no Retry for this request may have been
+     * consumed yet, and the host must be alive. Re-installing a new warning
+     * (e.g. the accepted auto-restart) gives the next cycle a fresh id.
+     */
+    fun consumeRetry(requestId: Long, hostAlive: Boolean): Boolean {
+        if (!hostAlive) return false
+        var callback: () -> Unit
+        while (true) {
+            val current = state.get()
+            val request = current.request
+            if (request == null || request.identity.id != requestId) return false
+            if (current.consumedRetryRequestId == requestId) return false
+            callback = request.callback
+            val next = current.copy(consumedRetryRequestId = requestId)
+            if (state.compareAndSet(current, next)) break
+        }
+        callback()
+        return true
+    }
+
+    /** onDestroy: drop the live request and invalidate any queued token. */
+    fun clear() {
+        while (true) {
+            val current = state.get()
+            if (state.compareAndSet(current, State(tokenId = current.tokenId + 1L))) return
+        }
+    }
 }

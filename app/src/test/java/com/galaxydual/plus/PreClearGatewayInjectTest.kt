@@ -1001,13 +1001,44 @@ class PreClearGatewayInjectTest {
 
     @Test
     fun autoRestartCap_allowsOneThenStops_untilUserReTap() {
-        // Availability fix：每次使用者點入口只自動重警 1 次；結構性 fail-closed 原因
-        //（空草稿 + 目標不存在／probe 持續失敗）否則會跨 Handler post 無限循環。
-        assertTrue(canAutoRestart(0)) // 第一次自動重啟：允許
-        assertFalse(canAutoRestart(1)) // 已用罷：不再排程，使用者必須重新點入口
+        // Availability contract：每次使用者真正點入口只自動重警 1 次；結構性
+        // fail-closed 原因（空草稿 + 目標不存在／probe 持續失敗）否則會跨
+        // Handler post 無限循環。Drive the LIVE controller: the old helper-only
+        // assertion (`canAutoRestart`) no longer reflects the shipped budget,
+        // which now lives in WarningRestartController per accepted request.
+        assertEquals(1, MAX_AUTO_WARNING_RESTARTS)
+        assertTrue(canAutoRestart(0)) // pure spec of the cap (kept as documentation)
+        assertFalse(canAutoRestart(1))
         assertFalse(canAutoRestart(2))
-        // 使用者重新點入口會把 autoRestartCount 重置為 0（Activity 行為，非 JVM 可測），
-        // 之後 canAutoRestart(0) 再次為 true。fail-closed 寫入不受影響。
+
+        val controller = WarningRestartController()
+        val posted = mutableListOf<Pair<Long, Long>>()
+        val post: (Long, Long, () -> Unit) -> Unit = { tokenId, requestId, _ ->
+            posted.add(tokenId to requestId)
+        }
+
+        val first = controller.install(
+            action = WarningRestartAction.CLEAR,
+            candidateKey = null,
+            generation = 1,
+            callback = {},
+            resetBudget = true, // genuine entry tap
+        )
+        assertTrue("first auto restart allowed", controller.schedule(true, MAX_AUTO_WARNING_RESTARTS, post))
+        assertFalse("cap reached: user must re-tap the entry", controller.schedule(true, MAX_AUTO_WARNING_RESTARTS, post))
+        assertEquals(1, posted.size)
+
+        // A genuine user entry tap re-arms the budget for the new request.
+        val second = controller.install(
+            action = WarningRestartAction.CLEAR,
+            candidateKey = null,
+            generation = 2,
+            callback = {},
+            resetBudget = true,
+        )
+        assertTrue(second.identity.id > first.identity.id)
+        assertTrue("fresh tap restores the budget", controller.schedule(true, MAX_AUTO_WARNING_RESTARTS, post))
+        assertEquals(2, posted.size)
     }
 
     @Test

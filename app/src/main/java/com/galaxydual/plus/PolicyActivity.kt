@@ -52,7 +52,6 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 
-import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
@@ -156,23 +155,21 @@ class PolicyActivity : ComponentActivity() {
     // 讀出並透傳給 VM（proceed 簽名維持不變）。每次警告開頭清空。
     private var pendingWarningConsent: PolicyWriteConsent? = null
 
-    // D03b：最近一次警告要求的 re-trigger；fail-closed abort 後強制全新警告。
-    // Activity 重建後為 null（使用者須再點寫入入口）。
-    // R4-1 (E01) 驗證：onRetry 先清 pendingClearConfirm 再 invoke 此 seam，
-    // re-entry 通過 consentResetAllowedForNewWarning（=!pending）；seam 用
-    // fromUserTap=false，autoRestartCount 不重置亦不遞增（重試非自動重啟）。
-    private var pendingWarningRestart: (() -> Unit)? = null
+    // Follow-up A: re-trigger is an identity-bound request in the controller —
+    // no mutable pendingWarningRestart slot exists here either. Installation
+    // happens only after the re-entry guard accepts, so a rejected entry tap
+    // cannot overwrite a live write request's callback.
+    private val warningRestartController = WarningRestartController()
+    /** Posted restart Runnable, removable individually on destroy. */
+    private var pendingWarningRestartRunnable: Runnable? = null
 
     // R6-1 (G01): one re-entry per INSTALLED WARNING, not per Activity (see
     // MainActivity). Re-armed whenever a new warning is installed, including an
     // auto re-entry; a late/duplicate settle from an older warning is ignored.
     private val warningRetryOneShot = WarningRetryOneShot()
 
-    // D03b fixer M5/M3：confirm 重入防護 + abort 重啟警告 one-shot 排程 guard。
+    // D03b fixer M5：confirm 重入防護. Restart scheduling is request-scoped now.
     private val consentConfirmInFlight = InFlightGuard()
-    private val warningRestartGuard = OneShotRestartGuard()
-    // D03b fixer (availability)：每次使用者真正點入口重置；自動重啟最多 MAX 次。
-    private val autoRestartCount = AtomicInteger(0)
 
     // R03：旗標翻轉時立即重建列，讓勾選控制項在 probe 啟動前就禁用；
     // 取消／完成／例外路徑同樣立刻恢復。
@@ -198,7 +195,9 @@ class PolicyActivity : ComponentActivity() {
     // manufacture, no restart for Corrupt/Unavailable.
     private fun retryUnknownWarning() {
         // R6-1 (G01): capture the token at the Retry tap, BEFORE the refresh.
+        // Follow-up A: bind the settle to the accepted request identity too.
         val token = warningRetryOneShot.capture()
+        val rid = warningRestartController.retryRequestId()
         vm.refreshPolicyDraftForWarningRetry { settled ->
             applyWarningRetryDecision(
                 decision = policyWarningRetryDecision(settled),
@@ -206,7 +205,9 @@ class PolicyActivity : ComponentActivity() {
                 onContinue = {
                     if (warningRetryOneShot.tryConsume(token)) {
                         setPendingClearConfirm(false)
-                        pendingWarningRestart?.invoke()
+                        if (rid == null || !warningRestartController.consumeRetry(rid, !isFinishing && !isDestroyed)) {
+                            preClearLog("editor unknown retry request stale; dropping")
+                        }
                     } else {
                         // LOG-ONLY: benign duplicates must not raise a toast.
                         preClearLog("unknown retry re-entry already consumed; dropping")
@@ -252,6 +253,9 @@ class PolicyActivity : ComponentActivity() {
     private fun requestEditorWriteWarning(
         candidate: Set<String>,
         proceed: (PolicyWarningBinding, Set<String>) -> Unit,
+        // Provenance of THIS entry: true only for a genuine user click. The
+        // installed restart callback (auto restart + Retry settle) passes false.
+        fromUserTap: Boolean,
         onCancel: () -> Unit = {},
         // D03b fixer M2：ROOT 驗證對話框兩個繼續回呼（只跳 membership 比對）。
         onRootVerified: () -> Unit = {},
@@ -276,6 +280,16 @@ class PolicyActivity : ComponentActivity() {
         if (!snap.known) {
             // #77: re-arm the Retry token only after the re-entry guard accepts.
             if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return
+            // Follow-up A: install the identity-bound request ONLY at this
+            // accept seam; a rejected entry must not change the live request.
+            warningRestartController.install(
+                action = WarningRestartAction.EDITOR_WRITE,
+                candidateKey = sanitizedCandidate.sorted().joinToString(),
+                generation = warningRetryOneShot.currentGeneration,
+                // INSTALLED callback: auto restart + Retry re-entry, never a tap.
+                callback = { startEditorWriteWarning(HashSet(ticks), fromUserTap = false) },
+                resetBudget = fromUserTap,
+            )
             setPendingClearConfirm(true)
             pendingWarningConsent = null
             showPreClearProbeFailedWarning(
@@ -296,6 +310,14 @@ class PolicyActivity : ComponentActivity() {
         }
         // #77: accepted new warning — only now may the Retry generation advance.
         if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return
+        warningRestartController.install(
+            action = WarningRestartAction.EDITOR_WRITE,
+            candidateKey = sanitizedCandidate.sorted().joinToString(),
+            generation = warningRetryOneShot.currentGeneration,
+            // INSTALLED callback: auto restart + Retry re-entry, never a tap.
+            callback = { startEditorWriteWarning(HashSet(ticks), fromUserTap = false) },
+            resetBudget = fromUserTap,
+        )
         setPendingClearConfirm(true)
         lifecycleScope.launch {
             // Phase B：與 MainActivity 同口徑——僅 Ok(empty) 直接放行，
@@ -321,12 +343,17 @@ class PolicyActivity : ComponentActivity() {
             when (probe) {
                 is DualProbeResult.Failed -> {
                     pendingWarningConsent = null
+                    // Follow-up A: bind this dialog's Retry to the accepted
+                    // editor-write request, never to a later entry's callback.
+                    val rid = warningRestartController.retryRequestId()
                     showPreClearProbeFailedWarning(
                         this@PolicyActivity,
                         config = probeFailedDialogConfig(write = true, unknown = false),
                         onRetry = {
                             setPendingClearConfirm(false)
-                            pendingWarningRestart?.invoke()
+                            if (rid == null || !warningRestartController.consumeRetry(rid, !isFinishing && !isDestroyed)) {
+                                preClearLog("editor probe-failed retry request stale; dropping")
+                            }
                         },
                         onCancel = { setPendingClearConfirm(false); onCancel() },
                         dialogHandles = destructiveDialogHandles,
@@ -624,6 +651,12 @@ class PolicyActivity : ComponentActivity() {
         riskDialogSlot.clear { it.dismiss() }
         editorEmptyGuideDialogSlot.clear { it.dismiss() }
         policyConfirmState.onPendingCleared()
+        // Follow-up A: invalidate the live request/queued token and remove the
+        // posted restart Runnable specifically; keep the blanket Handler
+        // cleanup below for the other callbacks (e.g. search debounce).
+        warningRestartController.clear()
+        pendingWarningRestartRunnable?.let { handler.removeCallbacks(it) }
+        pendingWarningRestartRunnable = null
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
     }
@@ -781,35 +814,39 @@ class PolicyActivity : ComponentActivity() {
         scheduleWarningRestart()
     }
 
-    // D03b fixer availability cap：自動重啟最多 MAX 次／每次使用者點入口；用罷不再
-    // 排程（recheck 訊息已由 consentAbortCleanup 顯示），使用者須重新點入口。
-    // 不影響 fail-closed 寫入（abort 依然零寫入）。
+    // Follow-up A: request-scoped auto-restart budget in the controller; no
+    // global guard/counter. A rejected entry cannot consume another action's
+    // restart, and a fresh accepted request gets a fresh budget.
     private fun scheduleWarningRestart() {
-        if (!warningRestartGuard.trySchedule()) {
-            preClearLog("warning restart already scheduled; dropping re-entrant request")
+        if (isFinishing || isDestroyed) {
+            preClearLog("warning restart dropped: host dying")
             return
         }
-        val previous = autoRestartCount.getAndIncrement()
-        if (!canAutoRestart(previous)) {
-            preClearLog("warning restart cap reached; user must re-tap entry")
-            warningRestartGuard.reset() // 未 post，必須歸還 guard
-            return
+        val scheduled = warningRestartController.schedule(
+            hostAlive = !isFinishing && !isDestroyed,
+            maxRestarts = MAX_AUTO_WARNING_RESTARTS,
+        ) { tokenId, requestId, body ->
+            // P2: reuse the Activity-owned Handler (also used by search debounce)
+            // so onDestroy can remove this specific callback; a fresh Handler
+            // here leaked the dying Activity.
+            pendingWarningRestartRunnable?.let { handler.removeCallbacks(it) }
+            val runnable = Runnable {
+                pendingWarningRestartRunnable = null
+                if (isFinishing || isDestroyed) {
+                    preClearLog("warning restart dropped at delivery: host dying token=$tokenId request=$requestId")
+                    return@Runnable
+                }
+                try {
+                    body()
+                } catch (_: Exception) {
+                    preClearLog("warning restart failed status=exception")
+                }
+            }
+            pendingWarningRestartRunnable = runnable
+            handler.post(runnable)
         }
-        // P2: reuse the Activity-owned Handler (also used by search debounce)
-        // so onDestroy's removeCallbacksAndMessages(null) really cancels this
-        // callback; a fresh Handler here leaked the dying Activity.
-        handler.post {
-            if (isFinishing || isDestroyed) {
-                warningRestartGuard.reset()
-                return@post
-            }
-            try {
-                pendingWarningRestart?.invoke()
-            } catch (_: Exception) {
-                preClearLog("warning restart failed status=exception")
-            } finally {
-                warningRestartGuard.reset()
-            }
+        if (!scheduled) {
+            preClearLog("warning restart not scheduled: no live request, host dying or cap reached")
         }
     }
 
@@ -839,18 +876,17 @@ class PolicyActivity : ComponentActivity() {
         pendingWarningConsent = pendingWarningConsent?.copy(rootVerifiedEmpty = true)
     }
 
-    // fromUserTap=false 表示由 scheduleWarningRestart 的 post 呼叫：不得重置上限。
-    private fun startEditorWriteWarning(candidate: Set<String>, fromUserTap: Boolean = true) {
-        if (fromUserTap) {
-            autoRestartCount.set(0)
-        }
-        // #77 (H02): the retry token is armed at the ACCEPT site inside
-        // requestEditorWriteWarning, never here — a stale auto-restart is
-        // rejected by that guard and must not burn the generation.
+    // Follow-up A: this entry NEVER mutates restart state. Both the retry
+    // token (#77) and the identity-bound restart request are installed only at
+    // the ACCEPT seam inside requestEditorWriteWarning, after the guard.
+    // Provenance only: a genuine editor tap passes true; the installed callback
+    // (auto restart + Retry settle) re-enters with false and carries the budget.
+    private fun startEditorWriteWarning(candidate: Set<String>, fromUserTap: Boolean) {
         requestEditorWriteWarning(
             candidate = candidate,
             proceed = { binding, frozen -> performWritePolicy(binding, frozen) },
             onRootVerified = markRootVerifiedEmpty,
+            fromUserTap = fromUserTap,
         )
     }
 
@@ -937,8 +973,7 @@ class PolicyActivity : ComponentActivity() {
             // Phase C N→M：old-minus-candidate delta，對 installed user95 彈警告；
             // R03：proceed 攜「綁定＋警告前凍結候選」，寫入時不再重讀 ticks。
             val candidate = HashSet(ticks)
-            pendingWarningRestart = { startEditorWriteWarning(HashSet(ticks), fromUserTap = false) }
-            startEditorWriteWarning(candidate)
+            startEditorWriteWarning(candidate, fromUserTap = true)
         }
         if (shouldShowRiskGate(riskAckStore.isAcknowledged())) {
             // #78 / D2b: track the ack-gate handle in the same slot as Main.

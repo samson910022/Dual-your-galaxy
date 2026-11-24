@@ -94,7 +94,10 @@ class RiskDisclosureSourceShapeTest {
         val policyWrite = block(main, "private fun onWritePolicyEntryClicked()")
         assertTrue("main policy write must consult gate", policyWrite.contains("shouldShowRiskGate("))
         assertTrue("main policy write must call showRiskAckGate", policyWrite.contains("showRiskAckGate("))
-        assertTrue("existing pre-write warning must still run after gate", policyWrite.contains("startWriteWarning()"))
+        assertTrue(
+            "existing pre-write warning must still run after gate with genuine-tap provenance",
+            policyWrite.contains("startWriteWarning(fromUserTap = true)"),
+        )
 
         val editorWrite = block(editor, "private fun onWritePolicyClicked()")
         assertTrue("editor policy write must consult gate", editorWrite.contains("shouldShowRiskGate("))

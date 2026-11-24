@@ -8,6 +8,7 @@
 // hostAlive guard, and that Handler's callbacks are removed on destroy.
 package com.galaxydual.plus
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -109,5 +110,116 @@ class WarningRetryLifecycleSourceTest {
             "PolicyActivity.onDestroy must remove owned Handler callbacks",
             editorDestroy.contains("handler.removeCallbacksAndMessages(null)"),
         )
+    }
+
+    private fun indicesOf(src: String, needle: String): List<Int> {
+        val out = mutableListOf<Int>()
+        var from = 0
+        while (true) {
+            val i = src.indexOf(needle, from)
+            if (i < 0) break
+            out.add(i)
+            from = i + needle.length
+        }
+        return out
+    }
+
+    @Test
+    fun restartRequestInstalledOnlyAtAcceptSeam_noMutablePendingSlot() {
+        val acceptGuard =
+            "if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return"
+        for ((name, src, entry, request) in listOf(
+            Seam("MainActivity/write", main, "private fun startWriteWarning(", "private fun requestPreWriteWarning("),
+            Seam("MainActivity/clear", main, "private fun startClearWarning(", "private fun requestPreClearWarning("),
+            Seam("PolicyActivity/editor", editor, "private fun startEditorWriteWarning(", "private fun requestEditorWriteWarning("),
+        )) {
+            val entryBody = block(src, entry)
+            assertFalse(
+                "$name start*Warning must not install a restart request (that is the accept seam)",
+                entryBody.contains("warningRestartController.install("),
+            )
+            assertFalse(
+                "$name start*Warning must not overwrite restart state at entry",
+                entryBody.contains("pendingWarningRestart") || entryBody.contains("autoRestartCount"),
+            )
+
+            val requestBody = block(src, request)
+            val installs = indicesOf(requestBody, "warningRestartController.install(")
+            assertEquals("$name must install at both accept seams (Unknown + probe)", 2, installs.size)
+            for (idx in installs) {
+                val before = requestBody.substring(maxOf(0, idx - 420), idx)
+                assertTrue(
+                    "$name install must follow the accepted-warning guard",
+                    before.contains(acceptGuard),
+                )
+            }
+            assertFalse(
+                "$name must not invoke an unbound pending restart callback",
+                requestBody.contains("pendingWarningRestart?.invoke()"),
+            )
+        }
+
+        assertEquals(
+            "Main write installs a candidate-keyed identity",
+            2,
+            indicesOf(block(main, "private fun requestPreWriteWarning("), "candidateKey = candidate.sorted().joinToString()").size,
+        )
+        assertEquals(
+            "Main clear installs a CLEAR identity",
+            2,
+            indicesOf(block(main, "private fun requestPreClearWarning("), "WarningRestartAction.CLEAR").size,
+        )
+        assertEquals(
+            "Editor installs a sanitized-candidate identity",
+            2,
+            indicesOf(block(editor, "private fun requestEditorWriteWarning("), "candidateKey = sanitizedCandidate.sorted().joinToString()").size,
+        )
+
+        for ((name, src) in listOf("MainActivity" to main, "PolicyActivity" to editor)) {
+            assertFalse(
+                "$name's mutable pendingWarningRestart callback field must be gone",
+                src.contains("private var pendingWarningRestart:"),
+            )
+            assertTrue(
+                "$name must own a WarningRestartController",
+                src.contains("private val warningRestartController = WarningRestartController()"),
+            )
+            assertTrue(
+                "$name Retry sites must be identity-bound",
+                src.contains("warningRestartController.retryRequestId()") && src.contains("warningRestartController.consumeRetry("),
+            )
+            assertTrue(
+                "$name onDestroy must clear the controller and its posted Runnable",
+                src.contains("warningRestartController.clear()") && src.contains("pendingWarningRestartRunnable?.let {"),
+            )
+        }
+    }
+
+    @Test
+    fun provenanceThreaded_fromUserTapOnlyForGenuineEntryTaps() {
+        for ((name, src, entry, request) in listOf(
+            Seam("MainActivity/write", main, "private fun startWriteWarning(", "private fun requestPreWriteWarning("),
+            Seam("MainActivity/clear", main, "private fun startClearWarning(", "private fun requestPreClearWarning("),
+            Seam("PolicyActivity/editor", editor, "private fun startEditorWriteWarning(", "private fun requestEditorWriteWarning("),
+        )) {
+            assertTrue(
+                "$name entry must forward provenance to the accept seam",
+                block(src, entry).contains("fromUserTap = fromUserTap"),
+            )
+            assertEquals(
+                "$name both accept seams must pass resetBudget = fromUserTap",
+                2,
+                indicesOf(block(src, request), "resetBudget = fromUserTap").size,
+            )
+        }
+        // The INSTALLED callback serves BOTH auto-restart delivery and Retry
+        // settles; neither may ever be mistaken for a fresh user entry tap.
+        assertEquals(2, indicesOf(main, "startWriteWarning(fromUserTap = false)").size)
+        assertEquals(2, indicesOf(main, "startClearWarning(fromUserTap = false)").size)
+        assertEquals(2, indicesOf(editor, "startEditorWriteWarning(HashSet(ticks), fromUserTap = false)").size)
+        // Genuine click handlers are the only true provenance sources.
+        assertEquals(2, indicesOf(main, "startWriteWarning(fromUserTap = true)").size)
+        assertEquals(1, indicesOf(main, "startClearWarning(fromUserTap = true)").size)
+        assertEquals(1, indicesOf(editor, "startEditorWriteWarning(candidate, fromUserTap = true)").size)
     }
 }
