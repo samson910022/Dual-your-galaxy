@@ -101,33 +101,26 @@ class WarningRetryLifecycleSourceTest {
             assertFalse("$name start*Warning must not arm the retry token", entryBody.contains("onWarningInstalled()"))
 
             val requestBody = block(src, request)
-            // G2: Main funnels warning accepts through installAcceptedWarning;
-            // PolicyActivity still calls tryAcceptWarning inline. Either way the
-            // generation advances only at the accept seam, never at entry/fast path.
-            val acceptSrc = if (name.startsWith("MainActivity")) {
-                block(src, "private fun installAcceptedWarning(")
-            } else {
-                requestBody
-            }
+            // G2: BOTH hosts funnel warning accepts through installAcceptedWarning;
+            // the generation advances only at that seam, never at entry/fast path.
+            val acceptSrc = block(src, "private fun installAcceptedWarning(")
             assertTrue("$name request*Warning must arm only via the accept seam", acceptSrc.contains("tryAcceptWarning("))
             assertTrue(
                 "$name accept seam must be gated by the re-entry guard",
                 acceptSrc.contains("consentResetAllowedForNewWarning(pendingClearConfirm)"),
             )
-            if (name.startsWith("MainActivity")) {
-                assertTrue(requestBody.contains("installAcceptedWarning("))
-                assertTrue(requestBody.contains("installAcceptedAction("))
-                assertFalse("fast paths must never arm the retry token", requestBody.contains("tryAcceptWarning("))
-                // Ordering matters, not just membership: the accept decision
-                // must precede installing the identity so a rejected accept
-                // can never leave an installed restart request behind.
-                val tryAcceptAt = acceptSrc.indexOf("tryAcceptWarning(")
-                val installAt = acceptSrc.indexOf("warningRestartController.install(")
-                assertTrue(
-                    "$name tryAcceptWarning must precede install at the accept seam",
-                    tryAcceptAt in 0 until installAt,
-                )
-            }
+            assertTrue(requestBody.contains("installAcceptedWarning("))
+            assertTrue(requestBody.contains("installAcceptedAction("))
+            assertFalse("fast paths must never arm the retry token", requestBody.contains("tryAcceptWarning("))
+            // Ordering matters, not just membership: the accept decision
+            // must precede installing the identity so a rejected accept
+            // can never leave an installed restart request behind.
+            val tryAcceptAt = acceptSrc.indexOf("tryAcceptWarning(")
+            val installAt = acceptSrc.indexOf("warningRestartController.install(")
+            assertTrue(
+                "$name tryAcceptWarning must precede install at the accept seam",
+                tryAcceptAt in 0 until installAt,
+            )
         }
     }
 
@@ -198,54 +191,41 @@ class WarningRetryLifecycleSourceTest {
                 "$name must not invoke an unbound pending restart callback",
                 requestBody.contains("pendingWarningRestart?.invoke()"),
             )
-            if (name.startsWith("MainActivity")) {
-                // G2: NO direct install inside a request body. All four accept
-                // branches (Unknown + probe + two no-warning fast paths) go
-                // through one of the two shared seams.
-                assertFalse("$name request body must not install directly", requestBody.contains("warningRestartController.install("))
-                assertEquals(
-                    "$name must accept both warning branches through the warning seam",
-                    2,
-                    indicesOf(requestBody, "installAcceptedWarning(").size,
-                )
-                assertEquals(
-                    "$name must install identity at both no-warning fast paths",
-                    2,
-                    indicesOf(requestBody, "installAcceptedAction(").size,
-                )
-                assertFalse("$name fast paths must not arm the retry token", requestBody.contains("tryAcceptWarning("))
-                val warningSeam = block(src, "private fun installAcceptedWarning(")
-                // installAcceptedAction is expression-bodied; block() bounds it
-                // at the next top-level declaration so no later guarded body
-                // can leak into this slice.
-                val actionSeam = block(src, "private fun installAcceptedAction(")
-                assertTrue(warningSeam.contains(acceptGuard))
-                assertTrue(warningSeam.contains("warningRestartController.install("))
-                assertTrue(warningSeam.contains("generation = warningRetryOneShot.currentGeneration"))
-                // Membership alone is not enough: a rejected accept must not
-                // install anything, so the guard has to run BEFORE install.
-                val guardAt = warningSeam.indexOf(acceptGuard)
-                val installAt = warningSeam.indexOf("warningRestartController.install(")
-                assertTrue("warning install must follow the accept guard", guardAt in 0 until installAt)
-                assertTrue(actionSeam.contains("warningRestartController.install("))
-                assertTrue(actionSeam.contains("generation = warningRetryOneShot.currentGeneration"))
-                // Exactly one scoped assertion: the Known/no-op fast path has
-                // NO accept guard and must not advance the retry generation.
-                assertFalse(
-                    "fast-path seam must NOT advance the retry generation or contain the accept guard",
-                    actionSeam.contains("tryAcceptWarning(") || actionSeam.contains(acceptGuard),
-                )
-            } else {
-                val installs = indicesOf(requestBody, "warningRestartController.install(")
-                assertEquals("$name must install at both accept seams (Unknown + probe)", 2, installs.size)
-                for (idx in installs) {
-                    val before = requestBody.substring(maxOf(0, idx - 420), idx)
-                    assertTrue(
-                        "$name install must follow the accepted-warning guard",
-                        before.contains(acceptGuard),
-                    )
-                }
-            }
+            // G2: NO direct install inside ANY request body. Every accept branch
+            // (Unknown + probe + no-warning fast paths) goes through a seam.
+            assertFalse("$name request body must not install directly", requestBody.contains("warningRestartController.install("))
+            assertEquals(
+                "$name must accept both warning branches through the warning seam",
+                2,
+                indicesOf(requestBody, "installAcceptedWarning(").size,
+            )
+            assertEquals(
+                "$name no-warning fast paths must install an identity through the action seam",
+                if (name.startsWith("MainActivity")) 2 else 1,
+                indicesOf(requestBody, "installAcceptedAction(").size,
+            )
+            assertFalse("$name fast paths must not arm the retry token", requestBody.contains("tryAcceptWarning("))
+            val warningSeam = block(src, "private fun installAcceptedWarning(")
+            // installAcceptedAction is expression-bodied; block() bounds it
+            // at the next top-level declaration so no later guarded body
+            // can leak into this slice.
+            val actionSeam = block(src, "private fun installAcceptedAction(")
+            assertTrue(warningSeam.contains(acceptGuard))
+            assertTrue(warningSeam.contains("warningRestartController.install("))
+            assertTrue(warningSeam.contains("generation = warningRetryOneShot.currentGeneration"))
+            // Membership alone is not enough: a rejected accept must not
+            // install anything, so the guard has to run BEFORE install.
+            val guardAt = warningSeam.indexOf(acceptGuard)
+            val installAt = warningSeam.indexOf("warningRestartController.install(")
+            assertTrue("warning install must follow the accept guard", guardAt in 0 until installAt)
+            assertTrue(actionSeam.contains("warningRestartController.install("))
+            assertTrue(actionSeam.contains("generation = warningRetryOneShot.currentGeneration"))
+            // Exactly one scoped assertion: the Known/no-op fast path has
+            // NO accept guard and must not advance the retry generation.
+            assertFalse(
+                "fast-path seam must NOT advance the retry generation or contain the accept guard",
+                actionSeam.contains("tryAcceptWarning(") || actionSeam.contains(acceptGuard),
+            )
         }
 
         assertEquals(
@@ -259,8 +239,8 @@ class WarningRetryLifecycleSourceTest {
             indicesOf(block(main, "private fun requestPreClearWarning("), "WarningRestartAction.CLEAR").size,
         )
         assertEquals(
-            "Editor installs a sanitized-candidate identity",
-            2,
+            "Editor installs a sanitized-candidate identity at all three accept branches",
+            3,
             indicesOf(block(editor, "private fun requestEditorWriteWarning("), "candidateKey = sanitizedCandidate.sorted().joinToString()").size,
         )
 
@@ -274,26 +254,25 @@ class WarningRetryLifecycleSourceTest {
                 src.contains("private val warningRestartController = WarningRestartController()"),
             )
             assertTrue("$name Retry sites must be identity-bound", src.contains("warningRestartController.consumeRetry("))
-            if (name == "MainActivity") {
-                // G2: Main captures the accept-time id instead of reading the
-                // controller's retry slot at settle time, and binds every
-                // abort/cleanup through it.
-                assertFalse(src.contains("warningRestartController.retryRequestId()"))
-                assertTrue(src.contains("warningRestartController.isLive("))
-                assertTrue(src.contains("warningRestartController.revoke("))
-                assertTrue(src.contains("expectedRequestId = actionId"))
-                assertTrue(src.contains("private fun cancelAcceptedWarning("))
-                assertTrue(src.contains("private var pendingWarningRestartActionId: Long? = null"))
-            } else {
-                assertTrue(src.contains("warningRestartController.retryRequestId()"))
-            }
+            // G2: BOTH hosts capture the accept-time id instead of reading the
+            // controller's retry slot at settle time, and bind every
+            // abort/cleanup through it.
+            assertFalse("$name must not read the retry slot at settle time", src.contains("warningRestartController.retryRequestId()"))
+            assertTrue(src.contains("warningRestartController.isLive("))
+            assertTrue(src.contains("warningRestartController.revoke("))
+            assertTrue(src.contains("expectedRequestId = actionId"))
+            assertTrue(src.contains("private fun cancelAcceptedWarning("))
+            assertTrue(src.contains("private var pendingWarningRestartActionId: Long? = null"))
             assertTrue(
                 "$name onDestroy must clear the controller and its posted Runnable",
                 src.contains("warningRestartController.clear()") && src.contains("pendingWarningRestartRunnable?.let {"),
             )
         }
-        val mainDestroy = block(main, "override fun onDestroy()")
-        assertTrue("onDestroy must drop session-scoped consent and Runnable owner", mainDestroy.contains("pendingWarningConsent = null") && mainDestroy.contains("pendingWarningRestartActionId = null"))
+        for ((name, src) in listOf("MainActivity" to main, "PolicyActivity" to editor)) {
+            val destroy = block(src, "override fun onDestroy()")
+            assertTrue("$name onDestroy must drop session-scoped consent and Runnable owner",
+                destroy.contains("pendingWarningConsent = null") && destroy.contains("pendingWarningRestartActionId = null"))
+        }
     }
 
     @Test
@@ -307,32 +286,25 @@ class WarningRetryLifecycleSourceTest {
                 "$name entry must forward provenance to the accept seam",
                 block(src, entry).contains("fromUserTap = fromUserTap"),
             )
-            if (name.startsWith("MainActivity")) {
-                // G2: provenance is applied in the shared seams, then forwarded
-                // by every accept branch (2 warnings + 2 no-warning fast paths).
-                val warningSeam = block(src, "private fun installAcceptedWarning(")
-                val actionSeam = block(src, "private fun installAcceptedAction(")
-                assertTrue(warningSeam.contains("resetBudget = fromUserTap"))
-                assertTrue(actionSeam.contains("resetBudget = fromUserTap"))
-                assertEquals(
-                    "$name all four accept branches must forward provenance",
-                    4,
-                    indicesOf(block(src, request), "fromUserTap = fromUserTap").size,
-                )
-            } else {
-                assertEquals(
-                    "$name both accept seams must pass resetBudget = fromUserTap",
-                    2,
-                    indicesOf(block(src, request), "resetBudget = fromUserTap").size,
-                )
-            }
+            // G2: provenance is applied in the shared seams, then forwarded by
+            // every accept branch (Main: 2 warnings + 2 fast paths; Editor:
+            // Unknown warning + no-op fast path + probe warning).
+            val warningSeam = block(src, "private fun installAcceptedWarning(")
+            val actionSeam = block(src, "private fun installAcceptedAction(")
+            assertTrue(warningSeam.contains("resetBudget = fromUserTap"))
+            assertTrue(actionSeam.contains("resetBudget = fromUserTap"))
+            assertEquals(
+                "$name every accept branch must forward provenance",
+                if (name.startsWith("MainActivity")) 4 else 3,
+                indicesOf(block(src, request), "fromUserTap = fromUserTap").size,
+            )
         }
         // The INSTALLED callback serves BOTH auto-restart delivery and Retry
         // settles; neither may ever be mistaken for a fresh user entry tap.
         // G2: one lambda per request function is reused by all its accept sites.
         assertEquals(1, indicesOf(main, "startWriteWarning(fromUserTap = false)").size)
         assertEquals(1, indicesOf(main, "startClearWarning(fromUserTap = false)").size)
-        assertEquals(2, indicesOf(editor, "startEditorWriteWarning(HashSet(ticks), fromUserTap = false)").size)
+        assertEquals(1, indicesOf(editor, "startEditorWriteWarning(HashSet(ticks), fromUserTap = false)").size)
         // Genuine click handlers are the only true provenance sources.
         assertEquals(2, indicesOf(main, "startWriteWarning(fromUserTap = true)").size)
         assertEquals(1, indicesOf(main, "startClearWarning(fromUserTap = true)").size)
@@ -408,5 +380,63 @@ class WarningRetryLifecycleSourceTest {
         val abortLiveAt = ab.indexOf("warningRestartController.isLive(actionId)")
         assertTrue("abort must gate consent cleanup with isLive", abortLiveAt in 0 until ab.indexOf("pendingWarningConsent = null"))
         assertTrue("abort must gate restart scheduling with isLive", abortLiveAt in 0 until ab.indexOf("scheduleWarningRestart(actionId)"))
+    }
+
+    @Test
+    fun editorDialogCancelsAndAborts_areIdentityBound() {
+        val body = block(editor, "private fun requestEditorWriteWarning(")
+        val cancelSites = indicesOf(body, "onCancel = {")
+        assertEquals("editor request must expose exactly three warning dialogs", 3, cancelSites.size)
+        for (idx in cancelSites) {
+            val newline = body.indexOf('\n', idx)
+            val line = body.substring(idx, if (newline < 0) body.length else newline)
+            assertTrue(
+                "editor dialog onCancel must route through cancelAcceptedWarning",
+                line.contains("cancelAcceptedWarning(actionId)"),
+            )
+            assertFalse(
+                "editor dialog onCancel must not touch pendingClearConfirm directly",
+                line.contains("setPendingClearConfirm("),
+            )
+        }
+        assertEquals(
+            "all three Editor dialog cancels route through cancelAcceptedWarning",
+            3,
+            indicesOf(editor, "cancelAcceptedWarning(actionId) { onCancel() }").size,
+        )
+        assertEquals(
+            "cancelAcceptedWarning has one definition and three call sites",
+            4,
+            indicesOf(editor, "cancelAcceptedWarning(").size,
+        )
+        assertEquals(
+            "all Editor abort cleanups pass actionId",
+            4,
+            indicesOf(editor, "consentAbortCleanup(R.string.pre_write_recheck_failed, actionId)").size,
+        )
+        assertEquals(
+            "consentAbortCleanup has one definition and four call sites",
+            5,
+            indicesOf(editor, "consentAbortCleanup(").size,
+        )
+
+        val cb = block(editor, "private fun cancelAcceptedWarning(")
+        val liveAt = cb.indexOf("warningRestartController.isLive(actionId)")
+        val clearAt = cb.indexOf("setPendingClearConfirm(false)")
+        assertTrue("cancel must gate setPendingClearConfirm(false) with isLive", liveAt in 0 until clearAt)
+        assertTrue("cancel must revoke the accepted identity", cb.contains("warningRestartController.revoke(actionId)"))
+
+        val ab = block(editor, "private fun consentAbortCleanup(")
+        val abortLiveAt = ab.indexOf("warningRestartController.isLive(actionId)")
+        assertTrue("abort must gate consent cleanup with isLive", abortLiveAt in 0 until ab.indexOf("pendingWarningConsent = null"))
+        assertTrue("abort must gate restart scheduling with isLive", abortLiveAt in 0 until ab.indexOf("scheduleWarningRestart(actionId)"))
+
+        // G2: every deferred lambda captures the accept-time id; the whole
+        // probe settle is identity-gated before consent/dialog/flag/proceed.
+        assertTrue(body.contains("onRetry = { retryUnknownWarning(actionId) }"))
+        assertTrue(body.contains("actionAlive = { warningRestartController.isLive(actionId) }"))
+        val gateAt = body.indexOf("if (!warningRestartController.isLive(actionId))")
+        assertTrue("probe settle gate must precede when(probe)", gateAt in 0 until body.indexOf("when (probe) {"))
+        assertTrue("probe settle gate must precede consent write", gateAt in 0 until body.indexOf("pendingWarningConsent = buildPolicyWriteConsent("))
     }
 }
