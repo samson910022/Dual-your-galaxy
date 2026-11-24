@@ -24,9 +24,12 @@ internal interface BbcVersionedPrefsView {
 }
 
 // --- PR #74 G1: runtime BBC injection opt-out (framework-free seam) ---
-// Minimal view of the ONE boolean the BBC gate needs, so JVM tests can inject
-// a fake (absent key / read throws) without an Android runtime. Production
-// adapts the real SharedPreferences once in bbcInjectionEnabledNow().
+// Minimal view of the ONE boolean the legacy bounded helper needs, so JVM
+// tests can inject a fake (absent key / read throws) without an Android
+// runtime. Phase B production reads this key from the SAME coherent getAll()
+// copy as every other gate input (see BbcPreactivationHookReader); this seam
+// and readBbcInjectionEnabledBounded below are retained for framework-free
+// JVM pins of the hybrid rule's bounded-read contract.
 internal interface BbcInjectionPrefsView {
     fun getBoolean(key: String, defValue: Boolean): Boolean
 }
@@ -137,6 +140,58 @@ internal inline fun bbcEffectGateOpen(
     } catch (_: Throwable) {
         false
     }
+}
+
+// Phase B (B3): production's FINAL BBC effect decision. Both stages are
+// evaluated from ONE coherent snapshot (one getAll() copy, one fence) so a
+// torn opt-in/runtime tuple can never be combined into an OPEN gate. This
+// helper is pure with respect to preferences: no IPC, no read, no write. The
+// hybrid rule still owns sticky/CAS/clock, but its runtime value is supplied
+// by the caller from the SAME generation — bbcInjectionGateOpen's
+// runtimeEnabled lambda must NOT touch remote prefs again.
+//
+// Fail-closed in all cases: kill switch false => zero pref reads; a null /
+// inconsistent snapshot => CLOSED; opt-out wins; any stage throw => CLOSED.
+internal fun bbcCoherentEffectDecision(
+    compileTimeGate: Boolean,
+    snapshot: BbcCoherentPrefsSnapshot?,
+    hybridOpen: (runtimeEnabled: Boolean?) -> Boolean,
+): Boolean {
+    if (!compileTimeGate) return false
+    if (snapshot == null || !snapshot.coherent) return false
+    val pre = try {
+        bbcPreactivationDecisionOpen(true, snapshot.preactivationPrefs())
+    } catch (_: Throwable) {
+        false
+    }
+    if (!pre) return false
+    return try {
+        hybridOpen(snapshot.runtimeEnabled)
+    } catch (_: Throwable) {
+        false
+    }
+}
+
+// Bounded single-read wrapper used by production (and JVM tests that inject a
+// counting executor). compileTimeGate is checked BEFORE the bounded read is
+// requested: a disabled emergency switch performs ZERO executor submissions
+// and ZERO pref reads. Exactly one readBbcPreactivationBounded call happens on
+// the open path, so a single deadline = min(BBC_GATE_MAX_MS, remainingBudget())
+// covers both stages; there is no second 15ms wait.
+internal fun bbcCoherentEffectGateBounded(
+    compileTimeGate: Boolean,
+    readBoundedSnapshot: () -> BbcCoherentPrefsSnapshot?,
+    hybridOpen: (runtimeEnabled: Boolean?) -> Boolean = { runtime ->
+        bbcInjectionGateOpen(compileTimeGate = true) { runtime }
+    },
+): Boolean {
+    if (!compileTimeGate) return false
+    val snapshot = try {
+        readBoundedSnapshot()
+    } catch (_: Throwable) {
+        null
+    }
+    return bbcCoherentEffectDecision(true, snapshot, hybridOpen)
 }
 
 // N06(a): process-local confirmed-OFF timestamp (millis on the injected clock;
@@ -964,84 +1019,54 @@ class DualHook : XposedModule() {
     // reader body 與白名單共用 policyRead()（單一實作：capability probe +
     // 單一 50ms end-to-end deadline budget + readRemotePrefs()）。
     // 最終 BBC 效應 = compile-time 緊急開關 BBC_AVAILABLE_APPS_INJECTION ×
-    // pre-activation opt-in／legacy 遷移決策（BbcPreactivationGate.kt；remote
-    // prefs I/O 已於 PR5 Phase B1 接線，見下方 bbcEffectGateOpen／
-    // bbcPreactivationPrefsNow）× 執行期 dual_policy opt-out × hybrid
-    // fail-closed（偏好讀取首次失敗即 fail-closed；已確認 OFF 後 30 分鐘內的
-    // 失敗亦維持關閉）。compile-time 常數不再是「預設開」的依據；opt-out 鍵
-    // 缺席只表示「沒有明確 opt-out」，不是預設開的依據。Stage-1 封緘不受影響；
-    // 白名單 effectiveCache 維持 fail-closed，零影響。偏好關閉時 getBbc 的
-    // gate-closed 仍不碰 reader；偏好讀取本身是快取 prefs 的布林查表（見
-    // bbcInjectionEnabledNow），但 D06 起此讀取另走專屬零佇列 executor + 真實
-    // 牆鐘上限（BBC_GATE_MAX_MS），避免 IPC 停頓直接釘住呼叫執行緒（原 50ms
-    // deadline 只管到後面的政策 reader）。
-    // Phase A P0 sticky last-good：null/拋/contention/deadline 失敗回上次成功
-    // 非空快照；clock 失效／倒退取樣則 fail-closed 丟棄 sticky 並回
-    // Unknown(emptySet())（新鮮度無法證明，上限不放寬）。Clock distrust 同時是
-    // fail-closed 的 linearization point：作廢 cached freshness、bump clock epoch
-    // 以 fence 既有 in-flight read；single-flight 用 fresh flightSeq TOKEN（非
-    // generation 序號）由 owner token-matched 釋放；所有 cached/sticky 回傳都經
-    // trusted-clock 的 fresh TTL sample 重新驗證。version evidence（high-water／
-    // cleared marker／lastAcceptedBbcCanonical+Version）獨立於可回傳快照保留，
-    // invalidate／clock distrust 都不清空，合法同版本 recovery 仍可通過，不開
-    // replay window。僅成功讀到空（帶版本證明 Cleared）方可收縮；TTL 過期/
-    // invalidate 不丟 BBC last-good（僅 sticky cap 到期才過期，計數+節流日誌）。
+    // pre-activation opt-in／durable classification（legacy 遷移標記；
+    // BbcPreactivationGate.kt；remote prefs I/O 已於 PR5 Phase B1 接線）×
+    // 執行期 dual_policy opt-out × hybrid fail-closed（偏好讀取首次失敗即
+    // fail-closed；已確認 OFF 後 30 分鐘內的失敗亦維持關閉）。compile-time
+    // 常數不再是「預設開」的依據；opt-out 鍵缺席只表示「沒有明確 opt-out」，
+    // 不是預設開的依據。Stage-1 封緘不受影響；白名單 effectiveCache 維持
+    // fail-closed，零影響；gate-closed 不碰 reader。
+    // Phase B（B1/B3）coherent 唯讀快照：opt-in、legacy marker／durable
+    // classification、執行期 opt-out 等所有輸入皆來自同一次 getAll() 複本
+    // （單一 generation）；最終 gate 只做一次 bounded 讀取、只有一個
+    // min(BBC_GATE_MAX_MS, remainingBudget()) deadline，不再有兩階段各自 15ms
+    // 取樣。compile-time 常數關閉時完全不碰 pref／executor（zero reads /
+    // zero submissions，沿用 historic zero-runtime-read pin）。getRemotePreferences
+    // 失敗、IPC／getAll 停頓、錯型別或 generation 不一致一律 fail-closed；
+    // 此路徑全程唯讀（無 edit()/put*/commit()），永不拋出到 system_server／
+    // daagent，也不會釘住呼叫執行緒。
+    // Phase A P0 sticky last-good（僅限非 clock 失敗）：null／拋／contention／
+    // deadline 失敗回上次成功非空快照；只有成功讀到空（帶版本證明 Cleared）
+    // 方可收縮；TTL 過期／invalidate 不丟 BBC last-good（僅 sticky cap 到期才
+    // 過期，計數＋節流日誌）。**Clock 失效／倒退取樣不同**：新鮮度無法證明，
+    // 一律 fail-closed 丟棄 sticky 並回 Unknown(emptySet())，上限不放寬。Clock
+    // distrust 同時是 fail-closed 的 linearization point：作廢 cached freshness、
+    // bump clock epoch 以 fence 既有 in-flight read；single-flight 用 fresh
+    // flightSeq TOKEN（非 generation 序號）由 owner token-matched 釋放；所有
+    // cached/sticky 回傳都經 trusted-clock 的 fresh TTL sample 重新驗證。
+    // version evidence（high-water／cleared marker／
+    // lastAcceptedBbcCanonical+Version）獨立於可回傳快照保留，invalidate／
+    // clock distrust 都不清空，合法同版本 recovery 仍可通過，不開 replay window。
     // TTL 60s／failureCooldown 5s／single-flight／50ms budget 語義與白名單
     // 一致；grace/deadline 取樣比照 effectivePolicy：僅 trusted clock 取樣
     // followerGraceMs／deadlineMs，clock 失效或例外時 grace=0、deadline=-1
     // （deadline 以同一單調時鐘的 nowNanos() 毫秒作絕對基準，非 t0/1e6，
     // 避免負 nanotime origin 把 clamp 丟掉），不漂移。
     //
-    // PR #74 G1 + PR5 Phase A/B1 (#80)：最終 AND = compile-time 緊急開關 ×
-    // preactivation opt-in／legacy 遷移決策 × 執行期 opt-out 偏好。
-    // dual_policy/bbc_injection_enabled 缺席仍走 defValue=true，但此鍵已不是
-    // 「預設開」的依據 —— 生效前同意由 BbcPreactivationGate 的 opt-in／legacy
-    // 遷移規則治理（B1 已接線 remote prefs 唯讀；P0 已移除 Hook 端 marker 寫入）。
-    // 偏好讀取走既有 remote prefs accessor（getRemotePreferences 在同一行程對
-    // 同一 group 為快取查表，非新增 binder IPC），只有布林讀；null/拋出交給
-    // 混合規則：首次失敗即 fail-closed，已確認 OFF 後 30 分鐘內的失敗亦維持
-    // 關閉（process-local，非裝置驗證）。此讀取在所有其他 bbcPolicy 邏輯之外
-    // 另有 try/catch，任何 Throwable 都不會逸出到 system_server/daagent。
-    private fun bbcInjectionEnabledNow(): Boolean? = try {
-        val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
-        if (prefs == null) {
-            null
-        } else {
-            readBbcInjectionEnabled(object : BbcInjectionPrefsView {
-                override fun getBoolean(key: String, defValue: Boolean): Boolean =
-                    prefs.getBoolean(key, defValue)
-            })
-        }
+    // Phase B (B1/B3): ONE strictly read-only coherent snapshot for the final
+    // BBC effect gate. The PUBLIC adapter calls getAll() exactly once and
+    // copies the map; opt-in, durable classification, migration marker AND the
+    // hybrid runtime opt-out therefore all come from the same generation.
+    // getRemotePreferences / getAll / a wrong type / a torn fence => the whole
+    // fail-closed snapshot. No edit()/put*/commit() anywhere on this path.
+    // Never throws; bbcInjectionGateOpen's sticky/CAS/clock rule consumes the
+    // snapshot's runtime value with NO second pref read.
+    private fun bbcCoherentPrefsNow(): BbcCoherentPrefsSnapshot = try {
+        BbcPreactivationHookReader.readCoherent(
+            getRemotePreferences(PolicySource.POLICY_PREFS_NAME),
+        )
     } catch (_: Throwable) {
-        null
-    }
-
-    // PR5 Phase B1 / PR #90 Phase A (P0): adapt the real remote prefs through
-    // the PUBLIC, strictly read-only adapter. A framework absence / throw maps
-    // to the ALL-FAIL-CLOSED snapshot — never to "existing install". No writes
-    // here (no edit()), no policy draft is touched.
-    private fun bbcPreactivationPrefsNow(): BbcPreactivationPrefs = try {
-        BbcPreactivationHookReader.read(getRemotePreferences(PolicySource.POLICY_PREFS_NAME))
-    } catch (_: Throwable) {
-        BbcPreactivationPrefs(null, null, null)
-    }
-
-    // B1 bounded pre-activation gate: read the snapshot AND apply the P0 decision
-    // inside ONE dedicated zero-queue executor task with a real wall-time ceiling.
-    // No remote-prefs IPC — READ OR WRITE — ever runs on the hooked caller thread.
-    // The worker performs ZERO writes; the owner App owns all persistence.
-    // A stalled task degrades to CLOSED. compileTimeGate=true because
-    // bbcEffectGateOpen already enforced the emergency switch before calling
-    // this (single judgment point). Never throws.
-    private fun bbcPreactivationOpenNow(timeoutMs: Long = BBC_GATE_MAX_MS): Boolean = try {
-        readBbcPreactivationBounded(bbcPreactivationExecutor, timeoutMs) {
-            bbcPreactivationDecisionOpen(
-                compileTimeGate = true,
-                prefs = bbcPreactivationPrefsNow(),
-            )
-        } ?: false
-    } catch (_: Throwable) {
-        false
+        BbcCoherentPrefsSnapshot.failClosed()
     }
 
     private fun bbcPolicy(): EffectivePolicyCache.BbcPolicy = try {
@@ -1076,39 +1101,30 @@ class DualHook : XposedModule() {
             // inside the guarded section, so a slow pref read is charged to the
             // same 50ms deadline budget instead of running outside it.
             //
-            // PR5 Phase B1 / PR #90 Phase A (P0) FINAL BBC EFFECT AND —
-            // bbcEffectGateOpen judges the compile-time emergency switch exactly
-            // ONCE (false => ZERO pref reads / ZERO writes, keeping the historic
-            // zero-runtime-read pin), then ANDs:
+            // Phase B (B3) FINAL BBC EFFECT AND — ONE coherent read, ONE deadline:
+            // bbcCoherentEffectGateBounded checks the compile-time emergency
+            // switch FIRST (false => ZERO executor submissions / ZERO pref reads,
+            // keeping the historic zero-runtime-read pin), then performs exactly
+            // ONE readBbcPreactivationBounded task on the dedicated zero-queue
+            // executor with min(BBC_GATE_MAX_MS, remaining-of-50ms). That task
+            // reads a SINGLE getAll() copy and returns the coherent snapshot;
+            // the pure decision helper evaluates BOTH stages from it:
             //   1. preactivationOpen = bbcPreactivationGate's READ-ONLY decision
-            //      on the bounded remote-prefs snapshot (optin / durable
-            //      classification / trusted migration marker). No writes at all;
+            //      (optin / durable classification / trusted migration marker);
             //   2. hybridOpen        = bbcInjectionGateOpen's runtime rule on the
-            //      legacy bbc_injection_enabled opt-out (sticky/CAS/clock
-            //      failures all fail closed since Phase A).
-            // The same compile-time constant is therefore NOT ANDed twice: the
-            // hybrid gate receives compileTimeGate=true here because the outer
-            // helper already owns the switch. Both pref reads are BOUNDED on
-            // dedicated zero-queue executors with min(BBC_GATE_MAX_MS,
-            // remaining-of-50ms), so a Binder stall cannot pin the caller;
-            // any failure degrades to CLOSED.
+            //      SAME copy's bbc_injection_enabled value (sticky/CAS/clock
+            //      preserved; runtimeEnabled lambda performs NO second read).
+            // The compile-time constant is NOT ANDed twice (hybrid gets true).
+            // A Binder stall, wrong type or torn generation degrades to CLOSED;
+            // ZERO writes on every path (libxposed API 102 read-only prefs).
             bbcGateOpen = {
-                bbcEffectGateOpen(
+                bbcCoherentEffectGateBounded(
                     compileTimeGate = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
-                    preactivationOpen = {
-                        bbcPreactivationOpenNow(minOf(BBC_GATE_MAX_MS, remainingBudget()))
-                    },
-                    hybridOpen = {
-                        bbcInjectionGateOpen(
-                            // Switch already enforced by bbcEffectGateOpen —
-                            // pass true so it is not ANDed a second time.
-                            compileTimeGate = true,
-                        ) {
-                            readBbcInjectionEnabledBounded(
-                                bbcGateExecutor,
-                                minOf(BBC_GATE_MAX_MS, remainingBudget()),
-                            ) { bbcInjectionEnabledNow() }
-                        }
+                    readBoundedSnapshot = {
+                        readBbcPreactivationBounded(
+                            bbcPreactivationExecutor,
+                            minOf(BBC_GATE_MAX_MS, remainingBudget()),
+                        ) { bbcCoherentPrefsNow() }
                     },
                 )
             },
@@ -2106,33 +2122,19 @@ class DualHook : XposedModule() {
             },
         )
 
-        // D06 (PR#74 r3): DEDICATED zero-queue daemon executor for the BBC
-        // opt-out gate pref read ONLY. Kept separate from policyRefreshExecutor
-        // and capabilityRefreshExecutor so a stuck BBC gate reader cannot
-        // self-contend with the policy reader it guards, nor starve it. The
-        // SynchronousQueue + AbortPolicy factory means a second concurrent
-        // gate read is REJECTED (mapped to null by
-        // readBbcInjectionEnabledBounded -> hybrid rule) rather than queued
-        // behind a stuck worker, so at most one worker can ever be resident.
-        // Bounded to BBC_GATE_MAX_MS per call. Never shut down (process
-        // lifetime); a stuck daemon worker is confined to this one executor.
-        // Reliability limitation (NOT a safety guarantee): a stuck
-        // uninterruptible gate read leaves this single zero-queue worker
-        // permanently busy, so every later gate read is REJECTED -> null ->
-        // the hybrid rule FAILS CLOSED since PR5 Phase A (#80); a confirmed
-        // OFF is kept sticky for BBC_STICKY_MAX_AGE_MS (30 min). Mirroring
-        // policyRefreshExecutor's process-lifetime residency, recovery from a
-        // stuck worker is process-restart-bound (daemon exits with the process).
-        private val bbcGateExecutor: java.util.concurrent.ThreadPoolExecutor =
-            PolicyRefreshBudget.newPolicyRefreshExecutor("GalaxyDual-bbc-optout-read")
-
-        // PR5 Phase B1 (#80): DEDICATED zero-queue executor for the new
-        // pre-activation prefs read ONLY. Separate from bbcGateExecutor (the
-        // legacy opt-out read) so a stuck preactivation reader cannot reject /
-        // starve the hybrid gate reader or vice versa. Same bounded mechanism
-        // (SynchronousQueue + AbortPolicy, daemon, process-lifetime): a second
-        // concurrent submit is REJECTED -> null -> fail closed, never queued
-        // behind a stuck worker. Bounded to BBC_GATE_MAX_MS per call.
+        // Phase B (B3): SINGLE dedicated zero-queue daemon executor for the
+        // final BBC effect gate. Kept separate from policyRefreshExecutor and
+        // capabilityRefreshExecutor so a stuck BBC gate reader cannot
+        // self-contend with the policy reader it guards, nor starve it.
+        // SynchronousQueue + AbortPolicy: a second concurrent submit is
+        // REJECTED -> null -> fail closed, never queued behind a stuck worker,
+        // so at most one worker can ever be resident. ONE task per gate call
+        // reads the whole coherent snapshot and both stages decide from it;
+        // there is no second executor / second 15ms wait any more. Never shut
+        // down (process lifetime); a stuck uninterruptible worker leaves later
+        // gate reads REJECTED -> CLOSED (with the old sticky-OFF TTL preserved
+        // by bbcInjectionGateOpen). Recovery is process-restart-bound; this is
+        // a reliability limitation, not a safety guarantee.
         private val bbcPreactivationExecutor: java.util.concurrent.ThreadPoolExecutor =
             PolicyRefreshBudget.newPolicyRefreshExecutor("GalaxyDual-bbc-preactivation-read")
 

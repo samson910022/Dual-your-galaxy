@@ -17,32 +17,27 @@ class BbcPreactivationReadOnlyTest {
 
     private class ReadOnlyFakePrefs(
         private val values: Map<String, Any?> = emptyMap(),
-        private val throwOnRead: Set<String> = emptySet(),
+        private val failGetAll: Boolean = false,
     ) : SharedPreferences {
         var editCalls = 0
             private set
 
-        override fun getAll(): MutableMap<String, *> = LinkedHashMap(values)
-        override fun getString(key: String?, defValue: String?): String? {
-            if (key != null && key in throwOnRead) throw IllegalStateException("read failed: $key")
-            return values[key] as? String ?: defValue
+        // Phase B: production reads ONE copy via getAll(); a broken transport
+        // therefore surfaces as a throwing getAll(), not a per-key throw.
+        override fun getAll(): MutableMap<String, *> {
+            if (failGetAll) throw IllegalStateException("remote prefs getAll failed")
+            return LinkedHashMap(values)
         }
+        override fun getString(key: String?, defValue: String?): String? = values[key] as? String ?: defValue
         override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
-            if (key != null && key in throwOnRead) throw IllegalStateException("read failed: $key")
             @Suppress("UNCHECKED_CAST")
             return values[key] as? MutableSet<String> ?: defValues
         }
         override fun getInt(key: String?, defValue: Int): Int = (values[key] as? Int) ?: defValue
         override fun getLong(key: String?, defValue: Long): Long = (values[key] as? Long) ?: defValue
         override fun getFloat(key: String?, defValue: Float): Float = (values[key] as? Float) ?: defValue
-        override fun getBoolean(key: String?, defValue: Boolean): Boolean {
-            if (key != null && key in throwOnRead) throw IllegalStateException("read failed: $key")
-            return (values[key] as? Boolean) ?: defValue
-        }
-        override fun contains(key: String?): Boolean {
-            if (key != null && key in throwOnRead) throw IllegalStateException("read failed: $key")
-            return values.containsKey(key)
-        }
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = (values[key] as? Boolean) ?: defValue
+        override fun contains(key: String?): Boolean = values.containsKey(key)
         override fun edit(): SharedPreferences.Editor {
             editCalls++
             throw AssertionError("Hook must NEVER call edit() on hooked-app remote prefs")
@@ -99,7 +94,7 @@ class BbcPreactivationReadOnlyTest {
                     PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
                 PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED to true,
             ),
-            throwOnRead = setOf(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED),
+            failGetAll = true,
         )
         val snapshot = BbcPreactivationHookReader.read(prefs)
         assertEquals(BbcPreactivationPrefs(null, null, null), snapshot)
