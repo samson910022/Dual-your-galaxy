@@ -49,11 +49,12 @@ class InventorySelectionTest {
         var dualId: Int = 95,
         val rootOk: Boolean = true,
         var failListPackages: Boolean = false,
-        // issue #69 RED 測試鉤子（僅測試用，預設 false 不影響既有測試）：
+        // issue #69 測試鉤子（僅測試用，預設 false 不影響既有測試）：
         // 首次 `pm uninstall` 後自動翻 failListPackages。confirmRemove 的
         // 「寫前」verifyState 仍見乾淨 Installed 清單，uninstall 之後的
         // verifyListProbe 才回 untrusted → RemoveOutcome.VerifyUnknown，
-        // 精確命中 DualViewModel.kt:6706-6732 分支（而非寫前拒絕Branch）。
+        // 精確命中 DualViewModel 的 RemoveOutcome.VerifyUnknown 分支
+        //（而非寫前 VerifyState.Unknown 拒絕分支）。
         var failListAfterUninstall: Boolean = false,
         val installFail: MutableSet<String> = mutableSetOf(),
         val hideFromList: MutableSet<String> = mutableSetOf(),
@@ -2642,9 +2643,9 @@ class InventorySelectionTest {
     }
 
     // issue #70：clearSelectionLocal() 在「選取本來就為空」時仍必須推進
-    // selectionGen。DualViewModel.kt:6937-6952 只在 selectedKeys 非空時
-    // changed=true 並 incrementAndGet()；而 restoreSelectionLocked 的 ABA
-    // 守衛 :13057 是 `selectedKeys.isNotEmpty() || selectionGen != startGen`
+    // selectionGen。舊實作只在 selectedKeys 非空時才 incrementAndGet()，而
+    // restoreSelectionLocked 的 ABA 守衛是
+    // `selectedKeys.isNotEmpty() || selectionGen != startGen`
     // ——clear-while-empty 無法被察覺，遲到的 restore 會把舊快照 A 寫回。
     // 既有 restore_aba_selectThenClear_abortsAndMarkerNotBurned 只覆蓋
     // 「先選 B 再清空」（gen 已前進），本例補上「從未選任何東西就清空」缺口。
@@ -2682,8 +2683,7 @@ class InventorySelectionTest {
         vm.persistSelection(-1)
         await { vm.state.value.msg.contains("no dual profile") }
         assertEquals(
-            "#70 RED: clear-while-empty must advance gen so the late restore " +
-                "aborts (fix locus: DualViewModel.kt:6937-6952, guard :13057)",
+            "#70: clear-while-empty must advance gen so the late restore aborts",
             emptySet<String>(),
             vm.state.value.selectedKeys,
         )
