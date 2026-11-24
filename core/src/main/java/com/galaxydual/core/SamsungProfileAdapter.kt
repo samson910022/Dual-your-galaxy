@@ -382,45 +382,39 @@ object SamsungProfileAdapter {
     private val SERIAL =
         Regex("(?<![A-Za-z0-9])serial(?:No|\\s*number)?\\s*[:=]\\s*(\\d+)", RegexOption.IGNORE_CASE)
 
-    // Parses `cmd user list -v` verbose output into one claim per user.
+    // Parses `cmd user list -v` verbose output into ONE CLAIM PER PARSED
+    // ROW/BLOCK (issue #87 R2: no collapsing, no last-wins overwrite).
     // Dual-format (PR-33 D2): legacy UserInfo{...} blocks are parsed as
     // before; new-ROM lines (`N: id=<id>, name=<label>, type=<type>, ...`,
     // no UserInfo header, no serial line, S24 實機) are parsed per line with
     // the label taken from `name=` and the type/parent evidence from the
     // `type=` token plus the flag/parent tail (the label never enters the
-    // body). Results merge by userId with UserInfo winning a duplicate
-    // (the two formats never coexist in practice). Issue #65/P2: if a fresh
-    // row and a legacy block meet on the SAME userId but disagree on userType,
-    // the merged claim is downgraded to UNKNOWN (confidence LOW) -- fail
-    // closed, never let a blindly overwriting legacy claim cancel a fresh
-    // CLONE (or vice versa). Combined with the classification shared with the
-    // strict gate, an inline `UserInfo{...}` inside a `name=` label cannot
-    // create such a conflict in the first place (a NEW_ROW line is never also
-    // scanned as a legacy header). Tolerant otherwise: line order, letter
-    // case, `:` vs `=` separators and missing lines are all accepted; a block
-    // without any type token yields userType UNKNOWN (never guessed from the
-    // label). The header label is retained display-only and never affects
-    // userType.
+    // body). BOTH claim lists are returned as-is, concatenated in parse order:
+    // a new row and a legacy block (or two rows / two blocks) naming the same
+    // userId each contribute their own claim. This is deliberate -- the old
+    // merge compared only `userType` and let a legacy claim overwrite a fresh
+    // one when the types agreed, erasing contradictory `parentId`/`serial`
+    // evidence. Consistency is NOT decided here: resolveDual() aggregates
+    // ALL claims and refuses a same-id parent/serial contradiction (while a
+    // missing parent/serial is still tolerated on the confirm path). Malformed
+    // / REJECTED rows emit bare UNKNOWN/LOW claims with no parent/serial, so
+    // their presence vetoes a same-channel CLONE via the resolver's missing-
+    // parent gate instead of being overwritten by a later valid row. Combined
+    // with the classification shared with the strict gate, an inline
+    // `UserInfo{...}` inside a `name=` label cannot create a competing legacy
+    // claim in the first place (a NEW_ROW line is never also scanned as a
+    // legacy header). Tolerant otherwise: line order, letter case, `:` vs `=`
+    // separators and missing lines are all accepted; a block without any type
+    // token yields userType UNKNOWN (never guessed from the label). The header
+    // label is retained display-only and never affects userType.
     fun parseUserListVerbose(text: String): List<ProfileIdentity> {
         // ONE classification per raw physical line, shared with the gate: both
         // parsers below consume these lines, neither re-parses/re-splits text.
         val lines = classifyIdentityLines(text)
-        val legacy = parseBlocks(lines, IdentitySource.USER_LIST_V)
-        val fresh = parseNewVerboseLines(lines)
-        if (fresh.isEmpty()) return legacy
-        if (legacy.isEmpty()) return fresh
-        val freshById = fresh.associateBy { it.userId }
-        val merged = LinkedHashMap<Int, ProfileIdentity>()
-        for (e in fresh) merged[e.userId] = e
-        for (e in legacy) {
-            val conflict = freshById[e.userId]
-            merged[e.userId] = if (conflict != null && conflict.userType != e.userType) {
-                e.copy(userType = ProfileUserType.UNKNOWN, confidence = IdentityConfidence.LOW)
-            } else {
-                e
-            }
-        }
-        return merged.values.toList()
+        // R2 aggregation: preserve every claim. NO associateBy/LinkedHashMap
+        // collapse -- a same-id duplicate may be the contradictory evidence
+        // that must reach resolveDual (see KDoc above).
+        return parseBlocks(lines, IdentitySource.USER_LIST_V) + parseNewVerboseLines(lines)
     }
 
     // Parses `dumpsys user` output into one claim per UserInfo{...} block.
@@ -883,9 +877,13 @@ object SamsungProfileAdapter {
     //   equal, and == 0. Either side missing -> Unknown (insufficient
     //   evidence); values differ -> Refused("conflicting parent ...");
     //   equal but != 0 -> Refused("non-owner parent ... policy ...").
-    //   Only dual-channel-agreed parentId 0 passes (single-device S24
-    //   evidence parentId=0, issue #21; other models unverified -- a
-    //   non-zero parent fails closed to Unknown/Refused, never confirms).
+    //   An explicit disagreement among the non-null parents is reported as
+    //   Refused BEFORE a missing parent is treated as Unknown (issue #87 R2:
+    //   same-id duplicate claims are preserved, so contradictory evidence
+    //   cannot be overwritten). Only dual-channel-agreed parentId 0 passes
+    //   (single-device S24 evidence parentId=0, issue #21; other models
+    //   unverified -- a non-zero parent fails closed to Unknown/Refused,
+    //   never confirms).
     // - serial: when BOTH channels carry a serial for the id and they
     //   differ -> Refused("conflicting serial ..."). A missing serial on
     //   either side is tolerated (verbose dumps do not always carry serial,
@@ -978,6 +976,14 @@ object SamsungProfileAdapter {
         // Either side missing (no claim or null parentId) is insufficient
         // evidence -> Unknown (fail closed); disagreement or a non-zero
         // agreed parent is a policy refusal, never a target.
+        // Issue #87 R2: an EXPLICIT contradiction is reported before a
+        // missing value. parseUserListVerbose now preserves every same-id
+        // claim (no last-wins merge), so a contradictory parent (e.g. 10 vs 0)
+        // coexists with the agreeing CLONE claims; it must surface as Refused
+        // even if another claim on that id also carries a null parent. A
+        // missing parent with no contradiction stays Unknown (tolerated only
+        // for serial, never for parent). The two-channel presence requirement
+        // below is unchanged.
         val verboseParents = typed.filter {
             it.source == IdentitySource.USER_LIST_V && it.userId == id
         }.map { it.parentId }.toSet()
@@ -985,16 +991,15 @@ object SamsungProfileAdapter {
             it.source == IdentitySource.DUMPSYS && it.userId == id
         }.map { it.parentId }.toSet()
         if (verboseParents.isEmpty() || dumpsysParents.isEmpty()) return DualResolution.Unknown
-        if (verboseParents.any { it == null } || dumpsysParents.any { it == null }) {
-            return DualResolution.Unknown
-        }
-        val agreedParents = (verboseParents + dumpsysParents).filterNotNull().toSet()
-        if (agreedParents.size > 1) {
+        val allParents = verboseParents + dumpsysParents
+        val nonNullParents = allParents.filterNotNull().toSet()
+        if (nonNullParents.size > 1) {
             return DualResolution.Refused(
                 "conflicting parent for user $id: verbose=$verboseParents vs dumpsys=$dumpsysParents",
             )
         }
-        val agreedParent = agreedParents.single()
+        if (allParents.any { it == null }) return DualResolution.Unknown
+        val agreedParent = nonNullParents.single()
         if (agreedParent != 0) {
             return DualResolution.Refused(
                 "non-owner parent $agreedParent for user $id: policy requires parentId 0",

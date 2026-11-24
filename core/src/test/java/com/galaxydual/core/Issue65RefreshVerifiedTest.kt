@@ -396,4 +396,89 @@ class Issue65RefreshVerifiedTest {
         ).joinToString("\n")
         assertFailClosed(FakeGateway(verbose), "R5: Unicode separator on owner/other rows")
     }
+
+    // ---- R2: same-id duplicate evidence at the FULL refreshVerified() level ----
+
+    // Extra claim lines are appended AFTER a clean owner/other snapshot so a
+    // legacy block body can run to EOF without swallowing another user's row.
+    private fun verboseWithTrailingClaims(claims: List<String>) = (
+        listOf(
+            "Users:",
+            "  0: id=0, name=Owner, type=full.SYSTEM, flags=0x00000013 (parentId=0)",
+            "  2: id=150, name=Secure Folder, type=profile.PRIVATE, flags=0x00000030 (parentId=0)",
+        ) + claims
+    ).joinToString("\n")
+
+    private val r2FreshParent10Serial99 =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=10) serialNo=99"
+    private val r2FreshParent0NoSerial =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0)"
+    private fun r2LegacyClone(serial: Int = 15) = listOf(
+        "  UserInfo{95:DUAL_APP:400} serialNo=$serial:",
+        "    parentId=0",
+        "    userType=android.os.usertype.profile.CLONE",
+    )
+
+    @Test
+    fun r2_newThenLegacySameTypeContradiction_failsClosedWithoutPackageRead() {
+        val verbose = verboseWithTrailingClaims(listOf(r2FreshParent10Serial99) + r2LegacyClone())
+        assertFailClosed(FakeGateway(verbose), "R2: new(parent10,serial99) then legacy(parent0,serial15)")
+    }
+
+    @Test
+    fun r2_legacyThenNewSameTypeContradiction_failsClosedWithoutPackageRead() {
+        val verbose = verboseWithTrailingClaims(r2LegacyClone() + listOf(r2FreshParent10Serial99))
+        assertFailClosed(FakeGateway(verbose), "R2: legacy(parent0,serial15) then new(parent10,serial99)")
+    }
+
+    @Test
+    fun r2_twoNewRowsParentConflict_failsClosedWithoutPackageRead() {
+        val parent10 = r2FreshParent10Serial99
+        val parent0 = "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15"
+        for (rows in listOf(listOf(parent10, parent0), listOf(parent0, parent10))) {
+            assertFailClosed(FakeGateway(verboseWithTrailingClaims(rows)), "R2: two new rows parent 10 vs 0")
+        }
+    }
+
+    @Test
+    fun r2_twoLegacyBlocksSerialConflict_failsClosedWithoutPackageRead() {
+        val serial99 = r2LegacyClone(99)
+        val serial15 = r2LegacyClone(15)
+        for (blocks in listOf(serial99 + serial15, serial15 + serial99)) {
+            assertFailClosed(FakeGateway(verboseWithTrailingClaims(blocks)), "R2: two legacy blocks serial 99 vs 15")
+        }
+    }
+
+    @Test
+    fun r2_serialOnlyConflictWithAgreedParent_failsClosedWithoutPackageRead() {
+        val serial99 = "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=99"
+        val serial15 = "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15"
+        assertFailClosed(
+            FakeGateway(verboseWithTrailingClaims(listOf(serial99, serial15))),
+            "R2: serial-only conflict with parent 0 on both rows",
+        )
+    }
+
+    @Test
+    fun r2_malformedEvidenceNotOverwritten_failsClosedWithoutPackageRead() {
+        // A malformed UNKNOWN/LOW row must stay alongside the valid CLONE row
+        // and veto confirmation through the resolver's missing-parent gate.
+        val malformed = "1: id=95, name=OK, type=, flags=X (parentId=0)"
+        val verbose = verboseWithTrailingClaims(listOf(malformed, r2FreshParent0NoSerial))
+        assertFailClosed(FakeGateway(verbose), "R2: malformed evidence not overwritten by valid CLONE")
+    }
+
+    @Test
+    fun r2_missingSerialIsTolerated_resolvesGroundTruth() {
+        // Positive control: fresh CLONE(parent 0, no serial) + legacy
+        // CLONE(parent 0, serial 15) agree; dumpsys CLONE(0,15) and prop 95
+        // supply the second channel/property. Missing serial is tolerated, not
+        // a contradiction -- the same target must still resolve to GroundTruth.
+        val verbose = verboseWithTrailingClaims(listOf(r2FreshParent0NoSerial) + r2LegacyClone())
+        val result = ground(FakeGateway(verbose))
+        assertEquals(95, result.target.userId)
+        assertEquals(15, result.target.serial)
+        assertEquals(0, result.target.parentId)
+        assertEquals(listOf("com.example.chat", "com.example.mail"), result.cloned)
+    }
 }

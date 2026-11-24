@@ -272,7 +272,9 @@ class Issue65ParserRegressionTest {
     }
 
     // A genuine legacy block for the same id with a DIFFERENT type must not
-    // silently overwrite a fresh claim: the merged claim is UNKNOWN.
+    // silently overwrite a fresh claim. Issue #87 R2: BOTH claims are now
+    // preserved (no merge/last-wins collapse) and the resolver refuses the
+    // same-id type contradiction -- fail closed, never a Confirmed target.
     @Test
     fun legacyAndFreshTypeDisagreement_resolvesUnknown() {
         val text = """
@@ -281,10 +283,13 @@ class Issue65ParserRegressionTest {
             1: id=95, name=DUAL_APP, type=profile.CLONE, flags=0x190 (parentId=0)
         """.trimIndent()
         val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
-        assertEquals(1, parsed.size)
-        val claim = parsed.first { it.userId == 95 }
-        assertEquals(ProfileUserType.UNKNOWN, claim.userType)
-        assertEquals(IdentityConfidence.LOW, claim.confidence)
+        // R2 contract: one claim per parsed row/block, NOT one merged claim.
+        assertEquals(2, parsed.size)
+        val types = parsed.filter { it.userId == 95 }.map { it.userType }.toSet()
+        assertEquals(setOf(ProfileUserType.OTHER, ProfileUserType.CLONE), types)
+        val resolution = SamsungProfileAdapter.resolveDual(parsed, propertyId = 95)
+        assertTrue("a same-id type contradiction must not Confirm: $resolution", resolution !is DualResolution.Confirmed)
+        assertTrue("a same-id type contradiction must be Refused: $resolution", resolution is DualResolution.Refused)
     }
 
     // ---- R1: structural invariant (reverse PoC B) ----
@@ -474,5 +479,166 @@ class Issue65ParserRegressionTest {
         assertEquals(ProfileUserType.UNKNOWN, claim.userType)
         assertEquals(IdentityConfidence.LOW, claim.confidence)
         assertFalse(PmOutputParser.isIdentityChannelOk(verbose, 0))
+    }
+
+    // ---- R2: same-id legacy/new duplicates must keep ALL evidence ----
+
+    // The exact R2 PoC: a fresh CLONE row (parent 10, serial 99) and a legacy
+    // CLONE block (parent 0, serial 15). Both are CLONE, so the OLD merge
+    // compared only userType and let the legacy block ERASE the contradictory
+    // parent/serial -- the resolver then confirmed u95 on clean dumpsys/prop.
+    private val r2FreshCloneParent10Serial99 =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=10) serialNo=99"
+    private val r2FreshCloneParent0 =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0)"
+    private val r2MalformedRow = "1: id=95, name=OK, type=, flags=X (parentId=0)"
+
+    private fun r2LegacyCloneBlock(serial: Int = 15) = listOf(
+        "  UserInfo{95:DUAL_APP:400} serialNo=$serial:",
+        "    parentId=0",
+        "    userType=android.os.usertype.profile.CLONE",
+    )
+
+    // Clean dumpsys CLONE(parent 0, serial 15) + conventional others, so a
+    // resolver Confirm would otherwise be possible; only the contradictory
+    // verbose claims may veto it.
+    private val r2Dumpsys = listOf(
+        "Users:",
+        "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:",
+        "    userType=android.os.usertype.full.SYSTEM",
+        "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+        "    parentId=0",
+        "    userType=android.os.usertype.profile.CLONE",
+    ).joinToString("\n")
+
+    private fun r2Resolve(vararg claimLines: String): DualResolution {
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(claimLines.joinToString("\n"))
+        return SamsungProfileAdapter.resolveDual(
+            parsed + SamsungProfileAdapter.parseDumpsysUser(r2Dumpsys),
+            propertyId = 95,
+        )
+    }
+
+    private fun r2ClaimSets(vararg claimLines: String): Pair<Set<Int?>, Set<Int?>> {
+        val claims = SamsungProfileAdapter.parseUserListVerbose(claimLines.joinToString("\n"))
+            .filter { it.userId == 95 }
+        return claims.map { it.parentId }.toSet() to claims.map { it.serial }.toSet()
+    }
+
+    @Test
+    fun r2_newThenLegacySameTypePreservesContradictoryParentAndSerial() {
+        val fresh = r2FreshCloneParent10Serial99
+        val legacy = r2LegacyCloneBlock()
+        val text = (listOf(fresh) + legacy).joinToString("\n")
+        val claims = SamsungProfileAdapter.parseUserListVerbose(text).filter { it.userId == 95 }
+        assertEquals("both same-id same-type claims must survive aggregation", 2, claims.size)
+        assertEquals(
+            setOf(ProfileUserType.CLONE, ProfileUserType.CLONE),
+            claims.map { it.userType }.toSet(),
+        )
+        assertEquals(setOf<Int?>(10, 0), claims.map { it.parentId }.toSet())
+        assertEquals(setOf<Int?>(99, 15), claims.map { it.serial }.toSet())
+        val resolution = r2Resolve(fresh, *legacy.toTypedArray())
+        assertTrue("explicit parent/serial contradiction must refuse: $resolution", resolution is DualResolution.Refused)
+        assertFalse(resolution is DualResolution.Confirmed)
+    }
+
+    @Test
+    fun r2_legacyThenNewSameTypeIsOrderIndependent() {
+        val fresh = r2FreshCloneParent10Serial99
+        val legacy = r2LegacyCloneBlock()
+        // Reverse the two blocks: the claim SETS and the resolution must be
+        // identical (no order-dependent last-wins overwrite).
+        val forward = r2ClaimSets(fresh, *legacy.toTypedArray())
+        val reverse = r2ClaimSets(*legacy.toTypedArray(), fresh)
+        assertEquals(forward, reverse)
+        assertEquals(setOf<Int?>(10, 0), forward.first)
+        assertEquals(setOf<Int?>(99, 15), forward.second)
+        val resolution = r2Resolve(*legacy.toTypedArray(), fresh)
+        assertTrue("reversed contradictory claims must still refuse: $resolution", resolution is DualResolution.Refused)
+        assertFalse(resolution is DualResolution.Confirmed)
+    }
+
+    @Test
+    fun r2_twoNewRowsWithContradictoryParent_bothOrdersRefuse() {
+        val parent10 = r2FreshCloneParent10Serial99
+        val parent0 = "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15"
+        for (rows in listOf(listOf(parent10, parent0), listOf(parent0, parent10))) {
+            val claims = SamsungProfileAdapter.parseUserListVerbose(rows.joinToString("\n"))
+                .filter { it.userId == 95 }
+            assertEquals("both new rows for 95 must be retained", 2, claims.size)
+            assertEquals(setOf<Int?>(10, 0), claims.map { it.parentId }.toSet())
+            val resolution = r2Resolve(*rows.toTypedArray())
+            assertTrue("two CLONE rows with parent 10 vs 0 must refuse: $resolution", resolution is DualResolution.Refused)
+            assertFalse(resolution is DualResolution.Confirmed)
+        }
+    }
+
+    @Test
+    fun r2_twoLegacyBlocksWithContradictorySerial_bothOrdersRefuse() {
+        val serial99 = r2LegacyCloneBlock(serial = 99)
+        val serial15 = r2LegacyCloneBlock(serial = 15)
+        for (blocks in listOf(serial99 + serial15, serial15 + serial99)) {
+            val claims = SamsungProfileAdapter.parseUserListVerbose(blocks.joinToString("\n"))
+                .filter { it.userId == 95 }
+            assertEquals("both legacy blocks for 95 must be retained", 2, claims.size)
+            assertEquals(setOf<Int?>(99, 15), claims.map { it.serial }.toSet())
+            val resolution = r2Resolve(*blocks.toTypedArray())
+            assertTrue("two CLONE blocks with serial 99 vs 15 must refuse: $resolution", resolution is DualResolution.Refused)
+            assertFalse(resolution is DualResolution.Confirmed)
+        }
+    }
+
+    @Test
+    fun r2_serialOnlyConflictWithAgreedParent_refuses() {
+        // Parent agrees at 0 on both rows; only the serials contradict.
+        val serial99 = "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=99"
+        val serial15 = "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15"
+        val claims = SamsungProfileAdapter.parseUserListVerbose(listOf(serial99, serial15).joinToString("\n"))
+            .filter { it.userId == 95 }
+        assertEquals(2, claims.size)
+        assertEquals(setOf<Int?>(0), claims.map { it.parentId }.toSet())
+        assertEquals(setOf<Int?>(99, 15), claims.map { it.serial }.toSet())
+        val resolution = r2Resolve(serial99, serial15)
+        assertTrue("conflicting serials must refuse even when parents agree: $resolution", resolution is DualResolution.Refused)
+    }
+
+    @Test
+    fun r2_malformedEvidenceIsNotOverwrittenByValidClone() {
+        val malformed = r2MalformedRow
+        val valid = r2FreshCloneParent0
+        val text = listOf(malformed, valid).joinToString("\n")
+        val claims = SamsungProfileAdapter.parseUserListVerbose(text).filter { it.userId == 95 }
+        assertEquals("malformed and valid claims must both survive", 2, claims.size)
+        val malformedClaim = claims.single { it.confidence == IdentityConfidence.LOW }
+        assertEquals(ProfileUserType.UNKNOWN, malformedClaim.userType)
+        assertNull(malformedClaim.parentId)
+        assertNull(malformedClaim.serial)
+        assertEquals(ProfileUserType.CLONE, claims.single { it.confidence == IdentityConfidence.MED }.userType)
+        // Missing parent on the malformed claim is a distinct outcome from an
+        // explicit contradiction: it is Unknown, never Refused/Confirmed.
+        val resolution = r2Resolve(malformed, valid)
+        assertTrue("a missing (not contradictory) parent must be Unknown: $resolution", resolution is DualResolution.Unknown)
+        assertFalse(resolution is DualResolution.Refused)
+        assertFalse(resolution is DualResolution.Confirmed)
+    }
+
+    @Test
+    fun r2_missingSerialIsToleratedNotTreatedAsContradiction() {
+        // Positive control: a fresh CLONE with parent 0 and NO serial, a
+        // legacy CLONE with parent 0 / serial 15, plus clean dumpsys/prop.
+        // The missing serial must be tolerated (the resolver's serial gate),
+        // yielding Confirmed(95, 15, 0) -- not a Refused contradiction.
+        val fresh = r2FreshCloneParent0
+        val legacy = r2LegacyCloneBlock()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose((listOf(fresh) + legacy).joinToString("\n"))
+        assertEquals(2, parsed.filter { it.userId == 95 }.size)
+        assertEquals(setOf<Int?>(0), r2ClaimSets(fresh, *legacy.toTypedArray()).first)
+        assertEquals(setOf<Int?>(null, 15), r2ClaimSets(fresh, *legacy.toTypedArray()).second)
+        val resolution = r2Resolve(fresh, *legacy.toTypedArray())
+        assertEquals(
+            DualResolution.Confirmed(95, 15, 0),
+            resolution,
+        )
     }
 }
