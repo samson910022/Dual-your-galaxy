@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Self-test for scripts/check-dex-classdefs.py (issue #67).
 #
-# Everything is generated offline from a synthetic minimal DEX builder embedded
-# below (Python 3 stdlib only) — no SDK, no network, no checked-in binary
-# fixture. The builder emits real DEX headers (112-byte header, little-endian
-# tag 0x12345678, 32-byte class_def_item entries) and wraps them in fake APKs
-# via zipfile so the checker's CLI path (classes*.dex inside an APK zip) is
-# exercised, not just the importable parsing function.
+# All fixtures are generated offline by the shared, parser-specific builder
+# scripts/fixtures/dex_builder.py (Python 3 stdlib only) — no SDK, no network,
+# no checked-in binary fixture. The builder emits minimal DEX headers/tables
+# and wraps them in fake APK ZIPs so the checker's CLI path (canonical
+# classes*.dex inside an APK) is exercised, not just the importable parser.
 #
 # Key regression fixture: negative.apk keeps the target descriptor STRING and
 # its type_ids reference but has class_defs_size=0. The old `grep -aFc
@@ -16,12 +15,17 @@
 # inner classes; it pins exact-descriptor matching against a lenient
 # prefix/startswith mutation that would inflate one target into many.
 #
+# Multi-dex / structural mutations pin the review findings: non-canonical or
+# missing/split DEX member names, file_size/magic lies, bad tables, malformed
+# MUTF-8 and duplicate class_defs must all fail closed with SPECIFIC messages.
+#
 # Intentionally `set -u` (not -e): pass and fail exit codes are both asserted.
 set -u
 
 cd "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(pwd)"
 CHECKER="$REPO_ROOT/scripts/check-dex-classdefs.py"
+BUILDER="$REPO_ROOT/scripts/fixtures/dex_builder.py"
 
 TARGET='Lrikka/shizuku/ShizukuProvider;'
 OTHER='Lcom/galaxydual/hook/DualHook;'
@@ -36,148 +40,8 @@ trap 'rm -rf "$SUITE_TMP"' EXIT
 # NOTE: no early "checker exists" guard — a missing/unreadable checker must
 # surface as assertion MISMATCHES (RED), not as a silent early exit.
 
-# --- synthetic minimal DEX generator (Python 3 stdlib, fully offline) --------
-cat > "$SUITE_TMP/gen_fixtures.py" <<'PYGEN'
-import os
-import struct
-import sys
-import zipfile
-
-OUT = sys.argv[1]
-HEADER_SIZE = 112
-ENDIAN_LITTLE = 0x12345678
-
-
-def uleb128(value):
-    out = bytearray()
-    while True:
-        byte = value & 0x7F
-        value >>= 7
-        if value:
-            out.append(byte | 0x80)
-        else:
-            out.append(byte)
-            return bytes(out)
-
-
-def build_dex(descriptors, class_idxs, endian_tag=ENDIAN_LITTLE, big=False):
-    """Build a minimal but structurally valid DEX.
-
-    descriptors: strings in string_ids/type_ids (index i maps to type i).
-    class_idxs:  type_ids index for each 32-byte class_def_item.
-    big:         emit fields big-endian with the reversed endian tag.
-    """
-    endian = ">" if big else "<"
-    n_str = len(descriptors)
-    n_types = len(descriptors)
-    n_defs = len(class_idxs)
-
-    str_ids_off = HEADER_SIZE
-    type_ids_off = str_ids_off + 4 * n_str
-    defs_off = type_ids_off + 4 * n_types
-    data_off = (defs_off + 32 * n_defs + 3) & ~3
-
-    data = bytearray()
-    string_offs = []
-    for desc in descriptors:
-        string_offs.append(data_off + len(data))
-        raw = desc.encode("utf-8")
-        # DEX string_data_item = uleb128(utf16_size) + MUTF-8 bytes + NUL.
-        data += uleb128(len(raw)) + raw + b"\x00"
-    while len(data) % 4:
-        data += b"\x00"
-    file_size = data_off + len(data)
-
-    hdr = bytearray(HEADER_SIZE)
-    hdr[0:8] = b"dex\n035\x00"
-    struct.pack_into(endian + "I", hdr, 0x20, file_size)
-    struct.pack_into(endian + "I", hdr, 0x24, HEADER_SIZE)
-    # The tag bytes are fixed by the format: 78 56 34 12 for a normal DEX,
-    # 12 34 56 78 for a byte-swapped one. Emit those raw bytes little-endian;
-    # the reader interprets them as 0x12345678 / 0x78563412 and picks the
-    # byte order for the remaining tables.
-    packed_tag = (0x78563412 if big else ENDIAN_LITTLE)
-    struct.pack_into("<I", hdr, 0x28, packed_tag)
-    struct.pack_into(endian + "II", hdr, 0x38, n_str, str_ids_off)
-    struct.pack_into(endian + "II", hdr, 0x40, n_types, type_ids_off)
-    struct.pack_into(endian + "II", hdr, 0x60, n_defs, defs_off)
-    struct.pack_into(endian + "II", hdr, 0x68, len(data), data_off)
-
-    out = bytearray(hdr)
-    for off in string_offs:
-        out += struct.pack(endian + "I", off)
-    assert len(out) == type_ids_off
-    for i in range(n_types):
-        out += struct.pack(endian + "I", i)
-    assert len(out) == defs_off
-    for idx in class_idxs:
-        # class_def_item is EIGHT uint32 (32 bytes), not 20.
-        out += struct.pack(endian + "8I", idx, 0, 0, 0, 0, 0, 0, 0)
-    assert len(out) == data_off, (len(out), data_off)
-    out += data
-    assert len(out) == file_size
-    return bytes(out)
-
-
-def write_apk(name, members):
-    with zipfile.ZipFile(os.path.join(OUT, name), "w", zipfile.ZIP_DEFLATED) as zf:
-        for member, payload in members.items():
-            if isinstance(payload, str):
-                payload = payload.encode("utf-8")
-            zf.writestr(member, payload)
-
-
-target = "Lrikka/shizuku/ShizukuProvider;"
-other = "Lcom/galaxydual/hook/DualHook;"
-
-positive = build_dex([target], [0])
-# #67 false-positive fixture: string table + type_ids kept, ZERO class_defs.
-negative = build_dex([target], [])
-missing = build_dex([other], [0])
-# Mutation guard: class_defs exist ONLY for inner/synthetic classes. The plain
-# target descriptors are still present in string_ids/type_ids (as a type
-# reference would be), but there is NO class_def_item for either target.
-# Precise `.count(descriptor)` -> MISSING; a lenient
-# `startswith(descriptor[:-1])` would match "$Inner;"/"$Companion;" and pass.
-inner_only = build_dex(
-    [target, target + "$Inner;", other, other + "$Companion;"],
-    [1, 3],  # class_def for the inner classes only
-)
-count2 = build_dex([target, other], [0, 0])
-both = build_dex([target, other], [0, 1])
-bad_index = build_dex([target], [999])
-big_endian = build_dex([target], [0], big=True)
-bad_endian = bytearray(positive)
-struct.pack_into("<I", bad_endian, 0x28, 0xDEADBEEF)
-truncated = positive[:50]
-
-for name, payload in [
-    ("positive.dex", positive),
-    ("negative.dex", negative),
-    ("count2.dex", count2),
-]:
-    with open(os.path.join(OUT, name), "wb") as f:
-        f.write(payload)
-
-write_apk("positive.apk", {"classes.dex": positive})
-write_apk("negative.apk", {"classes.dex": negative})
-write_apk("missing.apk", {"classes.dex": missing})
-write_apk("inner-only.apk", {"classes.dex": inner_only})
-write_apk("count2.apk", {"classes.dex": count2})
-write_apk("both.apk", {"classes.dex": both})
-write_apk("multi.apk", {"classes.dex": positive, "classes2.dex": count2})
-write_apk("big-endian.apk", {"classes.dex": big_endian})
-write_apk("truncated.apk", {"classes.dex": truncated})
-write_apk("bad-endian.apk", {"classes.dex": bytes(bad_endian)})
-write_apk("bad-index.apk", {"classes.dex": bad_index})
-write_apk("no-dex.apk", {"META-INF/xposed/module.prop": "id=io.github.samson910022.galaxydualplus\n"})
-with open(os.path.join(OUT, "not-a-zip.apk"), "wb") as f:
-    f.write(b"this is not a zip archive")
-print("generated fixtures in", OUT)
-PYGEN
-
-python3 "$SUITE_TMP/gen_fixtures.py" "$SUITE_TMP" || {
-  echo "::error::synthetic DEX fixture generation failed" >&2
+fixtures_output="$(python3 "$BUILDER" "$SUITE_TMP" 2>&1)" || {
+  echo "::error::shared DEX fixture generation failed: $fixtures_output" >&2
   exit 1
 }
 
@@ -238,11 +102,10 @@ fi
 assert_case "missing descriptor with non-empty class_defs" "$SUITE_TMP/missing.apk" 1 \
   "::error::MISSING class_def $TARGET" "$TARGET"
 
-# 3b. Mutation guard (review finding): inner/synthetic classes only, the two
-#     target descriptors themselves have NO class_def. Exact matching must
-#     report MISSING. The review's `startswith(descriptor[:-1])` mutation made
-#     these inner classes count as the target (real APK: DualHook 1 -> 33) and
-#     turned this into a false pass — this case pins that regression.
+# 3b. Mutation guard: inner/synthetic classes only, the two target
+#     descriptors themselves have NO class_def. Exact matching must report
+#     MISSING. The review's `startswith(descriptor[:-1])` mutation made these
+#     inner classes count as the target and turned this into a false pass.
 assert_case "inner-class-only class_defs (ShizukuProvider target absent)" \
   "$SUITE_TMP/inner-only.apk" 1 \
   "::error::MISSING class_def $TARGET" "$TARGET"
@@ -250,13 +113,22 @@ assert_case "companion-only class_defs (DualHook target absent)" \
   "$SUITE_TMP/inner-only.apk" 1 \
   "::error::MISSING class_def $OTHER" "$OTHER"
 
-# 4. two class_defs for the same descriptor -> count=2, exit 0.
-assert_case "count=2 for repeated class_def" "$SUITE_TMP/count2.apk" 0 \
-  "FOUND class_def $TARGET in classes.dex (count=2)" "$TARGET"
+# 4. (replaces the old count2.apk false pass) Duplicate class_idx in one DEX
+#    is illegal per the DEX spec and must fail closed, not yield count=2.
+assert_case "duplicate class_idx rejected" "$SUITE_TMP/dup-classidx.apk" 1 \
+  "duplicate class_def class_idx 0" "$TARGET"
 
-# 5. multi-DEX: counts across classes.dex and classes2.dex, exit 0.
-assert_case "multi-dex both entries" "$SUITE_TMP/multi.apk" 0 \
-  "FOUND class_def $TARGET in classes2.dex (count=2)" "$TARGET"
+# 4b. Two type_ids entries with the same descriptor also produce two
+#     class_defs for one class — reject the duplicate descriptor itself.
+assert_case "duplicate descriptor within one DEX rejected" \
+  "$SUITE_TMP/dup-descriptor-within.apk" 1 \
+  "duplicate class_def descriptor $TARGET" "$TARGET"
+
+# 5. Multi-DEX: target ONLY in the secondary entry; both descriptors found.
+assert_case "multi-dex target only in classes2.dex" "$SUITE_TMP/multi.apk" 0 \
+  "FOUND class_def $TARGET in classes2.dex (count=1)" "$TARGET" "$OTHER"
+assert_case "multi-dex primary entry still reported" "$SUITE_TMP/multi.apk" 0 \
+  "FOUND class_def $OTHER in classes.dex (count=1)" "$TARGET" "$OTHER"
 
 # 6. CLI accepts multiple descriptors in one invocation, exit 0.
 assert_case "multiple descriptors CLI" "$SUITE_TMP/both.apk" 0 \
@@ -266,41 +138,187 @@ assert_case "multiple descriptors CLI" "$SUITE_TMP/both.apk" 0 \
 assert_case "one missing among multiple descriptors" "$SUITE_TMP/both.apk" 1 \
   "::error::MISSING class_def $MISSING" "$TARGET" "$MISSING"
 
-# 8. truncated DEX -> fail closed with ::error::.
+# 8. truncated DEX -> fail closed with a specific message.
 assert_case "truncated DEX header" "$SUITE_TMP/truncated.apk" 1 \
-  "::error::" "$TARGET"
+  "truncated DEX: 50 bytes < 112-byte header" "$TARGET"
 
 # 9. invalid endian tag -> fail closed with ::error:: mentioning endian.
 assert_case "invalid endian tag" "$SUITE_TMP/bad-endian.apk" 1 \
-  "endian" "$TARGET"
+  "invalid DEX endian_tag" "$TARGET"
 
-# 10. class_idx out of range -> fail closed with ::error::.
+# 10. class_idx out of range -> fail closed.
 assert_case "out-of-range class_idx" "$SUITE_TMP/bad-index.apk" 1 \
-  "::error::" "$TARGET"
+  "class_idx 999 out of range" "$TARGET"
 
-# 11. APK with no classes*.dex -> fail closed.
+# 11. APK with no classes*.dex -> fail closed (missing primary).
 assert_case "no DEX entries in APK" "$SUITE_TMP/no-dex.apk" 1 \
-  "::error::" "$TARGET"
+  "missing primary classes.dex" "$TARGET"
 
 # 12. unreadable/non-zip APK -> fail closed.
 assert_case "non-zip APK" "$SUITE_TMP/not-a-zip.apk" 1 \
-  "::error::" "$TARGET"
+  "unable to open APK" "$TARGET"
 
-# 13. importable count_class_defs() unit check (not just the CLI).
-# The checker filename is hyphenated (matching the other scripts/ names), so
-# load it via importlib under a valid module name rather than a plain import.
-unit_output="$(python3 -c "
+# --- canonical multi-dex enumeration ---------------------------------------
+assert_case "missing primary (only classes2.dex)" "$SUITE_TMP/no-primary.apk" 1 \
+  "missing primary classes.dex" "$TARGET"
+
+assert_case "secondary numbering gap" "$SUITE_TMP/numbering-gap.apk" 1 \
+  "non-contiguous secondary DEX numbering" "$TARGET"
+
+assert_case "non-canonical classes0.dex" "$SUITE_TMP/noncanonical-classes0.apk" 1 \
+  "non-canonical DEX entry name 'classes0.dex'" "$TARGET"
+
+assert_case "non-canonical classes1.dex" "$SUITE_TMP/noncanonical-classes1.apk" 1 \
+  "non-canonical DEX entry name 'classes1.dex'" "$TARGET"
+
+assert_case "non-canonical classes01.dex" "$SUITE_TMP/noncanonical-classes01.apk" 1 \
+  "non-canonical DEX entry name 'classes01.dex'" "$TARGET"
+
+# A valid primary sibling must not mask a non-canonical secondary name.
+assert_case "non-canonical classes1.dex with valid primary" \
+  "$SUITE_TMP/noncanonical-with-primary.apk" 1 \
+  "non-canonical DEX entry name 'classes1.dex'" "$TARGET"
+
+assert_case "duplicate ZIP member classes.dex" "$SUITE_TMP/duplicate-member.apk" 1 \
+  "duplicate ZIP member 'classes.dex'" "$TARGET"
+
+# --- strict DEX structural validation --------------------------------------
+assert_case "bad magic version xyz" "$SUITE_TMP/bad-magic.apk" 1 \
+  "invalid DEX magic version b'xyz'" "$TARGET"
+
+assert_case "unsupported magic version 041" "$SUITE_TMP/bad-version.apk" 1 \
+  "invalid DEX magic version b'041'" "$TARGET"
+
+assert_case "file_size too small" "$SUITE_TMP/file-size-small.apk" 1 \
+  "DEX file_size 187 != DEX member byte length 188" "$TARGET"
+
+assert_case "file_size too large" "$SUITE_TMP/file-size-large.apk" 1 \
+  "DEX file_size 189 != DEX member byte length 188" "$TARGET"
+
+assert_case "wrong header_size" "$SUITE_TMP/bad-header-size.apk" 1 \
+  "unsupported DEX header_size 0x71" "$TARGET"
+
+assert_case "out-of-range table offset" "$SUITE_TMP/bad-string-ids-offset.apk" 1 \
+  "string_ids offset" "$TARGET"
+
+assert_case "misaligned table offset" "$SUITE_TMP/misaligned-offset.apk" 1 \
+  "misaligned string_ids offset" "$TARGET"
+
+assert_case "malformed uleb128" "$SUITE_TMP/malformed-uleb.apk" 1 \
+  "malformed uleb128" "$TARGET"
+
+assert_case "truncated uleb128" "$SUITE_TMP/truncated-uleb.apk" 1 \
+  "truncated uleb128" "$TARGET"
+
+assert_case "string_data_off outside data section" "$SUITE_TMP/string-off-outside-data.apk" 1 \
+  "string_data_off 112" "$TARGET"
+
+assert_case "unterminated string_data_item" "$SUITE_TMP/unterminated-string.apk" 1 \
+  "unterminated string_data_item" "$TARGET"
+
+assert_case "utf16_size zero" "$SUITE_TMP/utf16-size-zero.apk" 1 \
+  "utf16_size 0 for string_idx 0" "$TARGET"
+
+assert_case "utf16_size larger than actual" "$SUITE_TMP/utf16-size-large.apk" 1 \
+  "utf16_size 39 for string_idx 0" "$TARGET"
+
+# --- MUTF-8 decoding guards -------------------------------------------------
+# Each payload's utf16_sizes is the would-be decoded code-unit count, so the
+# decoder error (not the utf16_size equality check) is the expected failure.
+assert_case "invalid MUTF-8 leading byte 0x80" "$SUITE_TMP/mutf8-leading.apk" 1 \
+  "invalid MUTF-8 leading byte 0x80 for string_idx 0" "$TARGET"
+
+assert_case "overlong 2-byte MUTF-8 sequence" "$SUITE_TMP/mutf8-overlong.apk" 1 \
+  "overlong MUTF-8 sequence for string_idx 0" "$TARGET"
+
+assert_case "truncated 3-byte MUTF-8 sequence" "$SUITE_TMP/mutf8-truncated.apk" 1 \
+  "truncated MUTF-8 sequence for string_idx 0" "$TARGET"
+
+# --- more structural DEX guards --------------------------------------------
+assert_case "bad map_off" "$SUITE_TMP/bad-map-off.apk" 1 \
+  "map_off 8 outside DEX" "$TARGET"
+
+assert_case "data_size exceeds file_size" "$SUITE_TMP/bad-data-size.apk" 1 \
+  "data_size 188 at data_off" "$TARGET"
+
+assert_case "overlapping DEX tables" "$SUITE_TMP/overlapping-tables.apk" 1 \
+  "overlapping DEX tables" "$TARGET"
+
+assert_case "table out of bounds" "$SUITE_TMP/table-out-of-bounds.apk" 1 \
+  "class_defs table out of bounds" "$TARGET"
+
+assert_case "duplicate descriptor across DEXes" "$SUITE_TMP/dup-descriptor-across.apk" 1 \
+  "defined in multiple DEX entries" "$TARGET"
+
+assert_case "empty sibling DEX fails closed" "$SUITE_TMP/empty-sibling.apk" 1 \
+  "class_defs_size=0" "$TARGET"
+
+# 13. importable count_class_defs() unit check (not just the CLI). The checker
+# filename is hyphenated, so load it via importlib under a valid module name.
+# Values are passed strictly via sys.argv — never interpolated into Python
+# source — and the helper's exit code is asserted alongside its output.
+cat > "$SUITE_TMP/unit_check.py" <<'PYUNIT'
 import importlib.util
-spec = importlib.util.spec_from_file_location('check_dex_classdefs', '$CHECKER')
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-dex = open('$SUITE_TMP/positive.dex', 'rb').read()
-print(m.count_class_defs(dex, '$TARGET'), m.count_class_defs(dex, '$OTHER'))
-" 2>&1)" || true
-if [ "$unit_output" = "1 0" ]; then
-  pass_case "count_class_defs() importable unit check (1, 0)"
+import sys
+
+checker, dex_path, target, other = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("check_dex_classdefs", checker)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with open(dex_path, "rb") as handle:
+    dex = handle.read()
+print(module.count_class_defs(dex, target), module.count_class_defs(dex, other))
+PYUNIT
+unit_rc=0
+unit_output="$(python3 "$SUITE_TMP/unit_check.py" \
+  "$CHECKER" "$SUITE_TMP/positive.dex" "$TARGET" "$OTHER" 2>&1)" || unit_rc=$?
+if [ "$unit_rc" -eq 0 ] && [ "$unit_output" = "1 0" ]; then
+  pass_case "count_class_defs() importable unit check (1, 0; exit 0)"
 else
-  bad_case "count_class_defs() must return 1 for target and 0 for other" "$unit_output"
+  bad_case "count_class_defs() must return '1 0' with exit 0 (got exit $unit_rc)" "$unit_output"
+fi
+
+# 14. Defense-in-depth: pin the MUTF-8 canonical re-encode guard directly.
+#     The strict decoder already rejects every non-canonical byte sequence, so
+#     a data-only fixture cannot isolate this guard. Patch in a deliberately
+#     regressed decoder (NUL scan + errors="replace") on the invalid-leading-
+#     byte fixture; _string_at must still reject the resulting bytes.
+cat > "$SUITE_TMP/unit_canonical.py" <<'PYUNIT'
+import importlib.util
+import sys
+
+checker, dex_path = sys.argv[1:3]
+spec = importlib.util.spec_from_file_location("check_dex_classdefs_canonical", checker)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+def regressed_decode(data, start, limit, index):
+    nul = data.find(b"\x00", start, limit)
+    if nul < 0:
+        raise module.DexError(f"unterminated string_data_item for string_idx {index}")
+    raw = bytes(data[start:nul])
+    return raw.decode("utf-8", errors="replace"), raw, nul + 1
+
+
+module._decode_mutf8 = regressed_decode
+with open(dex_path, "rb") as handle:
+    dex = handle.read()
+try:
+    module.parse_class_def_descriptors(dex)
+except module.DexError as exc:
+    print(f"DexError: {exc}")
+else:
+    print("NO ERROR: canonical MUTF-8 guard did not fire")
+PYUNIT
+canon_rc=0
+canon_output="$(python3 "$SUITE_TMP/unit_canonical.py" \
+  "$CHECKER" "$SUITE_TMP/mutf8-leading.dex" 2>&1)" || canon_rc=$?
+canon_needle="DexError: non-canonical MUTF-8 bytes for string_idx 0"
+if [ "$canon_rc" -eq 0 ] && printf '%s\n' "$canon_output" | grep -qF -- "$canon_needle"; then
+  pass_case "canonical MUTF-8 re-encode guard rejects a decoder regression (exit 0)"
+else
+  bad_case "canonical MUTF-8 guard must reject regressed decoder with '$canon_needle' (got exit $canon_rc)" "$canon_output"
 fi
 
 echo "----"
