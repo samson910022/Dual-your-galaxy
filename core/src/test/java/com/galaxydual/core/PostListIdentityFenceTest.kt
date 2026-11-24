@@ -208,7 +208,7 @@ class PostListIdentityFenceTest {
 
     @Test
     fun cloneVerifiedExpected_unknownAfterSend_serialFlipsDuringListing_returnsVerifyUnknown() {
-        // Timeout arm (DualRepository.kt:1325): the write reply is abandoned,
+        // cloneVerifiedExpected timeout arm: the write reply is abandoned,
         // so the read-only probe decides; the post-list fence still applies.
         val gateway = DriftGateway(writeTimedOut = true)
         val outcome = runSuspend {
@@ -236,7 +236,7 @@ class PostListIdentityFenceTest {
 
     @Test
     fun removeVerified_unknownAfterSend_serialFlipsDuringListing_returnsVerifyUnknown() {
-        // Timeout arm (DualRepository.kt:1451): a clean absent listing would
+        // removeVerified unknown-after-send arm: a clean absent listing would
         // otherwise be Success; the fence must turn it into VerifyUnknown.
         val gateway = DriftGateway(writeTimedOut = true, listContainsPackage = false)
         val outcome = runSuspend { DualRepository(gateway).removeVerified("com.example.chat") }
@@ -264,7 +264,7 @@ class PostListIdentityFenceTest {
 
     @Test
     fun removeVerifiedExpected_unknownAfterSend_serialFlipsDuringListing_returnsVerifyUnknown() {
-        // Timeout arm (DualRepository.kt:1648): same contract as clone's
+        // removeVerifiedExpected timeout arm: same contract as clone's
         // timeout arm; the absent listing alone must not become Success.
         val gateway = DriftGateway(writeTimedOut = true, listContainsPackage = false)
         val outcome = runSuspend {

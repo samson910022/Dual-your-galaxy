@@ -2656,43 +2656,51 @@ class InventorySelectionTest {
         val gw = FakeRepo()
         val clock = FakeClock()
         val vm = makeVm(gw, clock, backend.store())
-        await { vm.state.value.channelReady }
-        vm.setSourceCatalog(
-            listOf(
-                SourceAppEntry("com.example.chat", "Chat", 0, false),
-                SourceAppEntry("com.example.mail", "Mail", 0, false),
-            ),
-        )
-        vm.refresh()
-        await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
-        assertTrue(vm.state.value.selectedKeys.isEmpty())
-        // 快照 A 必須在 refresh 之後存，避免 refresh 自動補觸提前還原 A。
-        assertTrue(
-            backend.store().save(SELECTION_SOURCE_CATALOG, 95, setOf(chatA), 2000L, 15),
-        )
-        backend.blockLoad = true
-        vm.restoreSelection(95)
-        assertTrue(
-            backend.loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS),
-        )
-        // 關鍵差異：什麼都沒勾選，直接 clear（選取本來就空）。
-        vm.clearSelectionLocal()
-        assertTrue(vm.state.value.selectedKeys.isEmpty())
-        backend.loadRelease.countDown()
-        // persist(-1) 經 opMutex 排在 restore 之後：其完成即 restore 已完成。
-        vm.persistSelection(-1)
-        await { vm.state.value.msg.contains("no dual profile") }
-        assertEquals(
-            "#70: clear-while-empty must advance gen so the late restore aborts",
-            emptySet<String>(),
-            vm.state.value.selectedKeys,
-        )
-        assertEquals(0, gw.installCalls.size)
-        // 不燒 marker：放開 latch 後重試仍可還原 A。
-        backend.blockLoad = false
-        vm.restoreSelection(95)
-        await { chatA in vm.state.value.selectedKeys }
-        assertEquals(setOf(chatA), vm.state.value.selectedKeys)
+        try {
+            await { vm.state.value.channelReady }
+            vm.setSourceCatalog(
+                listOf(
+                    SourceAppEntry("com.example.chat", "Chat", 0, false),
+                    SourceAppEntry("com.example.mail", "Mail", 0, false),
+                ),
+            )
+            vm.refresh()
+            await { !vm.state.value.loading && vm.state.value.inventory.targetId == 95 }
+            assertTrue(vm.state.value.selectedKeys.isEmpty())
+            // 快照 A 必須在 refresh 之後存，避免 refresh 自動補觸提前還原 A。
+            assertTrue(
+                backend.store().save(SELECTION_SOURCE_CATALOG, 95, setOf(chatA), 2000L, 15),
+            )
+            backend.blockLoad = true
+            try {
+                vm.restoreSelection(95)
+                assertTrue(
+                    backend.loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                )
+                // 關鍵差異：什麼都沒勾選，直接 clear（選取本來就空）。
+                vm.clearSelectionLocal()
+                assertTrue(vm.state.value.selectedKeys.isEmpty())
+            } finally {
+                backend.loadRelease.countDown()
+            }
+            // persist(-1) 經 opMutex 排在 restore 之後：其完成即 restore 已完成。
+            vm.persistSelection(-1)
+            await { vm.state.value.msg.contains("no dual profile") }
+            assertEquals(
+                "#70: clear-while-empty must advance gen so the late restore aborts",
+                emptySet<String>(),
+                vm.state.value.selectedKeys,
+            )
+            assertEquals(0, gw.installCalls.size)
+            // 不燒 marker：放開 latch 後重試仍可還原 A。
+            backend.blockLoad = false
+            vm.restoreSelection(95)
+            await { chatA in vm.state.value.selectedKeys }
+            assertEquals(setOf(chatA), vm.state.value.selectedKeys)
+        } finally {
+            backend.blockLoad = false
+            backend.loadRelease.countDown()
+        }
     }
 
     // PR #88 F4 / issue #70：真實 UI 入口 setSourceCatalog 的自動補觸恢復必須
