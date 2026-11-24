@@ -27,8 +27,12 @@ class EffectivePolicyCache(
     // last successful snapshot across TTL expiry / invalidate / cooldown /
     // contention / deadline instead of falling back to seed. A DEAD or
     // BACKWARDS clock sample is the exception: freshness cannot be proven, so
-    // the sticky is discarded and the call fails closed (Unknown(emptySet()))
-    // — the cap is never widened by an untrusted clock.
+    // the call fails closed (Unknown(emptySet())) — the cap is never widened
+    // by an untrusted clock. Clock distrust also invalidates cached freshness
+    // (a healthy call must re-read before Good) and bumps a clock epoch that
+    // fences in-flight reads; version evidence (cached / high-water / cleared
+    // marker) is retained so legitimate same-version same-content recovery
+    // still works and no replay window opens.
     // Whitelist path uses false (fail-closed, zero behavior change); BBC path
     // uses a separate instance with true (see DualHook.bbcCache).
     private val stickyLastGood: Boolean = false,
@@ -86,13 +90,24 @@ class EffectivePolicyCache(
     // fresh read and may satisfy the expiry.
     private var generation = 0L
 
-    // Stage C (P2 single-flight): non-null while a leader read is in flight,
-    // holding the generation it claimed under. Guarded by [lock] (like
-    // [generation], never volatile-read on the hot path). A follower that
-    // observes non-null returns without calling reader (seed-only or a valid
-    // snapshot). Cleared by the leader's finally (generation-matched, so a
-    // stale leader never clears a successor) and by invalidate().
-    private var inFlightGen: Long? = null
+    // Stage C (P2 single-flight): non-null while a leader read is in flight.
+    // Guarded by [lock] (like [generation], never volatile-read on the hot
+    // path). A follower that observes non-null returns without calling reader
+    // (seed-only or a valid snapshot). A claim takes a fresh [flightSeq] TOKEN
+    // (not a generation number), captured by the leader as token0; only the
+    // owner's finally releases it (token-matched), and a clock-distrust fault
+    // clears it too. This keeps an old leader from clearing a successor's
+    // flight after recovery. [generation] remains the separate invalidate()
+    // loser-drop fence.
+    private var flightSeq = 0L
+    private var inFlightToken: Long? = null
+
+    // Clock-distrust fence (R3). Bumped ONLY by failClosedUntrustedClockLocked()
+    // — never by TTL expiry or invalidate(). A read captures epoch0 at claim;
+    // a distrust during its flight bumps the epoch, so the read is a loser on
+    // completion and cannot publish stale/unproven state after recovery even
+    // though [generation] did not change.
+    private var clockEpoch = 0L
 
     // Follower grace (Phase3 herd fix, Phase7 budget-aware): a follower that
     // arrives while a leader read is in flight waits briefly on [lock], then
@@ -272,6 +287,12 @@ class EffectivePolicyCache(
     // in the same critical section is deliberate: two threads that sample at
     // different times but take the lock in the opposite order cannot make a
     // healthy interleaving look like clock skew.
+    //
+    // R4: EVERY cached/sticky return in getBbc() goes through
+    // probeCachedLocked(), which takes a FRESH trusted sample under [lock] at
+    // that decision point (never a stale now0) before re-checking TTL and
+    // serving cached/sticky. This is the single revalidation seam for all
+    // short-circuit arms of getBbc().
     private fun sampleClockOrNull(): Long? = try {
         nowMs()
     } catch (_: Throwable) {
@@ -290,16 +311,33 @@ class EffectivePolicyCache(
         sampleTrustedClockLocked()
     }
 
-    // The ONE fail-closed route for an untrusted clock at any point in
-    // getBbc(): the entry catch, a mid-read skew, or a dead completion sample.
-    // Drops ONLY the sticky snapshot (option (a): cached freshness is kept, so
-    // a later healthy call may still serve a genuinely valid cached value
-    // within TTL — one untrusted sample does not poison future healthy calls).
-    // Counts one sticky expiry (iff a sticky existed), one sticky fallback and
-    // one Unknown; emits the clock-free diagnostic. No reader, version gate,
-    // valid/cached/lastRefreshMs or failure-cooldown state is touched, and a
-    // single call returns immediately so no arm can double-count.
+    // The ONE fail-closed route / linearization point for an untrusted clock
+    // at any point in getBbc(): entry catch, a mid-read skew, a dead completion
+    // sample, or a fresh probe at a cached/sticky return. Clock distrust means
+    // FRESHNESS is unprovable, so it invalidates freshness state as a unit:
+    //   - drop cached validity + cooldown (valid=false, invalidated=true,
+    //     lastFailureMs=null) so a healthy call MUST re-read before Good again;
+    //   - discard the sticky snapshot (only cap expiry may shrink otherwise);
+    //   - bump [clockEpoch] so an in-flight read that started before the fault
+    //     loses (gen0/epoch0 fence) and cannot publish after recovery;
+    //   - release the flight claim and wake followers so a successor can lead.
+    // Canonical / version EVIDENCE is deliberately retained: cached,
+    // lastBbcSeenVersion and lastBbcClearedVersion are UNCHANGED, so a later
+    // legitimate same-version same-content read is still accepted and no old
+    // version/replay window is reopened. [generation] is untouched (only an
+    // explicit invalidate() bumps it).
+    // Exactly-once accounting: one sticky expiry (iff a sticky existed), one
+    // sticky fallback, one Unknown, one once-per-process clock-free log. No
+    // reader or version gate runs; a single call returns immediately so no arm
+    // can double-count.
+    // MUST be called while holding [lock].
     private fun failClosedUntrustedClockLocked(): BbcPolicy {
+        clockEpoch++
+        valid = false
+        invalidated = true
+        lastFailureMs = null
+        inFlightToken = null
+        notifyFollowers()
         val hadSticky = lastGoodSticky != null
         if (hadSticky) {
             lastGoodSticky = null
@@ -320,6 +358,44 @@ class EffectivePolicyCache(
         // bypass), so this path uses its own CLOCK-FREE diagnostic line.
         if (hadSticky) noteUntrustedClockDiscard() else noteBbcFallback("clock-no-sticky")
         return BbcPolicy.Unknown(emptySet())
+    }
+
+    // R4: a single under-lock probe for every cached/sticky return decision in
+    // getBbc(). Untrusted -> caller routes ONCE through
+    // failClosedUntrustedClockLocked(); Hit -> an already-accounted policy to
+    // return; Miss(now) -> the caller may use the FRESH trusted `now` for an
+    // elapsed/deadline/cooldown decision (never a stale entry sample).
+    // With a non-null `cause`, the probe also makes the sticky decision, so a
+    // sticky or seed-only Unknown is returned with exactly one accounting.
+    private sealed interface CachedProbe {
+        data object Untrusted : CachedProbe
+        data class Hit(val policy: BbcPolicy) : CachedProbe
+        data class Miss(val now: Long) : CachedProbe
+    }
+
+    private fun probeCachedLocked(cause: String? = null): CachedProbe {
+        val now = sampleTrustedClockLocked() ?: return CachedProbe.Untrusted
+        // TTL re-check with the FRESH sample (no counters/log/epoch here —
+        // plain TTL expiry is not clock distrust). getBbc's fallback arms
+        // prefer sticky regardless of `invalidated`.
+        if (valid && (now - lastRefreshMs >= maxCacheAgeMs || now - lastRefreshMs < 0L)) {
+            valid = false
+            invalidated = true
+        }
+        if (valid) {
+            return CachedProbe.Hit(
+                if (cached.isEmpty()) {
+                    BbcPolicy.Cleared(lastBbcClearedVersion)
+                } else {
+                    BbcPolicy.Good(cached)
+                },
+            )
+        }
+        if (cause != null) {
+            val sticky = stickyIfValidLocked(now)
+            return CachedProbe.Hit(unknownWithStickyLocked(sticky, cause))
+        }
+        return CachedProbe.Miss(now)
     }
 
     // Uniform Unknown accounting for every NON-clock fallback arm of getBbc:
@@ -541,6 +617,7 @@ class EffectivePolicyCache(
             return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
         }
         val gen0: Long
+        val token0: Long
         var isFollower = false
         synchronized(lock) {
             // TTL expiry: fail closed to the seed on the next read (invalidated
@@ -600,17 +677,22 @@ class EffectivePolicyCache(
             // they take the grace path below (sleep outside the lock, then
             // re-check valid) so a just-committed leader value is observed.
             // Only the leader proceeds to the IO below.
-            if (inFlightGen != null) {
+            if (inFlightToken != null) {
                 // Re-check valid under the same guard before leaving (a peer
                 // may have committed between the valid check above and here).
                 if (valid) return cached
                 isFollower = true
                 // Fall through to the grace wait outside the lock.
-                // gen0 unused for followers; assign a placeholder to satisfy
+                // gen0/token0 unused for followers; placeholders satisfy
                 // definite assignment (never read on this path).
                 gen0 = -1L
+                token0 = -1L
             } else {
-                inFlightGen = generation
+                // Claim by a fresh token, not by generation: only this leader
+                // may release the flight, even if a successor claims later.
+                flightSeq++
+                token0 = flightSeq
+                inFlightToken = token0
                 gen0 = generation
             }
         }
@@ -712,7 +794,7 @@ class EffectivePolicyCache(
                 } catch (_: Throwable) {
                     0L
                 }
-                if (budget2 > 0L && !valid && inFlightGen != null) {
+                if (budget2 > 0L && !valid && inFlightToken != null) {
                     // TT-P3-1: count the hit only once we are parked (or about
                     // to park) inside the lock — a pre-park preemption must not
                     // yield a false hits==1 for a follower that never waits.
@@ -854,8 +936,8 @@ class EffectivePolicyCache(
                     noteSeedOnlyFallback("contention")
                     return PolicySource.effective(seed, emptySet(), nonEmptyPolicyGateOpen)
                 } finally {
-                    if (inFlightGen == gen0) {
-                        inFlightGen = null
+                    if (inFlightToken == token0) {
+                        inFlightToken = null
                         notifyFollowers()
                     }
                 }
@@ -981,11 +1063,11 @@ class EffectivePolicyCache(
                 }
             } finally {
                 // Stage C: release the single-flight claim, but only if it is
-                // still ours -- an invalidate() (which clears inFlightGen) or
-                // a successor leader must never be cleared by a stale leader.
+                // still OUR token -- an invalidate(), a clock distrust, or a
+                // successor leader must never be cleared by a stale leader.
                 // Wake all waiting followers immediately via notifyAll().
-                if (inFlightGen == gen0) {
-                    inFlightGen = null
+                if (inFlightToken == token0) {
+                    inFlightToken = null
                     notifyFollowers()
                 }
             }
@@ -1007,8 +1089,12 @@ class EffectivePolicyCache(
     // Only Good(non-empty) and Cleared(empty+version) update the sticky
     // snapshot; Unknown never shrinks. TTL expiry / invalidate never discard
     // sticky (only BBC_STICKY_MAX_AGE_MS expires it, counted + throttled).
-    // A backwards sample (clock skew) or an unreadable clock fails closed and
-    // discards sticky: freshness is then unprovable, so the cap is not widened.
+    // A backwards sample (clock skew) or an unreadable clock fails closed:
+    // freshness is unprovable, so it invalidates cached freshness, discards
+    // sticky (cap never widened), and bumps the clock epoch that fences any
+    // in-flight read from publishing after recovery. Version evidence is kept.
+    // Every cached/sticky return goes through probeCachedLocked() with a FRESH
+    // trusted sample (R4); now0 only anchors elapsed/deadline arithmetic.
     // Gate-closed short-circuits to Cleared(-1) with zero IPC/state (BBC
     // injection disabled => empty, no Unknown log). N06(b): the gate is a LAZY
     // provider evaluated after now0 so a slow read is charged to the same
@@ -1045,49 +1131,48 @@ class EffectivePolicyCache(
         // still returns the exact Cleared(-1) sentinel with ZERO reader calls.
         if (!bbcGateOpen()) return BbcPolicy.Cleared(-1L)
         val gen0: Long
+        val epoch0: Long
+        val token0: Long
         var isFollower = false
         synchronized(lock) {
-            if (valid && (now0 - lastRefreshMs >= maxCacheAgeMs || now0 - lastRefreshMs < 0L)) {
-                valid = false
-                // NOTE: sticky intentionally NOT cleared here (unlike the
-                // whitelist fail-closed path which sets invalidated=true to
-                // suppress resurrection). invalidated is still set for the
-                // shared cooldown bookkeeping, but getBbc() fallback arms
-                // prefer sticky regardless of it.
-                invalidated = true
-            }
-            if (valid) {
-                return if (cached.isEmpty()) {
-                    BbcPolicy.Cleared(lastBbcClearedVersion)
-                } else {
-                    BbcPolicy.Good(cached)
-                }
-            }
-            // Resample immediately before the cooldown/sticky decision: a clock
-            // that died or skewed after the entry sample must fail closed here
-            // rather than reuse a stale sample to serve sticky.
-            val nowC = sampleTrustedClockLocked() ?: return failClosedUntrustedClockLocked()
-            val lf = lastFailureMs
-            if (lf != null && nowC - lf < failureCooldownMs && nowC - lf >= 0L) {
-                val sticky = stickyIfValidLocked(nowC)
-                return if (sticky != null) {
-                    unknownWithStickyLocked(sticky, "cooldown")
-                } else {
-                    unknownWithStickyLocked(null, "cooldown-no-sticky")
-                }
-            }
-            if (inFlightGen != null) {
-                if (valid) {
-                    return if (cached.isEmpty()) {
-                        BbcPolicy.Cleared(lastBbcClearedVersion)
-                    } else {
-                        BbcPolicy.Good(cached)
+            // R4: the MAIN cached-return site. A FRESH trusted sample re-checks
+            // TTL and validity before any cached Good/Cleared is served; now0
+            // is only an elapsed/deadline origin, never TTL/cap evidence.
+            // The same probe's fresh now drives the cooldown decision below.
+            when (val probe = probeCachedLocked()) {
+                CachedProbe.Untrusted -> return failClosedUntrustedClockLocked()
+                is CachedProbe.Hit -> return probe.policy
+                is CachedProbe.Miss -> {
+                    val lf = lastFailureMs
+                    if (lf != null && probe.now - lf < failureCooldownMs && probe.now - lf >= 0L) {
+                        // Cooldown is itself a cached/sticky return: probe once
+                        // more with a cause so sticky + Unknown are accounted
+                        // exactly once (no second count from the first probe).
+                        when (val cp = probeCachedLocked("cooldown")) {
+                            CachedProbe.Untrusted -> return failClosedUntrustedClockLocked()
+                            is CachedProbe.Hit -> return cp.policy
+                            // A cause always yields a Hit; defensive only.
+                            is CachedProbe.Miss -> return unknownWithStickyLocked(null, "cooldown")
+                        }
                     }
                 }
+            }
+            epoch0 = clockEpoch
+            if (inFlightToken != null) {
+                // The single probe above is the in-flight `if (valid) return`
+                // site too: same critical section, same fresh trusted sample,
+                // so no second probe (and no extra sample) is needed here.
                 isFollower = true
                 gen0 = -1L
+                token0 = -1L
             } else {
-                inFlightGen = generation
+                // R3: claim by a unique token and capture BOTH fences. A clock
+                // distrust during this flight bumps clockEpoch and clears the
+                // token; a later invalidate bumps generation. Either makes this
+                // read a loser on completion.
+                flightSeq++
+                token0 = flightSeq
+                inFlightToken = token0
                 gen0 = generation
             }
         }
@@ -1114,19 +1199,14 @@ class EffectivePolicyCache(
             }
             if (remainingGrace <= 0L) {
                 synchronized(lock) {
-                    if (valid) {
-                        return if (cached.isEmpty()) {
-                            BbcPolicy.Cleared(lastBbcClearedVersion)
-                        } else {
-                            BbcPolicy.Good(cached)
-                        }
+                    // R4: cached OR sticky return — one fresh under-lock probe
+                    // decides both, with exactly one Unknown accounting.
+                    when (val probe = probeCachedLocked("grace-expired")) {
+                        CachedProbe.Untrusted -> return failClosedUntrustedClockLocked()
+                        is CachedProbe.Hit -> return probe.policy
+                        // A cause always yields a Hit; defensive only.
+                        is CachedProbe.Miss -> return unknownWithStickyLocked(null, "grace-expired")
                     }
-                    // Fresh trusted sample for the sticky decision (no reuse of
-                    // the pre-wait/deadline sample).
-                    val nowG = sampleTrustedClockLocked()
-                        ?: return failClosedUntrustedClockLocked()
-                    val sticky = stickyIfValidLocked(nowG)
-                    return unknownWithStickyLocked(sticky, "grace-expired")
                 }
             }
             synchronized(lock) {
@@ -1146,7 +1226,7 @@ class EffectivePolicyCache(
                 } catch (_: Throwable) {
                     0L
                 }
-                if (budget2 > 0L && !valid && inFlightGen != null) {
+                if (budget2 > 0L && !valid && inFlightToken != null) {
                     try {
                         followerGraceHits.incrementAndGet()
                     } catch (_: Throwable) {
@@ -1162,20 +1242,16 @@ class EffectivePolicyCache(
                         }
                     }
                 }
-                if (valid) {
-                    return if (cached.isEmpty()) {
-                        BbcPolicy.Cleared(lastBbcClearedVersion)
-                    } else {
-                        BbcPolicy.Good(cached)
-                    }
+                // R4: this is the POST-WAIT probe — the only fresh sample after
+                // waitGrace. now2 was taken before parking and must NEVER be
+                // used for a freshness/cap decision. A clock that died or
+                // crossed the cap during the wait fails closed here.
+                when (val probe = probeCachedLocked("grace-expired")) {
+                    CachedProbe.Untrusted -> return failClosedUntrustedClockLocked()
+                    is CachedProbe.Hit -> return probe.policy
+                    // A cause always yields a Hit; defensive only.
+                    is CachedProbe.Miss -> return unknownWithStickyLocked(null, "grace-expired")
                 }
-                // Resample AFTER the grace wait: now2 was taken before parking
-                // and is stale for a cap/skew decision if the clock moved (or
-                // died) while the follower was waiting.
-                val nowAfterWait = sampleTrustedClockLocked()
-                    ?: return failClosedUntrustedClockLocked()
-                val sticky = stickyIfValidLocked(nowAfterWait)
-                return unknownWithStickyLocked(sticky, "grace-expired")
             }
         }
         var wasContention = false
@@ -1195,27 +1271,22 @@ class EffectivePolicyCache(
         if (wasContention) {
             synchronized(lock) {
                 try {
-                    if (valid) {
-                        return if (cached.isEmpty()) {
-                            BbcPolicy.Cleared(lastBbcClearedVersion)
-                        } else {
-                            BbcPolicy.Good(cached)
-                        }
+                    // R4: fresh under-lock probe covers the cached Good/Cleared
+                    // hit and the sticky/Unknown fallback after a slow contended
+                    // reader. The epoch fence joins the generation loser-drop.
+                    val loser = gen0 != generation || epoch0 != clockEpoch
+                    when (val probe = probeCachedLocked(if (loser) "invalidated-discard" else "contention")) {
+                        CachedProbe.Untrusted -> return failClosedUntrustedClockLocked()
+                        is CachedProbe.Hit -> return probe.policy
+                        // A cause always yields a Hit; defensive only.
+                        is CachedProbe.Miss -> return unknownWithStickyLocked(
+                            null,
+                            if (loser) "invalidated-discard" else "contention",
+                        )
                     }
-                    // Resample under the commit lock: the pre-read now0 is
-                    // stale after a slow contended reader, and an untrusted
-                    // clock here must fail closed instead of serving sticky.
-                    val nowC = sampleTrustedClockLocked()
-                        ?: return failClosedUntrustedClockLocked()
-                    // Sticky survives contention + invalidate-during-IO.
-                    val sticky = stickyIfValidLocked(nowC)
-                    return unknownWithStickyLocked(
-                        sticky,
-                        if (gen0 != generation) "invalidated-discard" else "contention",
-                    )
                 } finally {
-                    if (inFlightGen == gen0) {
-                        inFlightGen = null
+                    if (inFlightToken == token0) {
+                        inFlightToken = null
                         notifyFollowers()
                     }
                 }
@@ -1262,30 +1333,25 @@ class EffectivePolicyCache(
         }
         synchronized(lock) {
             try {
-                // Completion sample: trusted or null. This is taken INSIDE the
-                // commit critical section so an unreadable / skewed clock here
-                // fails closed BEFORE any valid/cached/lastRefreshMs/sticky/
-                // version publish from this read. The finally below still
-                // releases the single-flight claim on this early return.
-                val now1 = sampleTrustedClockLocked()
-                    ?: return failClosedUntrustedClockLocked()
-                if (gen0 != generation) {
-                    if (valid) {
-                        return if (cached.isEmpty()) {
-                            BbcPolicy.Cleared(lastBbcClearedVersion)
-                        } else {
-                            BbcPolicy.Good(cached)
-                        }
-                    }
-                    val sticky = stickyIfValidLocked(now1)
-                    return unknownWithStickyLocked(sticky, "invalidated-discard")
+                // R4/R3: ONE fresh under-lock probe serves as the completion
+                // sample, the cached Good/Cleared re-check, and (with a cause)
+                // the loser-drop sticky return. An untrusted clock here fails
+                // closed BEFORE any valid/cached/lastRefreshMs/sticky/version
+                // publish from this read. The clock epoch joins generation in
+                // the loser fence: a read that started before a clock fault
+                // cannot publish after recovery. The finally below still
+                // releases the single-flight claim on an early return.
+                val loser = gen0 != generation || epoch0 != clockEpoch
+                val probe = probeCachedLocked(if (loser) "invalidated-discard" else null)
+                if (probe is CachedProbe.Untrusted) return failClosedUntrustedClockLocked()
+                if (probe is CachedProbe.Hit) return probe.policy
+                val now1 = when (probe) {
+                    is CachedProbe.Miss -> probe.now
+                    else -> return failClosedUntrustedClockLocked() // unreachable
                 }
-                if (valid) {
-                    return if (cached.isEmpty()) {
-                        BbcPolicy.Cleared(lastBbcClearedVersion)
-                    } else {
-                        BbcPolicy.Good(cached)
-                    }
+                if (loser) {
+                    // Miss with a cause is unreachable; defensive fail-closed.
+                    return unknownWithStickyLocked(null, "invalidated-discard")
                 }
                 if (!unknownRead && mergeOk && merged != null) {
                     // Security MEDIUM: Cleared monotonicity gate (strictly
@@ -1390,8 +1456,8 @@ class EffectivePolicyCache(
                     return unknownWithStickyLocked(sticky, "failed-read")
                 }
             } finally {
-                if (inFlightGen == gen0) {
-                    inFlightGen = null
+                if (inFlightToken == token0) {
+                    inFlightToken = null
                     notifyFollowers()
                 }
             }
@@ -1409,9 +1475,10 @@ class EffectivePolicyCache(
         failureLogged = false
         // Stage C: release any in-flight single-flight claim so the next miss
         // elects a fresh leader under the new generation (the stale leader
-        // discards via the gen0 != generation loser-drop above).
+        // discards via the gen0 != generation loser-drop above). invalidate()
+        // does NOT bump clockEpoch — that fence is clock distrust only.
         // Wake all waiting followers immediately via notifyAll().
-        inFlightGen = null
+        inFlightToken = null
         generation++
         notifyFollowers()
     }
