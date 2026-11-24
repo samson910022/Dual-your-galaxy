@@ -101,7 +101,7 @@ class RiskDisclosureStringTest {
             "已安裝",
             "政策已存",
             "BBC ON/OFF",
-            "不代表 Hook 在生效前已取得你的同意",
+            "仍不是 Hook 生效前同意的證明",
         )
         for (token in required) assertTrue("zh full missing $token", zh.contains(token))
         assertTrue("zh full must name BBC_AVAILABLE_APPS_INJECTION", zh.contains("BBC_AVAILABLE_APPS_INJECTION"))
@@ -118,8 +118,8 @@ class RiskDisclosureStringTest {
             "other profiles",
             "Keystore",
             "BBC ON/OFF",
-            "BEFORE this App",
-            "do NOT mean",
+            "New installs keep the Hook effect OFF",
+            "not proof of hook consent before activation",
             "consent",
         )
         for (token in required) assertTrue("en full missing $token", en.contains(token))
@@ -135,8 +135,9 @@ class RiskDisclosureStringTest {
         assertTrue("zh must state 無法保證資料安全", zh.contains("無法保證資料安全"))
         assertTrue("en must state data safety cannot be guaranteed", en.contains("data safety cannot be guaranteed"))
 
-        // 保證資料安全 是 無法保證資料安全 的子字串；先移除強制否定句再查不安全宣稱。
-        val zhWithoutRequiredNegation = zh.replace("無法保證資料安全", "")
+        // 保證資料安全 是 無法保證資料安全／不保證資料安全 的子字串；
+        // 先移除這兩個強制否定句再查不安全宣稱。
+        val zhWithoutRequiredNegation = zh.replace("無法保證資料安全", "").replace("不保證資料安全", "")
         for (claim in listOf("零風險", "保證可還原", "保證資料安全", "完全安全", "絕對安全", "安全無虞")) {
             assertFalse("zh must not claim $claim", zhWithoutRequiredNegation.contains(claim))
         }

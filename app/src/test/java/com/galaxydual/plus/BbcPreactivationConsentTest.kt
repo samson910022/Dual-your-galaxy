@@ -3,7 +3,7 @@
 // PR5 Phase B2 (#80): BBC toggle 首次開啟的 pre-activation opt-in consent。
 // - 純決策 helper（framework-free，JVM 可測）：ON 且未 opt-in 才問；opt-in 寫入
 //   Confirmed 才繼續 onToggle，Unknown 绝不繼續。
-// - source-shape 鎖定 MainActivity 接線：取消零寫入並回復 OFF、show() 失敗的
+// - source-shape 鎖定 MainActivity 接線：取消零寫入並回復最後已知狀態、show() 失敗的
 //   catch 亦 fail-closed 走 onCancel（且不寫 opt-in／不 onToggle）、接受才寫 opt-in、
 //   已 opt-in 直接 onToggle、對話框 handle 追蹤並在 onDestroy 釋放。
 // - 三語系字串鎖定：文案如實說明 opt-in 不是 Samsung 冷啟動刪除防護（#75），
@@ -247,5 +247,144 @@ class BbcPreactivationConsentTest {
         assertTrue("zh copy must disclaim guarantees", zh.contains("不保證"))
         assertTrue("en copy must disclaim guarantees",
             en.contains("not device-verified") && en.contains("no general effectiveness"))
+    }
+
+    // ---- honest-copy contract (PR #90 Phase D / P2-07) ----
+    //
+    // These are JVM resource-content checks that parse the ACTUAL strings.xml
+    // values (no device/runtime reachability is claimed here, nor source-shape
+    // pinning). They fail if any locale reintroduces the old fail-open /
+    // confirmed-off / "cancel means OFF" claims.
+
+    private val honestCopyKeys = listOf(
+        "risk_details_full",
+        "settings_bbc_preactivation_write_failed",
+        "settings_bbc_preactivation_dialog_message",
+    )
+
+    private fun honestCopyMap(locale: String): Map<String, String> {
+        val map = stringMap(locale)
+        for (key in honestCopyKeys) {
+            assertTrue("$locale missing honest-copy key $key", map.containsKey(key))
+            assertTrue("$locale empty honest-copy key $key", map.getValue(key).isNotBlank())
+        }
+        return map
+    }
+
+    @Test
+    fun riskDetailsInAllLocalesNoLongerClaimsCompileTimeDefaultOn() {
+        val maps = locales.associateWith(::honestCopyMap)
+        val banned = listOf(
+            "預先 Hook 的現實限制",
+            "BBC_AVAILABLE_APPS_INJECTION 預設為 true",
+            "須另行設計",
+            "可能早於本 App 首次風險警告",
+            "Pre-activation Hook limitation",
+            "defaults to true",
+            "would require a separate design",
+            "take effect BEFORE this App",
+        )
+        for (locale in locales) {
+            val copy = maps.getValue(locale).getValue("risk_details_full")
+            for (phrase in banned) {
+                assertFalse("$locale risk_details_full must not claim '$phrase'", copy.contains(phrase))
+            }
+            assertTrue("$locale risk_details_full must keep the #75 caveat", copy.contains("#75"))
+            if (locale == "values-en") {
+                assertTrue("en risk copy must keep the no-data-safety caveat",
+                    copy.contains("data safety cannot be guaranteed"))
+                assertTrue("en risk copy must describe fail-closed reads", copy.contains("fail closed"))
+            } else {
+                assertTrue("$locale risk copy must keep the no-data-safety caveat",
+                    copy.contains("無法保證資料安全"))
+                assertTrue("$locale risk copy must describe fail-closed reads", copy.contains("fail-closed"))
+            }
+        }
+    }
+
+    @Test
+    fun consentWriteFailureCopyReportsUnknownNotConfirmedOff() {
+        val maps = locales.associateWith(::honestCopyMap)
+        val banned = listOf("未持久化", "效應未啟用", "was not persisted", "was not enabled")
+        for (locale in locales) {
+            val copy = maps.getValue(locale).getValue("settings_bbc_preactivation_write_failed")
+            for (phrase in banned) {
+                assertFalse("$locale write-failed copy must not claim '$phrase'", copy.contains(phrase))
+            }
+            // The UNKNOWN state must be stated explicitly. A retry/re-verify
+            // instruction is only supplementary evidence, never the sole
+            // UNKNOWN marker (old honest-looking copy also mentioned retry).
+            val mandatoryUnknownMarkers = if (locale == "values-en") {
+                listOf("UNKNOWN")
+            } else {
+                listOf("結果未知", "未知")
+            }
+            assertTrue("$locale write-failed copy must state UNKNOWN explicitly",
+                mandatoryUnknownMarkers.any(copy::contains))
+            val retryMarkers = if (locale == "values-en") {
+                listOf("retry", "re-verify", "hook-process restart")
+            } else {
+                listOf("重試", "重新核對", "重啟 Hook 行程")
+            }
+            assertTrue("$locale write-failed copy must also offer a retry/re-verify path",
+                retryMarkers.any(copy::contains))
+            assertTrue("$locale write-failed copy must say no further write was performed",
+                if (locale == "values-en") copy.contains("no further write was performed")
+                else copy.contains("本次未再進行其他寫入"))
+            assertTrue("$locale write-failed copy must keep the cold-start guard disclaimer",
+                if (locale == "values-en") copy.contains("NOT a Samsung cold-start deletion guard")
+                else copy.contains("不是 Samsung 冷啟動刪除防護"))
+        }
+    }
+
+    @Test
+    fun consentDialogCopyNeverClaimsCancelTurnsEffectOff() {
+        val maps = locales.associateWith(::honestCopyMap)
+        val banned = listOf("取消則維持關閉", "leaves the effect OFF")
+        for (locale in locales) {
+            val copy = maps.getValue(locale).getValue("settings_bbc_preactivation_dialog_message")
+            for (phrase in banned) {
+                assertFalse("$locale dialog copy must not claim '$phrase'", copy.contains(phrase))
+            }
+            assertTrue("$locale dialog copy must describe the two-phase grant/enable flow",
+                if (locale == "values-en") copy.contains("two phases") else copy.contains("兩階段"))
+            assertTrue("$locale dialog copy must say the UI returns to its last known state",
+                if (locale == "values-en") copy.contains("last known state") else copy.contains("最後已知狀態"))
+            assertTrue("$locale dialog copy must not promise the effect is off",
+                if (locale == "values-en") copy.contains("does NOT prove the Hook effect is off")
+                else copy.contains("不證明 Hook 效應已關閉"))
+            assertTrue("$locale dialog copy must keep the #75 / cold-start caveat",
+                copy.contains("#75") && (if (locale == "values-en") copy.contains("cold-start")
+                else copy.contains("冷啟動")))
+        }
+    }
+
+    @Test
+    fun consentDialogNegativeButtonNeverClaimsCancelMeansOff() {
+        // MainActivity wires this key to setNegativeButton(...) — the cancel path
+        // is zero writes and restores the last known state, NOT necessarily OFF.
+        val negativeKey = "settings_bbc_preactivation_dialog_negative"
+        val banned = listOf("維持關閉", "stay OFF")
+        for (locale in locales) {
+            val map = stringMap(locale)
+            assertTrue("$locale missing $negativeKey", map.containsKey(negativeKey))
+            val label = map.getValue(negativeKey)
+            assertTrue("$locale empty $negativeKey", label.isNotBlank())
+            for (phrase in banned) {
+                assertFalse("$locale $negativeKey must not claim '$phrase'", label.contains(phrase))
+            }
+            assertTrue("$locale $negativeKey must describe the last known state",
+                if (locale == "values-en") label.contains("last known state")
+                else label.contains("最後已知狀態"))
+        }
+    }
+
+    @Test
+    fun honestCopyKeysAreByteIdenticalBetweenHantAndDefault() {
+        assertEquals(
+            "Hant/default parity for the edited resource keys",
+            stringMap("values").filterKeys { it in honestCopyKeys },
+            stringMap("values-b+zh+Hant").filterKeys { it in honestCopyKeys },
+        )
     }
 }
