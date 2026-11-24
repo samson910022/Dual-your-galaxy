@@ -36,13 +36,15 @@ object PolicySource {
     // hook cache 60s / failure-cooldown 5s).
     const val NON_EMPTY_POLICY_EFFECTIVE_GATE: Boolean = false
 
-    // BBC 注入器效應開關（2026-11-17 裝置實機驗證後預設開）：只放寬 BBC 產生的
-    // 「Dual Messenger 可用的應用程式」清單（union-only append，fail-closed），
-    // 不影響 Stage-1 白名單查詢／system_server／<clinit> 路徑（封緘不變）。
-    // 這是 COMPILE-TIME DEFAULT；可在執行期由 dual_policy 的
-    // POLICY_KEY_BBC_INJECTION_ENABLED 覆蓋（Absent/讀取失敗 => 預設 true，
-    // 與此常數同值；false 才關閉 BBC 合併）。兩者 AND，設 false 即 BBC 零合併，
-    // 與 Stage-1 閘相互獨立（docs/HOOK.md §1.3a／§1.4）。
+    // BBC 注入器效應開關：只放寬 BBC 產生的「Dual Messenger 可用的應用程式」
+    // 清單（union-only append，fail-closed），不影響 Stage-1 白名單查詢／
+    // system_server／<clinit> 路徑（封緘不變）。
+    // PR5 Phase A (#80)：此 compile-time 常數**不再作為「預設開」的依據**；它只
+    // 保留為最終 AND 的緊急開關（設 false 即 BBC 零合併）。真正的生效前 opt-in
+    // 由 dual_policy/bbc_preactivation_optin（新安裝 fail-closed）與既有安裝的
+    // 安全遷移規則決定，見 BbcPreactivationGate.kt 與
+    // docs/ADR_bbc_preactivation_optin.md。與 Stage-1 閘相互獨立
+    // （docs/HOOK.md §1.3a／§1.4）。
     // 注意：關閉不是 Samsung 冷啟動刪除的防護（DELETE 早於 BBC 回調，issue #75）。
     const val BBC_AVAILABLE_APPS_INJECTION: Boolean = true
 
@@ -61,13 +63,31 @@ object PolicySource {
     const val POLICY_KEY_EXTRA_VERSION = "extra_whitelist_version"
     // PR #74 G1: persisted owner-controlled BBC injection opt-out (same
     // dual_policy group). App writes a boolean via HookPolicyStore; the hook
-    // reads it on the BBC path and ANDs it with BBC_AVAILABLE_APPS_INJECTION.
-    // DEFAULT TRUE (key absent or read failure) to preserve shipped behavior.
+    // reads it on the BBC path and ANDs it with the pre-activation gate and
+    // BBC_AVAILABLE_APPS_INJECTION. FALSE is always an explicit opt-out.
+    // PR5 Phase A (#80): this key is NO LONGER the "default on" source — an
+    // absent key still maps to true via its adapter defValue (no explicit
+    // OFF), but a READ FAILURE (null) now FAILS CLOSED in the hybrid gate.
+    // The real "off until opted in" comes from the new keys below.
     // This is a UI convenience, NOT a proven guard against Samsung's
     // system-side cold-start deletion (DELETE precedes the BBC callback;
     // issue #75 / docs/BBC_COLDSTART_DELETE_INCIDENT.md). Renaming abandons
     // persisted preference (breaking change; review required).
     const val POLICY_KEY_BBC_INJECTION_ENABLED = "bbc_injection_enabled"
+
+    // PR5 Phase A (#80): the real pre-activation opt-in — BREAKING-CHANGE-
+    // SENSITIVE keys. The hook treats an absent/unreadable
+    // POLICY_KEY_BBC_PREACTIVATION_OPTIN as OFF for new installs; the app writes
+    // true ONLY AFTER an explicit user pre-activation consent. For existing
+    // installs, POLICY_KEY_BBC_LEGACY_MIGRATED records the one-time safe
+    // migration of a non-empty legacy policy draft (legacy opted-in => effect
+    // stays ON; the draft itself is NEVER deleted/cleared/rewritten). Both live
+    // in the same dual_policy remote-prefs group. RENAMING EITHER KEY ABANDONS
+    // PERSISTED CONSENT / MIGRATION STATE (breaking change; review required).
+    // Full decision table: BbcPreactivationGate.kt and
+    // docs/ADR_bbc_preactivation_optin.md.
+    const val POLICY_KEY_BBC_PREACTIVATION_OPTIN = "bbc_preactivation_optin"
+    const val POLICY_KEY_BBC_LEGACY_MIGRATED = "bbc_legacy_migrated"
 
     // Pluggable remote-policy reader (Stage H2-P1 seam; Phase 4 hardened).
     //

@@ -675,6 +675,15 @@ class HookPolicyStore(
     // polluted with the new value even though the commit did not persist.
     private val loadBbcEnabledRaw: () -> Boolean? = { null },
     private val saveBbcEnabledRaw: (Boolean) -> Boolean = { false },
+    // PR5 Phase B2 (#80): pre-activation consent (dual_policy/bbc_preactivation_optin).
+    // Deliberately a SEPARATE single-key boolean seam from bbc_injection_enabled:
+    // the hook reads it as the real "new install = OFF until consent" gate.
+    // Absent/failed read => null => NOT opted in (fail-closed, unlike the legacy
+    // default-true BBC opt-out). Failed write => false => BbcWriteOutcome.Unknown;
+    // the optimistic local mMap may be polluted, so a re-read is not authority.
+    // Direct-injected test backends default to absent / failed write.
+    private val loadBbcPreactivationOptinRaw: () -> Boolean? = { null },
+    private val saveBbcPreactivationOptinRaw: (Boolean) -> Boolean = { false },
 ) {
 
     // E07 (PR #74 R4): app-process-local, one-shot signal that a SUCCESSFUL
@@ -746,6 +755,40 @@ class HookPolicyStore(
     // cancel the shared actor or an in-flight commit.
     internal fun setBbcInjectionEnabledDetailed(enabled: Boolean): BbcWriteOutcome = try {
         if (saveBbcEnabledRaw(enabled)) {
+            BbcWriteOutcome.Confirmed(enabled)
+        } else {
+            BbcWriteOutcome.Unknown
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcWriteOutcome.Unknown
+    }
+
+    // PR5 Phase B2 (#80): persisted pre-activation consent. Unlike the legacy
+    // BBC opt-out (default true), an ABSENT key and ANY read failure mean
+    // "NOT opted in" — the hook's new-install effect gate stays closed. A key
+    // explicitly written false is likewise not opted in. CancellationException
+    // stays an interruption (same contract as isBbcInjectionEnabled).
+    fun isBbcPreactivationOptIn(): Boolean = try {
+        loadBbcPreactivationOptinRaw() ?: false
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        false
+    }
+
+    // Best-effort single-key commit of the consent preference. Boolean wrapper
+    // is true ONLY for a Confirmed write; never infer confirmation from a
+    // follow-up read of the optimistic local mMap.
+    fun setBbcPreactivationOptIn(enabled: Boolean): Boolean =
+        setBbcPreactivationOptInDetailed(enabled) is BbcWriteOutcome.Confirmed
+
+    // Tri-state write seam mirroring setBbcInjectionEnabledDetailed(): a
+    // commit(false)/throw is Unknown, NOT "the old value survived". No hook
+    // behavior is asserted: Confirmed only means the daemon persisted the key.
+    internal fun setBbcPreactivationOptInDetailed(enabled: Boolean): BbcWriteOutcome = try {
+        if (saveBbcPreactivationOptinRaw(enabled)) {
             BbcWriteOutcome.Confirmed(enabled)
         } else {
             BbcWriteOutcome.Unknown
@@ -1491,6 +1534,45 @@ fun remoteHookPolicyStore(
                     synchronized(versionCommitLock) {
                         prefs.edit()
                             .putBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, enabled)
+                            .commit()
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+        },
+        // PR5 Phase B2 (#80): pre-activation consent. Same dual_policy group,
+        // SAME process-wide commit lock as the BBC opt-out (defense in depth
+        // against a whole-map commit dropping a concurrent policy draft).
+        // Absent/failed read => null => NOT opted in (fail-closed). Only this
+        // single key is written: packages/version and the hook-side legacy
+        // migration marker are never touched here. CE propagates; other
+        // throwables => null / false => fail-closed / Unknown.
+        loadBbcPreactivationOptinRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    prefs.getBoolean(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN, false)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        saveBbcPreactivationOptinRaw = { enabled ->
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                false
+            } else {
+                try {
+                    synchronized(versionCommitLock) {
+                        prefs.edit()
+                            .putBoolean(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN, enabled)
                             .commit()
                     }
                 } catch (ce: CancellationException) {

@@ -20,8 +20,8 @@ import java.util.concurrent.atomic.AtomicReference
 // genuine System.nanoTime elapsed time, NOT a fake clock: a stalled provider
 // that truly blocks a worker must return to the caller inside BBC_GATE_MAX_MS
 // (asserted with generous hang-guard headroom, not a hot-path SLA). The gate
-// decision logic itself is UNCHANGED — these pins only prove the bounded
-// wrapper hands null (failed read) to the existing hybrid rule.
+// wrapper hands null (failed read) to the hybrid rule. PR5 Phase A (#80): that
+// null now FAILS CLOSED instead of falling back to the shipped ON default.
 class BbcGateBoundedWaitTest {
 
     private fun newGateExecutor(name: String): ThreadPoolExecutor =
@@ -64,9 +64,9 @@ class BbcGateBoundedWaitTest {
     }
 
     @Test
-    fun gateTimeoutFirstFailure_failsOpen() {
+    fun gateTimeoutFirstFailure_failsClosed() {
         val release = CountDownLatch(1)
-        val executor = newGateExecutor("test-bbc-gate-failopen")
+        val executor = newGateExecutor("test-bbc-gate-failclosed")
         val state = AtomicReference<Long?>(null)
         val nowMs = AtomicLong(1_000L)
         try {
@@ -83,10 +83,10 @@ class BbcGateBoundedWaitTest {
                     false
                 }
             }
-            // No prior confirmed OFF in this fresh process-local state: the
-            // EXISTING hybrid rule maps a failed read to OPEN. "off" is NOT a
-            // safety guarantee (cold-start deletion, issue #75).
-            assertTrue(gate)
+            // No prior confirmed OFF in this fresh process-local state: since
+            // PR5 Phase A (#80) a failed read maps to CLOSED. A timeout must
+            // never open the BBC effect; only a confirmed true can.
+            assertFalse(gate)
             assertNull(state.get())
         } finally {
             release.countDown()

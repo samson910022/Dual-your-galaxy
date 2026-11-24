@@ -400,6 +400,12 @@
     <string name="settings_bbc_injection_effect_unknown">Effect unknown — restart the hook process (or reboot) and verify. This switch is NOT a Samsung cold-start deletion guard.</string>
     <!-- PR #74 R7b-3: version-tagged experimental / not-device-verified label for the BBC main effect. -->
     <string name="settings_bbc_injection_experimental_notice">Experimental: the BBC main effect is not device-verified on this version (%1$s). No general effectiveness or data-safety guarantee.</string>
+    <!-- PR5 Phase B2 (#80): one-time BBC pre-activation opt-in (persisted after acceptance; never asked again). -->
+    <string name="settings_bbc_preactivation_dialog_title">One-time consent before enabling BBC injection</string>
+    <string name="settings_bbc_preactivation_dialog_message">You are about to turn on BBC injection. On new installs the Hook keeps the BBC effect OFF until this pre-activation consent is written; accepting writes only one consent key in dual_policy during the consent step, and only then is your chosen BBC toggle setting written — neither means the Hook takes effect immediately (a hook-process restart or reboot may be required).\n\nThis consent is NOT a guard against Samsung\'s cold-start deletion — that deletion happens before the BBC callback (issue #75). The BBC main effect is still experimental and not device-verified on this version; no general effectiveness or data-safety guarantee. Cancelling leaves the effect OFF and writes nothing.</string>
+    <string name="settings_bbc_preactivation_dialog_positive">I understand, save consent and continue</string>
+    <string name="settings_bbc_preactivation_dialog_negative">Cancel, stay OFF</string>
+    <string name="settings_bbc_preactivation_write_failed">Consent was not persisted; the BBC injection effect was not enabled. Please retry. This switch is NOT a Samsung cold-start deletion guard.</string>
     <string name="settings_version_unknown">unknown</string>
     <string name="badge_number_format">%1$d</string>
     <!-- Phase G (i18n): bullet/count prefixes as format resources (were

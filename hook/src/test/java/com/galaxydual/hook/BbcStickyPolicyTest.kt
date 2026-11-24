@@ -24,6 +24,11 @@ import java.util.concurrent.atomic.AtomicReference
 //
 // Whitelist path (get, stickyLastGood=false) is unchanged fail-closed:
 // TTL/invalidate discard to seed, gate-closed short-circuits with zero reads.
+//
+// PR5 Phase A (#80): the hybrid gate's `null` arm (absent/failed opt-out read)
+// is now FAIL-CLOSED. Only a confirmed `true` opens the gate; a confirmed
+// `false` still stamps the process-local sticky OFF. The separate pre-activation
+// opt-in decision (BbcPreactivationGateTest) is a second fail-closed layer.
 class BbcStickyPolicyTest {
 
     private fun bbcCacheAt(time: Long, logs: MutableList<String> = mutableListOf()): Pair<EffectivePolicyCache, java.util.concurrent.atomic.AtomicLong> {
@@ -1603,14 +1608,13 @@ class BbcStickyPolicyTest {
     }
 
     @Test
-    fun absentOrThrownRuntimeReadKeepsShippedDefaultOn() {
-        // Absent key: the prefs adapter supplies defValue=true. Thrown read:
-        // readBbcInjectionEnabled returns null. With NO prior confirmed OFF in
-        // this (fresh) process-local state, the hybrid rule still maps null to
-        // true so a transient IPC failure never silently disables the shipped
-        // BBC effect ("off" is not a safety guarantee, issue #75). Once OFF has
-        // been confirmed the failures stay closed for up to 30 min — pinned by
-        // failedReadAfterConfirmedOffKeepsGateClosedWithinTtl below.
+    fun absentOrThrownRuntimeRead_nowAbsentOnThrownFailsClosed() {
+        // PR5 Phase A (#80): this legacy runtime opt-out key is NO LONGER the
+        // source of "default on" (the pre-activation opt-in / legacy migration
+        // rule is — see BbcPreactivationGateTest). An ABSENT key still maps to
+        // true via the adapter defValue (no explicit OFF), but a THROWN read is
+        // now null => FAIL CLOSED. A confirmed OFF inside TTL still keeps the
+        // gate closed (failedReadAfterConfirmedOffKeepsGateClosedWithinTtl).
         val freshState = { AtomicReference<Long?>(null) }
         val absent = readBbcInjectionEnabled(object : BbcInjectionPrefsView {
             override fun getBoolean(key: String, defValue: Boolean) = defValue
@@ -1623,10 +1627,10 @@ class BbcStickyPolicyTest {
                 throw RuntimeException("transient read failure")
         })
         assertEquals(null, thrown)
-        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION, stickyState = freshState()) { thrown })
+        assertFalse(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION, stickyState = freshState()) { thrown })
 
-        // Full provider failure (null prefs) is also null => default on.
-        assertTrue(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION, stickyState = freshState()) { null })
+        // Full provider failure (null prefs) is also null => fail closed.
+        assertFalse(bbcInjectionGateOpen(PolicySource.BBC_AVAILABLE_APPS_INJECTION, stickyState = freshState()) { null })
     }
 
     @Test
@@ -1683,7 +1687,8 @@ class BbcStickyPolicyTest {
         assertFalse(pinned.open)
         assertEquals(t0, pinned.confirmedOffAtMs)
         // false stamps OFF; true clears it; null inside TTL keeps it; null
-        // before any OFF / after expiry fails open to the shipped default.
+        // before any OFF / after expiry FAILS CLOSED (PR5 Phase A #80). Only a
+        // confirmed true may open the gate — a failed read never does.
         assertTrue(bbcInjectionGateOpenWithSticky(true, false, null, t0, ttl).let {
             !it.open && it.confirmedOffAtMs == t0
         })
@@ -1693,8 +1698,12 @@ class BbcStickyPolicyTest {
         assertTrue(bbcInjectionGateOpenWithSticky(true, null, t0, t0 + ttl / 2, ttl).let {
             !it.open && it.confirmedOffAtMs == t0
         })
-        assertTrue(bbcInjectionGateOpenWithSticky(true, null, null, t0, ttl).open)
-        assertTrue(bbcInjectionGateOpenWithSticky(true, null, t0, t0 + ttl + 1, ttl).open)
+        assertTrue(bbcInjectionGateOpenWithSticky(true, null, null, t0, ttl).let {
+            !it.open && it.confirmedOffAtMs == null
+        })
+        assertTrue(bbcInjectionGateOpenWithSticky(true, null, t0, t0 + ttl + 1, ttl).let {
+            !it.open && it.confirmedOffAtMs == null // expired sticky is cleared
+        })
     }
 
     @Test
@@ -1719,7 +1728,7 @@ class BbcStickyPolicyTest {
     }
 
     @Test
-    fun failedReadAfterConfirmedOffExpiresAfterTtl_defaultsTrue() {
+    fun failedReadAfterConfirmedOffExpiresAfterTtl_failsClosed() {
         val t0 = 1_000L
         val now = AtomicLong(t0)
         val state = AtomicReference<Long?>(null)
@@ -1732,17 +1741,19 @@ class BbcStickyPolicyTest {
         )
         assertFalse(gate { false })
         assertEquals(t0, state.get())
-        // t0 + TTL + 1: sticky OFF expired, failure falls back to shipped ON.
+        // t0 + TTL + 1: sticky OFF expired, but a failed read is no longer a
+        // reason to open — the gate stays closed until a confirmed true.
         now.set(t0 + gateTtl + 1)
-        assertTrue(gate(throwingRead()))
+        assertFalse(gate(throwingRead()))
         assertEquals(null, state.get())
     }
 
     @Test
-    fun failedReadBeforeAnyConfirmedOff_defaultsTrue() {
+    fun failedReadBeforeAnyConfirmedOff_failsClosed() {
         val now = AtomicLong(1_000L)
         val state = AtomicReference<Long?>(null)
-        assertTrue(bbcInjectionGateOpen(
+        // No confirmed OFF to stick to: the FIRST failure is now closed too.
+        assertFalse(bbcInjectionGateOpen(
             PolicySource.BBC_AVAILABLE_APPS_INJECTION,
             nowMs = { now.get() },
             ttlMs = gateTtl,
@@ -1770,9 +1781,10 @@ class BbcStickyPolicyTest {
         now.set(t0 + 100L)
         assertTrue(gate { true })
         assertEquals(null, state.get())
-        // Therefore a subsequent failure now defaults ON again.
+        // A subsequent failure is closed regardless: the confirmed ON can no
+        // longer re-open the gate on a read failure (PR5 Phase A #80).
         now.set(t0 + 200L)
-        assertTrue(gate(throwingRead()))
+        assertFalse(gate(throwingRead()))
         assertEquals(null, state.get())
     }
 
@@ -1816,8 +1828,9 @@ class BbcStickyPolicyTest {
         assertEquals(3, clock.calls.get()) // retry executed (3rd nowMs call)
         assertEquals(null, state.get()) // last committed read (ON) wins
 
-        // A later failing read follows that last confirmed ON => fail open.
-        assertTrue(gate(throwingRead()))
+        // A later failing read follows that last confirmed ON, but a failed
+        // read can no longer re-open the gate => fail closed (#80).
+        assertFalse(gate(throwingRead()))
         assertEquals(null, state.get())
     }
 
@@ -2079,5 +2092,20 @@ class BbcStickyPolicyTest {
         val applied = freshCache.getBbc(emptySet(), reader = { Pair(setOf("B"), 1L) })
         assertTrue(applied is EffectivePolicyCache.BbcPolicy.Good)
         assertEquals(setOf("B"), (applied as EffectivePolicyCache.BbcPolicy.Good).packages)
+    }
+
+    @Test
+    fun throwingClockFailsClosedWithoutThrowingOrMutatingSticky() {
+        // PR5 Phase A (#80) ADR decision 6: the defensive catch in
+        // bbcInjectionGateOpen (clock/state failure) must degrade to CLOSED,
+        // not re-open through the back door, and must not mutate sticky OFF.
+        val state = AtomicReference<Long?>(null)
+        val result = bbcInjectionGateOpen(
+            PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            nowMs = { throw RuntimeException("clock dead") },
+            stickyState = state,
+        ) { true } // even a runtime "confirmed ON" must not bypass the catch
+        assertFalse(result)
+        assertEquals(null, state.get())
     }
 }

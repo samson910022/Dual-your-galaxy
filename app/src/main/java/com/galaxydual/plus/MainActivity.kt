@@ -370,6 +370,10 @@ class MainActivity : ComponentActivity() {
     // 不覆寫既有 handle；single-flight 擋下第二個對話框；dismiss callback 由 slot
     // 以 identity 守護綁定。onDestroy 透過 slot best-effort dismiss。
     private val riskDialogSlot = DialogSlot<AlertDialog>()
+    // PR5 Phase B2 (#80)：首次 BBC 開啟的 pre-activation opt-in 對話框 handle。
+    // 比照風險對話框模式：show() 後保存，dismiss 時只清自己的 handle，
+    // onDestroy 再 best-effort dismiss + null，避免舊 Activity window 洩漏／BadToken。
+    private var bbcPreactivationDialog: AlertDialog? = null
 
     private lateinit var statusPillText: TextView
     private lateinit var statusPillDot: ImageView
@@ -697,6 +701,14 @@ class MainActivity : ComponentActivity() {
         // 釋放（舊 Activity window 洩漏／BadToken 防護；slot 先清空再 dismiss()，
         // 不用 cancel()，見 DialogSlot.clear）。
         riskDialogSlot.clear { it.dismiss() }
+        // PR5 Phase B2 (#80)：pre-activation opt-in 對話框 handle 同樣 best-effort 釋放
+        // （單一 handle 失敗不阻斷後續 cleanup）。
+        try {
+            bbcPreactivationDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        bbcPreactivationDialog = null
         // PR #74 R2 N05：終止 BBC 開關係統的單一 consumer，避免它在 Activity
         // 銷毀後仍回呼 onRestored/onFailed（舊 CheckBox / Toast 已無效）。
         bbcToggleController?.dispose()
@@ -836,6 +848,30 @@ class MainActivity : ComponentActivity() {
             )
         } catch (_: Exception) {
             // fail-closed：show 失敗即不標記、不繼續。
+        }
+    }
+
+    // PR5 Phase B2 (#80)：首次把 BBC 注入開關切到 ON 前的 pre-activation opt-in。
+    // 與 riskDialog 相同模式自行保存 handle（R7b-1 共用 helper 回傳 Unit，取不到 handle），
+    // onDestroy 再 best-effort dismiss。對話框本身不寫任何偏好、也不碰 controller：
+    // 只有 positive 的 onAccept 才寫 opt-in 並（且僅且 Confirmed）繼續 onToggle；
+    // negative 與返回鍵/外部觸控取消一律走 onCancel（回復 OFF、零寫入）。
+    // show() 失敗時 fail-closed：直接 onCancel，绝不寫入或生效。
+    private fun showBbcPreactivationOptInDialog(onAccept: () -> Unit, onCancel: () -> Unit) {
+        if (isFinishing || isDestroyed) return
+        try {
+            val dlg = AlertDialog.Builder(this)
+                .setTitle(R.string.settings_bbc_preactivation_dialog_title)
+                .setMessage(R.string.settings_bbc_preactivation_dialog_message)
+                .setPositiveButton(R.string.settings_bbc_preactivation_dialog_positive) { _, _ -> onAccept() }
+                .setNegativeButton(R.string.settings_bbc_preactivation_dialog_negative) { _, _ -> onCancel() }
+                .setCancelable(true)
+                .setOnCancelListener { onCancel() }
+                .show()
+            bbcPreactivationDialog = dlg
+            dlg.setOnDismissListener { if (bbcPreactivationDialog === dlg) bbcPreactivationDialog = null }
+        } catch (_: Exception) {
+            onCancel()
         }
     }
 
@@ -2632,6 +2668,40 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // PR5 Phase B2 (#80): pre-activation consent. Event order on the FIRST ON:
+        //   user ON -> dialog -> positive -> opt-in commit (single key) ->
+        //   Confirmed -> controller.onToggle(true) -> existing serializer path.
+        // Cancel (button / back / outside) -> restore CheckBox to OFF, ZERO writes.
+        // commit(false)/throw -> Unknown: mark the row unverified + honest toast,
+        //   NO onToggle. A re-read of the optimistic mMap is never used as proof.
+        fun markPreactivationOptInFailed() {
+            renderEffect(BbcEffectStatus.Unknown)
+            if (!isFinishing && !isDestroyed) {
+                Toast.makeText(
+                    this@MainActivity,
+                    R.string.settings_bbc_preactivation_write_failed,
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+
+        fun acceptPreactivationOptIn(checked: Boolean) {
+            if (isFinishing || isDestroyed) return
+            val outcome = bbcPolicyStore().setBbcPreactivationOptInDetailed(true)
+            if (shouldApplyBbcToggleAfterOptIn(outcome is BbcWriteOutcome.Confirmed)) {
+                bbcToggleController?.onToggle(checked)
+            } else {
+                markPreactivationOptInFailed()
+            }
+        }
+
+        fun cancelPreactivationOptIn() {
+            if (isFinishing || isDestroyed) return
+            restoring = true
+            toggle.isChecked = false
+            restoring = false
+        }
+
         bbcToggleController = BbcInjectionToggleController(
             coordinator = app.bbcToggleCoordinator,
             initialValue = initialChecked,
@@ -2652,7 +2722,15 @@ class MainActivity : ComponentActivity() {
         toggle.setOnCheckedChangeListener { _, checked ->
             if (restoring) return@setOnCheckedChangeListener
             unknownToastShown = false
-            bbcToggleController?.onToggle(checked)
+            if (shouldRequestPreactivationOptIn(checked, bbcPolicyStore().isBbcPreactivationOptIn())) {
+                showBbcPreactivationOptInDialog(
+                    onAccept = { acceptPreactivationOptIn(checked) },
+                    onCancel = ::cancelPreactivationOptIn,
+                )
+            } else {
+                // Already opted in (or turning OFF): the controller is unchanged.
+                bbcToggleController?.onToggle(checked)
+            }
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
