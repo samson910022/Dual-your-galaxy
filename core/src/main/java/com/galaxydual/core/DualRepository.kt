@@ -116,7 +116,15 @@ sealed interface VerifyState {
 // Only Success means the clone is confirmed present; every other outcome
 // must NOT be added to the UI's cloned list.
 sealed interface CloneOutcome {
-    data class Success(val dualId: Int) : CloneOutcome
+    // [verifiedSerial] is the serial of the freshest verified target that
+    // actually authorized this Success (the listing-adjacent `after` pin, or
+    // the expected/synthetic pin on the Expected variants). It travels to the
+    // ViewModel so a same-id rebuild can be detected there instead of being
+    // silently merged into an older FRESH (id, serial) inventory. Null keeps
+    // the documented "serial never observable" capability limit: callers must
+    // not manufacture drift from absent evidence, but must fail closed when
+    // later evidence is lost. Defaults to null so old call sites keep building.
+    data class Success(val dualId: Int, val verifiedSerial: Int? = null) : CloneOutcome
     data object NoDual : CloneOutcome
     data class ChannelError(val detail: String) : CloneOutcome
     data class InvalidPackage(val pkg: String) : CloneOutcome
@@ -150,7 +158,12 @@ sealed interface CloneOutcome {
 // Outcome of a pinned remove: resolve once, uninstall and re-check on the
 // same id. Only Success (post-check confirms absent) counts as removed.
 sealed interface RemoveOutcome {
-    data class Success(val dualId: Int) : RemoveOutcome
+    // Same contract as CloneOutcome.Success: the already-verified serial of
+    // the target that authorized this Success (null when no serial was ever
+    // observable). Read-only consumers may ignore it; the ViewModel must use
+    // it to keep a stale FRESH (id, serial) inventory from absorbing the
+    // result of a write on a different incarnation of the same id.
+    data class Success(val dualId: Int, val verifiedSerial: Int? = null) : RemoveOutcome
     data object NoDual : RemoveOutcome
     data class ChannelError(val detail: String) : RemoveOutcome
     data class InvalidPackage(val pkg: String) : RemoveOutcome
@@ -1026,6 +1039,16 @@ class DualRepository(
     // a different user. Issue #66 Phase B additionally fences the
     // after-to-probe window: the pin is re-verified after the listing so a
     // switch during the read-only probe is VerifyUnknown, never Success.
+    //
+    // Pin selection (PR #88 F1): the pre-write check still compares
+    // before-vs-fresh, but both the after-write drift check and the post-list
+    // fence use the FRESHEST ALREADY-OBSERVED identity. `fresh` is non-null
+    // once the pre-write check passed, and `after` is non-null once the
+    // after-write check passed; pinning `before` here would discard a serial
+    // that became observable between the first fetch and the write (a null
+    // before.serial tolerates a 15->16 change), yielding a false Success.
+    // When no serial is ever observable, the documented capability limit
+    // stays: all-null serials remain tolerated by continuityBreach.
     suspend fun cloneVerified(pkg: String): CloneOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return CloneOutcome.ChannelError(snap.detail)
@@ -1037,6 +1060,9 @@ class DualRepository(
         val fresh = fetchVerifiedTarget()
         val preDrift = checkTargetDrift(before, fresh)
         if (preDrift != null) return CloneOutcome.VerifyUnknown(dualId, preDrift)
+        // checkTargetDrift refuses a vanished target, so reaching here proves
+        // the fresher pre-write identity was actually observed.
+        val freshPinned = checkNotNull(fresh) { "fresh target vanished after pre-write drift check" }
         val clean = pkg.trim()
         val installCmd = try {
             PmOutputParser.buildInstallExisting(clean, dualId)
@@ -1099,17 +1125,21 @@ class DualRepository(
             val byText = !res.timedOut && !transportLost && isServiceTimeoutText(res.err)
             val postSpawnByText = !res.timedOut && !transportLost && isPostSpawnTransportText(res.err)
             val after = fetchVerifiedTarget()
-            val drift = checkTargetDrift(before, after)
+            val drift = checkTargetDrift(freshPinned, after)
             if (drift != null) return CloneOutcome.VerifyUnknown(dualId, drift)
+            // checkTargetDrift refuses a vanished target: `after` is the
+            // freshest observed identity and the pin for both the post-list
+            // fence and the Success serial carried to the caller.
+            val afterPinned = checkNotNull(after) { "after target vanished after drift check" }
             // Issue #66 Phase B: the listing itself can straddle an identity
             // change; re-verify the pin after the probe before trusting its
             // result (never map a drifted listing to Success).
             val state = verifyListProbe(clean, dualId)
-            postListIdentityDrift(before)?.let {
+            postListIdentityDrift(afterPinned)?.let {
                 return CloneOutcome.VerifyUnknown(dualId, it)
             }
             return when (state) {
-                is VerifyState.Installed -> CloneOutcome.Success(dualId)
+                is VerifyState.Installed -> CloneOutcome.Success(dualId, afterPinned.serial)
                 is VerifyState.NotInstalled ->
                     CloneOutcome.VerifyUnknown(
                         dualId,
@@ -1122,17 +1152,19 @@ class DualRepository(
             return CloneOutcome.InstallFailed(res.err.ifEmpty { res.out.ifEmpty { "clone failed" } })
         }
         val after = fetchVerifiedTarget()
-        val drift = checkTargetDrift(before, after)
+        val drift = checkTargetDrift(freshPinned, after)
         if (drift != null) return CloneOutcome.VerifyUnknown(dualId, drift)
+        // Same freshest-observed pin as the unknown-after-send arm above.
+        val afterPinned = checkNotNull(after) { "after target vanished after drift check" }
         // Issue #66 Phase B: post-list fence -- re-check the pre-probe pin
         // after the listing so an incarnation switch during the probe is
         // VerifyUnknown instead of a false Success.
         val state = verifyListProbe(clean, dualId)
-        postListIdentityDrift(before)?.let {
+        postListIdentityDrift(afterPinned)?.let {
             return CloneOutcome.VerifyUnknown(dualId, it)
         }
         return when (state) {
-            is VerifyState.Installed -> CloneOutcome.Success(dualId)
+            is VerifyState.Installed -> CloneOutcome.Success(dualId, afterPinned.serial)
             is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(dualId)
             is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(dualId, state.detail)
         }
@@ -1294,7 +1326,9 @@ class DualRepository(
                 return CloneOutcome.VerifyUnknown(expectedDualId, it)
             }
             return when (state) {
-                is VerifyState.Installed -> CloneOutcome.Success(expectedDualId)
+                // The serial gate above proved expectedSerial non-null; the
+                // synthetic pin is the identity that authorized this write.
+                is VerifyState.Installed -> CloneOutcome.Success(expectedDualId, expectedSerial)
                 is VerifyState.NotInstalled ->
                     CloneOutcome.VerifyUnknown(
                         expectedDualId,
@@ -1323,7 +1357,7 @@ class DualRepository(
             return CloneOutcome.VerifyUnknown(expectedDualId, it)
         }
         return when (state) {
-            is VerifyState.Installed -> CloneOutcome.Success(expectedDualId)
+            is VerifyState.Installed -> CloneOutcome.Success(expectedDualId, expectedSerial)
             is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(expectedDualId)
             is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(expectedDualId, state.detail)
         }
@@ -1341,6 +1375,12 @@ class DualRepository(
     // stays RemoveFailed by design (C2 scope: uninstall-side "Unknown
     // package" is not idempotent-success); refresh later syncs the display
     // from ground truth either way.
+    //
+    // Pin selection (PR #88 F1): identical to cloneVerified -- the pre-write
+    // check keeps before-vs-fresh, while the after-write drift check pins
+    // `fresh` and the post-list fence pins the listing-adjacent `after`.
+    // A `before.serial == null` must never erase a serial that became known
+    // before the write; all-null serials keep the documented capability limit.
     suspend fun removeVerified(pkg: String): RemoveOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return RemoveOutcome.ChannelError(snap.detail)
@@ -1352,6 +1392,8 @@ class DualRepository(
         val fresh = fetchVerifiedTarget()
         val preDrift = checkTargetDrift(before, fresh)
         if (preDrift != null) return RemoveOutcome.VerifyUnknown(dualId, preDrift)
+        // checkTargetDrift refuses a vanished target; `fresh` is observed here.
+        val freshPinned = checkNotNull(fresh) { "fresh target vanished after pre-write drift check" }
         val clean = pkg.trim()
         val uninstallCmd = try {
             PmOutputParser.buildUninstall(clean, dualId)
@@ -1400,15 +1442,17 @@ class DualRepository(
             val byText = !res.timedOut && !transportLost && isServiceTimeoutText(res.err)
             val postSpawnByText = !res.timedOut && !transportLost && isPostSpawnTransportText(res.err)
             val after = fetchVerifiedTarget()
-            val drift = checkTargetDrift(before, after)
+            val drift = checkTargetDrift(freshPinned, after)
             if (drift != null) return RemoveOutcome.VerifyUnknown(dualId, drift)
+            // Freshest observed pin for the post-list fence and Success serial.
+            val afterPinned = checkNotNull(after) { "after target vanished after drift check" }
             // Issue #66 Phase B: post-list fence before trusting the probe.
             val state = verifyListProbe(clean, dualId)
-            postListIdentityDrift(before)?.let {
+            postListIdentityDrift(afterPinned)?.let {
                 return RemoveOutcome.VerifyUnknown(dualId, it)
             }
             return when (state) {
-                is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
+                is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId, afterPinned.serial)
                 is VerifyState.Installed ->
                     RemoveOutcome.VerifyUnknown(
                         dualId,
@@ -1421,16 +1465,18 @@ class DualRepository(
             return RemoveOutcome.RemoveFailed(res.err.ifEmpty { res.out.ifEmpty { "remove failed" } })
         }
         val after = fetchVerifiedTarget()
-        val drift = checkTargetDrift(before, after)
+        val drift = checkTargetDrift(freshPinned, after)
         if (drift != null) return RemoveOutcome.VerifyUnknown(dualId, drift)
+        // Freshest observed pin (same rule as the unknown-after-send arm).
+        val afterPinned = checkNotNull(after) { "after target vanished after drift check" }
         // Issue #66 Phase B: re-verify the pin after the listing so a same-id
         // rebuild during the probe cannot be reported as a clean Success.
         val state = verifyListProbe(clean, dualId)
-        postListIdentityDrift(before)?.let {
+        postListIdentityDrift(afterPinned)?.let {
             return RemoveOutcome.VerifyUnknown(dualId, it)
         }
         return when (state) {
-            is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
+            is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId, afterPinned.serial)
             is VerifyState.Installed -> RemoveOutcome.StillInstalled(dualId)
             is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, state.detail)
         }
@@ -1479,7 +1525,12 @@ class DualRepository(
     // fetch propagates as in every other pinned identity fetch. Callers map
     // a non-null detail to VerifyUnknown/Unknown (never Success/Installed).
     // serial==null pins are not promoted to a drift by this helper (same
-    // tolerance as checkTargetDrift/continuityBreach).
+    // tolerance as checkTargetDrift/continuityBreach): a target whose serial
+    // was never observable keeps the documented capability limit. This is
+    // why callers must pass the FRESHEST OBSERVED pin (`after` in the pinned
+    // write paths, `fresh` in verifyOnProfiles) rather than an older `before`
+    // whose serial may have been null only because it was not yet published
+    // -- otherwise a known->different change would be tolerated as null->known.
     private suspend fun postListIdentityDrift(pinned: VerifiedTarget): String? {
         val reverify = fetchVerifiedTarget()
             ?: return "post-list identity unavailable"
@@ -1598,7 +1649,8 @@ class DualRepository(
                 return RemoveOutcome.VerifyUnknown(expectedDualId, it)
             }
             return when (state) {
-                is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId)
+                // expectedSerial was proved non-null by the pre-write gate.
+                is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId, expectedSerial)
                 is VerifyState.Installed ->
                     RemoveOutcome.VerifyUnknown(
                         expectedDualId,
@@ -1634,7 +1686,7 @@ class DualRepository(
             return RemoveOutcome.VerifyUnknown(expectedDualId, it)
         }
         return when (state) {
-            is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId)
+            is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId, expectedSerial)
             is VerifyState.Installed -> RemoveOutcome.StillInstalled(expectedDualId)
             is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(expectedDualId, state.detail)
         }

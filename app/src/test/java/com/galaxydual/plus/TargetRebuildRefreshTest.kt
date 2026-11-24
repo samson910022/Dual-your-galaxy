@@ -41,28 +41,94 @@ class TargetRebuildRefreshTest {
         // 本地可變 serial（預設 15，舊測試行為不變）：#68 需要「同 id 換 serial」
         // 的 delete+recreate 世界，不能改別的檔案的 RebuildFake（hardcoded 15）。
         var serial: Int = 15,
+        // PR #88 F2: model evidence loss in the VM's post-Success identity
+        // query. The 3rd identity triple AFTER the write is that extra fetch
+        // (after-pin -> post-list fence -> VM extra query); subsequent triples
+        // are the read-only refresh, which must also fail so the final
+        // inventory stays non-FRESH. NONE keeps all legacy behavior.
+        var postWriteIdentityMode: IdentityMode = IdentityMode.NONE,
+        // PR #88 Phase 1 regression: a same-id rebuild that core CANNOT see
+        // (its after-pin and post-list fences still report the OLD serial, so
+        // Success.verifiedSerial is the old one) but the VM's extra
+        // post-Success identity query CAN. Flip is deferred to the 3rd
+        // identity triple after the write: after-pin -> post-list fence ->
+        // VM extra query (verified against core's cloneVerified/
+        // removeVerifiedExpected). This test COUPLES to that fetch count.
+        var freshSerialAtExtraFetch: Int? = null,
+        // Set by the test AFTER the initial refresh: identity triples report
+        // no serial until that same extra fetch, modelling a core Success
+        // whose verifiedSerial==null while the VM inventory pins a known one.
+        var nullSerialBeforeExtraFetch: Boolean = false,
+        // Full content swap at the rebuild instant so a stale splice (old
+        // package list with a new serial, or vice versa) cannot look correct.
+        var freshPkgsAtExtraFetch: Set<String>? = null,
     ) : CmdGateway {
+        enum class IdentityMode { NONE, NULL_TARGET, NULL_SERIAL }
+
         override val privilege: Privilege = Privilege.ROOT
+
+        var writeCount: Int = 0
+            private set
+        private var identityFetches = 0
+        private var identityFetchesAtWrite = -1
+
+        // Active only from the VM's extra post-Success query onward, so the
+        // core's own after-pin and post-list fence still see a healthy target
+        // and can honestly return Success.
+        private fun activeMode(): IdentityMode {
+            if (postWriteIdentityMode == IdentityMode.NONE || writeCount == 0) return IdentityMode.NONE
+            val afterWriteFetches = identityFetches - identityFetchesAtWrite
+            if (afterWriteFetches < 3) return IdentityMode.NONE
+            // NULL_SERIAL is a one-shot at the extra query; the refresh that
+            // follows loses the whole target (a known serial cannot be
+            // recovered by a FRESH(id,null) listing in this scenario).
+            return if (postWriteIdentityMode == IdentityMode.NULL_SERIAL && afterWriteFetches == 3) {
+                IdentityMode.NULL_SERIAL
+            } else {
+                IdentityMode.NULL_TARGET
+            }
+        }
+
+        // Applied by BOTH identity command handlers before rendering output.
+        // dumpsys shares the triple with the verbose fetch (only verbose
+        // increments identityFetches), so both channels of that triple see
+        // the same new serial.
+        private fun effectiveSerial(): Int? {
+            val extraDue = writeCount > 0 && identityFetchesAtWrite >= 0 &&
+                identityFetches - identityFetchesAtWrite >= 3
+            if (extraDue && freshSerialAtExtraFetch != null) {
+                serial = freshSerialAtExtraFetch!!
+                freshPkgsAtExtraFetch?.let { replacement ->
+                    pkgsByUser.getOrPut(dualId) { mutableSetOf() }.apply {
+                        clear()
+                        addAll(replacement)
+                    }
+                }
+            }
+            return if (nullSerialBeforeExtraFetch && !extraDue) null else serial
+        }
 
         private fun usersOut(): String =
             "Users:\n\tUserInfo{0:Owner:13} running\n" +
                 "\tUserInfo{$dualId:DualApp:400} running\n"
 
-        private fun verboseOut(): String =
+        private fun verboseOut(mode: IdentityMode, visibleSerial: Int?): String =
             "Users:\n" +
                 "  UserInfo{0:Owner:13} running:\n" +
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$dualId:DualApp:400} running:\n" +
-                "    Serial: $serial\n" +
+                (if (mode == IdentityMode.NULL_SERIAL || visibleSerial == null) "" else "    Serial: $visibleSerial\n") +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
 
-        private fun dumpsysOut(): String =
+        private fun dumpsysOut(mode: IdentityMode, visibleSerial: Int?): String =
             "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$dualId:DualApp:400} serialNo=$serial:\n" +
+                "  UserInfo{$dualId:DualApp:400}" +
+                (if (mode == IdentityMode.NULL_SERIAL || visibleSerial == null) "" else " serialNo=$visibleSerial") +
+                ":\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
 
@@ -71,24 +137,46 @@ class TargetRebuildRefreshTest {
             return m?.groupValues?.get(1)?.toIntOrNull() ?: dualId
         }
 
+        private fun recordWrite() {
+            writeCount++
+            if (identityFetchesAtWrite < 0) identityFetchesAtWrite = identityFetches
+        }
+
         override suspend fun run(cmd: String): CmdResult = when {
             cmd.trim() == "id -u" ->
                 if (rootOk) CmdResult(exit = 0, out = "0\n", err = "")
                 else CmdResult(exit = 0, out = "1000\n", err = "")
             cmd == DualRepository.CMD_LIST_USERS ->
                 CmdResult(exit = 0, out = usersOut(), err = "")
-            cmd == DualRepository.CMD_USER_LIST_VERBOSE ->
-                CmdResult(exit = 0, out = verboseOut(), err = "")
-            cmd == DualRepository.CMD_DUMPSYS_USER ->
-                CmdResult(exit = 0, out = dumpsysOut(), err = "")
+            cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
+                identityFetches++
+                val mode = activeMode()
+                val visibleSerial = effectiveSerial()
+                if (mode == IdentityMode.NULL_TARGET) {
+                    CmdResult(exit = 1, out = "", err = "identity channel denied")
+                } else {
+                    CmdResult(exit = 0, out = verboseOut(mode, visibleSerial), err = "")
+                }
+            }
+            cmd == DualRepository.CMD_DUMPSYS_USER -> {
+                val mode = activeMode()
+                val visibleSerial = effectiveSerial()
+                if (mode == IdentityMode.NULL_TARGET) {
+                    CmdResult(exit = 1, out = "", err = "identity channel denied")
+                } else {
+                    CmdResult(exit = 0, out = dumpsysOut(mode, visibleSerial), err = "")
+                }
+            }
             cmd == DualRepository.CMD_GETPROP_DUAL ->
                 CmdResult(exit = 0, out = "$dualId\n", err = "")
             cmd.startsWith("pm install-existing") -> {
+                recordWrite()
                 val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
                 pkgsByUser.getOrPut(dualId) { mutableSetOf() }.add(pkg)
                 CmdResult(exit = 0, out = "Success", err = "")
             }
             cmd.startsWith("pm uninstall") -> {
+                recordWrite()
                 val pkg = cmd.trim().split("\\s+".toRegex()).lastOrNull() ?: ""
                 pkgsByUser[dualId]?.remove(pkg)
                 CmdResult(exit = 0, out = "Success", err = "")
@@ -192,11 +280,12 @@ class TargetRebuildRefreshTest {
 
         val s = vm.state.value
         assertEquals(96, s.lastOperation?.pinnedTarget)
-        assertTrue("new pkg must be listed, got: ${s.cloned}", s.cloned.contains("com.example.fresh"))
-        assertTrue(
-            "old-target-only pkg must not mix into the new list, got: ${s.cloned}",
-            !s.cloned.contains("com.example.old"),
+        assertEquals(
+            "rebuild refresh must publish the full new package set, got: ${s.cloned}",
+            setOf("com.example.chat", "com.example.fresh"),
+            s.cloned.toSet(),
         )
+        assertEquals("count must match the rebuilt list", s.cloned.size, s.inventory.count)
         assertNull("success after refresh must clear diagnose", s.diagnose)
     }
 
@@ -232,34 +321,23 @@ class TargetRebuildRefreshTest {
 
         val s = vm.state.value
         assertEquals(96, s.lastOperation?.pinnedTarget)
-        assertTrue(
-            "removed pkg must be gone, got: ${s.cloned}",
-            !s.cloned.contains("com.example.victim"),
+        assertEquals(
+            "rebuild refresh must publish the full new package set, got: ${s.cloned}",
+            setOf("com.example.chat"),
+            s.cloned.toSet(),
         )
-        assertTrue(
-            "old-target-only pkg must not mix into the new list, got: ${s.cloned}",
-            !s.cloned.contains("com.example.old"),
-        )
+        assertEquals("count must match the rebuilt list", s.cloned.size, s.inventory.count)
         assertNull("remove success after refresh must clear diagnose", s.diagnose)
         assertNull("confirm must drop pending", s.pendingRemove)
     }
 
-    // RED regression for issue #68 (same userId, fresh serial -> SUCCESS
-    // merged into the old-serial FRESH inventory). With id pinned at 95,
+    // Issue #68 regression (now fixed): same userId, fresh serial. A
     // delete+recreate of user 95 as (95,41) makes every identity channel
-    // report the new serial. CloneOutcome.Success carries only dualId
-    // (DualRepository.kt:119), and the clone Success branch
-    // (DualViewModel.kt:5256-5259) checks only
-    // `freshness == FRESH && inventory.targetId != newTarget`; both ids are
-    // 95 so needRebuildRefresh is false, refreshLocked() never runs, and
-    // the new package is appended to the old FRESH(95,15) list while
-    // targetSerial stays 15. Fix locus: under opMutex, fetch a fresh
-    // verified target (repo.fetchFreshVerifiedTarget() / the VM's public
-    // fetchFreshVerifiedTarget() wrapper) and compare BOTH (id, serial)
-    // against inventory's pin; on mismatch mark the old inventory STALE
-    // and re-probe the new incarnation whole (as the existing id-rebuild
-    // branch does with refreshLocked()). This test is intentionally RED
-    // on current code; production is NOT modified here.
+    // report the new serial; the VM must use the serial carried by the core
+    // Success plus a fresh verified triple, degrade the old FRESH(95,15)
+    // inventory and re-probe the WHOLE new incarnation (not splice the new
+    // package into the old list). The package CONTENT is replaced as well as
+    // the serial, so a partial merge cannot accidentally look correct.
     @Test
     fun cloneAfterSameIdSerialRebuild_doesNotKeepOldSerialFreshInventory() {
         val gw = RebuildFake()
@@ -271,41 +349,38 @@ class TargetRebuildRefreshTest {
         await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
         assertEquals(95, vm.state.value.inventory.targetId)
         assertEquals(15, vm.state.value.inventory.targetSerial)
-        assertTrue(vm.state.value.cloned.contains("com.example.old"))
+        assertEquals(setOf("com.example.chat", "com.example.old"), gw.pkgsByUser[95])
 
         // The profile was deleted and recreated with the SAME id but a fresh
-        // platform serial: all identity channels now agree on (95, 41).
+        // platform serial AND a different package set: (95,41) now carries
+        // `com.example.rebuilt` instead of the old `com.example.old`.
         gw.serial = 41
+        gw.pkgsByUser[95] = mutableSetOf("com.example.chat", "com.example.rebuilt")
 
         vm.clone("com.example.new")
         await {
             !vm.state.value.loading &&
-                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS
+                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS &&
+                vm.state.value.inventory.targetId == 95 &&
+                vm.state.value.inventory.targetSerial == 41 &&
+                vm.state.value.inventory.freshness == InventoryFreshness.FRESH
         }
 
         val s = vm.state.value
+        assertEquals(95, s.lastOperation?.pinnedTarget)
         assertEquals(
-            "same-id serial rebuild must be detected: inventory must carry " +
-                "the verified (95,41) pin, not the stale (95,15) pin",
-            41,
-            s.inventory.targetSerial,
+            "rebuild refresh must publish the full new package set, got: ${s.cloned}",
+            setOf("com.example.chat", "com.example.rebuilt", "com.example.new"),
+            s.cloned.toSet(),
         )
-        assertTrue(
-            "the write result must never be presented under a stale " +
-                "FRESH(95,15) snapshot; got: ${s.inventory}, cloned=${s.cloned}",
-            !(s.inventory.freshness == InventoryFreshness.FRESH &&
-                s.inventory.targetSerial == 15 &&
-                s.cloned.contains("com.example.new")),
-        )
+        assertEquals("count must match the rebuilt list", s.cloned.size, s.inventory.count)
+        assertNull("success after refresh must clear diagnose", s.diagnose)
     }
 
-    // Same #68 regression through the remove Success branch
-    // (DualViewModel.kt:6454-6456): removeVerifiedExpected pins the new
-    // serial in pendingRemove.dualSerial and succeeds, but the VM again
-    // compares only TargetMismatch-by-id, so the removal result is merged
-    // into the stale FRESH(95,15) inventory. Same fix locus: compare the
-    // fresh verified (id, serial) under opMutex and re-probe the whole
-    // new incarnation. Intentionally RED on current code.
+    // Same #68 regression through the remove Success branch: consent pins
+    // (95,41), the core Success carries 41, and the VM must still notice that
+    // the old FRESH(95,15) inventory is from a different incarnation. The
+    // package CONTENT is replaced too, so the rebuilt list is unambiguous.
     @Test
     fun removeAfterSameIdSerialRebuild_doesNotKeepOldSerialFreshInventory() {
         val gw = RebuildFake()
@@ -317,11 +392,12 @@ class TargetRebuildRefreshTest {
         await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
         assertEquals(95, vm.state.value.inventory.targetId)
         assertEquals(15, vm.state.value.inventory.targetSerial)
-        assertTrue(vm.state.value.cloned.contains("com.example.old"))
+        assertEquals(setOf("com.example.chat", "com.example.old"), gw.pkgsByUser[95])
 
-        // Same id, new serial: the pending remove is pinned to (95,41),
-        // which is the incarnation the uninstall actually targets.
+        // Same id, new serial and new content. `com.example.old` is kept so
+        // the confirm-time install re-check still authorizes the uninstall.
         gw.serial = 41
+        gw.pkgsByUser[95] = mutableSetOf("com.example.chat", "com.example.old", "com.example.rebuilt")
 
         vm.requestRemove("com.example.old")
         await { vm.state.value.pendingRemove?.dualId == 95 }
@@ -331,22 +407,237 @@ class TargetRebuildRefreshTest {
         await {
             !vm.state.value.loading &&
                 vm.state.value.lastOperation?.phase == OpPhase.SUCCESS &&
-                vm.state.value.pendingRemove == null
+                vm.state.value.pendingRemove == null &&
+                vm.state.value.inventory.targetId == 95 &&
+                vm.state.value.inventory.targetSerial == 41 &&
+                vm.state.value.inventory.freshness == InventoryFreshness.FRESH
+        }
+
+        val s = vm.state.value
+        assertEquals(95, s.lastOperation?.pinnedTarget)
+        assertEquals(
+            "rebuild refresh must publish the full new package set, got: ${s.cloned}",
+            setOf("com.example.chat", "com.example.rebuilt"),
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the rebuilt list", s.cloned.size, s.inventory.count)
+        assertNull("remove success after refresh must clear diagnose", s.diagnose)
+    }
+
+    // PR #88 Phase 1 regression (the stale-FRESH splice the pairwise helper
+    // fix closes): core sees NO rebuild -- both its after-pin and post-list
+    // fences still report (95,15), so Success.verifiedSerial == 15. The
+    // same-id rebuild to (95,41) happens AFTER those fences, before the VM's
+    // extra post-Success identity query. Comparing only
+    // {pinned=15, verified=15, consent=null} made [15,15,null] look agreed and
+    // spliced the new write into the stale FRESH(95,15) inventory.
+    // NOTE: this test COUPLES to core's post-write identity fetch count
+    // (after-pin -> post-list fence -> VM extra query == 3). If core adds or
+    // removes a post-write identity triple, update the fake's flip instant.
+    @Test
+    fun cloneAfterRebuildVisibleOnlyToVmExtraFetch_repinsFreshSerial41WithoutResend() {
+        val gw = RebuildFake(
+            freshSerialAtExtraFetch = 41,
+            freshPkgsAtExtraFetch = setOf("com.example.chat", "com.example.rebuilt"),
+        )
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+        assertEquals(setOf("com.example.chat", "com.example.old"), gw.pkgsByUser[95])
+
+        vm.clone("com.example.new")
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS &&
+                vm.state.value.inventory.targetId == 95 &&
+                vm.state.value.inventory.targetSerial == 41 &&
+                vm.state.value.inventory.freshness == InventoryFreshness.FRESH
+        }
+
+        val s = vm.state.value
+        assertEquals(95, s.lastOperation?.pinnedTarget)
+        assertEquals(
+            "refresh must publish the whole post-rebuild package set, got: ${s.cloned}",
+            setOf("com.example.chat", "com.example.rebuilt"),
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the rebuilt list", s.cloned.size, s.inventory.count)
+        assertNull("success after refresh must clear diagnose", s.diagnose)
+        assertEquals("no install resend may occur", 1, gw.writeCount)
+    }
+
+    // Same fail-open shape with core's verifiedSerial == null (serial not
+    // observable during the operation): the old helper saw [15,null,null],
+    // no pairwise disagreement, and again spliced into FRESH(95,15). With
+    // fresh.serial in the comparison, 15 vs 41 must force the rebuild refresh.
+    // The serial is suppressed only AFTER the initial refresh so the inventory
+    // starts as a known FRESH(95,15) pin.
+    @Test
+    fun cloneSuccessWithUnobservableCoreSerial_thenFresh41_repinsWithoutResend() {
+        val gw = RebuildFake(
+            freshSerialAtExtraFetch = 41,
+            freshPkgsAtExtraFetch = setOf("com.example.chat", "com.example.rebuilt"),
+        )
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+
+        // Core's pre-write/after-pin/post-list triples now see no serial, so
+        // its Success carries verifiedSerial=null; the VM's extra query sees 41.
+        gw.nullSerialBeforeExtraFetch = true
+        vm.clone("com.example.new")
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS &&
+                vm.state.value.inventory.targetId == 95 &&
+                vm.state.value.inventory.targetSerial == 41 &&
+                vm.state.value.inventory.freshness == InventoryFreshness.FRESH
         }
 
         val s = vm.state.value
         assertEquals(
-            "same-id serial rebuild must be detected: inventory must carry " +
-                "the verified (95,41) pin, not the stale (95,15) pin",
-            41,
-            s.inventory.targetSerial,
+            "refresh must publish the whole post-rebuild package set, got: ${s.cloned}",
+            setOf("com.example.chat", "com.example.rebuilt"),
+            s.cloned.toSet(),
         )
-        assertTrue(
-            "the remove result must never be presented under a stale " +
-                "FRESH(95,15) snapshot; got: ${s.inventory}, cloned=${s.cloned}",
-            !(s.inventory.freshness == InventoryFreshness.FRESH &&
-                s.inventory.targetSerial == 15 &&
-                !s.cloned.contains("com.example.old")),
+        assertEquals("count must match the rebuilt list", s.cloned.size, s.inventory.count)
+        assertNull("success after refresh must clear diagnose", s.diagnose)
+        assertEquals("no install resend may occur", 1, gw.writeCount)
+    }
+
+    // PR #88 F2: if the post-Success identity query cannot confirm the target
+    // (null triple), the old FRESH inventory must be degraded and a read-only
+    // refresh attempted. No install/uninstall may be re-issued.
+    @Test
+    fun cloneSuccess_thenPostSuccessIdentityNull_degradesAndNeverResendsWrite() {
+        val gw = RebuildFake(postWriteIdentityMode = RebuildFake.IdentityMode.NULL_TARGET)
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+
+        vm.clone("com.example.new")
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS &&
+                vm.state.value.inventory.freshness != InventoryFreshness.FRESH
+        }
+
+        val s = vm.state.value
+        assertTrue("inventory must be STALE or UNKNOWN, got: ${s.inventory}", s.inventory.freshness != InventoryFreshness.FRESH)
+        assertEquals(
+            "no stale FRESH splice may retain the written package, got: ${s.cloned}",
+            setOf("com.example.chat", "com.example.old"),
+            s.cloned.toSet(),
         )
+        assertEquals("count must match the retained list", s.cloned.size, s.inventory.count)
+        assertEquals("no install resend may occur", 1, gw.writeCount)
+    }
+
+    @Test
+    fun removeSuccess_thenPostSuccessIdentityNull_degradesAndNeverResendsWrite() {
+        val gw = RebuildFake(postWriteIdentityMode = RebuildFake.IdentityMode.NULL_TARGET)
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+
+        vm.requestRemove("com.example.old")
+        await { vm.state.value.pendingRemove?.dualId == 95 }
+        vm.confirmRemove()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS &&
+                vm.state.value.pendingRemove == null &&
+                vm.state.value.inventory.freshness != InventoryFreshness.FRESH
+        }
+
+        val s = vm.state.value
+        assertTrue("inventory must be STALE or UNKNOWN, got: ${s.inventory}", s.inventory.freshness != InventoryFreshness.FRESH)
+        assertEquals(
+            "no stale FRESH splice may retain the removed package, got: ${s.cloned}",
+            setOf("com.example.chat"),
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the retained list", s.cloned.size, s.inventory.count)
+        assertEquals("no uninstall resend may occur", 1, gw.writeCount)
+    }
+
+    // A known serial becoming null is evidence loss too -- never "no drift".
+    @Test
+    fun cloneSuccess_thenPostSuccessSerialBecomesNull_degradesAndNeverResendsWrite() {
+        val gw = RebuildFake(postWriteIdentityMode = RebuildFake.IdentityMode.NULL_SERIAL)
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+
+        vm.clone("com.example.new")
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS &&
+                vm.state.value.inventory.freshness != InventoryFreshness.FRESH
+        }
+
+        val s = vm.state.value
+        assertTrue("known -> unknown must degrade freshness", s.inventory.freshness != InventoryFreshness.FRESH)
+        assertEquals(
+            "no stale FRESH splice may retain the written package, got: ${s.cloned}",
+            setOf("com.example.chat", "com.example.old"),
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the retained list", s.cloned.size, s.inventory.count)
+        assertEquals("no install resend may occur", 1, gw.writeCount)
+    }
+
+    @Test
+    fun removeSuccess_thenPostSuccessSerialBecomesNull_degradesAndNeverResendsWrite() {
+        val gw = RebuildFake(postWriteIdentityMode = RebuildFake.IdentityMode.NULL_SERIAL)
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+
+        vm.requestRemove("com.example.old")
+        await { vm.state.value.pendingRemove?.dualId == 95 }
+        vm.confirmRemove()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS &&
+                vm.state.value.pendingRemove == null &&
+                vm.state.value.inventory.freshness != InventoryFreshness.FRESH
+        }
+
+        val s = vm.state.value
+        assertTrue("known -> unknown must degrade freshness", s.inventory.freshness != InventoryFreshness.FRESH)
+        assertEquals(
+            "no stale FRESH splice may retain the removed package, got: ${s.cloned}",
+            setOf("com.example.chat"),
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the retained list", s.cloned.size, s.inventory.count)
+        assertEquals("no uninstall resend may occur", 1, gw.writeCount)
     }
 }

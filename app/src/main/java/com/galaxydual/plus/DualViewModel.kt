@@ -4192,6 +4192,57 @@ class DualViewModel(
     // null/Unknown/通道失敗一律由呼叫端 fail closed。cancellation 透傳。
     suspend fun fetchFreshVerifiedTarget(): VerifiedTarget? = onIo { repo.fetchFreshVerifiedTarget() }
 
+    // #68 / PR #88 F2: shared decision used by BOTH clone and remove Success
+    // branches. A successful write must not be spliced into a FRESH inventory
+    // that still claims an older (id, serial) pin. Inputs:
+    // - writtenTargetId: the dualId the operation actually used (repo Success).
+    // - verifiedSerial: the serial from the freshest target that authorized
+    //   that write (carried by CloneOutcome/RemoveOutcome.Success).
+    // - consentSerial: remove-only, the serial pinned at request time
+    //   (pendingRemove.dualSerial) -- an additional same-id rebuild signal.
+    //
+    // Rules (all fail closed, none re-issues a write):
+    // - not FRESH: keep the existing "non-FRESH stays as-is" behavior.
+    // - (id) already differs: proven drift, return true WITHOUT the eager
+    //   extra identity fetch (keeps the opMutex critical section short).
+    // - extra identity fetch null, or a previously known serial (inventory
+    //   pin / operation / consent / fresh triple) becoming null now: evidence
+    //   loss, true.
+    // - any two known serials (INCLUDING fresh.serial) disagree, or the fresh
+    //   id differs: true. A same-id rebuild can happen after core's own
+    //   verified serial was captured, so omitting fresh.serial here would
+    //   fail open (issue #68 stale splice).
+    // - serial null everywhere (never observable): no fabricated drift.
+    // The caller degrades the inventory out of FRESH and runs a read-only
+    // refreshLocked(); this helper never mutates state nor persists anything.
+    private suspend fun needsTargetRebuildRefresh(
+        writtenTargetId: Int,
+        verifiedSerial: Int?,
+        consentSerial: Int? = null,
+    ): Boolean {
+        val pinned = _state.value.inventory
+        if (pinned.freshness != InventoryFreshness.FRESH) return false
+        // Proven by the operation's own id -- no extra IO needed.
+        if (pinned.targetId != writtenTargetId) return true
+        val fresh = fetchFreshVerifiedTarget()
+            ?: return true // evidence loss: never "no drift"
+        // pinned.targetId == writtenTargetId here (checked above), so one id
+        // comparison is enough; fresh.serial is compared by VALUE below.
+        if (fresh.userId != pinned.targetId) return true
+        if (fresh.serial == null &&
+            (pinned.targetSerial != null || verifiedSerial != null || consentSerial != null)
+        ) {
+            return true // known -> unknown is evidence loss, not agreement
+        }
+        // fresh.serial MUST participate: core's verifiedSerial is captured at
+        // write time and can still be the OLD serial when a same-id rebuild
+        // happens before this extra query. Comparing only the three older
+        // serials would fail open ([15,15,null] or [15,null,null] look agreed).
+        // All-null stays tolerated: filterNotNull() leaves an empty list.
+        val knownSerials = listOf(pinned.targetSerial, verifiedSerial, consentSerial, fresh.serial)
+        return knownSerials.filterNotNull().distinct().size > 1
+    }
+
     // Phase N2 Shizuku binding teardown (issue #34 re-review), hardened by
     // Phase B P2-2: ViewModel has no onCleared, so the retained + current
     // Shizuku instances skipped by the swap guards (old !== retained) leaked
@@ -5250,32 +5301,23 @@ class DualViewModel(
                             // 結果 B 不得留在舊 target 清單——當次寫入包已排除在舊清單外，
                             // 整單標 STALE 待重查），再對新 verified target 做全量 refresh
                             //（已在 opMutex 內，直接調 refreshLocked，不重入加鎖）。
-                            // 觸發條件僅 FRESH mismatch（UNKNOWN/STALE 本已非新鮮，維持原
+                            // 觸發條件為 FRESH 下的身份證據不一致或證據消失
+                            //（id/serial 漂移、已知 serial 消失、extra fetch 為 null；見
+                            // needsTargetRebuildRefresh）。UNKNOWN/STALE 本已非新鮮，維持原
                             // count 對齊待下次 refresh，避免冷啟動 UNKNOWN 覆寫成功提示）。
                             // rebuiltNote 保留原邏輯不變（FRESH + 舊 id + 上次釘舊 id 才附註）。
                             val newTarget = res.dualId
-                            // #68：CloneOutcome.Success 只帶 dualId；同 id 換 serial
-                            // (delete+recreate) 時舊的 id-only 比對恆相等，新寫入結果
-                            // 會被混進舊 serial 的 FRESH 清單。此處已在 opMutex 內，
-                            // 取真正的新 gateway identity triple 比對 (id, serial) 配對：
-                            // serial 為 null 代表無法證明漂移，不以未知冒充已知（fail
-                            // closed 由 repo 的 pin Handle 負責），僅兩邊 serial 皆已知
-                            // 且不同才觸發全量重查。既有 id-mismatch／rebuiltNote 不變。
-                            val pinned = _state.value.inventory
-                            val freshTarget =
-                                if (pinned.freshness == InventoryFreshness.FRESH) {
-                                    fetchFreshVerifiedTarget()
-                                } else {
-                                    null
-                                }
-                            val needRebuildRefresh =
-                                pinned.freshness == InventoryFreshness.FRESH &&
-                                    (pinned.targetId != newTarget ||
-                                        (freshTarget != null &&
-                                            (freshTarget.userId != pinned.targetId ||
-                                                (freshTarget.serial != null &&
-                                                    pinned.targetSerial != null &&
-                                                    freshTarget.serial != pinned.targetSerial))))
+                            // #68 / PR #88 F2：Success 現在帶操作當下已查證的 serial，
+                            // 連同 opMutex 內新取的 gateway identity triple 一起比對
+                            // (id, serial) 配對。證據消失（extra fetch 為 null、已知
+                            // serial 變 null）與 id/serial 不一致一律 fail closed：
+                            // 降原 inventory 為非 FRESH 並跑唯讀 refreshLocked()，
+                            // 絕不重送 install。helper 在 id 已證明不同時略過 extra fetch。
+                            // 既有 rebuiltNote（id-only）行為不變。
+                            val needRebuildRefresh = needsTargetRebuildRefresh(
+                                writtenTargetId = newTarget,
+                                verifiedSerial = res.verifiedSerial,
+                            )
                             _state.update { cur ->
                                 val current: List<String> =
                                     if (needRebuildRefresh) {
@@ -6474,28 +6516,20 @@ class DualViewModel(
                                             // 為 STALE（不清 cloned，只降新鮮度；remaining 已排除
                                             // 當次包，跨目標結果不混入舊清單，整單標 STALE 待重查），
                                             // 再對新 verified target 做全量 refresh（已在 opMutex
-                                            // 內，直接調 refreshLocked，不重入加鎖）。觸發條件僅
-                                            // FRESH mismatch；rebuiltNote 保留原邏輯不變。
-                                            // #68：同 clone 成功分支——RemoveOutcome.Success
-                                            // 亦只帶 dualId；同 id 換 serial 時必須比對
-                                            // (id, serial) 配對，否則移除結果會被呈現在舊
-                                            // serial 的 FRESH 快照上。opMutex 內取新鮮
-                                            // verified target；serial 未知則不以此證明漂移。
-                                            val pinned = _state.value.inventory
-                                            val freshTarget =
-                                                if (pinned.freshness == InventoryFreshness.FRESH) {
-                                                    fetchFreshVerifiedTarget()
-                                                } else {
-                                                    null
-                                                }
-                                            val needRebuildRefresh =
-                                                pinned.freshness == InventoryFreshness.FRESH &&
-                                                    (pinned.targetId != cur.dualId ||
-                                                        (freshTarget != null &&
-                                                            (freshTarget.userId != pinned.targetId ||
-                                                                (freshTarget.serial != null &&
-                                                                    pinned.targetSerial != null &&
-                                                                    freshTarget.serial != pinned.targetSerial))))
+                                            // 內，直接調 refreshLocked，不重入加鎖）。觸發條件為
+                                            // FRESH 下的身份證據不一致或證據消失（見
+                                            // needsTargetRebuildRefresh）；rebuiltNote 保留原邏輯不變。
+                                            // #68 / PR #88 F2：與 clone 共用 fail-closed
+                                            // helper；另有同意時釘住的 cur.dualSerial 作為
+                                            // 同 id 重建的額外訊號。Success 帶的 serial 是
+                                            // core 已查證的移除目標 serial；證據消失時降
+                                            // 非 FRESH + 唯讀 refreshLocked()，絕不重送
+                                            // uninstall。rebuiltNote 仍維持 id-only。
+                                            val needRebuildRefresh = needsTargetRebuildRefresh(
+                                                writtenTargetId = cur.dualId,
+                                                verifiedSerial = res.verifiedSerial,
+                                                consentSerial = cur.dualSerial,
+                                            )
                                             _state.update {
                                                 val remaining =
                                                     it.cloned.filterNot { p -> p == cur.pkg }
