@@ -33,20 +33,21 @@ import kotlinx.coroutines.withContext
  * lifetimes, not just within one controller.
  *
  * [submit] assigns its sequence at USER-INTENT time (via
- * [BbcToggleRuntimeState.nextSequence], called by the controller). Sequence
- * numbers therefore stay monotonic across rebuilds. A tap replaced in the
- * CONFLATED slot before it is dequeued never gets a result callback: its
- * outcome is irrelevant because a newer intent superseded it.
+ * [BbcToggleRuntimeState.nextSequence]) AND enqueues inside ONE critical
+ * section. Allocation and enqueue MUST be atomic: if a caller could allocate
+ * sequence N, be descheduled, and let another caller allocate N+1 and enqueue
+ * it first, CONFLATED would keep the LAST SEND — the older sequence — and the
+ * stale value could be written to disk last. Sequence numbers stay monotonic
+ * across rebuilds. A tap replaced in the CONFLATED slot before it is dequeued
+ * never gets a result callback: its outcome is irrelevant because a newer
+ * intent superseded it.
  *
- * #81: CONFLATED does NOT guarantee that submit() order matches nextSequence()
- * order — two callers can be descheduled between assigning their sequence and
- * submitting it. The consumer therefore re-checks the fence BEFORE commit():
- * a write whose sequence is older than the latest issued intent is discarded
- * wholesale (no commit, no mark, no callback). Without this, state.mark()'s
- * result-only fence would let a stale value land on disk LAST.
- *
- * 此 fence 假設 production Main-confined（submit 由 Main thread 呼叫）；跨執行緒下
- * CONFLATED 仍有微小遺失窗口（sequence 指派與 send 之間仍可能被交錯）。
+ * #81: the pre-commit sequence fence below remains as defense in depth. It is
+ * what makes [submitWithExplicitSequenceForTests] (test-only) safe and it
+ * protects any future caller that bypasses the atomic path. A write whose
+ * sequence is older than the latest issued intent is discarded wholesale (no
+ * commit, no mark, no callback), because state.mark()'s result-only fence is
+ * too late to protect the persisted preference.
  *
  * Cancellation of a controller's UI must NOT cancel this consumer or an
  * in-flight commit; `dispose()` on the controller only detaches UI callbacks.
@@ -78,6 +79,23 @@ internal class BbcToggleCoordinator(
     // CONFLATED: a burst keeps just the newest not-yet-dequeued intent. There
     // is exactly one consumer below, so commits are serialized process-wide.
     private val writes = Channel<Write>(Channel.CONFLATED)
+
+    /**
+     * Sequence allocation and channel enqueue share ONE critical section.
+     * Without it, two callers can interleave as allocate(N) / allocate(N+1) /
+     * send(N+1) / send(N); CONFLATED keeps the last SEND, so the stale lower
+     * sequence would overwrite the newer value on disk and never notify the
+     * newest intent's caller (#81 follow-up B).
+     */
+    private val enqueueLock = Any()
+
+    /**
+     * Test seam only — invoked INSIDE [enqueueLock], after the sequence is
+     * allocated but before trySend. Must not throw and is null in production.
+     * A test can park here to observe that a concurrent [submit] cannot make
+     * progress (and cannot allocate a higher sequence) until the lock is freed.
+     */
+    internal var afterBbcSequenceAllocatedForTests: ((Long) -> Unit)? = null
 
     /** Test seam only: writes dropped by the pre-commit sequence fence (C1/#81). */
     @Volatile
@@ -125,8 +143,38 @@ internal class BbcToggleCoordinator(
         }
     }
 
-    /** Never blocks. Superseded CONFLATED intents simply never get a callback. */
-    fun submit(sequence: Long, value: Boolean, onResult: (BbcWriteOutcome) -> Unit) {
+    /**
+     * Atomic user-intent submit: allocate the sequence AND enqueue in one
+     * critical section, then return the allocated sequence for caller
+     * bookkeeping/telemetry. A controller must fence its result callbacks on a
+     * token captured BEFORE this call (see BbcInjectionToggleController.onToggle),
+     * because an inline consumer can deliver the result before we return.
+     * Never blocks on the consumer; superseded
+     * CONFLATED intents simply never get a callback. This is the ONLY submit
+     * overload production code may call.
+     */
+    fun submit(value: Boolean, onResult: (BbcWriteOutcome) -> Unit): Long =
+        synchronized(enqueueLock) {
+            val seq = state.nextSequence()
+            afterBbcSequenceAllocatedForTests?.invoke(seq)
+            writes.trySend(Write(seq, value, onResult))
+            seq
+        }
+
+    /**
+     * TEST-ONLY / explicit-sequence overload, kept for back-compat and for the
+     * #81 race test that deliberately allocates in one order and submits in the
+     * opposite order. It does NOT allocate a sequence and does NOT take
+     * [enqueueLock]; the pre-commit fence above is what keeps stale explicit
+     * sequences harmless. Production callers must use [submit] above — the
+     * explicit name makes any accidental production use obvious in review.
+     */
+    @androidx.annotation.VisibleForTesting
+    fun submitWithExplicitSequenceForTests(
+        sequence: Long,
+        value: Boolean,
+        onResult: (BbcWriteOutcome) -> Unit,
+    ) {
         writes.trySend(Write(sequence, value, onResult))
     }
 

@@ -35,11 +35,13 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
+import java.io.File
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.coroutineContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -954,12 +956,12 @@ class BbcToggleConcurrencyTest {
             val staleCallbackCalls = AtomicInteger(0)
             val freshCallbackCalls = AtomicInteger(0)
 
-            coordinator.submit(freshSeq, true) { freshCallbackCalls.incrementAndGet() }
+            coordinator.submitWithExplicitSequenceForTests(freshSeq, true) { freshCallbackCalls.incrementAndGet() }
             sink.awaitNewerStarted() // newer commit is in flight and blocked
 
             val submitReturned = CountDownLatch(1)
             submitter.execute {
-                coordinator.submit(staleSeq, false) { staleCallbackCalls.incrementAndGet() }
+                coordinator.submitWithExplicitSequenceForTests(staleSeq, false) { staleCallbackCalls.incrementAndGet() }
                 submitReturned.countDown()
             }
             check(submitReturned.await(5, TimeUnit.SECONDS))
@@ -988,5 +990,292 @@ class BbcToggleConcurrencyTest {
             appScope.cancel()
             io.close()
         }
+    }
+
+    // --- Follow-up B: sequence allocation + enqueue in ONE critical section ---
+
+    /**
+     * Discriminating test for the #81 follow-up. The test seam parks the FIRST
+     * atomic submit after allocating seq 2 but BEFORE trySend, while the single
+     * consumer is held on a real latch. A SECOND submit on another thread must
+     * then be unable to finish — indeed unable to allocate seq 3 — until the
+     * lock is freed. After release the HIGHEST sequence's value is what reaches
+     * disk and only its callback fires.
+     *
+     * "Cannot finish" is a bounded latch wait whose PASS condition is the
+     * timeout; no wall-clock sleep is used as a pass/fail signal.
+     */
+    @Test
+    fun enqueueIsAtomicWithSequenceAllocation() = runBlocking {
+        val io = newIoDispatcher()
+        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val firstSubmitter = Executors.newSingleThreadExecutor { r -> Thread(r, "bbc-atomic-first") }
+        val secondSubmitter = Executors.newSingleThreadExecutor { r -> Thread(r, "bbc-atomic-second") }
+        val sink = BlockingSink(initial = false)
+        val releasePark = CountDownLatch(1) // declared outside try so cleanup can always free it
+        try {
+            val state = BbcToggleRuntimeState(initialConfirmed = false)
+            val coordinator = BbcToggleCoordinator(
+                scope = appScope, state = state, commit = { sink.commit(it) }, io = io,
+            )
+
+            // Occupy the single consumer so neither atomic write is dequeued
+            // while the enqueue-lock handoff is under test. The blocker writes
+            // TRUE; the final value below is FALSE, so disk proves who won.
+            val blockerCallbacks = AtomicInteger(0)
+            coordinator.submitWithExplicitSequenceForTests(state.nextSequence(), true) { blockerCallbacks.incrementAndGet() }
+            sink.awaitFirstStarted()
+
+            val allocatedSeq2 = CountDownLatch(1)
+            coordinator.afterBbcSequenceAllocatedForTests = { seq ->
+                if (seq == 2L) {
+                    allocatedSeq2.countDown()
+                    check(releasePark.await(5, TimeUnit.SECONDS)) // parked inside the lock
+                }
+            }
+
+            val firstSeq = AtomicLong(0L)
+            val firstReturned = CountDownLatch(1)
+            val firstCallbacks = AtomicInteger(0)
+            firstSubmitter.execute {
+                firstSeq.set(coordinator.submit(true) { firstCallbacks.incrementAndGet() })
+                firstReturned.countDown()
+            }
+            check(allocatedSeq2.await(5, TimeUnit.SECONDS))
+            assertEquals("only the parked submit allocated so far", 2L, coordinator.latestSequence())
+
+            val secondSeq = AtomicLong(0L)
+            val secondStarted = CountDownLatch(1) // proves the 2nd thread reached submit()
+            val secondReturned = CountDownLatch(1)
+            val secondCallbacks = AtomicInteger(0)
+            secondSubmitter.execute {
+                secondStarted.countDown() // immediately before submit(false)
+                secondSeq.set(coordinator.submit(false) { secondCallbacks.incrementAndGet() })
+                secondReturned.countDown()
+            }
+            check(secondStarted.await(5, TimeUnit.SECONDS))
+
+            // NEGATIVE OBSERVATION: a split allocate/enqueue would let this
+            // finish immediately; the atomic one cannot make progress at all.
+            assertFalse(
+                "second submit must not complete while the first is parked inside the enqueue lock",
+                secondReturned.await(300, TimeUnit.MILLISECONDS),
+            )
+            assertEquals(
+                "second submit must not even allocate while the lock is held",
+                2L, coordinator.latestSequence(),
+            )
+
+            releasePark.countDown()
+            check(firstReturned.await(5, TimeUnit.SECONDS))
+            check(secondReturned.await(5, TimeUnit.SECONDS))
+            coordinator.afterBbcSequenceAllocatedForTests = null
+
+            sink.releaseFirst()
+            sink.awaitSecondEnded()
+            withTimeout(5_000L) { while (secondCallbacks.get() == 0) yield() }
+
+            assertEquals(2L, firstSeq.get())
+            assertEquals(3L, secondSeq.get())
+            assertEquals(3L, coordinator.latestSequence())
+            // seq 3 is the last value in the CONFLATED slot; the parked-but-
+            // lower seq 2 never even reached the channel.
+            assertEquals("highest sequence's value must be the final disk value",
+                false, sink.persisted)
+            assertEquals(listOf("start:true", "end:true", "start:false", "end:false"),
+                sink.snapshot())
+            assertEquals("highest sequence's callback must fire", 1, secondCallbacks.get())
+            assertEquals("coalesced lower sequence must never notify", 0, firstCallbacks.get())
+            assertEquals(1, blockerCallbacks.get())
+        } finally {
+            releasePark.countDown() // idempotent: no latch-blocked submit survives a failure
+            sink.releaseFirst()
+            firstSubmitter.shutdownNow()
+            secondSubmitter.shutdownNow()
+            appScope.cancel()
+            io.close()
+        }
+    }
+
+    /**
+     * Three atomic submits with a real latch holding seq 1's commit. Seq 2 is
+     * coalesced away; seq 3 is the newest. Asserts the NEWEST value lands on
+     * disk, its mark/UI callback fires, and the stale seq-1 Unknown callback
+     * does NOT fire. skippedWrites() is checked but is deliberately not the
+     * only signal (here it is 0 — the guarantee comes from atomic enqueue and
+     * the controller's per-intent fence, not from a pre-commit skip).
+     */
+    @Test
+    fun threeSequences_highestWinsOnDiskAndNotifies() = runBlocking {
+        val io = newIoDispatcher()
+        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val sink = BlockingSink(initial = true)
+        try {
+            val state = BbcToggleRuntimeState(initialConfirmed = true)
+            var firstCommit = true
+            val coordinator = BbcToggleCoordinator(
+                scope = appScope,
+                state = state,
+                commit = { value ->
+                    val outcome = sink.commit(value)
+                    // Force the STALE first write to Unknown: if the per-intent
+                    // fence broke, onUnknown/onFailed would fire for it.
+                    if (firstCommit) { firstCommit = false; BbcWriteOutcome.Unknown } else outcome
+                },
+                io = io,
+            )
+            val log = UiLog()
+            val statuses = StatusLog()
+            val c = uiController(coordinator, initial = true, log = log, statusLog = statuses)
+
+            c.onToggle(true)  // seq 1: enters the latched (stale) commit
+            sink.awaitFirstStarted()
+            c.onToggle(true)  // seq 2: takes the CONFLATED slot...
+            c.onToggle(false) // seq 3: ...and replaces it with the newest intent
+
+            assertEquals(3L, coordinator.latestSequence())
+            assertEquals("no further commit may start while seq 1 is blocked",
+                listOf("start:true"), sink.snapshot())
+
+            sink.releaseFirst()
+            sink.awaitSecondEnded()
+            withTimeout(5_000L) { while (state.confirmedOrUnknown != false) yield() }
+            withTimeout(5_000L) { while (c.currentLastGood()) yield() }
+
+            assertEquals("newest value must be what actually reached disk", false, sink.persisted)
+            assertEquals(listOf("start:true", "end:true", "start:false", "end:false"),
+                sink.snapshot())
+            assertEquals("state.mark must apply the newest value", false, state.confirmedOrUnknown)
+            assertEquals("newest intent's UI callback must fire", false, c.currentLastGood())
+            assertTrue("stale Unknown callback must be fenced out", log.isEmpty())
+            assertEquals(0, log.unknown)
+            assertEquals(0, log.failures)
+            assertEquals(
+                listOf(
+                    BbcEffectStatus.Provisional,
+                    BbcEffectStatus.Unknown,
+                    BbcEffectStatus.Confirmed(false),
+                ),
+                statuses.snapshot(),
+            )
+            assertEquals("guarantee is atomic enqueue + fences, not skipped writes",
+                0, coordinator.skippedWrites())
+            c.dispose()
+        } finally {
+            sink.releaseFirst() // idempotent: no latch-blocked commit survives a failure
+            appScope.cancel()
+            io.close()
+        }
+    }
+
+    /**
+     * Regression for the "publish the token after enqueue" bug. With the
+     * Unconfined UI+IO seam the consumer commits, marks and invokes onResult
+     * INLINE inside submit(), before submit() returns. A fence that reads a
+     * token assigned only after submit() returns therefore treats every tap
+     * after the first as stale and drops its own newest result. The fence must
+     * be captured from generation (incremented at the top of onToggle) BEFORE
+     * enqueue instead.
+     */
+    @Test
+    fun inlineConsumer_newestIntentResultIsNotDroppedByFence() = runBlocking {
+        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val sink = Sink(initial = false)
+        sink.resultAt = { idx -> idx != 2 } // newest (third) intent is forced Unknown
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope,
+            state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { sink.commit(it) },
+            io = Dispatchers.Unconfined,
+        )
+        val log = UiLog()
+        val c = BbcInjectionToggleController(
+            coordinator = coordinator,
+            initialValue = false,
+            main = Dispatchers.Unconfined, // UI block runs inline inside onResult inside submit()
+            onRestored = { log.restored.add(it) },
+            onFailed = { log.failures++ },
+            onUnknown = { log.unknown++ },
+        )
+        try {
+            c.onToggle(true) // seq 1: Confirmed(true) -> lastGood true
+            assertEquals(true, c.currentLastGood())
+
+            c.onToggle(false) // seq 2: Confirmed(false) -> newest result must apply
+            assertEquals("newest Confirmed result must not be dropped",
+                false, c.currentLastGood())
+
+            c.onToggle(true) // seq 3: forced Unknown -> newest Unknown must be reported
+            assertEquals("newest Unknown result must not be dropped", 1, log.unknown)
+            assertEquals(1, log.failures)
+            assertEquals("Unknown must never advance lastGood", false, c.currentLastGood())
+            assertEquals(3L, coordinator.latestSequence())
+            c.dispose()
+        } finally {
+            c.dispose()
+            appScope.cancel()
+        }
+    }
+
+    // --- Source shape: the controller must not split allocation from enqueue --
+
+    private fun prodSource(name: String): File {
+        val candidates = listOf(
+            File("src/main/java/com/galaxydual/plus/$name"),
+            File("app/src/main/java/com/galaxydual/plus/$name"),
+        )
+        return candidates.firstOrNull { it.isFile }
+            ?: throw AssertionError("missing $name (tried ${candidates.map { it.path }})")
+    }
+
+    private fun functionBlock(src: String, signature: String): String {
+        val start = src.indexOf(signature)
+        assertTrue("$signature must exist", start >= 0)
+        val brace = src.indexOf('{', start)
+        assertTrue("$signature must open a block", brace >= 0)
+        var depth = 0
+        for (i in brace until src.length) {
+            when (src[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return src.substring(start, i + 1)
+                }
+            }
+        }
+        throw AssertionError("$signature block never closes")
+    }
+
+    @Test
+    fun sourceShape_controllerUsesAtomicSubmit_only() {
+        val onToggle = functionBlock(
+            prodSource("BbcInjectionToggleController.kt").readText(), "fun onToggle(",
+        )
+        assertFalse(
+            "controller must NOT call state.nextSequence() directly before coordinator.submit(",
+            onToggle.contains("state.nextSequence()"),
+        )
+        assertTrue("controller must use the atomic submit(value, onResult) overload",
+            onToggle.contains("coordinator.submit(checked)"))
+        assertTrue("controller must adopt the sequence returned by atomic submit",
+            onToggle.contains("lastSubmittedSequence = seq"))
+        assertTrue(
+            "per-intent fence must be captured from generation BEFORE enqueue",
+            onToggle.contains("val myIntent = generation") &&
+                onToggle.indexOf("val myIntent = generation") <
+                onToggle.indexOf("coordinator.submit(checked)") &&
+                onToggle.contains("myIntent != generation"),
+        )
+
+        // Pin the critical section itself, not just the presence of its tokens
+        // somewhere in the file: a mutation that leaves the lock before
+        // trySend() must fail this test.
+        val coordinatorSrc = prodSource("BbcToggleCoordinator.kt").readText()
+        val atomicSubmit = functionBlock(coordinatorSrc, "fun submit(value: Boolean")
+        val critical = functionBlock(atomicSubmit, "synchronized(enqueueLock)")
+        assertTrue("enqueue must share the lock with allocation",
+            critical.contains("writes.trySend("))
+        assertTrue("allocation must be inside the lock",
+            critical.contains("state.nextSequence()"))
     }
 }
