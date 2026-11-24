@@ -9,18 +9,18 @@
 
 ## ⚠️ 身分辨識（依目前安裝的 id 條件化）
 
-**套件 id 遷移發生在 beta.2**：`applicationId`／LSPosed module id 從 `com.galaxydual.plus` 改為 `io.github.samson910022.galaxydualplus`。**beta.3 本身只改 App 顯示名稱與 versionCode 4，套件識別碼不變**。
+**套件 id 遷移發生在 beta.2**：`applicationId`／LSPosed module id 從 `com.galaxydual.plus` 改為 `io.github.samson910022.galaxydualplus`。**套件識別碼不變；beta.3 同步 App 顯示名稱與版本欄位（versionCode 4 等）**。
 
 **先確認目前安裝的 id**：若是舊 id `com.galaxydual.plus` → 全新安裝、不遷移舊資料、不可與新 id 共存、先備份並確認可還原；若已是 `io.github.samson910022.galaxydualplus`（含 beta.2 → beta.3）→ **同 id、同簽章 in-place 升級，不需卸載**，Android 通常會就地保留該管理 App 的資料，但**不保證 Samsung 分身或其資料完好**。
 
-Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 迁移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。
+Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 遷移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。
 
 不同套件 id 會被 Android 與 LSPosed 當成**另一個完全不同的 App／模組**：
 
 - **不會遷移任何東西**（僅舊 id → 新 id 的情境）：頻道偏好（channel preference）、雙開選擇（dual-app selection）、風險確認 ACK、修復提示（repair hint）、LSPosed 政策草稿（policy draft）全部留在舊套件下，**不會**自動帶到新套件。升級後請重新設定、重新確認風險、重新寫入政策。
 - **舊資料仍留在 `com.galaxydual.plus`**：安裝新版本不會清掉舊套件的資料；解除安裝舊版本也不會把資料搬進新套件。兩邊的內部儲存空間彼此獨立。
 - **沒有 App 內建匯出／匯入**（no in-app export/import）。請在解除安裝任何一個版本**之前**，先以每個 App 各自支援的機制（App 內建備份／雲端同步／系統備份）備份並實際驗證可還原分身與聊天資料；不要把唯一重要資料只放在分身內。
-- **請勿同時安裝或啟用新、舊兩個套件 id。** 兩者會成為兩個獨立的 LSPosed 模組，並使用各自獨立的遠端偏好 authorities（舊 `com.galaxydual.plus.XposedService`／新 `io.github.samson910022.galaxydualplus.XposedService`，Shizuku authorities 同理）。同時啟用會造成兩組模組與偏好並存、行為不可預期。請先停用並解除安裝其中一個，再安裝另一個。一般既有雙開 App 不需為此迁移**手動移除**，但這**不表示**分身不受影響（見上方 Samsung 說明）。
+- **請勿同時安裝或啟用新、舊兩個套件 id。** 兩者會成為兩個獨立的 LSPosed 模組，並使用各自獨立的遠端偏好 authorities（舊 `com.galaxydual.plus.XposedService`／新 `io.github.samson910022.galaxydualplus.XposedService`，Shizuku authorities 同理）。同時啟用會造成兩組模組與偏好並存、行為不可預期。請先停用並解除安裝其中一個，再安裝另一個。一般既有雙開 App 不需為此遷移**手動移除**，但這**不表示**分身不受影響（見上方 Samsung 說明）。
 
 > **Rollout 註記**：已發布的 GitHub Release body 仍為舊的身分／A/B/C 用語，由 maintainer 於 rollout 同步更新（PR 描述記錄 owner）；更新前以本檔與 README／USAGE／HOOK 的安裝警告為準。此為 release-metadata 更新，**不得 retag／rebuild／改 APK bytes**。
 
@@ -63,7 +63,7 @@ Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App �
 
 - 此 APK 為 signed release；LSPosed 模組與 App 同一 APK（`module.prop` 與 `java_init.list` 已由 release gate／套件身分檢查驗證）。
 - **先確認目前安裝的 id**：若是舊 id `com.galaxydual.plus` → 全新安裝、不遷移舊資料、不可與新 id 共存、先備份並確認可還原；若已是 `io.github.samson910022.galaxydualplus`（含 beta.2 → beta.3）→ **同 id、同簽章 in-place 升級，不需卸載**，Android 通常會就地保留該管理 App 的資料，但**不保證 Samsung 分身或其資料完好**。
-- Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 迁移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。
+- Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 遷移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。
 - 停用／卸載／opt-out／重開機**都不是**刪除防護；beta.3 的 hook **可能早於首次 App UI 警告生效**。BBC 清單注入仍為 experimental／本版本未實機驗證。
 - 需要 Root（KernelSU / Magisk）+ LSPosed 與相容的 Xposed API（102），以及 Samsung Dual Messenger。
 - 不同 One UI／Android 版本的行為可能不同；未驗證組合請視為 UNKNOWN。

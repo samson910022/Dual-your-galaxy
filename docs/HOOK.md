@@ -466,8 +466,8 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 > **安裝／升級警告（v0.1.0-beta.3）— 請先讀完本警告再點 Release 連結：**
 > **先確認目前安裝的 id**：若是舊 id `com.galaxydual.plus` → 全新安裝、不遷移舊資料、不可與新 id 共存、先備份並確認可還原；若已是 `io.github.samson910022.galaxydualplus`（含 beta.2 → beta.3）→ **同 id、同簽章 in-place 升級，不需卸載**，Android 通常會就地保留該管理 App 的資料，但**不保證 Samsung 分身或其資料完好**。
-> Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 迁移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。
-> release applicationId `io.github.samson910022.galaxydualplus`，自建 debug APK 為 `io.github.samson910022.galaxydualplus.debug`（是**不同套件**；舊 id `com.galaxydual.plus` 的資料**不會遷移**），其 applicationId 與 `module.prop` 的 module id `io.github.samson910022.galaxydualplus` 不一致（已知限制、不保證被 LSPosed 正確載入）。**無內建匯入／匯出**，請先備份並**確認備份可還原**。**新舊管理 App／LSPosed 模組不可同時啟用**（一般既有雙開 App 不需為此迁移**手動移除**，資料也不會合併）；不同 applicationId／module id／remote-prefs authority 會被系統視為不同個體。停用／卸載／opt-out／重開機**都不是**刪除防護；beta.3 的 hook **可能早於首次 App UI 警告生效**。BBC 清單注入仍為 experimental／本版本未實機驗證，LSPosed 寫入通道仍為 NoOp 佔位。**截至 v0.1.0-beta.3（`fc579de3`）尚無 pre-activation opt-in；PR #90 合併後以 `docs/HOOK.md` §1.4／ADR 為準。**
+> Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 遷移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。
+> release applicationId `io.github.samson910022.galaxydualplus`，自建 debug APK 為 `io.github.samson910022.galaxydualplus.debug`（是**不同套件**；舊 id `com.galaxydual.plus` 的資料**不會遷移**），其 applicationId 與 `module.prop` 的 module id `io.github.samson910022.galaxydualplus` 不一致（已知限制、不保證被 LSPosed 正確載入）。**無內建匯入／匯出**，請先備份並**確認備份可還原**。**新舊管理 App／LSPosed 模組不可同時啟用**（一般既有雙開 App 不需為此遷移**手動移除**，資料也不會合併）；不同 applicationId／module id／remote-prefs authority 會被系統視為不同個體。停用／卸載／opt-out／重開機**都不是**刪除防護；beta.3 的 hook **可能早於首次 App UI 警告生效**。BBC 清單注入仍為 experimental／本版本未實機驗證，LSPosed 寫入通道仍為 NoOp 佔位。**截至 v0.1.0-beta.3（`fc579de3`）尚無 pre-activation opt-in；PR #90 合併後以 `docs/HOOK.md` §1.4／ADR 為準。**
 > **已發布的 Release page 目前仍有舊身分／A/B/C 文字；maintainer 同步更新前，以本警告與 repo 內 `docs/RELEASE_NOTES_beta3.md` 為準。**
 
 1. 主用戶（user 0）安裝本 App 的**已簽章 release** `app-release.apk`（applicationId `io.github.samson910022.galaxydualplus`；一般使用者請用 [GitHub Release](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3) 的版本化 asset）。若已裝同一 id（beta.2 → beta.3），直接覆蓋更新即可，不需卸載。
@@ -498,7 +498,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 ### 2.2 LSPosed 勾選（＋ App 內通道選擇）
 
-> **安裝／升級警告（v0.1.0-beta.3）**：勾選作用域／重開機前請先讀本文件 §2.1／[docs/USAGE.md](USAGE.md)「安裝」節的完整警告與 repo 內 `docs/RELEASE_NOTES_beta3.md`：全新安裝僅相對於舊 id `com.galaxydual.plus`（beta.2→beta.3 同 id 為 in-place 升級、**不需卸載**）、**無資料／偏好自動遷移**、無內建匯入匯出，先備份並確認可還原；**舊版管理 App 與其 LSPosed 模組不可與新版同時啟用**。Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 迁移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。停用／卸載／opt-out／重開機不是刪除防護，beta.3 hook 可能早於首次 App UI 警告生效。**已發布的 Release page 仍有舊身分／A/B/C 文字；maintainer 同步前以上述警告與 `docs/RELEASE_NOTES_beta3.md` 為準。**
+> **安裝／升級警告（v0.1.0-beta.3）**：勾選作用域／重開機前請先讀本文件 §2.1／[docs/USAGE.md](USAGE.md)「安裝」節的完整警告與 repo 內 `docs/RELEASE_NOTES_beta3.md`：全新安裝僅相對於舊 id `com.galaxydual.plus`（beta.2→beta.3 同 id 為 in-place 升級、**不需卸載**）、**無資料／偏好自動遷移**、無內建匯入匯出，先備份並確認可還原；**舊版管理 App 與其 LSPosed 模組不可與新版同時啟用**。Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 遷移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。停用／卸載／opt-out／重開機不是刪除防護，beta.3 hook 可能早於首次 App UI 警告生效。**已發布的 Release page 仍有舊身分／A/B/C 文字；maintainer 同步前以上述警告與 `docs/RELEASE_NOTES_beta3.md` 為準。**
 
 1. 打開 LSPosed 管理器 → 模組 → 勾選 **Dual your Galaxy**（LSPosed 模組）並啟用；此名稱即 App 顯示名稱——`module.prop` 無 `name` 鍵、hook manifest 無 `android:label`，以 App 的 label 為準。
 2. 作用域（Scope）勾選以下兩項（H4：自家包自報已退場，file marker 為唯一訊號）：
@@ -514,7 +514,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 ### 2.3 重啟需求
 
-> **安裝／升級警告（v0.1.0-beta.3）**：重開機**不是**刪除防護；一般安裝／升級請先讀 §2.1 完整警告與 repo 內 `docs/RELEASE_NOTES_beta3.md`（全新安裝僅相對於舊 id `com.galaxydual.plus`，beta.2→beta.3 同 id 為 in-place 升級、**不需卸載**；無資料遷移／內建匯入匯出、先備份並確認可還原；新舊管理 App 與其 LSPosed 模組不可同時啟用）。Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 迁移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。**已發布的 Release page 仍有舊身分／A/B/C 文字；maintainer 同步前以上述警告與 `docs/RELEASE_NOTES_beta3.md` 為準。**
+> **安裝／升級警告（v0.1.0-beta.3）**：重開機**不是**刪除防護；一般安裝／升級請先讀 §2.1 完整警告與 repo 內 `docs/RELEASE_NOTES_beta3.md`（全新安裝僅相對於舊 id `com.galaxydual.plus`，beta.2→beta.3 同 id 為 in-place 升級、**不需卸載**；無資料遷移／內建匯入匯出、先備份並確認可還原；新舊管理 App 與其 LSPosed 模組不可同時啟用）。Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 遷移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。**已發布的 Release page 仍有舊身分／A/B/C 文字；maintainer 同步前以上述警告與 `docs/RELEASE_NOTES_beta3.md` 為準。**
 
 - **首次啟用／改動作用域後必須重啟**：`system_server` 注入只在開機時發生，
   不重啟等於沒 hook。建議直接完整重啟手機（軟重啟若管理器支援亦可）。
