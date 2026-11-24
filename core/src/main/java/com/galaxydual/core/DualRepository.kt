@@ -1023,7 +1023,9 @@ class DualRepository(
     // Neither is added to cloned. Unknown/Refused identity maps to NoDual
     // (fail closed); the pinned re-check itself does not re-resolve identity
     // beyond the before/fresh/after pin so a write can never be redirected to
-    // a different user (the after-to-probe window is read-only, see below).
+    // a different user. Issue #66 Phase B additionally fences the
+    // after-to-probe window: the pin is re-verified after the listing so a
+    // switch during the read-only probe is VerifyUnknown, never Success.
     suspend fun cloneVerified(pkg: String): CloneOutcome {
         val snap = profilesSnapshot()
         if (snap is ProfilesSnapshot.ChannelError) return CloneOutcome.ChannelError(snap.detail)
@@ -1099,7 +1101,14 @@ class DualRepository(
             val after = fetchVerifiedTarget()
             val drift = checkTargetDrift(before, after)
             if (drift != null) return CloneOutcome.VerifyUnknown(dualId, drift)
-            return when (val state = verifyListProbe(clean, dualId)) {
+            // Issue #66 Phase B: the listing itself can straddle an identity
+            // change; re-verify the pin after the probe before trusting its
+            // result (never map a drifted listing to Success).
+            val state = verifyListProbe(clean, dualId)
+            postListIdentityDrift(before)?.let {
+                return CloneOutcome.VerifyUnknown(dualId, it)
+            }
+            return when (state) {
                 is VerifyState.Installed -> CloneOutcome.Success(dualId)
                 is VerifyState.NotInstalled ->
                     CloneOutcome.VerifyUnknown(
@@ -1115,7 +1124,14 @@ class DualRepository(
         val after = fetchVerifiedTarget()
         val drift = checkTargetDrift(before, after)
         if (drift != null) return CloneOutcome.VerifyUnknown(dualId, drift)
-        return when (val state = verifyListProbe(clean, dualId)) {
+        // Issue #66 Phase B: post-list fence -- re-check the pre-probe pin
+        // after the listing so an incarnation switch during the probe is
+        // VerifyUnknown instead of a false Success.
+        val state = verifyListProbe(clean, dualId)
+        postListIdentityDrift(before)?.let {
+            return CloneOutcome.VerifyUnknown(dualId, it)
+        }
+        return when (state) {
             is VerifyState.Installed -> CloneOutcome.Success(dualId)
             is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(dualId)
             is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(dualId, state.detail)
@@ -1272,7 +1288,12 @@ class DualRepository(
             val timeoutAfter = fetchVerifiedTarget()
             val timeoutDrift = checkTargetDrift(syntheticTimeoutBefore, timeoutAfter)
             if (timeoutDrift != null) return CloneOutcome.VerifyUnknown(expectedDualId, timeoutDrift)
-            return when (val state = verifyListProbe(clean, expectedDualId)) {
+            // Issue #66 Phase B: post-list fence on the pinned (id, serial).
+            val state = verifyListProbe(clean, expectedDualId)
+            postListIdentityDrift(syntheticTimeoutBefore)?.let {
+                return CloneOutcome.VerifyUnknown(expectedDualId, it)
+            }
+            return when (state) {
                 is VerifyState.Installed -> CloneOutcome.Success(expectedDualId)
                 is VerifyState.NotInstalled ->
                     CloneOutcome.VerifyUnknown(
@@ -1296,7 +1317,12 @@ class DualRepository(
         val after = fetchVerifiedTarget()
         val drift = checkTargetDrift(syntheticBefore, after)
         if (drift != null) return CloneOutcome.VerifyUnknown(expectedDualId, drift)
-        return when (val state = verifyListProbe(clean, expectedDualId)) {
+        // Issue #66 Phase B: re-verify the synthetic pin after the listing.
+        val state = verifyListProbe(clean, expectedDualId)
+        postListIdentityDrift(syntheticBefore)?.let {
+            return CloneOutcome.VerifyUnknown(expectedDualId, it)
+        }
+        return when (state) {
             is VerifyState.Installed -> CloneOutcome.Success(expectedDualId)
             is VerifyState.NotInstalled -> CloneOutcome.VerifyFailed(expectedDualId)
             is VerifyState.Unknown -> CloneOutcome.VerifyUnknown(expectedDualId, state.detail)
@@ -1376,7 +1402,12 @@ class DualRepository(
             val after = fetchVerifiedTarget()
             val drift = checkTargetDrift(before, after)
             if (drift != null) return RemoveOutcome.VerifyUnknown(dualId, drift)
-            return when (val state = verifyListProbe(clean, dualId)) {
+            // Issue #66 Phase B: post-list fence before trusting the probe.
+            val state = verifyListProbe(clean, dualId)
+            postListIdentityDrift(before)?.let {
+                return RemoveOutcome.VerifyUnknown(dualId, it)
+            }
+            return when (state) {
                 is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
                 is VerifyState.Installed ->
                     RemoveOutcome.VerifyUnknown(
@@ -1392,7 +1423,13 @@ class DualRepository(
         val after = fetchVerifiedTarget()
         val drift = checkTargetDrift(before, after)
         if (drift != null) return RemoveOutcome.VerifyUnknown(dualId, drift)
-        return when (val state = verifyListProbe(clean, dualId)) {
+        // Issue #66 Phase B: re-verify the pin after the listing so a same-id
+        // rebuild during the probe cannot be reported as a clean Success.
+        val state = verifyListProbe(clean, dualId)
+        postListIdentityDrift(before)?.let {
+            return RemoveOutcome.VerifyUnknown(dualId, it)
+        }
+        return when (state) {
             is VerifyState.NotInstalled -> RemoveOutcome.Success(dualId)
             is VerifyState.Installed -> RemoveOutcome.StillInstalled(dualId)
             is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(dualId, state.detail)
@@ -1428,6 +1465,25 @@ class DualRepository(
             return detail
         }
         return null
+    }
+
+    // Issue #66 Phase B: post-list identity fence shared by every
+    // verifyListProbe caller. The probe itself is read-only and does not
+    // re-resolve identity, so the incarnation can change between the
+    // pre-probe pin and the probe result (including during the probe's retry
+    // waits). Re-fetch the same verified triple after the listing and require
+    // the pin to still hold via the EXISTING checkTargetDrift/continuityBreach
+    // semantics (id, serial known-to-unknown/unequal, parent unequal). A null
+    // re-fetch is evidence loss and fails closed ("identity unavailable"),
+    // never a license to trust the listing. CancellationException from the
+    // fetch propagates as in every other pinned identity fetch. Callers map
+    // a non-null detail to VerifyUnknown/Unknown (never Success/Installed).
+    // serial==null pins are not promoted to a drift by this helper (same
+    // tolerance as checkTargetDrift/continuityBreach).
+    private suspend fun postListIdentityDrift(pinned: VerifiedTarget): String? {
+        val reverify = fetchVerifiedTarget()
+            ?: return "post-list identity unavailable"
+        return checkTargetDrift(pinned, reverify)?.let { "post-list $it" }
     }
 
     /**
@@ -1536,7 +1592,12 @@ class DualRepository(
             val timeoutAfter = fetchVerifiedTarget()
             val timeoutDrift = checkTargetDrift(syntheticTimeoutBefore, timeoutAfter)
             if (timeoutDrift != null) return RemoveOutcome.VerifyUnknown(expectedDualId, timeoutDrift)
-            return when (val state = verifyListProbe(clean, expectedDualId)) {
+            // Issue #66 Phase B: post-list fence on the pinned (id, serial).
+            val state = verifyListProbe(clean, expectedDualId)
+            postListIdentityDrift(syntheticTimeoutBefore)?.let {
+                return RemoveOutcome.VerifyUnknown(expectedDualId, it)
+            }
+            return when (state) {
                 is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId)
                 is VerifyState.Installed ->
                     RemoveOutcome.VerifyUnknown(
@@ -1567,7 +1628,12 @@ class DualRepository(
         val after = fetchVerifiedTarget()
         val drift = checkTargetDrift(syntheticBefore, after)
         if (drift != null) return RemoveOutcome.VerifyUnknown(expectedDualId, drift)
-        return when (val state = verifyListProbe(clean, expectedDualId)) {
+        // Issue #66 Phase B: re-verify the synthetic pin after the listing.
+        val state = verifyListProbe(clean, expectedDualId)
+        postListIdentityDrift(syntheticBefore)?.let {
+            return RemoveOutcome.VerifyUnknown(expectedDualId, it)
+        }
+        return when (state) {
             is VerifyState.NotInstalled -> RemoveOutcome.Success(expectedDualId)
             is VerifyState.Installed -> RemoveOutcome.StillInstalled(expectedDualId)
             is VerifyState.Unknown -> RemoveOutcome.VerifyUnknown(expectedDualId, state.detail)
@@ -1645,16 +1711,24 @@ class DualRepository(
                 )
             }
         }
-        return verifyListProbe(pkg, dualId)
+        // Issue #66 Phase B: the probe is read-only but can straddle an
+        // incarnation switch. Pin the identity that authorized this probe
+        // (`fresh`) and re-verify it AFTER the listing; a drift (or evidence
+        // loss) maps to Unknown, never Installed. This also covers
+        // verifyState's expected=null path.
+        val state = verifyListProbe(pkg, dualId)
+        postListIdentityDrift(fresh)?.let { return VerifyState.Unknown(it) }
+        return state
     }
 
     // List-only re-check for an already-verified id (pinned flows): runs the
     // `pm list packages --user <dualId>` probe WITHOUT re-resolving identity.
-    // The write is already pinned to the same id (before/fresh/after pin);
-    // the probe itself performs no resolve, so a residual after-to-probe
-    // window remains. It is read-only and fail-closed in the misread
-    // direction: a drifted target can only misreport presence/absence, never
-    // redirect a write to another user.
+    // The write is already pinned to the same id (before/fresh/after pin), so
+    // the probe itself performs no resolve and can never redirect a write to
+    // another user. Issue #66 Phase B: every caller now re-verifies its pin
+    // after this probe via postListIdentityDrift (including retry waits), so
+    // an incarnation switch during the read-only listing fails closed to
+    // VerifyUnknown/Unknown instead of being misreported as Success/Installed.
     // All tri-state/trusted-parse/retry semantics are identical to the explicit
     // path below (PR-2 owns that contract; #21 only changes WHO may be
     // probed, never HOW the probe is judged).

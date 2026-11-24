@@ -5254,9 +5254,28 @@ class DualViewModel(
                             // count 對齊待下次 refresh，避免冷啟動 UNKNOWN 覆寫成功提示）。
                             // rebuiltNote 保留原邏輯不變（FRESH + 舊 id + 上次釘舊 id 才附註）。
                             val newTarget = res.dualId
+                            // #68：CloneOutcome.Success 只帶 dualId；同 id 換 serial
+                            // (delete+recreate) 時舊的 id-only 比對恆相等，新寫入結果
+                            // 會被混進舊 serial 的 FRESH 清單。此處已在 opMutex 內，
+                            // 取真正的新 gateway identity triple 比對 (id, serial) 配對：
+                            // serial 為 null 代表無法證明漂移，不以未知冒充已知（fail
+                            // closed 由 repo 的 pin Handle 負責），僅兩邊 serial 皆已知
+                            // 且不同才觸發全量重查。既有 id-mismatch／rebuiltNote 不變。
+                            val pinned = _state.value.inventory
+                            val freshTarget =
+                                if (pinned.freshness == InventoryFreshness.FRESH) {
+                                    fetchFreshVerifiedTarget()
+                                } else {
+                                    null
+                                }
                             val needRebuildRefresh =
-                                _state.value.inventory.freshness == InventoryFreshness.FRESH &&
-                                    _state.value.inventory.targetId != newTarget
+                                pinned.freshness == InventoryFreshness.FRESH &&
+                                    (pinned.targetId != newTarget ||
+                                        (freshTarget != null &&
+                                            (freshTarget.userId != pinned.targetId ||
+                                                (freshTarget.serial != null &&
+                                                    pinned.targetSerial != null &&
+                                                    freshTarget.serial != pinned.targetSerial))))
                             _state.update { cur ->
                                 val current: List<String> =
                                     if (needRebuildRefresh) {
@@ -5494,6 +5513,12 @@ class DualViewModel(
                                 )
                                 it.copy(
                                     loading = false,
+                                    // #69：install 已執行但重驗未知 → 可能已寫入未驗證，
+                                    // FRESH 不得謊稱新鮮（比照批次 successful/unknown 路徑）；
+                                    // 只降 freshness，profiles/cloned/count/身份皆保留。
+                                    inventory = it.inventory.copy(
+                                        freshness = InventoryFreshness.STALE,
+                                    ),
                                     lastOperation = op,
                                     diagnose = diag,
                                     // 理由 (本機回音原文)：msg 的包名回音顯示原文；
@@ -6451,9 +6476,26 @@ class DualViewModel(
                                             // 再對新 verified target 做全量 refresh（已在 opMutex
                                             // 內，直接調 refreshLocked，不重入加鎖）。觸發條件僅
                                             // FRESH mismatch；rebuiltNote 保留原邏輯不變。
+                                            // #68：同 clone 成功分支——RemoveOutcome.Success
+                                            // 亦只帶 dualId；同 id 換 serial 時必須比對
+                                            // (id, serial) 配對，否則移除結果會被呈現在舊
+                                            // serial 的 FRESH 快照上。opMutex 內取新鮮
+                                            // verified target；serial 未知則不以此證明漂移。
+                                            val pinned = _state.value.inventory
+                                            val freshTarget =
+                                                if (pinned.freshness == InventoryFreshness.FRESH) {
+                                                    fetchFreshVerifiedTarget()
+                                                } else {
+                                                    null
+                                                }
                                             val needRebuildRefresh =
-                                                _state.value.inventory.freshness == InventoryFreshness.FRESH &&
-                                                    _state.value.inventory.targetId != cur.dualId
+                                                pinned.freshness == InventoryFreshness.FRESH &&
+                                                    (pinned.targetId != cur.dualId ||
+                                                        (freshTarget != null &&
+                                                            (freshTarget.userId != pinned.targetId ||
+                                                                (freshTarget.serial != null &&
+                                                                    pinned.targetSerial != null &&
+                                                                    freshTarget.serial != pinned.targetSerial))))
                                             _state.update {
                                                 val remaining =
                                                     it.cloned.filterNot { p -> p == cur.pkg }
@@ -6717,6 +6759,12 @@ class DualViewModel(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
+                                                    // #69：uninstall 已執行但重驗未知 → 可能已寫入
+                                                    // 未驗證，FRESH 必須降 STALE（比照批次路徑）；
+                                                    // cloned/身份/count 皆保留，只降新鮮度。
+                                                    inventory = it.inventory.copy(
+                                                        freshness = InventoryFreshness.STALE,
+                                                    ),
                                                     lastOperation = op,
                                                     diagnose = diag,
                                                     // 理由 (本機回音原文)：msg 的包名回音顯示原文；
@@ -6935,18 +6983,23 @@ class DualViewModel(
     // 清空勾選 (記憶體):只改 selectedKeys,不跑任何 uninstall,不碰持久化。
     // 語意:「取消勾選」≠「卸載分身」。
     fun clearSelectionLocal() {
-        var changed = false
         _state.update { cur ->
-            if (cur.selectedKeys.isEmpty()) return@update cur
-            changed = true
-            cur.copy(
-                selectedKeys = emptySet(),
-                batchReport = null,
-                msg = "已清除勾選（未卸載任何分身）",
-                msgKind = MsgKind.INFO,
-            )
+            if (cur.selectedKeys.isEmpty()) {
+                cur
+            } else {
+                cur.copy(
+                    selectedKeys = emptySet(),
+                    batchReport = null,
+                    msg = "已清除勾選（未卸載任何分身）",
+                    msgKind = MsgKind.INFO,
+                )
+            }
         }
-        if (changed) selectionGen.incrementAndGet()
+        // #70：此入口永遠是「明確使用者 clear」，即使當下選取本來就為空也必須
+        // 推進 gen。restoreSelectionLocked 的 ABA 守衛只認 gen（isEmpty 無法
+        // 區分從未選取與已清除），不推進就擋不住 clear 之前啟動的晚到 restore。
+        // 不碰任何 uninstall／持久化：取消勾選 ≠ 卸載分身。
+        selectionGen.incrementAndGet()
         // Phase B #1：清空即解綁（空集合無歸屬）。
         selectionBoundTarget = SELECTION_BOUND_NONE
     }

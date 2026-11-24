@@ -127,7 +127,7 @@ closed，不計成功）；explicit-ID 入口僅做 fresh 自洽檢查（expecte
 TOCTOU 已揭露（check 與寫入之間重建同 id 無法在此入口偵測）。serial 單邊缺失則
 放行（tolerate，與 Phase B 一致）：僅雙邊皆有且不等才拒；跨 fetch 已知→未知亦拒
 （continuity lost，與實作一致）。
-pinned 寫入（`cloneVerified()`／`removeVerified()`）為 snapshot1＋before3＋fresh3＋write1＋after3＋list1＝12 命令（probe 最多 2 次 retry 另計）；寫前 fresh-vs-before 重核僅縮小 before-to-write 重用窗口，仍殘餘 fresh-to-write 微窗口（fail closed，與 DualRepository KDoc 一致）。
+pinned 寫入（`cloneVerified()`／`removeVerified()`）為 snapshot1＋before3＋fresh3＋write1＋after3＋list1＋post-list re-verify triple3＝15 命令（probe 最多 2 次 retry 另計）；post-list fence 在 `pm list packages` 完成後再核對 pinned `(id, serial, parent)`，漂移即回 `VerifyUnknown`（不發布新 incarnation 清單為舊目標成功；serial==null 時仍為能力限制）；寫前 fresh-vs-before 重核僅縮小 before-to-write 重用窗口，仍殘餘 fresh-to-write 微窗口（fail closed，與 DualRepository KDoc 一致）。
 列表刷新（`refreshVerified()`，Phase D P2-D）為單一 target：一次 `pm list users`（1）
 ＋一次 typed target（`cmd user list -v`＋`dumpsys user`＋`getprop`＝3）
 ＋一次 `pm list packages --user <dualId>`（1）＋post-list re-verify triple（3）＝8 命令（舊 resolve-then-reverify

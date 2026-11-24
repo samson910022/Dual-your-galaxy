@@ -38,6 +38,9 @@ class TargetRebuildRefreshTest {
             96 to mutableSetOf("com.example.chat"),
         ),
         var rootOk: Boolean = true,
+        // 本地可變 serial（預設 15，舊測試行為不變）：#68 需要「同 id 換 serial」
+        // 的 delete+recreate 世界，不能改別的檔案的 RebuildFake（hardcoded 15）。
+        var serial: Int = 15,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.ROOT
 
@@ -51,7 +54,7 @@ class TargetRebuildRefreshTest {
                 "    Serial number: 0\n" +
                 "    User type: android.os.usertype.full.SYSTEM\n" +
                 "  UserInfo{$dualId:DualApp:400} running:\n" +
-                "    Serial: 15\n" +
+                "    Serial: $serial\n" +
                 "    parentId=0\n" +
                 "    User type: android.os.usertype.profile.CLONE\n"
 
@@ -59,7 +62,7 @@ class TargetRebuildRefreshTest {
             "Users:\n" +
                 "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:\n" +
                 "    userType=android.os.usertype.full.SYSTEM\n" +
-                "  UserInfo{$dualId:DualApp:400} serialNo=15:\n" +
+                "  UserInfo{$dualId:DualApp:400} serialNo=$serial:\n" +
                 "    parentId=0\n" +
                 "    userType=android.os.usertype.profile.CLONE\n"
 
@@ -239,5 +242,111 @@ class TargetRebuildRefreshTest {
         )
         assertNull("remove success after refresh must clear diagnose", s.diagnose)
         assertNull("confirm must drop pending", s.pendingRemove)
+    }
+
+    // RED regression for issue #68 (same userId, fresh serial -> SUCCESS
+    // merged into the old-serial FRESH inventory). With id pinned at 95,
+    // delete+recreate of user 95 as (95,41) makes every identity channel
+    // report the new serial. CloneOutcome.Success carries only dualId
+    // (DualRepository.kt:119), and the clone Success branch
+    // (DualViewModel.kt:5256-5259) checks only
+    // `freshness == FRESH && inventory.targetId != newTarget`; both ids are
+    // 95 so needRebuildRefresh is false, refreshLocked() never runs, and
+    // the new package is appended to the old FRESH(95,15) list while
+    // targetSerial stays 15. Fix locus: under opMutex, fetch a fresh
+    // verified target (repo.fetchFreshVerifiedTarget() / the VM's public
+    // fetchFreshVerifiedTarget() wrapper) and compare BOTH (id, serial)
+    // against inventory's pin; on mismatch mark the old inventory STALE
+    // and re-probe the new incarnation whole (as the existing id-rebuild
+    // branch does with refreshLocked()). This test is intentionally RED
+    // on current code; production is NOT modified here.
+    @Test
+    fun cloneAfterSameIdSerialRebuild_doesNotKeepOldSerialFreshInventory() {
+        val gw = RebuildFake()
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+        assertTrue(vm.state.value.cloned.contains("com.example.old"))
+
+        // The profile was deleted and recreated with the SAME id but a fresh
+        // platform serial: all identity channels now agree on (95, 41).
+        gw.serial = 41
+
+        vm.clone("com.example.new")
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS
+        }
+
+        val s = vm.state.value
+        assertEquals(
+            "same-id serial rebuild must be detected: inventory must carry " +
+                "the verified (95,41) pin, not the stale (95,15) pin",
+            41,
+            s.inventory.targetSerial,
+        )
+        assertTrue(
+            "the write result must never be presented under a stale " +
+                "FRESH(95,15) snapshot; got: ${s.inventory}, cloned=${s.cloned}",
+            !(s.inventory.freshness == InventoryFreshness.FRESH &&
+                s.inventory.targetSerial == 15 &&
+                s.cloned.contains("com.example.new")),
+        )
+    }
+
+    // Same #68 regression through the remove Success branch
+    // (DualViewModel.kt:6454-6456): removeVerifiedExpected pins the new
+    // serial in pendingRemove.dualSerial and succeeds, but the VM again
+    // compares only TargetMismatch-by-id, so the removal result is merged
+    // into the stale FRESH(95,15) inventory. Same fix locus: compare the
+    // fresh verified (id, serial) under opMutex and re-probe the whole
+    // new incarnation. Intentionally RED on current code.
+    @Test
+    fun removeAfterSameIdSerialRebuild_doesNotKeepOldSerialFreshInventory() {
+        val gw = RebuildFake()
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertEquals(15, vm.state.value.inventory.targetSerial)
+        assertTrue(vm.state.value.cloned.contains("com.example.old"))
+
+        // Same id, new serial: the pending remove is pinned to (95,41),
+        // which is the incarnation the uninstall actually targets.
+        gw.serial = 41
+
+        vm.requestRemove("com.example.old")
+        await { vm.state.value.pendingRemove?.dualId == 95 }
+        assertEquals(41, vm.state.value.pendingRemove?.dualSerial)
+
+        vm.confirmRemove()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.lastOperation?.phase == OpPhase.SUCCESS &&
+                vm.state.value.pendingRemove == null
+        }
+
+        val s = vm.state.value
+        assertEquals(
+            "same-id serial rebuild must be detected: inventory must carry " +
+                "the verified (95,41) pin, not the stale (95,15) pin",
+            41,
+            s.inventory.targetSerial,
+        )
+        assertTrue(
+            "the remove result must never be presented under a stale " +
+                "FRESH(95,15) snapshot; got: ${s.inventory}, cloned=${s.cloned}",
+            !(s.inventory.freshness == InventoryFreshness.FRESH &&
+                s.inventory.targetSerial == 15 &&
+                !s.cloned.contains("com.example.old")),
+        )
     }
 }

@@ -282,15 +282,20 @@ class RemoveConfirmStageCTest {
 
     // C5a：confirm-NoDual 後備分支先走 typed 入口；Confirmed(otherId) 即目標
     // 已變更 → MISMATCH，不落入 targetListed 啟發式。腳本 (呼叫順序)：
-    // init 1 快照+3 身份、request 2 快照+6 身份、confirm 預檢 3 快照+9 身份
-    // (含 verifyState 內快照) 全見 95；repo 內 verified 期快照與 typed 同見 owner-only (pmIds={0}，
+    // init 1 快照+3 身份、request 2 快照+6 身份、confirm 預檢 3 快照+12 身份
+    // (含 verifyState 內快照與 issue #66 Phase B 的 post-list 身份再驗) 全見 95；
+    // repo 內 verified 期快照與 typed 同見 owner-only (pmIds={0}，
     // 無 pm 否決) → repo 回 NoDual；VM 後備期新鮮快照與 typed 同見 96 →
     // Confirmed(96)!=95 → VERIFY_MISMATCH。零卸載。
     @Test
     fun confirmNoDualFallbackTypedDrift_mapsMismatch() {
         val gw = ScriptedGateway(
             snapScript = ArrayDeque(listOf(95, 95, 95, 95, 95, 95, -1, 96)),
-            identScript = ArrayDeque(List(18) { 95 } + List(3) { -1 } + List(3) { 96 }),
+            // Issue #66 Phase B: both requestRemove and confirmRemove call
+            // verifyState, whose post-list fence adds one identity triple each
+            // (+6 identity calls). Keep those windows at 95 so the repo-typed
+            // -1 and the fallback 96 still land where the scenario expects.
+            identScript = ArrayDeque(List(24) { 95 } + List(3) { -1 } + List(3) { 96 }),
         )
         val vm = makeVm(gw)
         awaitVm(vm) { vm.state.value.channelReady }
@@ -469,7 +474,11 @@ class RemoveConfirmStageCTest {
     fun confirmRepoTypedConflict_mapsChannelError() {
         val gw = ScriptedGateway(
             snapScript = ArrayDeque(List(7) { 95 }),
-            identScript = ArrayDeque(List(18) { 95 } + listOf(-1, 96, 96)),
+            // Issue #66 Phase B: the two extra post-list identity triples
+            // (requestRemove + confirmRemove verifyState) still see 95; the
+            // conflicting typed query (-1, 96, 96) must land in the repo's
+            // removeVerifiedExpected.
+            identScript = ArrayDeque(List(24) { 95 } + listOf(-1, 96, 96)),
         )
         val vm = makeVm(gw)
         awaitVm(vm) { vm.state.value.channelReady }
