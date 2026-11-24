@@ -162,7 +162,10 @@ BBC-SPIKE FAIL: BBC library not resolvable on this ROM
 
 ## 7. Commands
 
+> 本節指令僅供 11-17／11-18 歷史復現；**一般安裝請改用 [README 快速開始](../README.md)／[GitHub Release](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3)**，並先讀[安裝／升級警告（v0.1.0-beta.3）](../README.md)（全新安裝、無資料／偏好遷移、無內建匯入匯出、先備份並確認可還原；新舊管理 App 與其 LSPosed 模組不可同時啟用，一般既有雙開 App 不需刪除；停用／卸載／opt-out／重開機不是刪除防護；自建 debug id `io.github.samson910022.galaxydualplus.debug` 與 module id 不一致；hook 可能早於首次 App UI 警告）。以下為歷史指令，非目前版本的安裝建議。
+
 ```bash
+# ⚠️ 僅供歷史復現；一般安裝見 README 快速開始／GitHub Release 並先讀安裝／升級警告：https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ./gradlew :hook:testDebugUnitTest assembleDebug --console=plain
 adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk   # serial 不入 repo

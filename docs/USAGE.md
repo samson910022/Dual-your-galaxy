@@ -10,13 +10,13 @@
 > 本文件描述包含設計目標與未完成流程；凡 [待實作]／[待實機驗證]／[已接線] 皆不宣稱為可用功能（[已接線]＝有程式碼並已接通，但端到端未實機驗證），
 > 驗證須依個別情境判讀，不能由正常成功案例推論所有通道與安全負向邊界。歷史 S24 寫入紀錄與本輪唯讀調查見下方更新。
 
-## 安裝（v0.1.0-beta.2 起／含 beta.3）
+## 安裝（v0.1.0-beta.3）
 
-> **全新安裝／不遷移／勿共存**：自 **v0.1.0-beta.2 起為全新安裝，不遷移舊 id 資料**。目前 `applicationId` 為 `io.github.samson910022.galaxydualplus`（舊為 `com.galaxydual.plus`）；**請勿與舊版或既有雙開安裝共存**——不同 applicationId 會被系統視為不同 app，舊資料不會自動帶過來，安裝前請先備份。
+> **安裝／升級警告（v0.1.0-beta.3）**：請先讀 [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3)。此版本為**全新安裝**：release applicationId `io.github.samson910022.galaxydualplus`，自建 debug APK 為 `io.github.samson910022.galaxydualplus.debug`（舊 id `com.galaxydual.plus` 的資料**不會遷移**，偏好／政策草稿／風險確認也不會自動搬移）；**無內建匯入／匯出**，請先備份並**確認備份可還原**。**舊版管理 App 與其 LSPosed 模組不可與新版同時啟用**（一般既有雙開 App 不需刪除、資料也不會合併）。不同 applicationId／module id／remote-prefs authority 會被系統視為不同個體。停用／卸載／opt-out／重開機**都不是**刪除防護；beta.3 的 hook **可能早於首次 App UI 警告生效**。
 >
 > `AndroidManifest.xml` 的 `package="com.galaxydual.plus"` 為歷史殘留欄位，與目前 applicationId 不同（AGP 以 `namespace`／`applicationId` 為準）；此差異不影響上列「全新安裝、不遷移」結論，本文不改程式。
 >
-> BBC 清單注入仍為 experimental／本版本未實機驗證（正向證據僅 11-17／11-18 舊 build）；LSPosed 寫入通道仍為 NoOp 佔位。生效前同意（pre-activation opt-in）屬 PR #90 範圍，尚未於本分支生效。
+> BBC 清單注入仍為 experimental／本版本未實機驗證（正向證據僅 11-17／11-18 舊 build）；LSPosed 寫入通道仍為 NoOp 佔位。生效前同意（pre-activation opt-in）屬 PR #90 範圍，尚未於本分支生效。一般安裝請用 [GitHub Release](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3) 的已簽章 `app-release.apk`；自建 debug APK 的 id 與 `module.prop` 的 module id 不一致，屬已知限制。
 
 > **2026-11-05 更新**：[S24 調查與追蹤計畫](UX_REVIEW_S24.md) 彙整既有 #6/#9 的正常 SHELL clone/remove、手動通道證據，以及新發現與 issues #21–#29。本文較舊 F4a 的「無實機／Factory 靜態選路」敘述屬歷史階段，不代表手動重選仍未實作；未完成項目仍不得宣稱可用。
 
@@ -187,6 +187,8 @@ adb shell pm uninstall --user <dualId> com.example.chat
 
 ## 4. 通道選擇與 LSPosed 模式（F4b-P1 picker＋P2 marker；ROOT／SHIZUKU 已授權一鍵已抽驗 [S24 已驗證]，其餘 [待實機驗證]）
 
+> **安裝／升級警告（v0.1.0-beta.3）**：下達「作用域勾選→重開機」前請先讀 [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3) 與本文件「安裝」節警告：全新安裝、**無資料／偏好自動遷移**、無內建匯入匯出，先備份並確認可還原；**舊版管理 App 與其 LSPosed 模組不可與新版同時啟用**（一般既有雙開 App 不需刪除、資料不會合併）；停用／卸載／opt-out／重開機不是刪除防護，beta.3 hook 可能早於首次 App UI 警告生效。
+
 - 已 ROOT + LSPosed 的裝置：到 LSPosed 管理器勾選 **Dual your Galaxy**，
   作用域勾 `system`＋`com.samsung.android.da.daagent`（見 `docs/HOOK.md` §1.5／§2.2）後重啟；再到 App 內按 LSPosed 按鈕切到 LSPosed 模式：Hook 行顯示 marker 狀態（per-scope marker；`偵測到歷史 Hook 標記（…，僅存在性證據，未確認本次開機是否生效）`／`未偵測到`／`狀態未知（…）`，P1 四態見本節末段；file marker 存在性證據，僅顯示、永不授權；daagent 側因 SELinux 寫入失敗故 marker 恆缺 daagent，見 `docs/HOOK.md` §1.5）；LSPosed 通道為 NoOp 佔位、寫入一律拒絕（BBC 注入（非寫入通道）僅 11-17／11-18 舊 build 有實機證據，**目前 HEAD experimental／本版本未實機驗證**：Samsung 設定頁可見第三方 app 並可雙開，見 [docs/HOOK.md](docs/HOOK.md) §1.3a／§2.3；寫入通道仍為 NoOp 佔位，一律拒絕）。marker gateway-`cat` 顯示 [待實機驗證]，無實機證據。
 - AUTO 模式按 su→Shizuku→NoOp 解析執行通道（hook 永不被自動選中）；`channelReadyFor` 純函數 [已支援]（ROOT 需 su 探測、hook 訊號永不授權、NONE 永不就緒）；Auto probe 降級已實作（P25：首次探測即依 live probes 修正啟動猜測——su 存在但探測拒絕＋Shizuku 通過→SHIZUKU＋降級說明，雙通道皆失敗→NOOP 唯讀，暫態失敗後點 `重新連線並更新` 即重探恢復）；實機切換 [待實機驗證] DEVICE-UNVERIFIED。
@@ -291,6 +293,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 
 ## English Summary
 
+- **Install / upgrade warning (v0.1.0-beta.3):** See [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3). Clean install only — release applicationId `io.github.samson910022.galaxydualplus`, locally built debug APK `io.github.samson910022.galaxydualplus.debug`; no migration from the old id `com.galaxydual.plus`, no built-in import/export. Back up first and verify the backup is restorable. Do **not** enable the legacy management App / LSPosed module together with the new one (ordinary dual apps are **not** affected and need not be removed). Disabling, uninstalling, opting out or rebooting are **not** a deletion guard; the beta.3 hook may act before the first in-app warning.
 - Privilege routing (tested pure function + wired channels [DEVICE-UNVERIFIED]): manual `ChannelPreference` picker (AUTO default, `selectChannel` swaps gateway + re-probes; `channelReadyFor` pure gate, tested: ROOT needs su probe, hook signal never grants, NONE never ready), su ROOT via `SuCmdGateway` (`su -c`), Shizuku (SHELL) via `ShizukuCmdGateway` (UserService; `newProcess` removed in 13.1.5)
   fallback, else read-only (NONE) with `NoOp` fail-closed. LSPosed mode is an explicit NoOp placeholder (writes refused); hook state comes from the F4b-P2 per-scope file marker (display-only, `HookStateProvider` direct + gateway-`cat` reads); marker gateway-`cat` display, Shizuku unauthorized/dead-guidance paths, first-time SHIZUKU selection are unverified (`pm path` is auxiliary only, never ground truth, see #22); BBC callback logs and non-empty policy are device-verified on 2026-11-17/18 builds; experimental / not device-verified on the current HEAD (S23 Ultra + Tab S7, 2026-11-17, **pre-unification build** — see `docs/ACCEPTANCE.md` §6; unified build re-verified 2026-11-18, BBC1–BBC3 re-verified; BBC4/BBC5 caveated／UNVERIFIED（2026-11-18 17:21/17:22，pid=3568 僅 historical note，非目前 HEAD 通過）；BBC6 後 SSAID 拒絕；恢復=重啟+Samsung toggle-on（見 BBC6_SSAID_INCIDENT.md）; BBC6 destroyed the dual app (see BBC6_SSAID_INCIDENT.md)); in-app ROOT one-click, authorized-SHIZUKU one-click (installed-verify), bare-pm clone, `su -c` reinstall, and uninstall rollback verified on S24.
 - Pair Shizuku via Wireless debugging (Android 11+, unverified flow), approve Dual your Galaxy, then Reconnect-and-refresh (single entry `reconnectAndRefresh()`: probe with Auto degrade + refresh; title syncs to `(SHELL/SHIZUKU)` only when the Shizuku probe passes, otherwise stays read-only NONE — switching itself is DEVICE-UNVERIFIED).
