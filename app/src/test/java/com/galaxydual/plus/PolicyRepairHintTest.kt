@@ -131,12 +131,60 @@ class PolicyRepairHintTest {
         }
     }
 
+    // PR #89: a reentrant fake that lets a NEWER mark fully settle (including a
+    // FAILED save) inside the OLDER mark's successful save() before that older
+    // save reports success. The older writer then reaches the post-save fence
+    // with a STALE ticket; a stale success must never certify the newer pending
+    // state (otherwise the next mark would early-return and skip its retry).
+    private class ReentrantStaleSuccessStore : RepairHintStore {
+        private val map = HashMap<String, Any>()
+        val writes = CopyOnWriteArrayList<RepairHintState>()
+        var coordinator: PolicyTxCoordinator? = null
+        var calls = 0
+            private set
+
+        override fun load(): RepairHintState = synchronized(this) {
+            RepairHintState(
+                active = map[REPAIR_HINT_KEY_ACTIVE] as? Boolean ?: false,
+                generation = map[REPAIR_HINT_KEY_GENERATION] as? Long ?: 0L,
+                repairedVersion = map[REPAIR_HINT_KEY_REPAIRED_VERSION] as? Long ?: -1L,
+            )
+        }
+
+        override fun save(state: RepairHintState): Boolean = synchronized(this) {
+            calls++
+            writes.add(state)
+            when (calls) {
+                1 -> {
+                    // Older mark's physical write succeeds...
+                    map[REPAIR_HINT_KEY_ACTIVE] = state.active
+                    map[REPAIR_HINT_KEY_GENERATION] = state.generation
+                    map[REPAIR_HINT_KEY_REPAIRED_VERSION] = state.repairedVersion
+                    // ...but a newer mark settles reentrantly before this result
+                    // is handed back. Its save is call #2 and FAILS.
+                    coordinator?.markRepairHint()
+                    true
+                }
+                2 -> false // newer mark's save fails -> durability stays UNKNOWN
+                else -> {
+                    map[REPAIR_HINT_KEY_ACTIVE] = state.active
+                    map[REPAIR_HINT_KEY_GENERATION] = state.generation
+                    map[REPAIR_HINT_KEY_REPAIRED_VERSION] = state.repairedVersion
+                    true
+                }
+            }
+        }
+    }
+
     // PR4 review (Required 1, follow-up): NON-reentrant variant. The mark thread
     // is parked by the production seam AFTER writeId=1 is issued but BEFORE it
     // takes repairHintIoLock; a REAL second thread then completes the ack
     // (writeId=2) and lands its clear on disk. The reentrant fake above cannot
     // cover this window because it re-enters from inside save(), i.e. after the
     // IO lock is already held.
+    // PR #89: with the fused decision this seam fires AFTER the decision (ticket
+    // issued, durability pending, mirror installed) but BEFORE any IO, so both
+    // interleavings below can be pinned deterministically with two real threads.
     private class GatedInterleavingRepairHintStore : RepairHintStore {
         private val map = HashMap<String, Any>()
         val writes = CopyOnWriteArrayList<RepairHintState>()
@@ -779,6 +827,200 @@ class PolicyRepairHintTest {
     }
 
     @Test
+    fun markDecidesFirst_ackOnAnotherThreadWinsEverywhere() {
+        // PR #89 ordering (a): the mark linearizes first (active=true, gen=1) and
+        // parks after its FUSED decision, before IO. A separate real thread then
+        // runs a FULL acknowledge (clear + disk commit). Releasing the mark must
+        // leave the ack as the last decision AND the last physical write: no
+        // resurrected warning, not even in a fresh (cold-start) coordinator.
+        val store = GatedInterleavingRepairHintStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        val firstDecisionParked = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val armFirst = AtomicBoolean(true)
+        coord.beforeRepairHintIoLockSeamForTests = {
+            if (armFirst.compareAndSet(true, false)) {
+                firstDecisionParked.countDown()
+                try {
+                    releaseFirst.await(5, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+
+        val markThread = Thread {
+            coord.markRepairHint(repairedVersion = 1L)
+        }.apply { isDaemon = true; name = "repair-hint-mark-first" }
+
+        try {
+            markThread.start()
+            assertTrue("mark must reach the post-decision pre-IO seam", firstDecisionParked.await(3, TimeUnit.SECONDS))
+
+            val ackDone = CountDownLatch(1)
+            val ackThread = Thread {
+                try {
+                    coord.acknowledgeRepairHint()
+                } finally {
+                    ackDone.countDown()
+                }
+            }.apply { isDaemon = true; name = "repair-hint-ack-second" }
+            ackThread.start()
+            assertTrue("ack must fully settle while the mark is parked", ackDone.await(3, TimeUnit.SECONDS))
+            ackThread.join(3_000L)
+            assertFalse("ack thread must have finished", ackThread.isAlive)
+            assertTrue(
+                "a successful ack must flip the REAL durability verdict to true",
+                coord.repairHintDurableForTests,
+            )
+
+            releaseFirst.countDown()
+            markThread.join(3_000L)
+            assertFalse("mark thread must have finished", markThread.isAlive)
+
+            assertEquals("the stale mark must skip its physical save", 1, store.writes.size)
+            assertFalse("last disk write is the ack's clear", store.writes.last().active)
+            assertEquals("the clear keeps the mark's generation", 1L, store.writes.last().generation)
+            assertFalse("live hint stays cleared", coord.repairHint.value)
+            assertFalse("in-memory mirror stays cleared", coord.repairHintPersistedState.active)
+            assertEquals("generation must not regress", 1L, coord.repairHintPersistedState.generation)
+            assertTrue(
+                "a stale writer must not clobber the newest write's durability verdict",
+                coord.repairHintDurableForTests,
+            )
+            assertFalse("durable value stays cleared", store.load().active)
+
+            val fresh = PolicyTxCoordinator(repairHintStore = store)
+            coords.add(fresh)
+            assertFalse("cold start must not resurrect an acknowledged warning", fresh.repairHint.value)
+            assertFalse(fresh.repairHintPersistedState.active)
+            assertEquals(1L, fresh.repairHintPersistedState.generation)
+        } finally {
+            releaseFirst.countDown()
+            coord.beforeRepairHintIoLockSeamForTests = null
+            markThread.join(3_000L)
+        }
+    }
+
+    @Test
+    fun ackDecidesFirst_newerMarkOnAnotherThreadWinsAndGenerationNeverRegresses() {
+        // PR #89 ordering (b): mirror the review scenario with the roles swapped.
+        // Start from a DURABLE active marker (gen=3); park a full clear after its
+        // fused decision; a newer mark settles from another thread (gen=4); then
+        // release the ack. The ack's later ticket must be stale for BOTH its
+        // physical save and its outcome fence, so disk stays active=true and a
+        // fresh coordinator still warns.
+        val store = GatedInterleavingRepairHintStore()
+        store.save(RepairHintState(active = true, generation = 3L, repairedVersion = 1L))
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertTrue(coord.repairHint.value)
+        assertEquals(3L, coord.repairHintPersistedState.generation)
+
+        val firstDecisionParked = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val armFirst = AtomicBoolean(true)
+        coord.beforeRepairHintIoLockSeamForTests = {
+            if (armFirst.compareAndSet(true, false)) {
+                firstDecisionParked.countDown()
+                try {
+                    releaseFirst.await(5, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+
+        val ackThread = Thread {
+            coord.acknowledgeRepairHint()
+        }.apply { isDaemon = true; name = "repair-hint-ack-first" }
+
+        try {
+            ackThread.start()
+            assertTrue("ack must reach the post-decision pre-IO seam", firstDecisionParked.await(3, TimeUnit.SECONDS))
+
+            val markDone = CountDownLatch(1)
+            val markThread = Thread {
+                try {
+                    coord.markRepairHint(repairedVersion = 2L)
+                } finally {
+                    markDone.countDown()
+                }
+            }.apply { isDaemon = true; name = "repair-hint-mark-second" }
+            markThread.start()
+            assertTrue("newer mark must settle while the ack is parked", markDone.await(3, TimeUnit.SECONDS))
+            markThread.join(3_000L)
+            assertFalse("mark thread must have finished", markThread.isAlive)
+
+            releaseFirst.countDown()
+            ackThread.join(3_000L)
+            assertFalse("ack thread must have finished", ackThread.isAlive)
+
+            // One preloaded write + the newer mark; the stale ack never touches disk.
+            assertEquals(2, store.writes.size)
+            assertTrue("last disk write is the newer mark's active=true", store.writes.last().active)
+            assertEquals("generation must not regress", 4L, store.writes.last().generation)
+            assertTrue("live hint stays raised", coord.repairHint.value)
+            assertTrue("in-memory mirror stays active", coord.repairHintPersistedState.active)
+            assertEquals(4L, coord.repairHintPersistedState.generation)
+            assertTrue("durable value stays active", store.load().active)
+
+            val fresh = PolicyTxCoordinator(repairHintStore = store)
+            coords.add(fresh)
+            assertTrue("cold start must still warn about the live repair", fresh.repairHint.value)
+            assertEquals("generation must not regress across restart", 4L, fresh.repairHintPersistedState.generation)
+        } finally {
+            releaseFirst.countDown()
+            coord.beforeRepairHintIoLockSeamForTests = null
+            ackThread.join(3_000L)
+        }
+    }
+
+    @Test
+    fun staleSuccessfulSave_cannotCertifyNewerPendingState() {
+        // PR #89: the older mark's save() physically succeeds, but a NEWER mark
+        // (a retry of the still-pending active intent) fully settles reentrantly
+        // before the older result is reported. The older writer's ticket is then
+        // stale at the post-save fence: it must NOT certify durability for the
+        // newer state. Observable proof: a subsequent mark still retries the
+        // write (3 commit calls) with the SAME generation (retry verbatim).
+        val store = ReentrantStaleSuccessStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        store.coordinator = coord
+
+        coord.markRepairHint(repairedVersion = 1L)
+        assertEquals("mark plus reentrant retry", 2, store.calls)
+        assertFalse(
+            "the newest (failed) save must leave real durability UNKNOWN, not certified",
+            coord.repairHintDurableForTests,
+        )
+
+        // If the stale success had been applied, this mark would see
+        // active && durable and early-return (no third save).
+        coord.markRepairHint(repairedVersion = 2L)
+        assertEquals("stale success must not skip the newer mark's retry", 3, store.calls)
+        assertEquals(1L, store.writes[0].generation)
+        assertEquals("reentrant retry is verbatim", 1L, store.writes[1].generation)
+        assertEquals("later retry is verbatim", 1L, store.writes[2].generation)
+        assertTrue("live hint stays raised", coord.repairHint.value)
+        assertTrue("the retried write landed durably", store.load().active)
+        assertTrue(
+            "the newest successful retry certifies real durability",
+            coord.repairHintDurableForTests,
+        )
+
+        // Cold start over the same store must still raise the durable hint.
+        val fresh = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(fresh)
+        assertTrue("cold start must still warn about the retried repair", fresh.repairHint.value)
+        assertTrue(fresh.repairHintPersistedState.active)
+        assertEquals(1L, fresh.repairHintPersistedState.generation)
+    }
+
+    @Test
     fun failedFirstSave_thenSecondMark_retriesPersist() {
         // #76 RED: markRepairHint() early-returns when the in-memory
         // `persisted.active` is true, so a second notification after a FAILED
@@ -811,5 +1053,150 @@ class PolicyRepairHintTest {
             true,
             prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean ?: false,
         )
+    }
+
+    // =====================================================================
+    // PR #89 FIXER: discriminating seams for the FUSED decision.
+    //
+    // The earlier tests park at beforeRepairHintIoLockSeamForTests, which in the
+    // UNFIXED base already sat AFTER ticket issuance (inside persistRepairHint)
+    // and therefore passed against the bug. The seam below is in the CALLER,
+    // immediately after the decision block and before publish/save: in a split
+    // implementation the ticket is issued later, so the parked writer has NO
+    // ticket yet and a newer ack can overtake it. That is the regression this
+    // test pins.
+    // =====================================================================
+    @Test
+    fun decisionBeforeTicket_mustNotLetOlderIntentLandLast() {
+        val store = GatedInterleavingRepairHintStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        val firstDecisionParked = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val armFirst = AtomicBoolean(true)
+        coord.afterRepairHintDecisionSeamForTests = {
+            // ONE-SHOT: the ack's own decision must NOT park, otherwise the
+            // main thread deadlocks waiting for the ack it is running itself.
+            if (armFirst.compareAndSet(true, false)) {
+                firstDecisionParked.countDown()
+                try {
+                    releaseFirst.await(5, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+
+        val markThread = Thread {
+            coord.markRepairHint(repairedVersion = 1L)
+        }.apply { isDaemon = true; name = "repair-hint-decision-first" }
+
+        try {
+            markThread.start()
+            assertTrue("mark must reach the post-decision seam", firstDecisionParked.await(3, TimeUnit.SECONDS))
+
+            // Full ack on the test thread: decides active=false with a NEWER
+            // ticket, publishes it, commits false, and certifies durability.
+            coord.acknowledgeRepairHint()
+            assertTrue("the ack must certify durability", coord.repairHintDurableForTests)
+            assertFalse(coord.repairHint.value)
+
+            releaseFirst.countDown()
+            markThread.join(3_000L)
+            assertFalse("mark thread must have finished", markThread.isAlive)
+
+            assertEquals("the stale decision must not write active on disk", 1, store.writes.size)
+            assertFalse("final disk value is the ack's false", store.load().active)
+            assertFalse("final live flow stays cleared", coord.repairHint.value)
+            assertFalse("final in-memory mirror stays cleared", coord.repairHintPersistedState.active)
+            assertTrue("stale writer must not clobber the ack's durability verdict", coord.repairHintDurableForTests)
+
+            val fresh = PolicyTxCoordinator(repairHintStore = store)
+            coords.add(fresh)
+            assertFalse("a fresh coordinator must stay quiet", fresh.repairHint.value)
+            assertFalse(fresh.repairHintPersistedState.active)
+        } finally {
+            releaseFirst.countDown()
+            coord.afterRepairHintDecisionSeamForTests = null
+            markThread.join(3_000L)
+        }
+    }
+
+    @Test
+    fun olderPublishDecision_cannotOverwriteNewerPublishedClear() {
+        // The publisher seam sits at ENTRY, before repairHintPublishLock, so a
+        // parked older publisher cannot block the newer one. Only the monotonic
+        // `intent.ticket <= lastPublishedRepairHintTicket` check keeps the older
+        // publication from re-raising the flow after the newer clear landed.
+        val store = GatedInterleavingRepairHintStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        val olderParked = CountDownLatch(1)
+        val releaseOlder = CountDownLatch(1)
+        val armFirst = AtomicBoolean(true)
+        coord.beforeRepairHintPublishSeamForTests = {
+            if (armFirst.compareAndSet(true, false)) {
+                olderParked.countDown()
+                try {
+                    releaseOlder.await(5, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+
+        val olderThread = Thread {
+            coord.markRepairHint(repairedVersion = 1L)
+        }.apply { isDaemon = true; name = "repair-hint-older-publisher" }
+
+        try {
+            olderThread.start()
+            assertTrue("older publisher must reach the entry seam", olderParked.await(3, TimeUnit.SECONDS))
+
+            coord.acknowledgeRepairHint() // newer ticket publishes false and commits false
+            assertFalse(coord.repairHint.value)
+
+            releaseOlder.countDown()
+            olderThread.join(3_000L)
+            assertFalse("older thread must have finished", olderThread.isAlive)
+
+            assertFalse("a stale publication must not re-raise the live flow", coord.repairHint.value)
+            assertFalse("in-memory mirror stays cleared", coord.repairHintPersistedState.active)
+            assertFalse("disk stays cleared", store.load().active)
+
+            val fresh = PolicyTxCoordinator(repairHintStore = store)
+            coords.add(fresh)
+            assertFalse("cold start stays quiet", fresh.repairHint.value)
+        } finally {
+            releaseOlder.countDown()
+            coord.beforeRepairHintPublishSeamForTests = null
+            olderThread.join(3_000L)
+        }
+    }
+
+    @Test
+    fun resetForTest_resetsPublicationTicket_soNextMarkPublishes() {
+        val store = GatedInterleavingRepairHintStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        coord.markRepairHint(repairedVersion = 1L)
+        assertTrue("first mark publishes active", coord.repairHint.value)
+
+        coord.resetForTest()
+        assertFalse("reset publishes inactive", coord.repairHint.value)
+        assertFalse("reset clears the mirror", coord.repairHintPersistedState.active)
+        assertEquals(0L, coord.repairHintPersistedState.generation)
+
+        // If resetForTest forgot lastPublishedRepairHintTicket, the next mark
+        // would reissue ticket=1 and the monotonic publish fence would swallow
+        // its active=true publication.
+        coord.markRepairHint(repairedVersion = 2L)
+        assertTrue("next mark must publish active after reset", coord.repairHint.value)
+        assertTrue(coord.repairHintPersistedState.active)
+        assertEquals(1L, coord.repairHintPersistedState.generation)
+        assertTrue("next mark must land durably after reset", store.load().active)
     }
 }

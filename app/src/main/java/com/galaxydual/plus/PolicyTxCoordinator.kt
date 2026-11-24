@@ -112,14 +112,71 @@ class PolicyTxCoordinator internal constructor(
 
     // #76: false = the last write's commit(false)/exception or a recovered load
     // left durability UNKNOWN. markRepairHint must then RETRY instead of returning.
+    // PR #89: flipped to false INSIDE the same fused decision block that issues
+    // the ticket, so a concurrent mark can never observe a stale
+    // `active && durable` and early-return while an older write is still pending.
     private var persistedDurable = true
+
+    // Monotonic ticket. PR #89: mutated ONLY inside the single fused decision
+    // critical section (markRepairHint / applyRepairHintClear). No second monitor
+    // ever issues a ticket, so a ticket can no longer be *later* than the intent
+    // it represents.
     private var repairHintWriteSeq = 0L
+
     // Serializes hint commits without holding the coordinator monitor (#76).
+    // Phase C will replace this with an async worker; the physical save stays
+    // outside the coordinator monitor either way.
     private val repairHintIoLock = Any()
 
-    // PR4 review (Required 1, follow-up): JVM-only hook parked AFTER writeId is
-    // issued but BEFORE the IO lock is acquired. A two-thread test uses it to pin
-    // the exact stale-write window the pre-save fence closes. null in production.
+    // PR #89: immutable write intent returned by the fused decision. The ticket
+    // and the candidate state are captured together and never re-read from
+    // mutable coordinator fields by the writer that performs the IO.
+    private data class RepairHintWrite(val ticket: Long, val state: RepairHintState)
+
+    // F6: MutableStateFlow.value notifies collectors synchronously. Normally do
+    // NOT write it while holding the coordinator monitor: a reentrant collector
+    // could otherwise nest a decision (and its IO) under `this`. Publication
+    // happens after the decision block, guarded by a SEPARATE lock with a
+    // monotonic ticket check so an older ticket cannot overwrite a newer
+    // publication. The only work done under this lock is the StateFlow write
+    // itself; save() always runs later, under repairHintIoLock (never under this
+    // lock).
+    //
+    // DELIBERATE CARVE-OUTS (both under `this`, neither goes through this lock):
+    //  * the fail-safe re-raise in persistRepairHint's outcome fence, which must
+    //    raise the flow when the NEWEST save reports unknown durability;
+    //  * resetForTest(), a JVM-only process-lifetime reset that takes `this` then
+    //    this lock in that fixed order (no path takes the publish lock then
+    //    `this`, so there is no ABBA cycle).
+    private val repairHintPublishLock = Any()
+    private var lastPublishedRepairHintTicket = -1L
+
+    // JVM-only hook at ENTRY, BEFORE taking repairHintPublishLock, so a parked
+    // first publisher cannot block a newer publisher (which must still be able
+    // to publish). The monotonic ticket check inside publishRepairHint is what
+    // keeps the parked older publisher from overwriting it on release.
+    internal var beforeRepairHintPublishSeamForTests: (() -> Unit)? = null
+
+    private fun publishRepairHint(intent: RepairHintWrite) {
+        beforeRepairHintPublishSeamForTests?.invoke()
+        synchronized(repairHintPublishLock) {
+            if (intent.ticket <= lastPublishedRepairHintTicket) return
+            lastPublishedRepairHintTicket = intent.ticket
+            _repairHint.value = intent.state.active
+        }
+    }
+
+    // PR #89 regression seam: located in the CALLER, immediately after the fused
+    // decision returns and BEFORE publish/save. If anyone reintroduces a split
+    // where the ticket is issued later inside persistRepairHint, this seam once
+    // again sits BEFORE ticket issuance and the two-thread ordering test that
+    // uses it fails. null in production.
+    internal var afterRepairHintDecisionSeamForTests: (() -> Unit)? = null
+
+    // PR4 review (Required 1, follow-up): JVM-only hook parked AFTER the fused
+    // decision (ticket issued) but BEFORE the IO lock is acquired. A two-thread
+    // test uses it to pin the exact stale-write window the pre-save fence closes.
+    // null in production.
     internal var beforeRepairHintIoLockSeamForTests: (() -> Unit)? = null
 
     init {
@@ -147,21 +204,30 @@ class PolicyTxCoordinator internal constructor(
     @get:Synchronized
     internal val repairHintPersistedState: RepairHintState get() = persisted
 
+    // JVM-test seam: real durability verdict (not the SharedPreferences fake's
+    // loadWasRecovered() default). false after a failed/UNKNOWN save or a
+    // recovered/corrupt load, true only once the newest write certified commit().
+    @get:Synchronized
+    internal val repairHintDurableForTests: Boolean get() = persistedDurable
+
     /**
      * Raise the app-scoped hint after a successful Invalid->v1 repair commit.
      * Idempotent: an ALREADY-DURABLE active marker never bumps
      * [RepairHintState.generation]; an active-but-unconfirmed marker retries the
      * same state instead of silently skipping the durable write (#76).
      *
-     * State mutation happens under the coordinator monitor; the SharedPreferences
-     * commit runs OUTSIDE it so a slow disk write never blocks other coordinator
-     * operations. On failure the live warning stays raised and a later mark retries.
+     * PR #89: state mutation, ticket issuance, and the pending-durability flip
+     * happen in ONE `synchronized(this)` block. The returned [RepairHintWrite]
+     * is immutable: no later monitor can hand a *newer* ticket to an *older*
+     * intent. The physical commit runs OUTSIDE the coordinator monitor, and
+     * the live flow is published after the decision on a separate lock.
      */
     fun markRepairHint(repairedVersion: Long = -1L) {
-        val next = synchronized(this) {
+        val intent = synchronized(this) {
             if (persisted.active && persistedDurable) {
-                // Verified durable: keep the live truth raised, no generation bump.
-                _repairHint.value = true
+                // Verified durable: keep the live truth raised, no generation
+                // bump and no new write intent. The flow is already published
+                // as active by the write that certified this state.
                 null
             } else {
                 val candidate = if (persisted.active) {
@@ -174,12 +240,19 @@ class PolicyTxCoordinator internal constructor(
                         repairedVersion = repairedVersion,
                     )
                 }
+                // Fused decision: ticket, pending durability, and mirror all
+                // change atomically with the candidate selection.
+                repairHintWriteSeq += 1L
+                val ticket = repairHintWriteSeq
+                persistedDurable = false
                 persisted = candidate
-                _repairHint.value = true
-                candidate
+                RepairHintWrite(ticket, candidate)
             }
         }
-        if (next != null) persistRepairHint(next)
+        afterRepairHintDecisionSeamForTests?.invoke()
+        if (intent == null) return
+        publishRepairHint(intent)
+        persistRepairHint(intent)
     }
 
     /** Explicit user acknowledgement. The ONLY production clear. */
@@ -192,65 +265,71 @@ class PolicyTxCoordinator internal constructor(
     internal fun clearOnVerifiedHookRebirth() = applyRepairHintClear()
 
     private fun applyRepairHintClear() {
-        val next = synchronized(this) {
+        // Same fused decision as markRepairHint: the clear's ticket is issued
+        // while its candidate is installed, never in a second monitor later.
+        val intent = synchronized(this) {
             val candidate = persisted.copy(active = false)
+            repairHintWriteSeq += 1L
+            val ticket = repairHintWriteSeq
+            persistedDurable = false
             persisted = candidate
-            _repairHint.value = false
-            candidate
+            RepairHintWrite(ticket, candidate)
         }
-        persistRepairHint(next)
+        afterRepairHintDecisionSeamForTests?.invoke()
+        publishRepairHint(intent)
+        persistRepairHint(intent)
     }
 
-    // #76: the durable write is deliberately OUTSIDE the @Synchronized monitor.
-    // Only the in-memory decision is serialized; commit() runs under a separate
-    // IO lock so concurrent callers cannot interleave two SharedPreferences edits.
-    private fun persistRepairHint(next: RepairHintState) {
+    // #76: the durable write is deliberately OUTSIDE the coordinator monitor.
+    // PR #89: the caller now supplies the immutable [intent] produced by the
+    // fused decision; its ticket is used for BOTH the pre-save skip and the
+    // post-save outcome fence. No ticket is ever issued here.
+    private fun persistRepairHint(intent: RepairHintWrite) {
         val store = repairHintStore ?: return
-        val writeId = synchronized(this) {
-            repairHintWriteSeq += 1L
-            // Unverified until commit() actually reports success.
-            persistedDurable = false
-            repairHintWriteSeq
-        }
         beforeRepairHintIoLockSeamForTests?.invoke()
         val durable = synchronized(repairHintIoLock) {
-            // PR4 review (Required 1, follow-up): the post-save seq check below
-            // protects only the IN-MEMORY outcome. A writer whose writeId is
-            // already stale by the time it reaches this IO lock must not touch
-            // the store at all — otherwise an older mark can still land
-            // active=true on disk ON TOP OF a newer ack's clear. Re-read the seq
-            // under `this` for a happens-before-safe snapshot, then release that
-            // monitor BEFORE save() so the physical commit stays off it.
-            if (synchronized(this) { writeId != repairHintWriteSeq }) {
+            // A writer whose ticket is already stale by the time it reaches this
+            // IO lock must not touch the store at all — otherwise an older mark
+            // could still land active=true ON TOP OF a newer ack's clear.
+            // Re-read the seq under `this` for a happens-before-safe snapshot,
+            // then release that monitor BEFORE save() so the physical commit
+            // stays off it.
+            if (synchronized(this) { intent.ticket != repairHintWriteSeq }) {
                 false // stale: skip the physical commit entirely; do NOT touch store
             } else {
                 try {
-                    store.save(next)
+                    store.save(intent.state)
                 } catch (_: Throwable) {
                     false
                 }
             }
         }
-        // PR4 review (Required 1): a save result may arrive AFTER a newer write
-        // has already settled. Applying such a stale result can resurrect an
-        // acknowledged hint (A: mark/save(false) preempted after releasing the
-        // IO lock; B: ack/save(true) settles; A then re-raises the warning).
+        // A save result may arrive AFTER a newer write has already settled.
+        // Applying such a stale result can resurrect an acknowledged hint
+        // (A: mark/save(false) preempted after releasing the IO lock;
+        // B: ack/save(true) settles; A then re-raises the warning).
         //
-        // Linearization point: [repairHintWriteSeq] is issued under THIS monitor
-        // at entry, and the SAME monitor is re-entered here to read the current
-        // seq and apply the outcome as one atomic step. The seq is mutated only
-        // inside `synchronized(this)`, so this read is a consistent snapshot:
-        // any write that started after ours has already bumped the seq by the
-        // time we get here. A stale result (writeId != seq) is therefore ignored
-        // in FULL — it touches neither [persisted], [_repairHint], nor
-        // [persistedDurable] that the newer write may already have certified.
+        // The ticket was issued under `this` in the fused decision, and the same
+        // monitor is re-entered here to read the current seq and apply the
+        // outcome as one atomic step. A stale result (ticket != seq) is ignored
+        // in FULL: it touches neither [persisted], [persistedDurable], nor the
+        // live flow that the newer write may already have published/certified.
         synchronized(this) {
-            if (writeId == repairHintWriteSeq) {
+            if (intent.ticket == repairHintWriteSeq) {
                 if (!durable) {
                     // Unknown durability: never hide an already-raised warning,
-                    // and keep the mirror active so the next mark retries.
+                    // and keep the mirror active so the next mark retries. Only
+                    // the newest ticket reaches this fence, so publishing here
+                    // cannot overwrite a newer decision's flow value.
                     if (!persisted.active) {
                         persisted = persisted.copy(active = true)
+                        // Documented carve-out to the "publish on publishLock"
+                        // rule above: re-raise under `this` with the CURRENT
+                        // ticket still installed. Routing this through
+                        // publishRepairHint(intent) would be WRONG — the intent
+                        // here is a failed clear (active=false), and its ticket
+                        // was already published, so the monotonic check would
+                        // skip it and an acknowledged hint would stay hidden.
                         _repairHint.value = true
                     }
                     persistedDurable = false
@@ -1719,14 +1798,26 @@ class PolicyTxCoordinator internal constructor(
         // PR #74 R6-2 (G02): reset the repair marker too, so JVM tests stay isolated
         // (generation back to 0, repairedVersion back to -1, live hint false).
         try {
-            persisted = RepairHintState(false, 0L, -1L)
-            _repairHint.value = false
-            // PR4 review (Optional 3): a fresh test coordinator must also forget
-            // any prior write generation/durability verdict, otherwise a leftover
-            // writeId could make the next persist look stale (or look verified).
-            persistedDurable = true
-            repairHintWriteSeq = 0L
-            repairHintStore?.save(persisted)
+            // PR #89 P3: the whole repair-hint reset must be atomic against an
+            // in-flight writer. Hold `this` FIRST, then the publish lock, and
+            // never take them in the opposite order anywhere else (the decision
+            // block releases `this` before publishing; no path takes publishLock
+            // then `this`). An in-flight writer's stale ticket then fails both
+            // the pre-save and post-save seq fences against the reset seq=0.
+            synchronized(this) {
+                synchronized(repairHintPublishLock) {
+                    persisted = RepairHintState(false, 0L, -1L)
+                    lastPublishedRepairHintTicket = -1L
+                    _repairHint.value = false
+                    // PR4 review (Optional 3): a fresh test coordinator must also
+                    // forget any prior write generation/durability verdict,
+                    // otherwise a leftover writeId could make the next persist
+                    // look stale (or look verified).
+                    persistedDurable = true
+                    repairHintWriteSeq = 0L
+                    repairHintStore?.save(persisted)
+                }
+            }
         } catch (_: Exception) {
             // Best effort.
         }
