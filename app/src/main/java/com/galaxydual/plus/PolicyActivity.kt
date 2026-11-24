@@ -607,10 +607,14 @@ class PolicyActivity : ComponentActivity() {
         }
         // R5-1 (F02): a repair committed in the Main VM (or an ack there) changes
         // only the App-scoped signal, so observe it directly as well.
+        // P3 device-risk: the flow can be emitted from repair-hint-io or an IO
+        // dispatcher, so hop to Main (no-op when already there) before touching Views.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 vm.repairHintFromApp.collect {
-                    try { applyRepairHint(vm.state.value) } catch (_: Exception) { /* Best effort. */ }
+                    withContext(Dispatchers.Main.immediate) {
+                        try { applyRepairHint(vm.state.value) } catch (_: Exception) { /* Best effort. */ }
+                    }
                 }
             }
         }

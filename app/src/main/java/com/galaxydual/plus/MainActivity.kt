@@ -555,9 +555,15 @@ class MainActivity : ComponentActivity() {
         // R5-1 (F02): a repair committed by the OTHER Activity's VM marks the
         // App-scoped coordinator (no new UiState emission reaches this VM), so
         // observe that flow too and re-render the last known state on change.
+        // P3 device-risk: the flow can be emitted from repair-hint-io or an IO
+        // dispatcher, so hop to Main (no-op when already there) before touching Views.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                vm.repairHintFromApp.collect { lastState?.let { s -> render(s) } ?: render(vm.state.value) }
+                vm.repairHintFromApp.collect {
+                    withContext(Dispatchers.Main.immediate) {
+                        lastState?.let { s -> render(s) } ?: render(vm.state.value)
+                    }
+                }
             }
         }
         refreshShizukuPresenceCache()
@@ -8792,10 +8798,11 @@ internal suspend fun dispatchConsentGatedConfirm(
     }
 }
 
-// D03b fixer M3/M5：兩個 one-shot guard（framework-free、JVM 可測）。
-// - InFlightGuard：confirm 重入防護——第一段 enter 成功者才 launch，其餘直接丟棄。
-// - OneShotRestartGuard：abort 後的重啟警告排程去抖＋打破同步遞迴
-//   （Activities 用 main Handler.post 實際延後；guard 只鎖「是否已排程」語義）。
+// D03b fixer M3/M5：framework-free、JVM 可測的 guard helpers。
+// - InFlightGuard：confirm 重入防護——第一段 enter 成功者才 launch，其餘直接丟棄（仍 live）。
+// - OneShotRestartGuard：LEGACY / test-only helper，不再是實際的排程 guard。
+//   auto-restart 的 dedup 與 budget 現在由 WarningRestartController 統一管理
+//   （Activities 用 main Handler.post 實際延後）；此 guard 只保留給舊 JVM 測試。
 internal class InFlightGuard {
     private val inFlight = AtomicBoolean(false)
     fun tryEnter(): Boolean = inFlight.compareAndSet(false, true)
@@ -8809,10 +8816,12 @@ internal class OneShotRestartGuard {
 }
 
 // D03b fixer (availability)：自動重啟警告的次數上限（每次「使用者真正點入口」重置）。
-// OneShotRestartGuard 只擋同一次 post 內的 re-entrant scheduling；此上限擋的是
-// 「連續多次 post」。結構性 fail-closed 原因（空草稿 + 目標不存在／probe 持續失敗）
-// 否則會跨 post 無限重警。用罷即不再排程，使用者必須重新點入口；不影響 fail-closed
-// 寫入（abort 依然零寫入）。pure function 故 JVM 可測。
+// MAX_AUTO_WARNING_RESTARTS 仍 live：它是兩邊 Activity 傳給 WarningRestartController
+// 的 maxRestarts；實際 auto-restart 的 dedup / budget 已搬到該 controller。
+// canAutoRestart 與 OneShotRestartGuard 一樣只保留為 test-only / legacy helper，
+// 不再是線上排程路徑的一部分（此 pure function 僅作為上限規格的 JVM 文件）。
+// 上限擋的是結構性 fail-closed 原因（空草稿 + 目標不存在／probe 持續失敗）跨 post
+// 無限重警；不影響 fail-closed 寫入（abort 依然零寫入）。
 internal const val MAX_AUTO_WARNING_RESTARTS = 1
 internal fun canAutoRestart(previousCount: Int): Boolean = previousCount < MAX_AUTO_WARNING_RESTARTS
 

@@ -150,8 +150,10 @@ class PolicyTxCoordinator internal constructor(
     // Serializes hint commits without holding the coordinator monitor (#76).
     // Phase C: the commit now runs inside a RepairHintIoOwner task; this lock is
     // still the serialization point when JVM tests override dispatch to run the
-    // task synchronously on the calling thread. Either way save() is NEVER called
-    // while holding the coordinator monitor or the publish lock.
+    // task synchronously on the calling thread. Either way, on the COMMIT path
+    // save() is NEVER called while holding the coordinator monitor or the publish
+    // lock. The sole deliberate exception is resetForTest() (JVM-only): it saves
+    // under both monitors to force a clean process-lifetime reset.
     private val repairHintIoLock = Any()
 
     // PR #89: immutable write intent returned by the fused decision. The ticket
@@ -361,7 +363,10 @@ class PolicyTxCoordinator internal constructor(
     //    unconfirmed clear can therefore never leave the hint silently hidden;
     //  * [persistedDurable] is certified ONLY by the NEWEST ticket's confirmed
     //    commit. A stale ticket's outcome (success OR failure) is ignored in
-    //    full: it touches neither the mirror, durability, nor the live flow.
+    //    full: it touches neither the mirror, durability, nor the live flow;
+    //  * there is NO watchdog: a permanently stuck IO owner never reaches the
+    //    outcome fence, so an acknowledged hint stays hidden until a later mark
+    //    re-raises it (liveness here is best-effort, not guaranteed).
     //
     // #76: the durable write is deliberately OUTSIDE the coordinator monitor.
     // PR #89: the caller supplies the immutable [intent] produced by the fused

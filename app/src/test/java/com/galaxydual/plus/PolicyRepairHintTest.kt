@@ -22,6 +22,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -1945,6 +1946,56 @@ class PolicyRepairHintTest {
             assertTrue("the IO owner thread must be a daemon", ioThread.isDaemon)
         } finally {
             RepairHintIoOwner.dispatchOverrideForTests = { task -> task() }
+        }
+    }
+
+    // P3 device-risk (PR #89 final polish): repairHint can be emitted from
+    // repair-hint-io or Dispatchers.IO, so both Activity collectors must hop to
+    // Main.immediate before touching Views. Source-shape lock (non-vacuous: also
+    // requires the original View work in the very same collector body).
+    @Test
+    fun repairHintFromAppCollectors_hopToMain_immediate() {
+        fun prodFile(name: String): File {
+            val candidates = listOf(
+                File("src/main/java/com/galaxydual/plus/$name"),
+                File("app/src/main/java/com/galaxydual/plus/$name"),
+            )
+            return candidates.firstOrNull { it.isFile }
+                ?: throw AssertionError("missing $name (tried ${candidates.map { it.path }})")
+        }
+
+        fun collectBody(src: String, label: String): String {
+            val marker = "vm.repairHintFromApp.collect"
+            val start = src.indexOf(marker)
+            assertTrue("$label must collect vm.repairHintFromApp", start >= 0)
+            val open = src.indexOf('{', start + marker.length)
+            assertTrue("$label collector must open a lambda body", open >= 0)
+            var depth = 0
+            for (i in open until src.length) {
+                when (src[i]) {
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) return src.substring(open, i + 1)
+                    }
+                }
+            }
+            throw AssertionError("$label collector lambda never closes")
+        }
+
+        for ((label, name, viewCall) in listOf(
+            Triple("MainActivity", "MainActivity.kt", "render("),
+            Triple("PolicyActivity", "PolicyActivity.kt", "applyRepairHint("),
+        )) {
+            val body = collectBody(prodFile(name).readText(), label)
+            assertTrue(
+                "$label repairHintFromApp.collect body must hop to Main.immediate",
+                body.contains("withContext(Dispatchers.Main.immediate)"),
+            )
+            assertTrue(
+                "$label collector body must still do its View work (non-vacuous)",
+                body.contains(viewCall),
+            )
         }
     }
 }
