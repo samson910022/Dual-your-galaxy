@@ -1,33 +1,49 @@
 # ACCEPTANCE — 實機/模擬器驗收矩陣（Phase P29, issue #29）
 
 > 定位：harness（`app/src/androidTest`）只保證
-> **編譯通過 + 零真機寫入**；真正的裝置驗收一律走本文件的人工矩陣記錄。
+> **編譯通過 + 零真機寫入**；另在 API 29 emulator 上自動執行 instrumented tests
+> （`locale-instrumentation`，60 tests／15 test classes；**tested APK byte 未錨定**）。
+> 真正的裝置驗收一律走本文件的人工矩陣記錄。
 > harness 測試於每次 PR 的 `locale-instrumentation` job（API 29 emulator）自動執行，
-> 另於 `workflow_dispatch` 的 `instrumentation-manual` job（API 34 emulator）手動執行；
+> 另於 `workflow_dispatch` 的 `instrumentation-manual` job（API 34 emulator）手動執行（beta.3 為 **SKIPPED**）；
 > PR CI 另跑 `:app:assembleDebugAndroidTest`（編譯）作為編譯閘門。
 
 ## Round-7b 範圍收斂（2026-11-23；優先於本文 round-2～6 的合併閘門用語）
 
 > 依最新 Scoped Review，本文所有 N01/D01/E00/F00/G00、N08/D08、N09、D06、D07 及 Scope A 的 UNMEASURED／NOT a pass 列，全部是**風險揭露與後續研究清單**，**不是 PR #74 的合併阻擋項**；唯一合併門檻為 **M1**（風險 UX）與 **M2**（主功能正確性），已於 PR #74（r7b-1..3）實作。下文 round-2～6 的「P0 合併門檻維持開啟／未關閉」用語保留為歷史風險揭露記錄，由本節重新分類。
 >
-> P0（Samsung system-uid user95 DELETE）是**真實觀察，不是通過／不是已修復**：A/B/C 為負向控制關聯（各臂 App build 不同；`pm install-existing --user 95` 只還原套件存在、不還原 user-95 原有資料；根因未證實；原始私有 log 未由本 reviewer 獨立覆核）。依 round-7b 維護者決策，在 M1/M2 完成並誠實揭露後，**接受為 experimental limitation**——此為發布責任、風險資訊與操作保護的分離，**不是安全宣稱**。**H01–H04**（RepairHintStore durability／`commit(false)`、被拒絕重入的警告 generation、ack 的 SharedPreferences commit on UI、PM IPC／15ms gate／30min sticky／Samsung UI 矩陣）與 **#75**（DAAgent pre-DELETE 研究）為 **follow-ups，非 blocker**。PR #74 的 Round 7b/8 程式與 CI 驗證**未新增實機驗收**；另於 2026-11-23 依持有人授權在已備份裝置完成 A/B/C 破壞性對照（本節 §6，三臂皆清除 user-95 分身與資料，**不是安全通過**），原始私有 log 未由本次 review 獨立覆核；最終 run #45103347110（PR head）與 #45113206916（main merge 後）皆 **SUCCESS**（build／locale-instrumentation 通過，manual emulator matrix **SKIPPED**）——此二者為 **PR #74 歷史 run**，**不用於驗證目前 beta.3 HEAD**；目前 HEAD 的 CI 錨點為 beta.3 run **#45228233599**（Android CI，PR head `e5c61f51`，build／locale-instrumentation SUCCESS、manual emulator matrix **SKIPPED**）與 **#45233459919**（Release，main push `fc579de3`，release／publish SUCCESS；無 manual matrix job）；兩者 tree hash 相同（`33614a81…`），APK SHA256 `98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`，無 tested-byte provenance；JVM／CI 全綠不構成裝置通過。
+> P0（Samsung system-uid user95 DELETE）是**真實觀察，不是通過／不是已修復**：A/B/C 為負向控制關聯（各臂 App build 不同；`pm install-existing --user 95` 只還原套件存在、不還原 user-95 原有資料；根因未證實；原始私有 log 未由本 reviewer 獨立覆核）。依 round-7b 維護者決策，在 M1/M2 完成並誠實揭露後，**接受為 experimental limitation**——此為發布責任、風險資訊與操作保護的分離，**不是安全宣稱**。**H01–H04**（RepairHintStore durability／`commit(false)`、被拒絕重入的警告 generation、ack 的 SharedPreferences commit on UI、PM IPC／15ms gate／30min sticky／Samsung UI 矩陣）與 **#75**（DAAgent pre-DELETE 研究）為 **follow-ups，非 blocker**。PR #74 的 Round 7b/8 程式與 CI 驗證**未新增實機驗收**；另於 2026-11-23 依持有人授權在已備份裝置完成 A/B/C 破壞性對照（本節 §6，三臂皆清除 user-95 分身與資料，**不是安全通過**），原始私有 log 未由本次 review 獨立覆核；最終 run #45103347110（PR head）與 #45113206916（main merge 後）皆 **SUCCESS**（build／locale-instrumentation 通過，manual emulator matrix **SKIPPED**）——此二者為 **PR #74 歷史 run**，**不用於驗證本版本（beta.3）**；本版本（beta.3）的 CI 錨點為 run **#45228233599**（Android CI，PR head `e5c61f51`，build／locale-instrumentation SUCCESS、manual emulator matrix **SKIPPED**）與 **#45233459919**（Release，main push `fc579de3`，release／publish SUCCESS；無 manual matrix job）；兩者 tree hash 相同（`33614a81…`），APK SHA256 `98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`，無 tested-byte provenance；JVM／CI 全綠不構成裝置通過。
 
-## 1. 版本錨定（每次驗收必填）
+## 1. 版本錨定（v0.1.0-beta.3；固定錨點，非日後 source 的驗收）
 
-| 欄位 | 值 |
-| --- | --- |
-| source commit | `fc579de348f21dc3a0ed5f88f7148736805a8119`（`fc579de3`，main，v0.1.0-beta.3；beta.3 CI run 見下） |
-| APK SHA256 | `98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`（v0.1.0-beta.3 release APK，GitHub release asset；非 debug APK、非 tested-byte 證據）；**此為 build 產物 SHA，非 tested-byte 證據；無 beta.3 manual job `tested-apk-provenance` artifact**（**測試位元組證據必須來自 manual job 的 `tested-apk-provenance` artifact**；`apk-debug` artifact 僅為編譯產物，**不是** tested-byte 證據；無 emulator 時由本機 build 取得且須自行記錄 provenance） |
-| 測試 APK（androidTest） | `未測`（無 beta.3 androidTest APK SHA／provenance 紀錄） |
-| 裝置 / 模擬器 | `未測`（manual emulator matrix **SKIPPED**；無 beta.3 實機／模擬器矩陣紀錄） |
-| 通道 | `未測`（無畫面「實際：」紀錄） |
-| 驗收人 / 日期 | `未測`（無 beta.3 人工驗收） |
-| 已測 APK provenance | `未測／無`（無 beta.3 `tested-apk-provenance` artifact；不得留空冒充通過） |
-| artifact / run ID | beta.3 **#45228233599**（Android CI／PR head `e5c61f51`：build＋locale-instrumentation SUCCESS、manual emulator matrix SKIPPED）／**#45233459919**（Release／main push `fc579de3`：release＋publish SUCCESS，無 manual matrix job）；兩 run tree 相同（`33614a81…`）；無 `tested-apk-provenance` artifact |
-| artifact source commit | `未測／無 artifact`（CI run 關聯 source commit 為 `fc579de3`，但未經 `tested-apk-provenance.txt` 確認） |
-| installed APK SHA | `未測`（無實機安裝；不得與上列 build APK SHA 混為 tested-byte 證據） |
-| install result | `未測` |
-| versionCode / versionName | `4` / `0.1.0-beta.3`（與 app/build.gradle.kts 一致） |
+> **免責**：此固定版本錨點僅對應 beta.3（annotated tag → `fc579de3`），**不得當作日後 source 的驗收**；日後 source 須重新建立 provenance（tag／commit／tree／asset digest／tested byte／installed byte 皆須重新錨定）。本節 **beta.3 相關** run／artifact 只描述 beta.3 當時的事實，不隨目前分支 head 變動；表中『本 PR』列另行揭露本次文件審查基線（PR #91 head `6876be77`）。
+
+| 面向 | 狀態 | 證據／限制 |
+| --- | --- | --- |
+| Release artifact provenance | 已錨定 | annotated tag `v0.1.0-beta.3`（tag object `d71972eb8bc458490b4c38c9b7df0338ecec12f9`）→ commit `fc579de348f21dc3a0ed5f88f7148736805a8119`；release asset `app-release.apk` digest `sha256:98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`（GitHub API metadata，未重新下載 hash binary；非 tested byte） |
+| API 29 automated harness（debug） | 已執行 | run #45228233599，event=pull_request，head `e5c61f51a3ad24acfeac45f66df82c71547d595e`，tree `33614a81…`；build success（`apk-debug` artifact 含 `debug/app-debug.apk` 與 `androidTest/debug/app-debug-androidTest.apk`）；locale-instrumentation success（API 29 connectedDebugAndroidTest，`locale-instrumentation-reports` 上傳）；**tested APK／installed APK SHA 未記錄、未核實**；無 `tested-apk-provenance` artifact |
+| Release run | 已發布 | run #45233459919，event=push，head `fc579de3…`，tree `33614a81…`；release＋publish success；無 manual matrix job |
+| API 34 manual emulator matrix | 未測 | `instrumentation-manual` job SKIPPED（僅 workflow_dispatch 啟用；本 run event=pull_request） |
+| Samsung 實機／人工矩陣 | 未測 | 無 beta.3 人工紀錄；§2 全部 ☐ |
+| 通道／驗收人／日期 | 未測 | 無畫面「實際：」紀錄 |
+| installed APK SHA／install result | 未測 | 無實機安裝；不得與 release digest 混為 tested byte |
+| 本 PR（#91，純文件） | 已揭露 | 審查基線 head `6876be77`，run #45326857828，tree `c00fe1db…`（與 beta.3 的 `33614a81…` 不同）；build／locale-instrumentation success、manual skipped；後續修復 commit 的 CI 另行執行；**不構成 Samsung 實機通過** |
+| versionCode / versionName | 4 / 0.1.0-beta.3 | 與 app/build.gradle.kts 一致 |
+
+### 1.1 錨點連結
+
+- [Android CI run #45228233599](https://github.com/samson910022/Dual-your-galaxy/actions/runs/45228233599)
+- [Release run #45233459919](https://github.com/samson910022/Dual-your-galaxy/actions/runs/45233459919)
+- [Release tag v0.1.0-beta.3](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3)
+- [Release asset app-release.apk](https://github.com/samson910022/Dual-your-galaxy/releases/download/v0.1.0-beta.3/app-release.apk)（[SHA256SUMS.txt](https://github.com/samson910022/Dual-your-galaxy/releases/download/v0.1.0-beta.3/SHA256SUMS.txt)）
+
+### 1.2 provenance 限制（誠實揭露；全文唯一處）
+
+- **兩 run 的 head 不同**：Android CI = `e5c61f51a3ad24acfeac45f66df82c71547d595e`；Release = `fc579de348f21dc3a0ed5f88f7148736805a8119`。兩者 tree 相同（`33614a81…`）**僅代表 source tree 一致，不代表 tested byte 或 installed byte 同一**。
+- **無 `tested-apk-provenance` artifact**。實際存在的 artifact：`apk-debug`、`locale-instrumentation-reports`、`unit-test-reports`、`lint-reports`、`release-publish`（Release run 的 `unit-test-reports`／`lint-reports` 帶 `-release` 後綴，如 `unit-test-reports-release`、`lint-reports-release`）。
+- **測試 APK（androidTest）已產出並用於 API 29 locale-instrumentation**（`apk-debug` 內 `androidTest/debug/app-debug-androidTest.apk`）；其 SHA256／tested-byte provenance **未記錄、未核實**。
+- **無 tested-byte provenance**：測試位元組證據必須來自 manual job 的 `tested-apk-provenance` artifact；`apk-debug` 僅為編譯產物，**不是** tested-byte 證據；無 emulator 時由本機 build 取得且須自行記錄 provenance。本限制適用本文件所有章節，不再逐列重複。
+- build／CI 成功、release asset digest 皆**不是**裝置通過證明；§2 人工矩陣維持全部 ☐，不得留空冒充通過。
 
 ## 2. 操作矩陣
 
@@ -45,8 +61,14 @@
 
 ## 3. 未測項（誠實揭露）
 
-- 例：LSPosed 通道未在真機驗證（`[待實機驗證]`）。
-- 例：API 29 最低版模擬器矩陣本次未跑。
+- LSPosed 通道未在真機驗證（`[待實機驗證]`）。
+- §2 人工矩陣（C1/C2/…；未綁定 API 29/34）與 API 34 manual emulator matrix 未跑（automated locale-instrumentation 已執行，見 §1）。
+- Samsung 實機人工矩陣（§2 C1/C2/R1/R2/R3/B1/B2/I1/W1）全部未測、☐；通道／驗收人／日期無畫面「實際：」紀錄；installed APK SHA／install result 無實機安裝紀錄。
+- Scope A dialog（PreClear warning）從未在裝置上觸發或擷錄；ROOT dialog 未測。
+- 512-entry IPC（政策規模 1/50/200/512）與 15ms opt-out gate 的真實 wall-time p50/p95/max、Binder IPC 次數（含 cold process）未量測。
+- 30min sticky 到期／fresh DAAgent 行程 failover、政策 TTL 於活躍 user-95 clone 下的降解未測。
+- BBC4（`pm path`）／BBC5（並存 `ps`）於 11-18 unified build 皆 UNVERIFIED；11-17 pre-unification 正向觀察僅為歷史，不用於本版本（beta.3）。
+- 序號／marker 邊界未於 beta.3 實機核對；寫後 listing 目標身分核對仍待實機驗證。
 - Activity 層 rotation/background 檢查部分自動化（view 存在 + EditText 文字 + 對話框重顯 via `activity_recreate_retainsPendingDialog`）；選取恢復、back-press 仍為手動（見 §5）。
 - 任何未執行的列在「實際」填 `未測`，不得留空冒充通過。
 
@@ -82,11 +104,11 @@ Harness 共 60 個自動化測試（`app/src/androidTest`，16 個檔案 / 15 �
 
 > **版本：v1（PR #91）；最後更新 2026-11-24；本 PR 為唯讀文件審查，所有 `private-only` raw log 未經 reviewer 獨立稽核。**
 >
-> **本矩陣為 BBC 證據狀態的唯一真相來源（single source of truth）；其餘保留歷史摘要與既有標記的檔案（README／HOOK／TAB7／USAGE／ARCHITECTURE 等）一律以本矩陣為準；既有 ☑/☐ 標記僅為歷史摘要，不得解讀為目前 HEAD 通過。**
+> **本矩陣為 BBC 證據狀態的唯一真相來源（single source of truth）；其餘保留歷史摘要與既有標記的檔案（README／HOOK／TAB7／USAGE／ARCHITECTURE 等）一律以本矩陣為準；既有 ☑/☐ 標記僅為歷史摘要，不得解讀為本版本（beta.3）通過。**
 >
 > 狀態 enum：`POSITIVE-HISTORICAL`／`PARTIAL-POSITIVE`／`UNVERIFIED`／`NEGATIVE-CONFIRMED`／`DESTRUCTIVE-FAIL`／`NOT-TESTED`／`INCONCLUSIVE`。可重查性 enum：`repo-artifact`／`private-only-not-in-repo`／`user-report-only`／`JVM-only`／`CI-only`／`session-only-not-persisted`。每列均標「本 PR 是否獨立稽核：No」。
 
-| ID | Build / source | 日期時間 | 裝置 / ROM | 項目 | 觀察結果 | 狀態(enum) | 可重查性(enum) | 與目前 HEAD 的關係 | 限制 / 風險 | 引用 |
+| ID | Build / source | 日期時間 | 裝置 / ROM | 項目 | 觀察結果 | 狀態(enum) | 可重查性(enum) | 與本版本（beta.3）的關係 | 限制 / 風險 | 引用 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | E-17-P-S23-BBC1 | pre-unification build（政策 group `galaxydual_policy`；reader 已退役） | 2026-11-17 22:54 | S23 Ultra / One UI 9、Android 17、DAAgent 3.7.00.0 | BBC hook 安裝 | `BBC-HOOK installed=1 (daagent, pid=21472)` | POSITIVE-HISTORICAL | private-only-not-in-repo | 僅歷史；非本版本（beta.3）驗收證據 | raw log 私有、reviewer 未獨立稽核；pid 屬 11-17 歷史 | `s23_bbc_evidence_20261117.log`；本 PR 是否獨立稽核：No |
 | E-17-P-S23-BBC2 | pre-unification build | 2026-11-17（空政策基線） | S23 Ultra / One UI 9 | 空政策基線 | `initial load: 0 package(s)`；callback 回傳 Samsung 原始物件（僅回傳物件位元一致） | POSITIVE-HISTORICAL | private-only-not-in-repo | 僅歷史；非本版本驗收證據 | 位元一致僅指回傳物件，不代表裝置行為不變 | `s23_bbc_evidence_20261117.log`；本 PR 是否獨立稽核：No |
@@ -107,7 +129,7 @@ Harness 共 60 個自動化測試（`app/src/androidTest`，16 個檔案 / 15 �
 | E-B3-HEAD | beta.3 source `fc579de3`／APK `98a3ce20…` | 2026-11-24 review | —（無實機） | BBC effect／tested-byte／manual matrix | 皆 NOT-TESTED／EXPERIMENTAL；CI #45228233599／#45233459919 | NOT-TESTED | CI-only | 即本版本；無實機、無 tested-apk-provenance | build 成功不等於裝置通過 | `docs/ACCEPTANCE.md` §1；本 PR 是否獨立稽核：No |
 | E-JVM-CI | 1924 JVM tests／build＋locale-instrumentation | 2026-11-18（orchestrator 記錄） | —（JVM／CI） | 程式碼與 CI 閘門 | 1924 JVM tests 全綠；build／locale-instrumentation SUCCESS | POSITIVE-HISTORICAL | JVM-only | code／CI only，非裝置證據 | 不證明 hook 安裝、callback 命中或裝置行為 | repo CI artifacts；本 PR 是否獨立稽核：No |
 
-> **provenance 聲明（先讀）**：2026-11-17 的 BBC 實測在 **pre-unification build**（BBC 分支；政策 group `galaxydual_policy`）上做；其改變的讀者模型**已不再實作**。unified tree（`unify/bbc-on-main`）已遷移為共享 `dual_policy/extra_whitelist_packages` → `EffectivePolicyCache`（60s TTL 輪詢）→ `BbcInjector.mergeAvailableList`（`BBC_AVAILABLE_APPS_INJECTION=true`；`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘不變）。**2026-11-18 已於 S23 Ultra 以 unified build 部分重驗（BBC1–BBC3 正向紀錄；BBC4（`pm path` 17:56 本機 log，未入 repo）／BBC5（17:22:20 啟動，無並存 `ps`）皆 UNVERIFIED；BBC6 破壞性不通過；詳 §6.0／§8.3）。** Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身，資料清除。狀態以 §6.0 矩陣為唯一真相來源；目前 HEAD（v0.1.0-beta.3／`fc579de3`）之 BBC 效應為 experimental／本版本未實機驗證，下列 11-17/11-18 舊 build 證據不用於驗證目前 HEAD。 結論補錄如下；2026-11-17 段落作為 reference 保留。
+> **provenance 聲明（先讀）**：2026-11-17 的 BBC 實測在 **pre-unification build**（BBC 分支；政策 group `galaxydual_policy`）上做；其改變的讀者模型**已不再實作**。unified tree（`unify/bbc-on-main`）已遷移為共享 `dual_policy/extra_whitelist_packages` → `EffectivePolicyCache`（60s TTL 輪詢）→ `BbcInjector.mergeAvailableList`（`BBC_AVAILABLE_APPS_INJECTION=true`；`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘不變）。**2026-11-18 已於 S23 Ultra 以 unified build 部分重驗（BBC1–BBC3 正向紀錄；BBC4（`pm path` 17:56 本機 log，未入 repo）／BBC5（17:22:20 啟動，無並存 `ps`）皆 UNVERIFIED；BBC6 破壞性不通過；詳 §6.0／§8.3）。** Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身，資料清除。狀態以 §6.0 矩陣為唯一真相來源；v0.1.0-beta.3 release source（annotated tag → `fc579de3`）之 BBC 效應為 experimental／本版本未實機驗證，下列 11-17/11-18 舊 build 證據不用於驗證本版本（beta.3）。 結論補錄如下；2026-11-17 段落作為 reference 保留。
 
 > **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 已於 2026-11-21 更正為非空回調；仍以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。本節所有 11-18 列（含 BBC6）皆受此更新節制。
 
@@ -248,9 +270,9 @@ BBC6 注意事項（unified build）：
 **誠實解讀**：
 - **強關聯證據（ASSOCIATION，非因果證明）**：Samsung system-uid 的 DELETE 在 BBC 注入 ON、執行期 gate 確認 OFF、以及完全沒有 BBC hook 三種條件下**皆發生**；A/B 臂 DELETE 早於 BBC 回調（D−E/D−C = −83/−99 ms、−69/−89 ms），C 臂**無 BBC 回調可比**（process-start 代理、低精度 +103 ms）。三臂皆為 system-uid DELETE 的**負向控制關聯（ASSOCIATION，非因果）**，支持「刪除決策位於 Samsung `system_server`、與本模組 BBC 注入無關」的推論（issue #75，§6.0 E-23-ABC），並**確認執行期 opt-out 不是刪除防護**。此為 negative-control association，**不是**已完成的安全根因研究，亦不構成任何合併閘門通過。
 - **DELETE 前的決策輸入仍 UNMEASURED**：三臂完成本身**不證明** P0 風險已排除、**不證明** BBC 預設設定安全、也不證明根因已定論；adb 無法讀取 `system_server` 內的 pre-DELETE 決策輸入，關聯與時序不等於因果。依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是 PR #74 合併門檻（不作任何通過或安全性的結論）。
-- **F06／其餘未測項仍 UNMEASURED／NOT a pass**：DAAgent UI callback 中 512 次 package-manager 查詢的 p50/p95/max 與 Binder IPC 次數（含 cold process）、15ms opt-out gate 的真實 Binder 延遲、政策 TTL／30 分鐘 sticky 在活躍 user-95 clone 下的 failover、Samsung Scope A warning／ROOT dialog，全部 **UNMEASURED／NOT a pass**；Android CI #334 手動模擬器矩陣略過；PR 最終 run #45103347110 與 main merge 後 #45113206916 皆 SUCCESS（build／locale-instrumentation 通過，manual emulator matrix 仍 **SKIPPED**）——二者為 **PR #74 歷史 run**，非目前 HEAD 錨點；目前 HEAD 為 beta.3（`fc579de3`，APK SHA256 `98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`），CI run #45228233599（Android CI／PR head `e5c61f51`：build＋locale-instrumentation SUCCESS、manual emulator matrix SKIPPED）與 #45233459919（Release／main push `fc579de3`：release＋publish SUCCESS，無 manual matrix job）為目前 HEAD 錨點，無 tested-byte provenance；JVM／CI 全綠不構成裝置通過。2026-11-23 破壞性 A/B/C 對照**不能替代**上述效能／UI／安全測試。
+- **F06／其餘未測項仍 UNMEASURED／NOT a pass**：DAAgent UI callback 中 512 次 package-manager 查詢的 p50/p95/max 與 Binder IPC 次數（含 cold process）、15ms opt-out gate 的真實 Binder 延遲、政策 TTL／30 分鐘 sticky 在活躍 user-95 clone 下的 failover、Samsung Scope A warning／ROOT dialog，全部 **UNMEASURED／NOT a pass**；Android CI #334 手動模擬器矩陣略過；PR 最終 run #45103347110 與 main merge 後 #45113206916 皆 SUCCESS（build／locale-instrumentation 通過，manual emulator matrix 仍 **SKIPPED**）——二者為 **PR #74 歷史 run**，非本版本錨點；本版本（beta.3）＝v0.1.0-beta.3 release source（annotated tag → `fc579de3`，APK SHA256 `98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`），CI run #45228233599（Android CI／PR head `e5c61f51`：build＋locale-instrumentation SUCCESS、manual emulator matrix SKIPPED）與 #45233459919（Release／main push `fc579de3`：release＋publish SUCCESS，無 manual matrix job）為本版本錨點，無 tested-byte provenance；JVM／CI 全綠不構成裝置通過。2026-11-23 破壞性 A/B/C 對照**不能替代**上述效能／UI／安全測試。
 
-> **M2 版本標記證據註記（round-7b）**：Scoped Review 審查基線 `3e86f9a2daca6f5d2b4c57ba4b2879f3b785cbbf`（PR 最終 head `e102a5ef`；Round 8 僅修正 androidTest；main merge commit `ecf42d7e`）之 BBC 主要效果標為 **EXPERIMENTAL／NOT DEVICE-VERIFIED ON THIS VERSION**（此 Scoped Review 基線與 run #45103347110／#45113206916 皆為 **PR #74 歷史錨點**；**目前 HEAD 為 v0.1.0-beta.3／`fc579de3`，APK SHA256 `98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`，CI run #45228233599（Android CI／PR head `e5c61f51`：build＋locale-instrumentation SUCCESS、manual matrix SKIPPED）／#45233459919（Release／main push `fc579de3`：release＋publish SUCCESS，無 manual matrix job），無 tested-byte provenance；BBC 效應同樣為 EXPERIMENTAL／NOT DEVICE-VERIFIED ON THIS VERSION**）。2026-11-17 pre-unification（已退役的 listener reader 模型）與 2026-11-18 unified-build 的正向證據皆早於 r1–r6 各輪，**不用於驗證目前 HEAD**；上列 A/B/C 是關於 Samsung 刪除的**負向控制關聯**，**不是** BBC 主要效果的正向驗證。本文不對一般有效性或資料安全作任何宣稱。
+> **M2 版本標記證據註記（round-7b）**：Scoped Review 審查基線 `3e86f9a2daca6f5d2b4c57ba4b2879f3b785cbbf`（PR 最終 head `e102a5ef`；Round 8 僅修正 androidTest；main merge commit `ecf42d7e`）之 BBC 主要效果標為 **EXPERIMENTAL／NOT DEVICE-VERIFIED ON THIS VERSION**（此 Scoped Review 基線與 run #45103347110／#45113206916 皆為 **PR #74 歷史錨點**；**本版本＝v0.1.0-beta.3 release source（annotated tag → `fc579de3`），APK SHA256 `98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`，CI run #45228233599（Android CI／PR head `e5c61f51`：build＋locale-instrumentation SUCCESS、manual matrix SKIPPED）／#45233459919（Release／main push `fc579de3`：release＋publish SUCCESS，無 manual matrix job），無 tested-byte provenance；BBC 效應同樣為 EXPERIMENTAL／NOT DEVICE-VERIFIED ON THIS VERSION**）。2026-11-17 pre-unification（已退役的 listener reader 模型）與 2026-11-18 unified-build 的正向證據皆早於 r1–r6 各輪，**不用於驗證本版本（beta.3）**；上列 A/B/C 是關於 Samsung 刪除的**負向控制關聯**，**不是** BBC 主要效果的正向驗證。本文不對一般有效性或資料安全作任何宣稱。
 
 **還原與重開機**：每個破壞性臂後皆以 `pm install-existing --user 95` 還原 baseline；Arm C 後另以 narrow restore 只回補本模組 2 條 scope row（共 19 條，其他模組未動），lspd 重啟 ＋ 軟重開機後 hook 重新生效（新 pid 4219 `installed=1`），clone 健康（SSAID=0）、gate ON、root 保留。**全程未使用硬重開機**（無 `adb reboot`／power cycle）。Scope B／SSAID／ABX 修補從未嘗試。還原僅限套件存在；user-95 資料於各破壞性臂皆已清除且未還原，故不聲稱回到相同 prior-data 基線。
 
@@ -271,7 +293,7 @@ provenance：pre-unification build 之 BBC 實測——政策 group `galaxydual_
 | 政策（裝置本機） | 裝置 2：`com.openai.chatgpt`；裝置 1：`com.shopee.tw`／`org.mozilla.firefox`／`com.google.android.apps.bard`（Gemini） |
 | 證據檔 | `s23_bbc_evidence_20261117.log`（S23）；`s4_gate_true_bbc.log`（Tab S7）；`s3_boot.txt:8`（Tab S7 政策空基線） |
 
-> **全表為 2026-11-17 pre-unification 舊 build 歷史紀錄，僅供溯源**：☑ 僅表示該次歷史觀察，**不用於驗證目前 HEAD（v0.1.0-beta.3／`fc579de3`）**；目前 BBC 效應為 experimental／本版本未實機驗證。**BBC4/BBC5 的 ☑ 僅代表 11-17 pre-unification 歷史觀察；11-18 unified 的 BBC4/BBC5 另列為 UNVERIFIED（見 §8.3／§6.0）；兩者皆非目前 HEAD 通過。** 狀態以 §6.0 矩陣為唯一真相來源。
+> **全表為 2026-11-17 pre-unification 舊 build 歷史紀錄，僅供溯源**：☑ 僅表示該次歷史觀察，**不用於驗證 v0.1.0-beta.3 release source（annotated tag → `fc579de3`）**；目前 BBC 效應為 experimental／本版本未實機驗證。**BBC4/BBC5 的 ☑ 僅代表 11-17 pre-unification 歷史觀察；11-18 unified 的 BBC4/BBC5 另列為 UNVERIFIED（見 §8.3／§6.0）；兩者皆非本版本（beta.3）通過。** 狀態以 §6.0 矩陣為唯一真相來源。
 
 | # | 操作 | 實際（裝置 2 ／ 裝置 1） | 歷史觀察／結果 |
 | --- | --- | --- | --- |

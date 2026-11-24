@@ -1,9 +1,9 @@
 <!-- MIT - Original spec by Dual your Galaxy contributors. No GPL content. -->
 # Spec：BBC/DAAgent 層 Dual Messenger 白名單擴充（Tab S7 / One UI 5）
 
-> **⚠ 歷史 spec／證據效力宣告（PR6 文件誠實性）**：本文為 2026-11-17／11-18 的**歷史 spec 與舊 build（pre-unification／unified）證據，僅供溯源**。**目前 HEAD（v0.1.0-beta.3，source commit `fc579de3`）之 BBC 清單注入效應為 experimental／not device-verified，本版本未實機驗證**。文中所有「BBC1–BBC5 通過」列皆屬舊 build 歷史紀錄，**不得視為目前 HEAD 通過**；**11-18 unified 的 BBC4/5 皆 UNVERIFIED（`pm path` 17:56 本機 log 未入 repo／17:22:20 啟動無並存 `ps`）；11-17 BBC4/5 的 ☑ 僅為 pre-unification 歷史 observation，兩者皆非目前版本通過，且 11-17 正向觀察不得被 11-18 缺證下修**。目前狀態以 `docs/ACCEPTANCE.md` §6.0 Evidence Matrix（唯一狀態來源）／`docs/HOOK.md` 為準； deletion 風險深挖見 issue #75（[`BBC_COLDSTART_DELETE_INCIDENT.md`](BBC_COLDSTART_DELETE_INCIDENT.md)）與 issue #79。JVM／CI 全綠不等於裝置通過。
+> **⚠ 歷史 spec／證據效力宣告（PR6 文件誠實性）**：本文為 2026-11-17／11-18 的**歷史 spec 與舊 build（pre-unification／unified）證據，僅供溯源**。**v0.1.0-beta.3 release source（annotated tag → `fc579de3`）之 BBC 清單注入效應為 experimental／not device-verified，本版本未實機驗證**。文中所有「BBC1–BBC5 通過」列皆屬舊 build 歷史紀錄，**不得視為本版本（beta.3）通過**；**11-18 unified 的 BBC4/5 皆 UNVERIFIED（`pm path` 17:56 本機 log 未入 repo／17:22:20 啟動無並存 `ps`）；11-17 BBC4/5 的 ☑ 僅為 pre-unification 歷史 observation，兩者皆非目前版本通過，且 11-17 正向觀察不得被 11-18 缺證下修**。目前狀態以 `docs/ACCEPTANCE.md` §6.0 Evidence Matrix（唯一狀態來源）／`docs/HOOK.md` 為準； deletion 風險深挖見 issue #75（[`BBC_COLDSTART_DELETE_INCIDENT.md`](BBC_COLDSTART_DELETE_INCIDENT.md)）與 issue #79。JVM／CI 全綠不等於裝置通過。
 
-狀態：**Draft v2（待人審）**　|　日期：2026-11-17（v2：依 SPEC_REVIEW 28 項修正）　|　**2026-11-18：unified build 遷移紀錄見文末 Addendum B；本文多處仍引用 `galaxydual_policy`（pre-unification group），自 unified tree 起政策 group 改為 `dual_policy`／key `extra_whitelist_packages`。**　|　**效力以文首「歷史 spec／證據效力宣告」為準：目前 HEAD experimental／not device-verified。**
+狀態：**Draft v2（待人審）**　|　日期：2026-11-17（v2：依 SPEC_REVIEW 28 項修正）　|　**2026-11-18：unified build 遷移紀錄見文末 Addendum B；本文多處仍引用 `galaxydual_policy`（pre-unification group），自 unified tree 起政策 group 改為 `dual_policy`／key `extra_whitelist_packages`。**　|　**效力以文首「歷史 spec／證據效力宣告」為準：本版本（beta.3）experimental／not device-verified。**
 裝置基準：SM-T870（Android 13, One UI 5, DAAgent 3.3.00.0, Vector v2.2 / API 102）。裝置序號不寫入 repo。
 非目標 ROM：S24（本 spec 以 Tab S7 為證據基準；2026-11-17 另驗 S23 Ultra／One UI 9，證據為 pre-unification build，見 Addendum A；其他 ROM 只做候選級保留）
 授權：MIT original（借鑑思路見 `docs/CREDITS.md`，不複製任何第三方代碼；OneUIX=AGPL 禁止複製，DualAppMod=Apache-2.0 僅思路）
@@ -241,7 +241,7 @@ internal fun mergeAvailableList(
 
 ## 12. Success Criteria（現況：2026-11-18 unified tree 對照；□＝未測／待驗）
 
-> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 已於 2026-11-21 更正為非空回調；仍以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。本節及 Addendum B/C 所有 11-17/11-18 列皆受此更新節制，亦受文首宣告節制：**僅舊 build 歷史紀錄，目前 HEAD experimental／not device-verified，BBC1–BBC5 的 ☑ 不代表目前 HEAD 通過。**
+> **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 已於 2026-11-21 更正為非空回調；仍以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。本節及 Addendum B/C 所有 11-17/11-18 列皆受此更新節制，亦受文首宣告節制：**僅舊 build 歷史紀錄，本版本（beta.3）experimental／not device-verified，BBC1–BBC5 的 ☑ 不代表本版本（beta.3）通過。**
 
 1. `:hook:testDebugUnitTest` 全綠；`assembleDebug` 成功 — ☑ unified tree Stage 8.1：1924 JVM tests 全綠、`assembleDebug` OK（orchestrator 2026-11-18 記錄）。
 2. spike 通過；`BBC-HOOK installed=1`（或 fail-closed 記 `BBC-HOOK skip` 且行為不變） — ☑（2026-11-17，pre-unification build，兩裝置；S23 `BBC-HOOK installed=1 (daagent, pid=21472)`、Tab S7 pid 7812/18538/21602；**11-18 BBC1 installed=1 正向紀錄（部分重驗（BBC1–BBC3），2026-11-18，`BBC-HOOK installed=1 (daagent, pid=29265)`））**。
@@ -331,7 +331,7 @@ internal fun mergeAvailableList(
 
 ## Addendum C（2026-11-18，unified build 裝置重驗完畢）
 
-unified build（`unify/bbc-on-main` 分支，2026-11-18 於 S23 Ultra 部分重驗（BBC1–BBC3））— **舊 build 歷史紀錄，目前 HEAD experimental／not device-verified**：**BBC1–BBC3 於該舊 build 有正向紀錄（部分重驗）；BBC4（`pm path` 17:56 本機 log，未入 repo）／BBC5（17:22:20 啟動，無並存 `ps`）皆 UNVERIFIED（本 PR 未獨立稽核）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6 ＝破壞性的系統卸載分身（含 user-95 資料）**。〔11-20/11-21 更新優先：11-18 觀察到清除政策後 deletion，但此因果已撤回——非空政策下冷啟動亦遭刪除、DELETE 早於回調 116–144ms，機制未證實；見 §12 更新註記與 `BBC_COLDSTART_DELETE_INCIDENT.md` §5/§8〕：
+unified build（`unify/bbc-on-main` 分支，2026-11-18 於 S23 Ultra 部分重驗（BBC1–BBC3））— **舊 build 歷史紀錄，本版本（beta.3）experimental／not device-verified**：**BBC1–BBC3 於該舊 build 有正向紀錄（部分重驗）；BBC4（`pm path` 17:56 本機 log，未入 repo）／BBC5（17:22:20 啟動，無並存 `ps`）皆 UNVERIFIED（本 PR 未獨立稽核）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6 ＝破壞性的系統卸載分身（含 user-95 資料）**。〔11-20/11-21 更新優先：11-18 觀察到清除政策後 deletion，但此因果已撤回——非空政策下冷啟動亦遭刪除、DELETE 早於回調 116–144ms，機制未證實；見 §12 更新註記與 `BBC_COLDSTART_DELETE_INCIDENT.md` §5/§8〕：
 
 | Step | 證據（LSPosed verbose mirror） |
 | --- | --- |
@@ -342,7 +342,7 @@ unified build（`unify/bbc-on-main` 分支，2026-11-18 於 S23 Ultra 部分重�
 | BBC5 | `am start --user 95 -n com.openai.chatgpt/.MainActivity` → 17:22:20 pid=3568 啟動（本機私有 session log，不入 repo、本 PR 未獨立稽核；session 觀察、無持久化 `ps` 證據）；本節無同時 `ps` u95+u0 證據；pid 僅 historical note（E-18-U-S23-BBC5） |
 | BBC6 | 編輯器 0 包寫入被 VM 拒絕（CATALOG_MISSING 分支）；空政策清除走主畫面「清除草稿」→ `BBC-HOOK callback getPossibleDualAppPackages (pid=8239)`（不帶 nonempty）→ 再寫入 1 包 → `BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=9255)` + **`BBC-HOOK merged +1 packages (total 7, pid=9255)`**（後續 app 啟動崩潰、分身被三星卸載——詳見 BBC6_SSAID_INCIDENT.md）；截圖 `s23u_03_bbc6_cleared.png`／`s23u_04_bbc6_restored.png` |
 
-untick→再勾→app 卸載並無法啟動——**BBC6 不是回滾，是破壞性指令**；11-18 觀察到其後伴隨政策清空，但「清空才刪」因果已由 11-20/11-21 非空政策 deletion 撤回，觸發機制未證實（`BBC_COLDSTART_DELETE_INCIDENT.md` §8）。`source commit = 3e9ccede…`；APK sha256=`953803c455cc17f1ad3cde70db8e072b03381c36540a407940ceb0d15f31496f`；證據檔 `s23_bbc_unified_20261118.log`（本機私有，不入 repo、本 PR 未獨立稽核）。**本 Addendum 全段為 11-18 舊 build 歷史證據；目前 HEAD experimental／not device-verified，不用於驗證目前 HEAD。**
+untick→再勾→app 卸載並無法啟動——**BBC6 不是回滾，是破壞性指令**；11-18 觀察到其後伴隨政策清空，但「清空才刪」因果已由 11-20/11-21 非空政策 deletion 撤回，觸發機制未證實（`BBC_COLDSTART_DELETE_INCIDENT.md` §8）。`source commit = 3e9ccede…`；APK sha256=`953803c455cc17f1ad3cde70db8e072b03381c36540a407940ceb0d15f31496f`；證據檔 `s23_bbc_unified_20261118.log`（本機私有，不入 repo、本 PR 未獨立稽核）。**本 Addendum 全段為 11-18 舊 build 歷史證據；本版本（beta.3）experimental／not device-verified，不用於驗證本版本（beta.3）。**
 
 ACCEPTANCE §6.0 Evidence Matrix 為唯一狀態來源；以下至少 5 項仍未測／UNVERIFIED：
 1. Tab S7 dual install 持久化證據（pre-unification session 面，無 `u95_*` process 檔案）；
