@@ -14,10 +14,12 @@ import java.util.concurrent.atomic.AtomicReference
 // Phase A P0 BBC sticky last-good JVM pins.
 //
 // BBC path (getBbc, sticky): failed reads keep the last successful snapshot
-// across TTL expiry / invalidate / cooldown / contention / clock / deadline;
-// only a successful empty WITH version proof (Cleared) may shrink. All
-// fallback arms emit a throttled BBC log + counters; the sticky snapshot
-// expires after BBC_STICKY_MAX_AGE_MS (fail-closed to empty).
+// across TTL expiry / invalidate / cooldown / contention / deadline; a dead or
+// backwards clock sample instead fails closed (sticky discarded,
+// Unknown(emptySet())) because freshness cannot be proven. Only a successful
+// empty WITH version proof (Cleared) may shrink. All fallback arms emit a
+// throttled BBC log + counters; the sticky snapshot also expires after
+// BBC_STICKY_MAX_AGE_MS (fail-closed to empty).
 //
 // Whitelist path (get, stickyLastGood=false) is unchanged fail-closed:
 // TTL/invalidate discard to seed, gate-closed short-circuits with zero reads.

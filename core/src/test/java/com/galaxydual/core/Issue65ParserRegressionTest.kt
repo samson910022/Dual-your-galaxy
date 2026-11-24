@@ -21,13 +21,13 @@ import org.junit.Test
 // of each new-format verbose line before the strict ERROR_LINE scan -- NOT the
 // whole line. Stripping the whole line (or exempting all verbose lines) would
 // let a genuine body error (`Failure [...]`, a non-zero exit, etc.) slip
-// through. The negative-control tests below pin that: they PASS today and must
-// keep passing after the fix.
+// through. The negative-control tests below pin that and must keep passing.
 //
-// RED evidence (before the fix): the two `name=` gate assertions and the
-// display-name type-injection assertion failed; the two control tests passed.
-// After neutralizing only the `name=` segment (PmOutputParser) and taking the
-// LAST `, type=` token (SamsungProfileAdapter), all five pass. All data is synthetic.
+// All rows are synthetic. The display-only name= assertions and the type-
+// injection assertion cover the fix (neutralize only the name= span in
+// PmOutputParser; take the LAST `, type=` token in SamsungProfileAdapter);
+// the negative controls keep both gates fail-closed for genuine body errors
+// and for structurally malformed / ambiguous rows.
 class Issue65ParserRegressionTest {
 
     // Realistic synthetic new-ROM verbose output. u95 is the clone and its
@@ -42,9 +42,9 @@ class Issue65ParserRegressionTest {
 
     @Test
     fun newVerbose_errorLabelInNameIsDisplayOnly_gatePasses() {
-        // RED: name=Error is a display-only label, not a command error. Today
-        // IDENTITY_HEADER_STRIP strips nothing (no UserInfo header), ERROR_LINE
-        // matches "Error" on the u95 line, and the gate returns false.
+        // name=Error is a display-only label, not a command error: the
+        // structured sanitizer neutralizes only the name= span, so ERROR_LINE
+        // can no longer match the label and the gate passes.
         assertTrue(
             "new-format name=Error is a display label and must not fail the identity gate",
             PmOutputParser.isIdentityChannelOk(verboseWithErrorName, 0),
@@ -53,8 +53,8 @@ class Issue65ParserRegressionTest {
 
     @Test
     fun newVerbose_notFoundLabelInNameIsDisplayOnly_gatePasses() {
-        // RED: same root cause with a multi-word keyword matched by the
-        // `not\s+found` pattern in ERROR_LINE.
+        // Same root cause with a multi-word keyword matched by the
+        // `not\s+found` pattern in ERROR_LINE (display-only after the fix).
         val verbose = verboseWithErrorName.replace("name=Error", "name=not found")
         assertTrue(
             "new-format name=not found is a display label and must not fail the identity gate",
@@ -62,12 +62,12 @@ class Issue65ParserRegressionTest {
         )
     }
 
-    // RED regression for the display-name comma/type injection variant:
-    // `NEW_VERBOSE_LINE`'s `name=([^,]*)` stops at the first comma, so a
-    // user-renamed label containing `, type=profile.CLONE` makes the injected
-    // token land in group 3 (the authorization-relevant userType) while the
-    // real `type=full.SYSTEM` token is pushed into the ignored tail. The
-    // label is display-only: group 3 must come from the LAST `, type=`.
+    // Regression for the display-name comma/type injection variant: a greedy
+    // old-style `name=([^,]*)` capture let a user-renamed label containing
+    // `, type=profile.CLONE` put the injected token in the authorization-
+    // relevant userType slot while the real `type=full.SYSTEM` was pushed
+    // into the ignored tail. The label is display-only: the userType must come
+    // from the LAST `, type=` declaration.
     @Test
     fun newVerbose_displayNameWithInjectedType_doesNotChangeUserType() {
         val verbose = """
@@ -118,8 +118,8 @@ class Issue65ParserRegressionTest {
     fun newVerbose_errorLabelInNameStillResolvesDualTarget() {
         // PASSING CONTROL (display-only guarantee at the resolver level): the
         // same u95 name=Error verbose channel still resolves to the dual user
-        // when the legacy dumpsys channel and the property agree. This already
-        // passes today -- the bug is confined to the strict identity gate.
+        // when the legacy dumpsys channel and the property agree. The resolver
+        // path stays correct alongside the strict identity-gate fix.
         val dumpsys = """
             Users:
               UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
@@ -229,8 +229,11 @@ class Issue65ParserRegressionTest {
     @Test
     fun newVerbose_pocH_carriageReturnBeforeSmuggledDeclaration_failsClosed() {
         // A lone \r is NOT a row separator (VerboseUserRow.verboseLines): it
-        // stays inside the row, where the empty last declaration / earlier
-        // canonical declaration and the C0-control check all fail it closed.
+        // stays inside the row, where rule 1 (the LAST `, type=` declaration
+        // must have a non-empty token) is violated by `type=`, so the row is
+        // malformed and the gate fails closed. The injected CLONE is only
+        // label text and is not eligible to authorize (the C0 control check is
+        // an additional guard, not the deciding rule for this row).
         assertSmuggledDeclarationFailsClosed(
             "H",
             "1: id=95, name=foo, type=profile.CLONE, flags=X (parentId=0)\r" +
