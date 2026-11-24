@@ -214,23 +214,18 @@ print("OK: no sharedUserId in APK binary AndroidManifest.xml")
     fail "sharedUserId scan failed or matched for $apk"
   fi
 
-  # 2. ShizukuProvider survives into the released DEX (exact descriptor).
-  FOUND=0
-  DEX_COUNT=0
-  while IFS= read -r dex; do
-    [ -z "$dex" ] && continue
-    DEX_COUNT=$((DEX_COUNT + 1))
-    hits="$(unzip -p "$apk" "$dex" | grep -aFc 'Lrikka/shizuku/ShizukuProvider;' || true)"
-    if [ "${hits:-0}" -gt 0 ]; then
-      echo "FOUND Lrikka/shizuku/ShizukuProvider; in $dex"
-      FOUND=1
-    fi
-  done < <(unzip -l "$apk" | grep -o 'classes[0-9]*\.dex' | sort -u)
-  if [ "$DEX_COUNT" -eq 0 ]; then
-    fail "No DEX entries found in $apk"
-  fi
-  if [ "$FOUND" -eq 0 ]; then
-    fail "ShizukuProvider class descriptor not found in DEX of $apk"
+  # 2. ShizukuProvider survives into the released DEX as a real class_def.
+  #    Issue #67: `grep -aFc 'Lrikka/shizuku/ShizukuProvider;'` also matches a
+  #    bare descriptor string in the DEX string table (e.g. left by a type
+  #    reference), so an APK with zero class_def_item entries for the class
+  #    passed the gate. scripts/check-dex-classdefs.py resolves
+  #    class_def_item -> type_ids -> string_ids and counts actual definitions;
+  #    it is the sole DEX-policy authority here — it also fails closed on
+  #    missing/duplicated/non-canonical classes*.dex entries, gaps in secondary
+  #    numbering, corrupt tables and class_defs_size=0. There is deliberately
+  #    no second, looser shell name guard and no grep fallback (issue #67).
+  if ! python3 "$SCRIPT_DIR/check-dex-classdefs.py" "$apk" 'Lrikka/shizuku/ShizukuProvider;'; then
+    fail "ShizukuProvider class_def not found in DEX of $apk"
   fi
 
   # 3. Exact Xposed archive members exist (no suffix false-positives).
@@ -249,23 +244,12 @@ print("OK: no sharedUserId in APK binary AndroidManifest.xml")
   fi
   echo "FOUND DualHook entry in java_init.list"
 
-  # 5. DualHook survives into the DEX (exact descriptor).
-  FOUND=0
-  DEX_COUNT=0
-  while IFS= read -r dex; do
-    [ -z "$dex" ] && continue
-    DEX_COUNT=$((DEX_COUNT + 1))
-    hits="$(unzip -p "$apk" "$dex" | grep -aFc 'Lcom/galaxydual/hook/DualHook;' || true)"
-    if [ "${hits:-0}" -gt 0 ]; then
-      echo "FOUND Lcom/galaxydual/hook/DualHook; in $dex"
-      FOUND=1
-    fi
-  done < <(unzip -l "$apk" | grep -o 'classes[0-9]*\.dex' | sort -u)
-  if [ "$DEX_COUNT" -eq 0 ]; then
-    fail "No DEX entries found in $apk"
-  fi
-  if [ "$FOUND" -eq 0 ]; then
-    fail "DualHook class descriptor not found in DEX of $apk"
+  # 5. DualHook survives into the DEX as a real class_def (same #67 hardening
+  #    as step 2: scripts/check-dex-classdefs.py is the sole DEX-policy
+  #    authority — class_def parsing, no descriptor-string grep fallback and
+  #    no separate shell DEX-name guard).
+  if ! python3 "$SCRIPT_DIR/check-dex-classdefs.py" "$apk" 'Lcom/galaxydual/hook/DualHook;'; then
+    fail "DualHook class_def not found in DEX of $apk"
   fi
 
   # 6. scope.list carries exactly the canonical two scopes.
