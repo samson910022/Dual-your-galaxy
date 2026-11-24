@@ -629,21 +629,33 @@ object SamsungProfileAdapter {
     // Intra-block parent/serial contradiction (P1-B): more than one
     // distinct parsable parentId (or serial) value inside the SAME block
     // forces userType UNKNOWN (fail closed). The first parsable value is
-    // retained for diagnosis; confidence follows the final userType.
+    // retained for DIAGNOSIS ONLY (issue #87 R9): it is not an authorization
+    // value and is flagged via evidenceInvalid so resolveDual() vetoes the
+    // claim on that id even when a duplicate good CLONE claim exists.
     private fun parseOneBlock(
         userId: Int,
         label: String,
         body: String,
         source: IdentitySource,
     ): ProfileIdentity {
-        var userType = classifyType(body)
+        val classifiedType = classifyType(body)
         val parentIds = PARENT_ID.findAll(body).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
         val serials = SERIAL.findAll(body).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
-        if (parentIds.distinct().size > 1 || serials.distinct().size > 1) {
-            userType = ProfileUserType.UNKNOWN
+        val userType = if (parentIds.distinct().size > 1 || serials.distinct().size > 1) {
+            ProfileUserType.UNKNOWN
+        } else {
+            classifiedType
         }
         val parentId = parentIds.firstOrNull()
         val serial = serials.firstOrNull()
+        // R9 invariant: an UNKNOWN that still carries a parent/serial either
+        // came from contradictory values in this block or from an ambiguous
+        // type classification. Retaining the first value for logs must never
+        // let it authorize a Confirm; mark the whole claim invalid instead.
+        // Bare UNKNOWN (no values) stays unflagged -> two-tier Unknown at the
+        // resolver, never Refused.
+        val evidenceInvalid = userType == ProfileUserType.UNKNOWN &&
+            (parentId != null || serial != null)
         // Single-source confidence cap: a typed claim is MED (still needs a
         // second source for HIGH); an untyped block is LOW.
         val confidence = when (userType) {
@@ -658,6 +670,7 @@ object SamsungProfileAdapter {
             source = source,
             confidence = confidence,
             label = label,
+            evidenceInvalid = evidenceInvalid,
         )
     }
 
@@ -984,6 +997,26 @@ object SamsungProfileAdapter {
             return DualResolution.Refused("conflicting type evidence for user $id")
         }
 
+        // Issue #87 R9: for the id about to be Confirmed, ANY claim that is
+        // UNKNOWN or carries contradictory/invalid evidence vetoes, regardless
+        // of the retained parent/serial values, channel, or claim order.
+        // parseOneBlock flags an UNKNOWN that still carries values (two
+        // distinct parents/serials in one block, or an ambiguous type with
+        // values) as evidenceInvalid: its FIRST value is kept for diagnosis
+        // only and must never authorize. Refused is the stronger, explicit
+        // verdict for such evidence; a plain/bare UNKNOWN (malformed/rejected
+        // row, no type line) only means insufficient evidence -> Unknown.
+        // This preserves the existing clonePlusUnknown_* / bare-UNKNOWN
+        // two-tier contract while closing the "UNKNOWN(0,15) + CLONE(0,15)
+        // still confirms" gap. Checks cover ALL typed claims on this id, not
+        // just the CLONE subset.
+        if (typed.any { it.userId == id && it.evidenceInvalid }) {
+            return DualResolution.Refused("contradictory evidence for user $id")
+        }
+        if (typed.any { it.userId == id && it.userType == ProfileUserType.UNKNOWN }) {
+            return DualResolution.Unknown
+        }
+
         if (effectiveProp != null && effectiveProp != id) {
             return DualResolution.Refused("property id $effectiveProp disagrees with clone user $id")
         }
@@ -1037,8 +1070,14 @@ object SamsungProfileAdapter {
         // a serial and they disagree. A missing serial on either side is
         // tolerated (S24 verbose evidence does not guarantee serial); the
         // agreed value is the deduplicated single serial or null.
+        // Issue #87 R9: pool ALL typed claims on this id, not just the CLONE
+        // subset -- comparing only CLONEs could discard a contradictory
+        // serial carried by a same-id claim. OTHER claims already Refused
+        // above and UNKNOWN claims already vetoed above, so at this point
+        // every remaining claim for the id is CLONE; widening the pool is
+        // safe and makes the no-evidence-is-dropped invariant explicit.
         val serials = typed.filter {
-            it.userId == id && it.userType == ProfileUserType.CLONE
+            it.userId == id
         }.mapNotNull { it.serial }.toSet()
         if (serials.size > 1) {
             return DualResolution.Refused("conflicting serial for user $id: $serials")
@@ -1074,6 +1113,16 @@ object SamsungProfileAdapter {
         val confirmed = resolveDual(candidates, propertyId) as? DualResolution.Confirmed
             ?: return null
         val id = confirmed.userId
+        // R9 defense in depth: even if a future resolver change let an
+        // UNKNOWN/invalid claim coexist with a Confirm, the serial-bound
+        // target must stay null. Only the two verified verbose channels are
+        // consulted (PROP is id-only and never identity evidence).
+        if (candidates.any {
+                it.userId == id &&
+                    (it.source == IdentitySource.USER_LIST_V || it.source == IdentitySource.DUMPSYS) &&
+                    (it.userType == ProfileUserType.UNKNOWN || it.evidenceInvalid)
+            }
+        ) return null
         // Carry the resolver's agreed parentId (#53): resolveDual requires
         // both verbose channels to carry it, equal and == 0, so a Confirmed
         // target always bears a non-null parent; a null here (policy change

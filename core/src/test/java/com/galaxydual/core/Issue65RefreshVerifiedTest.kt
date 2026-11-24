@@ -28,6 +28,9 @@ class Issue65RefreshVerifiedTest {
         verbose: String,
         // Override the whole verbose-channel result (exit code / truncation).
         private val verboseResult: CmdResult? = null,
+        // R9: override the dumpsys payload so an UNKNOWN-on-target dumpsys
+        // snapshot can be exercised through the full refreshVerified() flow.
+        private val dumpsysOutput: String? = null,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         var verboseOutput: String = verbose
@@ -51,7 +54,7 @@ class Issue65RefreshVerifiedTest {
                     verboseResult ?: CmdResult(exit = 0, out = verboseOutput, err = "")
                 DualRepository.CMD_DUMPSYS_USER -> CmdResult(
                     exit = 0,
-                    out = """
+                    out = dumpsysOutput ?: """
                         Users:
                           UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
                             userType=android.os.usertype.full.SYSTEM
@@ -495,6 +498,112 @@ class Issue65RefreshVerifiedTest {
         // supply the second channel/property. Missing serial is tolerated, not
         // a contradiction -- the same target must still resolve to GroundTruth.
         val verbose = verboseWithTrailingClaims(listOf(r2FreshParent0NoSerial) + r2LegacyClone())
+        val result = ground(FakeGateway(verbose))
+        assertEquals(95, result.target.userId)
+        assertEquals(15, result.target.serial)
+        assertEquals(0, result.target.parentId)
+        assertEquals(listOf("com.example.chat", "com.example.mail"), result.cloned)
+    }
+
+    // ---- R9: invalid evidence never authorizes a package read (full flow) ----
+
+    // Two same-id CLONE rows whose parent/serial agree (0/15). Without R9 the
+    // contradictory first row's retained values would be indistinguishable
+    // from authorization and the target would be Confirmed.
+    private val r9GoodClone =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15"
+    private val r9ConflictingParents =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) (parentId=10) serialNo=15"
+    private val r9ConflictingSerials =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15 serialNo=99"
+    private val r9ConflictingTypeBlock = listOf(
+        "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+        "    parentId=0",
+        "    userType=android.os.usertype.profile.CLONE",
+        "    userType=android.os.usertype.profile.PRIVATE",
+    )
+
+    @Test
+    fun r9_conflictingParentsInOneRow_failsClosedWithoutPackageRead_bothOrders() {
+        for (rows in listOf(
+            listOf(r9ConflictingParents, r9GoodClone),
+            listOf(r9GoodClone, r9ConflictingParents),
+        )) {
+            assertFailClosed(
+                FakeGateway(verboseWithTrailingClaims(rows)),
+                "R9: conflicting parents 0/10 in one row + good clone",
+            )
+        }
+    }
+
+    @Test
+    fun r9_conflictingSerialsInOneRow_failsClosedWithoutPackageRead_bothOrders() {
+        for (rows in listOf(
+            listOf(r9ConflictingSerials, r9GoodClone),
+            listOf(r9GoodClone, r9ConflictingSerials),
+        )) {
+            assertFailClosed(
+                FakeGateway(verboseWithTrailingClaims(rows)),
+                "R9: conflicting serials 15/99 in one row + good clone",
+            )
+        }
+    }
+
+    @Test
+    fun r9_conflictingTypeInLegacyBlock_failsClosedWithoutPackageRead_bothOrders() {
+        for (rows in listOf(
+            r9ConflictingTypeBlock + listOf(r9GoodClone),
+            listOf(r9GoodClone) + r9ConflictingTypeBlock,
+        )) {
+            assertFailClosed(
+                FakeGateway(verboseWithTrailingClaims(rows)),
+                "R9: conflicting CLONE/PRIVATE type in one legacy block + good clone",
+            )
+        }
+    }
+
+    @Test
+    fun r9_unknownClaimInVerboseChannel_failsClosedWithoutPackageRead_bothOrders() {
+        // A legacy u95 block with parent/serial but NO type line is UNKNOWN
+        // carrying plausible values: it must veto the clean CLONE row.
+        val unknownBlock = listOf(
+            "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+            "    parentId=0",
+        )
+        for (rows in listOf(
+            unknownBlock + listOf(r9GoodClone),
+            listOf(r9GoodClone) + unknownBlock,
+        )) {
+            assertFailClosed(
+                FakeGateway(verboseWithTrailingClaims(rows)),
+                "R9: UNKNOWN verbose claim with parent/serial",
+            )
+        }
+    }
+
+    @Test
+    fun r9_unknownClaimInDumpsysChannel_failsClosedWithoutPackageRead() {
+        val unknownDumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DUAL_APP:400} serialNo=15:
+                parentId=0
+        """.trimIndent()
+        val verbose = verboseWithTrailingClaims(listOf(r9GoodClone))
+        val u95 = SamsungProfileAdapter.parseDumpsysUser(unknownDumpsys).single { it.userId == 95 }
+        assertEquals(ProfileUserType.UNKNOWN, u95.userType)
+        assertTrue("the UNKNOWN dumpsys claim must be flagged", u95.evidenceInvalid)
+        assertFailClosed(
+            FakeGateway(verbose, dumpsysOutput = unknownDumpsys),
+            "R9: UNKNOWN dumpsys claim with parent/serial",
+        )
+    }
+
+    @Test
+    fun r9_cleanDuplicateCloneStillResolvesGroundTruthWithAbsolutePins() {
+        // Positive control: two agreeing CLONE rows, clean dumpsys and prop.
+        val verbose = verboseWithTrailingClaims(listOf(r9GoodClone, r2FreshParent0NoSerial))
         val result = ground(FakeGateway(verbose))
         assertEquals(95, result.target.userId)
         assertEquals(15, result.target.serial)

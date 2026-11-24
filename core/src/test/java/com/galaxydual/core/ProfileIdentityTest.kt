@@ -220,6 +220,7 @@ class ProfileIdentityTest {
         serial: Int? = null,
         parentId: Int? = if (userId == 0) null else 0,
         label: String = "",
+        evidenceInvalid: Boolean = false,
     ) = ProfileIdentity(
         userId = userId,
         serial = serial,
@@ -228,6 +229,7 @@ class ProfileIdentityTest {
         source = source,
         confidence = IdentityConfidence.MED,
         label = label,
+        evidenceInvalid = evidenceInvalid,
     )
 
     @Test
@@ -751,6 +753,93 @@ class ProfileIdentityTest {
         )
         // Base strict semantics (triple consensus): the Confirm needs
         // propertyId=95 alongside dual-CLONE + parentId=0 on both channels.
+        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+        assertEquals(
+            VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
+            SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
+        )
+    }
+
+    // ---- Issue #87 R9: invalid evidence vetoes independently of values ----
+
+    // A flagged UNKNOWN on the SAME channel as a CLONE is the decisive case:
+    // verbose has CLONE(0,15) + flagged UNKNOWN(0,15), dumpsys has CLONE(0,15)
+    // and the property agrees. Every old gate would pass; only the flag can
+    // veto. The retained 0/15 values are diagnosis, not authorization.
+    @Test
+    fun r9_flaggedVerboseUnknownClaimRefusesDualTarget() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = 15, evidenceInvalid = true),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+        )
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("flagged verbose evidence must refuse: $res", res is DualResolution.Refused)
+        assertTrue((res as DualResolution.Refused).reason.contains("contradictory evidence"))
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
+    @Test
+    fun r9_flaggedDumpsysUnknownClaimRefusesDualTarget() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.DUMPSYS, serial = 15, evidenceInvalid = true),
+        )
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("flagged dumpsys evidence must refuse: $res", res is DualResolution.Refused)
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
+    @Test
+    fun r9_bareUnknownStaysUnknownNotRefused() {
+        // Two-tier contract: a bare UNKNOWN (no contradictory/invalid value)
+        // means insufficient evidence -> Unknown, never Refused.
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = null, parentId = null),
+        )
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
+    @Test
+    fun r9_flagOnOtherIdDoesNotVetoTarget95() {
+        // id scoping: an invalid claim for a DIFFERENT id must not disturb
+        // an otherwise clean Confirmed(95,15,0).
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+            claim(96, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = 99, evidenceInvalid = true),
+        )
+        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+        assertEquals(
+            VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
+            SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
+        )
+    }
+
+    @Test
+    fun r9_flagPlusConflictingSerialIsNonConfirmed() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 99),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = 42, evidenceInvalid = true),
+        )
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("flag must veto even alongside a serial conflict: $res", res !is DualResolution.Confirmed)
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
+    @Test
+    fun r9_cleanDualCloneStillConfirmsWithAbsolutePins() {
+        // Positive control with absolute pins: no UNKNOWN/invalid claim means
+        // the R9 vetoes are inert and the legitimate target still confirms.
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+        )
         assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
         assertEquals(
             VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
