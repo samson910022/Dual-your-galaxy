@@ -164,6 +164,14 @@ class EffectivePolicyCache(
     // the sticky cap expires it.
     private var lastGoodSticky: Set<String>? = null
     private var lastGoodStickyAtMs: Long = 0L
+    // Trusted-clock high-water mark (guarded by [lock], like the sticky state).
+    // Every nowMs() sample used for a policy decision in getBbc() is validated
+    // against this mark; a sample BELOW it is a backwards jump / skew and is
+    // treated as untrusted (fail closed). Sampling and the high-water update are
+    // a single atomic step under [lock], so a thread that samples earlier but
+    // takes the lock later is NOT misclassified: samples are totally ordered by
+    // lock acquisition and only a genuine decrease is rejected.
+    private var lastTrustedClockMs: Long? = null
     private var lastBbcClearedVersion: Long = -1L
     // Phase A P0 Security MEDIUM: monotonic version gate. Tracks the highest
     // accepted BBC version (Good-with-version or Cleared) to reject replays:
@@ -245,9 +253,97 @@ class EffectivePolicyCache(
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Trusted clock sampling (getBbc only; the whitelist get() path keeps its
+    // existing clock handling untouched).
+    //
+    // There is NO stale fallback anywhere in this family: an unreadable clock
+    // or a backwards sample returns null, and the caller MUST route through
+    // failClosedUntrustedClockLocked(). That is what makes the invariant
+    // "untrusted/bounded clock => fail closed" true for the WHOLE read, not
+    // just the entry sample — no later sticky/TTL/freshness decision can be
+    // made with a laundered `catch { now0 }` / `catch { now1 }` value.
+    //
+    // sampleTrustedClockLocked() is called while holding [lock] (or via the
+    // synchronized wrapper). Sampling AND validating/advancing the high-water
+    // in the same critical section is deliberate: two threads that sample at
+    // different times but take the lock in the opposite order cannot make a
+    // healthy interleaving look like clock skew.
+    private fun sampleClockOrNull(): Long? = try {
+        nowMs()
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun sampleTrustedClockLocked(): Long? {
+        val sample = sampleClockOrNull() ?: return null
+        val highWater = lastTrustedClockMs
+        if (highWater != null && sample < highWater) return null
+        lastTrustedClockMs = sample
+        return sample
+    }
+
+    private fun sampleTrustedClock(): Long? = synchronized(lock) {
+        sampleTrustedClockLocked()
+    }
+
+    // The ONE fail-closed route for an untrusted clock at any point in
+    // getBbc(): the entry catch, a mid-read skew, or a dead completion sample.
+    // Drops ONLY the sticky snapshot (option (a): cached freshness is kept, so
+    // a later healthy call may still serve a genuinely valid cached value
+    // within TTL — the comment on the old entry catch claiming a later call
+    // "cannot resurrect it" was misleading). Counts one sticky expiry (iff a
+    // sticky existed), one sticky fallback and one Unknown; emits the
+    // clock-free diagnostic. No reader, version gate, valid/cached/
+    // lastRefreshMs or failure-cooldown state is touched, and a single call
+    // returns immediately so no arm can double-count.
+    private fun failClosedUntrustedClockLocked(): BbcPolicy {
+        val hadSticky = lastGoodSticky != null
+        if (hadSticky) {
+            lastGoodSticky = null
+            try {
+                bbcStickyExpiredCount.incrementAndGet()
+            } catch (_: Throwable) {
+            }
+        }
+        try {
+            bbcStickyFallbackCount.incrementAndGet()
+        } catch (_: Throwable) {
+        }
+        try {
+            bbcUnknownCount.incrementAndGet()
+        } catch (_: Throwable) {
+        }
+        // A dead clock suppresses noteBbcFallback entirely (no throttle
+        // bypass), so this path uses its own CLOCK-FREE diagnostic line.
+        if (hadSticky) noteUntrustedClockDiscard() else noteBbcFallback("clock-no-sticky")
+        return BbcPolicy.Unknown(emptySet())
+    }
+
+    // Uniform Unknown accounting for every NON-clock fallback arm of getBbc:
+    // one sticky-fallback count, one Unknown count, one throttled log with the
+    // caller's existing cause. Callers no longer wrap stickyIfValidLocked() in
+    // `catch { lastGoodSticky }`: a throwing helper can never return an
+    // unchecked sticky — a fail-closed empty set is the only fallback.
+    private fun unknownWithStickyLocked(sticky: Set<String>?, cause: String): BbcPolicy {
+        try {
+            bbcStickyFallbackCount.incrementAndGet()
+        } catch (_: Throwable) {
+        }
+        try {
+            bbcUnknownCount.incrementAndGet()
+        } catch (_: Throwable) {
+        }
+        noteBbcFallback(cause)
+        return BbcPolicy.Unknown(sticky ?: emptySet())
+    }
+
     // A dead clock suppresses noteBbcFallback entirely (no throttle bypass),
-    // so the untrusted-clock sticky discard gets its own CLOCK-FREE, once-per-
-    // process diagnostic line. Counters are the primary signal on every hit.
+    // so the untrusted-clock sticky discard gets its own CLOCK-FREE diagnostic
+    // line. Counters are the primary signal on every hit. The flag is per-cache
+    // instance: production has exactly one long-lived BBC cache
+    // (DualHook.bbcCache), so this is once per process there while each test
+    // gets an independent, deterministic log budget.
     private val untrustedClockDiscardLogged = AtomicLong(0L)
     private fun noteUntrustedClockDiscard() {
         if (!untrustedClockDiscardLogged.compareAndSet(0L, 1L)) return
@@ -912,46 +1008,23 @@ class EffectivePolicyCache(
         deadlineMs: Long = -1L,
         reader: () -> Pair<Set<String>?, Long?>,
     ): BbcPolicy {
-        val now0: Long = try {
-            nowMs()
-        } catch (_: Throwable) {
-            // Preserve the gate-closed invariant even when the clock sample
-            // fails: re-evaluate the opt-out provider (wrapped, never throws)
-            // and still short-circuit to Cleared(-1) with zero reader calls.
-            // A broken provider cannot mask the existing clock fallback.
+        // Entry sample goes through the SAME trusted sampler as every later
+        // sample: null means the clock is dead OR skewed vs the high-water.
+        // No caller ever substitutes a stale `now0` for a failed read.
+        val now0 = sampleTrustedClock()
+        if (now0 == null) {
+            // Preserve the gate-closed invariant even when the clock sample is
+            // untrusted: re-evaluate the opt-out provider (wrapped, never
+            // throws) and still short-circuit to Cleared(-1) with ZERO reader
+            // calls and ZERO state/counter changes. A broken provider cannot
+            // mask the existing clock fallback.
             val gateClosed = try {
                 !bbcGateOpen()
             } catch (_: Throwable) {
                 false
             }
             if (gateClosed) return BbcPolicy.Cleared(-1L)
-            // Without a trusted clock the sticky snapshot's freshness cannot be
-            // proven against the 30-min cap, so fail closed instead of serving
-            // an unverifiable value. Drop it once (so a later call cannot
-            // resurrect it) and count it as an expiry for observability.
-            val hadSticky = synchronized(lock) {
-                val present = lastGoodSticky != null
-                if (present) {
-                    lastGoodSticky = null
-                    try {
-                        bbcStickyExpiredCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                }
-                present
-            }
-            try {
-                bbcStickyFallbackCount.incrementAndGet()
-            } catch (_: Throwable) {
-            }
-            try {
-                bbcUnknownCount.incrementAndGet()
-            } catch (_: Throwable) {
-            }
-            // noteBbcFallback() cannot log with a dead clock (by design: no
-            // throttle bypass), so use the clock-free once-per-process line.
-            if (hadSticky) noteUntrustedClockDiscard() else noteBbcFallback("clock-no-sticky")
-            return BbcPolicy.Unknown(emptySet())
+            return synchronized(lock) { failClosedUntrustedClockLocked() }
         }
         // N06(b): gate read happens AFTER now0/deadline sampling, inside the
         // guarded section, so a slow pref read consumes the same deadline
@@ -977,31 +1050,18 @@ class EffectivePolicyCache(
                     BbcPolicy.Good(cached)
                 }
             }
+            // Resample immediately before the cooldown/sticky decision: a clock
+            // that died or skewed after the entry sample must fail closed here
+            // rather than reuse a stale sample to serve sticky.
+            val nowC = sampleTrustedClockLocked() ?: return failClosedUntrustedClockLocked()
             val lf = lastFailureMs
-            if (lf != null && now0 - lf < failureCooldownMs && now0 - lf >= 0L) {
-                val sticky = stickyIfValidLocked(now0)
-                if (sticky != null) {
-                    try {
-                        bbcStickyFallbackCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    try {
-                        bbcUnknownCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    noteBbcFallback("cooldown")
-                    return BbcPolicy.Unknown(sticky)
+            if (lf != null && nowC - lf < failureCooldownMs && nowC - lf >= 0L) {
+                val sticky = stickyIfValidLocked(nowC)
+                return if (sticky != null) {
+                    unknownWithStickyLocked(sticky, "cooldown")
+                } else {
+                    unknownWithStickyLocked(null, "cooldown-no-sticky")
                 }
-                try {
-                    bbcStickyFallbackCount.incrementAndGet()
-                } catch (_: Throwable) {
-                }
-                try {
-                    bbcUnknownCount.incrementAndGet()
-                } catch (_: Throwable) {
-                }
-                noteBbcFallback("cooldown-no-sticky")
-                return BbcPolicy.Unknown(emptySet())
             }
             if (inFlightGen != null) {
                 if (valid) {
@@ -1019,11 +1079,8 @@ class EffectivePolicyCache(
             }
         }
         if (isFollower) {
-            val now1 = try {
-                nowMs()
-            } catch (_: Throwable) {
-                now0
-            }
+            val now1 = sampleTrustedClock()
+                ?: return synchronized(lock) { failClosedUntrustedClockLocked() }
             val elapsed = try {
                 (now1 - now0).coerceAtLeast(0L)
             } catch (_: Throwable) {
@@ -1051,29 +1108,17 @@ class EffectivePolicyCache(
                             BbcPolicy.Good(cached)
                         }
                     }
-                    val sticky = try {
-                        stickyIfValidLocked(now1)
-                    } catch (_: Throwable) {
-                        lastGoodSticky
-                    }
-                    try {
-                        bbcStickyFallbackCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    try {
-                        bbcUnknownCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    noteBbcFallback("grace-expired")
-                    return BbcPolicy.Unknown(sticky ?: emptySet())
+                    // Fresh trusted sample for the sticky decision (no reuse of
+                    // the pre-wait/deadline sample).
+                    val nowG = sampleTrustedClockLocked()
+                        ?: return failClosedUntrustedClockLocked()
+                    val sticky = stickyIfValidLocked(nowG)
+                    return unknownWithStickyLocked(sticky, "grace-expired")
                 }
             }
             synchronized(lock) {
-                val now2: Long = try {
-                    nowMs()
-                } catch (_: Throwable) {
-                    now1
-                }
+                val now2 = sampleTrustedClockLocked()
+                    ?: return failClosedUntrustedClockLocked()
                 val elapsed2: Long = try {
                     (now2 - now0).coerceAtLeast(0L)
                 } catch (_: Throwable) {
@@ -1111,21 +1156,13 @@ class EffectivePolicyCache(
                         BbcPolicy.Good(cached)
                     }
                 }
-                val sticky = try {
-                    stickyIfValidLocked(now2)
-                } catch (_: Throwable) {
-                    lastGoodSticky
-                }
-                try {
-                    bbcStickyFallbackCount.incrementAndGet()
-                } catch (_: Throwable) {
-                }
-                try {
-                    bbcUnknownCount.incrementAndGet()
-                } catch (_: Throwable) {
-                }
-                noteBbcFallback("grace-expired")
-                return BbcPolicy.Unknown(sticky ?: emptySet())
+                // Resample AFTER the grace wait: now2 was taken before parking
+                // and is stale for a cap/skew decision if the clock moved (or
+                // died) while the follower was waiting.
+                val nowAfterWait = sampleTrustedClockLocked()
+                    ?: return failClosedUntrustedClockLocked()
+                val sticky = stickyIfValidLocked(nowAfterWait)
+                return unknownWithStickyLocked(sticky, "grace-expired")
             }
         }
         var wasContention = false
@@ -1152,22 +1189,17 @@ class EffectivePolicyCache(
                             BbcPolicy.Good(cached)
                         }
                     }
+                    // Resample under the commit lock: the pre-read now0 is
+                    // stale after a slow contended reader, and an untrusted
+                    // clock here must fail closed instead of serving sticky.
+                    val nowC = sampleTrustedClockLocked()
+                        ?: return failClosedUntrustedClockLocked()
                     // Sticky survives contention + invalidate-during-IO.
-                    val sticky = try {
-                        stickyIfValidLocked(now0)
-                    } catch (_: Throwable) {
-                        lastGoodSticky
-                    }
-                    try {
-                        bbcStickyFallbackCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    try {
-                        bbcUnknownCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    noteBbcFallback(if (gen0 != generation) "invalidated-discard" else "contention")
-                    return BbcPolicy.Unknown(sticky ?: emptySet())
+                    val sticky = stickyIfValidLocked(nowC)
+                    return unknownWithStickyLocked(
+                        sticky,
+                        if (gen0 != generation) "invalidated-discard" else "contention",
+                    )
                 } finally {
                     if (inFlightGen == gen0) {
                         inFlightGen = null
@@ -1215,13 +1247,15 @@ class EffectivePolicyCache(
                 unknownRead = true
             }
         }
-        val now1: Long = try {
-            nowMs()
-        } catch (_: Throwable) {
-            now0
-        }
         synchronized(lock) {
             try {
+                // Completion sample: trusted or null. This is taken INSIDE the
+                // commit critical section so an unreadable / skewed clock here
+                // fails closed BEFORE any valid/cached/lastRefreshMs/sticky/
+                // version publish from this read. The finally below still
+                // releases the single-flight claim on this early return.
+                val now1 = sampleTrustedClockLocked()
+                    ?: return failClosedUntrustedClockLocked()
                 if (gen0 != generation) {
                     if (valid) {
                         return if (cached.isEmpty()) {
@@ -1230,21 +1264,8 @@ class EffectivePolicyCache(
                             BbcPolicy.Good(cached)
                         }
                     }
-                    val sticky = try {
-                        stickyIfValidLocked(now1)
-                    } catch (_: Throwable) {
-                        lastGoodSticky
-                    }
-                    try {
-                        bbcStickyFallbackCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    try {
-                        bbcUnknownCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    noteBbcFallback("invalidated-discard")
-                    return BbcPolicy.Unknown(sticky ?: emptySet())
+                    val sticky = stickyIfValidLocked(now1)
+                    return unknownWithStickyLocked(sticky, "invalidated-discard")
                 }
                 if (valid) {
                     return if (cached.isEmpty()) {
@@ -1260,21 +1281,8 @@ class EffectivePolicyCache(
                     // (sticky, never cached/shrunk), counted like failed-read.
                     if (clearedVersion != null && !isClearedVersionAcceptableLocked(clearedVersion)) {
                         lastFailureMs = now1
-                        val sticky = try {
-                            stickyIfValidLocked(now1)
-                        } catch (_: Throwable) {
-                            lastGoodSticky
-                        }
-                        try {
-                            bbcStickyFallbackCount.incrementAndGet()
-                        } catch (_: Throwable) {
-                        }
-                        try {
-                            bbcUnknownCount.incrementAndGet()
-                        } catch (_: Throwable) {
-                        }
-                        noteBbcFallback("cleared-rejected")
-                        return BbcPolicy.Unknown(sticky ?: emptySet())
+                        val sticky = stickyIfValidLocked(now1)
+                        return unknownWithStickyLocked(sticky, "cleared-rejected")
                     }
                     // R06 (P1): BBC Good(non-empty) with a version must pass the
                     // monotonic + content gate (isGoodVersionAcceptableLocked) —
@@ -1301,23 +1309,11 @@ class EffectivePolicyCache(
                         noVersionGoodRejected
                     ) {
                         lastFailureMs = now1
-                        val sticky = try {
-                            stickyIfValidLocked(now1)
-                        } catch (_: Throwable) {
-                            lastGoodSticky
-                        }
-                        try {
-                            bbcStickyFallbackCount.incrementAndGet()
-                        } catch (_: Throwable) {
-                        }
-                        try {
-                            bbcUnknownCount.incrementAndGet()
-                        } catch (_: Throwable) {
-                        }
-                        noteBbcFallback(
+                        val sticky = stickyIfValidLocked(now1)
+                        return unknownWithStickyLocked(
+                            sticky,
                             if (goodVersion == null) "good-rejected-no-version" else "good-rejected",
                         )
-                        return BbcPolicy.Unknown(sticky ?: emptySet())
                     }
                     val unmod = try {
                         java.util.Collections.unmodifiableSet(merged)
@@ -1377,21 +1373,8 @@ class EffectivePolicyCache(
                     }
                 } else {
                     lastFailureMs = now1
-                    val sticky = try {
-                        stickyIfValidLocked(now1)
-                    } catch (_: Throwable) {
-                        lastGoodSticky
-                    }
-                    try {
-                        bbcStickyFallbackCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    try {
-                        bbcUnknownCount.incrementAndGet()
-                    } catch (_: Throwable) {
-                    }
-                    noteBbcFallback("failed-read")
-                    return BbcPolicy.Unknown(sticky ?: emptySet())
+                    val sticky = stickyIfValidLocked(now1)
+                    return unknownWithStickyLocked(sticky, "failed-read")
                 }
             } finally {
                 if (inFlightGen == gen0) {
