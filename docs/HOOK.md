@@ -376,12 +376,12 @@ JVM 單元測試全綠（`testDebugUnitTest`）**不構成開啟 `NON_EMPTY_POLI
 >
 > **硬閘門（hard gate，缺一不可；11-17 historical spec 用語，round-7b 已重新分類，見 round-7b 揭露段）— 四個分離時點：**
 >
-> ① **11-17 歷史授權**：僅根據 11-17 兩裝置 pre-unification 證據（commit `71920f95`），owner 授權 BBC 效應開關 `BBC_AVAILABLE_APPS_INJECTION=true`；raw log 私有、本 PR 未獨立稽核（E-17-P-S23-BBC1–BBC5／E-17-P-S7-LIST）。
-> ② **11-18 unified build**：僅 BBC1–BBC3 reader 接線部分重驗正向紀錄；BBC4／BBC5 UNVERIFIED、BBC6 破壞性 fail；共享 `dual_policy/extra_whitelist_packages`→`EffectivePolicyCache` 輪詢讀者，**不構成全項目重驗**（E-18-U-S23-BBC1–BBC6）。
+> ① **11-17 歷史授權（pre-unification 舊閘）**：owner 依 11-17 兩裝置證據授權 BBC 清單注入效應（commit `71920f95`）；**該 commit 的常數是 `NON_EMPTY_POLICY_EFFECTIVE_GATE: Boolean = true`（舊閘）；當時尚未有 `BBC_AVAILABLE_APPS_INJECTION` 常數，不得把現行 BBC 專用開關直接歸給此 commit**。BBC 效應開關到 unified tree 才拆分命名（見 ②／TAB7 Addendum B）。raw log 私有、本 PR 未獨立稽核（E-17-P-S23-BBC1–BBC5／E-17-P-S7-LIST）。
+> ② **11-18 unified build**：僅 BBC1–BBC3 reader 接線部分重驗正向紀錄；BBC4／BBC5 UNVERIFIED、BBC6 破壞性 fail；共享 `dual_policy/extra_whitelist_packages`→`EffectivePolicyCache` 輪詢讀者，**不構成全項目重驗**（E-18-U-S23-BBC1–BBC6）。效應面拆為 BBC-only `BBC_AVAILABLE_APPS_INJECTION=true`、Stage-1 `NON_EMPTY_POLICY_EFFECTIVE_GATE` 重新封緘 `false`（TAB7 Addendum B）。
 > ③ **目前 beta.3**：BBC effect experimental／本版本未實機驗證、無 tested-byte provenance（E-B3-HEAD；詳 `docs/ACCEPTANCE.md` §1／§6.0）。
 > ④ **round-7b 維護者決策**：M1/M2 為合併門檻、P0 以 experimental limitation 接受揭露、H01–H04/#75 為 follow-ups——**不是安全宣稱、不重啟 P0 為合併門檻**。
 >
-> Stage-1 閘 `NON_EMPTY_POLICY_EFFECTIVE_GATE` **未曾翻轉、維持封緘 `false`**。
+> **unified/current Stage-1 閘** `NON_EMPTY_POLICY_EFFECTIVE_GATE` **自 11-18 重新封緘 `false` 後未曾翻轉、維持封緘 `false`**（現行 beta.3 同此）；11-17 pre-unification 舊閘（commit `71920f95`）曾為 `true`，與 unified/current Stage-1 不是同一閘，不得據以宣稱『未曾翻轉』。
 
 > provenance 摘要：本節裝置證據僅代表 pre-unification build 之 BBC 合併行為（BBC jar 於兩裝置逐字等價，見 §1.3a）；unified build 的 BBC 注入效應由 `PolicySource.BBC_AVAILABLE_APPS_INJECTION` 治理，reader 接線部分重驗（2026-11-18，BBC1–BBC3 正向紀錄；BBC4（`pm path` 17:56 本機 log，未入 repo）／BBC5（17:22:20 啟動，無並存 `ps`）皆 UNVERIFIED（本 PR 未獨立稽核）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載；`BBC-HOOK merged +1 packages (total 7, pid=…)` 重現）。詳 `docs/ACCEPTANCE.md` §6。
 
