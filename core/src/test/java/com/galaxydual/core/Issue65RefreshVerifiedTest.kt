@@ -221,9 +221,13 @@ class Issue65RefreshVerifiedTest {
 
     @Test
     fun pocB_smuggledCanonicalFlagsWithSpaceBeforeComma_failsClosedWithoutPackageRead() {
+        // The space before the comma is no longer the deciding reason: the
+        // canonical grammar now tolerates it. The earlier declaration fails
+        // because it is STRUCTURAL (owns a flags/parent tail), so the later
+        // canonical-looking token may not overwrite it.
         val row = "1: id=95, name=foo, type=profile.CLONE, flags=X, " +
             "type=profile.PRIVATE , flags=0x190 (parentId=0)"
-        assertFailClosed(FakeGateway(verboseWithRow(row)), "PoC B: space before comma")
+        assertFailClosed(FakeGateway(verboseWithRow(row)), "PoC B: earlier structural declaration")
     }
 
     @Test
@@ -291,5 +295,105 @@ class Issue65RefreshVerifiedTest {
             "flags=0x00000190 (parentId=0) java.lang.SecurityException: denied",
         )
         assertFailClosed(FakeGateway(verbose), "SecurityException in the flags tail")
+    }
+
+    // ---- R1: reverse PoC B at the full refreshVerified() level ----
+
+    private fun assertReversePocBWithoutPackageRead(row: String, reason: String) {
+        assertFailClosed(FakeGateway(verboseWithRow(row)), reason)
+    }
+
+    @Test
+    fun r1_reversePocEarlierStructuralDeclarationWithSpace_failsClosedWithoutPackageRead() {
+        assertReversePocBWithoutPackageRead(
+            "1: id=95, name=OK, type=profile.PRIVATE , flags=X (parentId=10), " +
+                "type=profile.CLONE, flags=X (parentId=0)",
+            "R1 reverse PoC B: earlier structural declaration (space)",
+        )
+    }
+
+    @Test
+    fun r1_reversePocEarlierStructuralDeclarationWithTab_failsClosedWithoutPackageRead() {
+        assertReversePocBWithoutPackageRead(
+            "1: id=95, name=OK, type=profile.PRIVATE\t, flags=X (parentId=10), " +
+                "type=profile.CLONE, flags=X (parentId=0)",
+            "R1 reverse PoC B: earlier structural declaration (tab)",
+        )
+    }
+
+    @Test
+    fun r1_reversePocEarlierParentOnlyDeclaration_failsClosedWithoutPackageRead() {
+        assertReversePocBWithoutPackageRead(
+            "1: id=95, name=OK, type=profile.PRIVATE (parentId=10), " +
+                "type=profile.CLONE, flags=X (parentId=0)",
+            "R1 reverse PoC B: earlier parent-only declaration",
+        )
+    }
+
+    @Test
+    fun r1_singleSpacedCanonicalCloneStillResolvesGroundTruth() {
+        // Positive grammar guard at the full level: a single declaration with
+        // space before its canonical comma must still resolve u95.
+        val row = "1: id=95, name=OK, type=profile.CLONE , flags=X (parentId=0)"
+        val result = ground(FakeGateway(verboseWithRow(row)))
+        assertEquals(95, result.target.userId)
+        assertEquals(15, result.target.serial)
+        assertEquals(0, result.target.parentId)
+        assertEquals(listOf("com.example.chat", "com.example.mail"), result.cloned)
+    }
+
+    // ---- R5: raw-line classification at the full refresh level ----
+
+    @Test
+    fun r5_tabInUserInfoShapedNameLabel_failsClosedWithoutPackageRead() {
+        val row = "1: id=95, name=UserInfo{95:a\tb:400}, type=profile.CLONE, flags=X (parentId=0)"
+        assertFailClosed(FakeGateway(verboseWithRow(row)), "R5: real tab in UserInfo-shaped name label")
+    }
+
+    @Test
+    fun r5_headerLikeFailureInFlagsTail_failsClosedWithoutPackageRead() {
+        val row = "1: id=95, name=OK, type=profile.CLONE, flags=UserInfo{1:Failure:0} (parentId=0)"
+        assertFailClosed(FakeGateway(verboseWithRow(row)), "R5: Failure in flags-tail header token")
+    }
+
+    @Test
+    fun r5_unicodeSeparatorInName_failsClosedWithoutPackageRead() {
+        val row = "1: id=95, name=foo\u2028UserInfo{95:x:400}, type=profile.CLONE, flags=X (parentId=0)"
+        assertFailClosed(FakeGateway(verboseWithRow(row)), "R5: U+2028 in the name")
+    }
+
+    @Test
+    fun r5_legacyOnlyCrLfFixtureStillResolvesGroundTruth() {
+        // Compat: CRLF is handled by the shared LF/CRLF splitter, so a
+        // legacy-only verbose snapshot still confirms the dual target.
+        val verbose = listOf(
+            "Users:",
+            "  UserInfo{0:Owner:13} running:",
+            "    Serial number: 0",
+            "    User type: android.os.usertype.full.SYSTEM",
+            "  UserInfo{95:DualApp:400} running:",
+            "    Serial: 15",
+            "    parentId=0",
+            "    User type: android.os.usertype.profile.CLONE",
+        ).joinToString("\r\n")
+        val result = ground(FakeGateway(verbose))
+        assertEquals(95, result.target.userId)
+        assertEquals(15, result.target.serial)
+        assertEquals(0, result.target.parentId)
+        assertEquals(listOf("com.example.chat", "com.example.mail"), result.cloned)
+    }
+
+    @Test
+    fun r5_unicodeSeparatorOnOtherRows_failsClosedWithoutPackageRead() {
+        // u95's own row stays clean; a Unicode separator on owner/other rows
+        // must still fail the channel closed (no hidden record separator may
+        // split a different row into a fresh legacy/new claim).
+        val verbose = listOf(
+            "Users:",
+            "  0: id=0, name=Owner\u2028UserInfo{95:DUAL_APP:400}, type=full.SYSTEM, flags=X (parentId=0)",
+            "  1: id=95, name=DUAL_APP, type=profile.CLONE, flags=0x00000190 (parentId=0)",
+            "  2: id=150, name=Secure\u2028Folder, type=profile.PRIVATE, flags=X (parentId=0)",
+        ).joinToString("\n")
+        assertFailClosed(FakeGateway(verbose), "R5: Unicode separator on owner/other rows")
     }
 }

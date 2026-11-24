@@ -10,9 +10,9 @@ import org.junit.Test
 // RED regression test for issue #65: the new One UI verbose `cmd user list -v`
 // format (`N: id=<id>, name=<label>, type=<token>, flags=... (parentId=0) ...`)
 // has NO `UserInfo{...}` header, so a user-renamed profile whose `name=` label
-// contains an error keyword (`Error`, `not found`, ...) is left untouched by
-// PmOutputParser.IDENTITY_HEADER_STRIP and is then matched by ERROR_LINE in
-// checkStrictLines(). That wrongly fails isIdentityChannelOk()/the verified
+// contains an error keyword (`Error`, `not found`, ...) used to be left
+// untouched by the old global header strip and then matched by ERROR_LINE in
+// checkStrictLines(). That wrongly failed isIdentityChannelOk()/the verified
 // identity gate even though the label is display-only by contract.
 //
 // The label is display-only in SamsungProfileAdapter too (parseNewVerboseLines
@@ -210,6 +210,11 @@ class Issue65ParserRegressionTest {
 
     @Test
     fun newVerbose_pocB_smuggledCanonicalFlagsWithSpaceBeforeComma_failsClosed() {
+        // The space before the comma is NOT the deciding reason any more:
+        // the canonical grammar now tolerates space/tab on BOTH delimiter
+        // spellings. This row still fails because an EARLIER declaration owns
+        // a structural tail (`, flags=X`), which the structural invariant
+        // refuses to let the later canonical-looking token overwrite.
         assertSmuggledDeclarationFailsClosed(
             "B",
             "1: id=95, name=foo, type=profile.CLONE, flags=X, " +
@@ -280,5 +285,194 @@ class Issue65ParserRegressionTest {
         val claim = parsed.first { it.userId == 95 }
         assertEquals(ProfileUserType.UNKNOWN, claim.userType)
         assertEquals(IdentityConfidence.LOW, claim.confidence)
+    }
+
+    // ---- R1: structural invariant (reverse PoC B) ----
+
+    // An EARLIER structurally complete declaration must beat a later
+    // canonical-looking one, whether its delimiter carries a space, a tab,
+    // or only a parentId tail. Whitespace normalization alone cannot fix this:
+    // the ambiguity detector looks for flags/parent/serial in each
+    // declaration's own window, not for one literal space spelling.
+    private fun assertEarlierStructuralDeclarationRejected(row: String, reason: String) {
+        assertFalse(
+            "$reason must fail the strict identity gate",
+            PmOutputParser.isIdentityChannelOk("Users:\n$row", 0),
+        )
+        assertFalse(
+            "$reason must fail the pm-list-users gate too",
+            PmOutputParser.isListUsersOutputOk(row, 0),
+        )
+        val claim = SamsungProfileAdapter.parseUserListVerbose(row).single { it.userId == 95 }
+        assertEquals("$reason must not claim CLONE", ProfileUserType.UNKNOWN, claim.userType)
+        assertEquals(IdentityConfidence.LOW, claim.confidence)
+        assertNull("$reason must not claim a parent", claim.parentId)
+        assertNull(claim.serial)
+    }
+
+    @Test
+    fun r1_reversePocEarlierStructuralDeclarationWithSpace_failsClosed() {
+        assertEarlierStructuralDeclarationRejected(
+            "1: id=95, name=OK, type=profile.PRIVATE , flags=X (parentId=10), " +
+                "type=profile.CLONE, flags=X (parentId=0)",
+            "earlier structural declaration with a space before its comma",
+        )
+    }
+
+    @Test
+    fun r1_reversePocEarlierStructuralDeclarationWithTab_failsClosed() {
+        assertEarlierStructuralDeclarationRejected(
+            "1: id=95, name=OK, type=profile.PRIVATE\t, flags=X (parentId=10), " +
+                "type=profile.CLONE, flags=X (parentId=0)",
+            "earlier structural declaration with a tab before its comma",
+        )
+    }
+
+    @Test
+    fun r1_reversePocEarlierParentOnlyDeclaration_failsClosed() {
+        assertEarlierStructuralDeclarationRejected(
+            "1: id=95, name=OK, type=profile.PRIVATE (parentId=10), " +
+                "type=profile.CLONE, flags=X (parentId=0)",
+            "earlier parent-only structural declaration",
+        )
+    }
+
+    @Test
+    fun r1_spaceBeforeCanonicalCommaStillParsesAsClone() {
+        // Positive grammar guard against over-rejection: the SAME whitespace
+        // that makes the earlier declaration detectable must not reject a
+        // single, canonical, structural declaration.
+        val row = "1: id=95, name=OK, type=profile.CLONE , flags=X (parentId=0)"
+        val claim = SamsungProfileAdapter.parseUserListVerbose(row).single { it.userId == 95 }
+        assertEquals(ProfileUserType.CLONE, claim.userType)
+        assertEquals(0, claim.parentId)
+        assertTrue("a lone canonical declaration with a spaced comma stays valid", PmOutputParser.isIdentityChannelOk(row, 0))
+
+        // Raw-vs-sanitized validity consistency: replacing ONLY the raw name
+        // span (exactly what the gate's sanitizer does) must not change the
+        // shared parser's verdict or the authorized type token.
+        val raw = VerboseUserRow.parse(row)!!
+        assertFalse(raw.malformed)
+        val sanitized = row.substring(0, raw.nameStart) + "<display-name>" + row.substring(raw.nameEnd)
+        val after = VerboseUserRow.parse(sanitized)!!
+        assertFalse("sanitizing only the name span must not change row validity", after.malformed)
+        assertEquals(raw.typeToken, after.typeToken)
+    }
+
+    // ---- R5: one raw physical-line classification shared by gate/parser ----
+
+    // The raw line is classified by the SAME object the gate uses, so a raw
+    // invalid line (malformed NEW_ROW or REJECTED) must always fail closed.
+    private fun assertRawInvalidLineFailsGate(raw: String, reason: String) {
+        val physical = VerboseUserRow.verboseLines(raw).single { it.isNotBlank() }
+        val classified = IdentityLineClassifier.classify(physical)
+        val rawInvalid = when (classified.kind) {
+            IdentityLineKind.REJECTED -> true
+            IdentityLineKind.NEW_ROW -> classified.row!!.malformed
+            else -> false
+        }
+        assertTrue("$reason must classify raw-invalid", rawInvalid)
+        assertFalse("$reason must fail the identity gate", PmOutputParser.isIdentityChannelOk(raw, 0))
+    }
+
+    @Test
+    fun r5_tabInsideLegacyShapedNameLabel_isMalformedNotLegacyHeader() {
+        val row = "1: id=95, name=UserInfo{95:a\tb:400}, type=profile.CLONE, flags=X (parentId=0)"
+        val claims = SamsungProfileAdapter.parseUserListVerbose(row)
+        assertEquals(1, claims.size)
+        val claim = claims.single()
+        assertEquals(95, claim.userId)
+        assertEquals(ProfileUserType.UNKNOWN, claim.userType)
+        assertEquals(IdentityConfidence.LOW, claim.confidence)
+        assertNull(claim.parentId)
+        assertNull(claim.serial)
+        assertRawInvalidLineFailsGate(row, "a real tab in a UserInfo-shaped name label")
+    }
+
+    @Test
+    fun r5_headerLikeFailureInFlagsTailSurvivesSanitizer() {
+        val row = "1: id=95, name=OK, type=profile.CLONE, flags=UserInfo{1:Failure:0} (parentId=0)"
+        // The row itself is structurally valid: the gate fails because the
+        // header-like token in the TAIL survives (no whole-output strip).
+        val raw = VerboseUserRow.parse(row)!!
+        assertFalse(raw.malformed)
+        val sanitized = row.substring(0, raw.nameStart) + "<display-name>" + row.substring(raw.nameEnd)
+        assertFalse(VerboseUserRow.parse(sanitized)!!.malformed)
+        assertFalse(
+            "Failure inside a flags-tail UserInfo token must not be deleted",
+            PmOutputParser.isIdentityChannelOk(row, 0),
+        )
+        assertFalse(PmOutputParser.isListUsersOutputOk(row, 0))
+    }
+
+    @Test
+    fun r5_unicodeSeparatorInNameIsRejectedNotLegacyHeader() {
+        val row = "1: id=95, name=foo\u2028UserInfo{95:x:400}, type=profile.CLONE, flags=X (parentId=0)"
+        val claims = SamsungProfileAdapter.parseUserListVerbose(row)
+        assertEquals(1, claims.size)
+        val claim = claims.single()
+        assertEquals(95, claim.userId)
+        assertEquals(ProfileUserType.UNKNOWN, claim.userType)
+        assertEquals(IdentityConfidence.LOW, claim.confidence)
+        assertNull("a rejected line must not claim a parent", claim.parentId)
+        assertNull(claim.serial)
+        assertRawInvalidLineFailsGate(row, "U+2028 in the name")
+    }
+
+    @Test
+    fun r5_legacyOnlyCrLfFixtureStillParsesClone() {
+        // Compat: CRLF is handled by the shared LF/CRLF splitter, so legacy
+        // headers and their bodies are unchanged.
+        val legacy = listOf(
+            "Users:",
+            "  UserInfo{0:Owner:13} running:",
+            "    Serial number: 0",
+            "    User type: android.os.usertype.full.SYSTEM",
+            "  UserInfo{95:DualApp:400} running:",
+            "    Serial: 15",
+            "    parentId=0",
+            "    User type: android.os.usertype.profile.CLONE",
+        ).joinToString("\r\n")
+        val clone = SamsungProfileAdapter.parseUserListVerbose(legacy).single { it.userId == 95 }
+        assertEquals(ProfileUserType.CLONE, clone.userType)
+        assertEquals(15, clone.serial)
+        assertEquals(0, clone.parentId)
+        assertTrue(PmOutputParser.isIdentityChannelOk(legacy, 0))
+    }
+
+    @Test
+    fun r5_loneCrInLegacyHeaderLineCannotYieldClone() {
+        val verbose = listOf(
+            "Users:",
+            "  UserInfo{95:DualApp:400} running:\rSerial: 15",
+            "    parentId=0",
+            "    User type: android.os.usertype.profile.CLONE",
+        ).joinToString("\n")
+        val claims = SamsungProfileAdapter.parseUserListVerbose(verbose)
+        assertEquals(1, claims.size)
+        val claim = claims.single()
+        assertEquals(95, claim.userId)
+        assertEquals(ProfileUserType.UNKNOWN, claim.userType)
+        assertEquals(IdentityConfidence.LOW, claim.confidence)
+        assertNull(claim.parentId)
+        assertNull(claim.serial)
+        assertFalse(PmOutputParser.isIdentityChannelOk(verbose, 0))
+    }
+
+    @Test
+    fun r5_loneCrInLegacyBodyDoesNotContributeType() {
+        // A lone CR inside a body line makes that whole physical line
+        // REJECTED: it is excluded from the legacy block body, so its
+        // `userType=...CLONE` cannot type the preceding header's claim.
+        val verbose = listOf(
+            "Users:",
+            "  UserInfo{95:DualApp:400} running:",
+            "    Serial: 15\ruserType=android.os.usertype.profile.CLONE",
+            "    parentId=0",
+        ).joinToString("\n")
+        val claim = SamsungProfileAdapter.parseUserListVerbose(verbose).single { it.userId == 95 }
+        assertEquals(ProfileUserType.UNKNOWN, claim.userType)
+        assertEquals(IdentityConfidence.LOW, claim.confidence)
+        assertFalse(PmOutputParser.isIdentityChannelOk(verbose, 0))
     }
 }
