@@ -239,6 +239,19 @@ internal class WarningRestartController {
      * they CARRY OVER the consumed auto-restart budget. Without that carry-over
      * an auto-restart would re-install with a fresh budget and defeat
      * [MAX_AUTO_WARNING_RESTARTS], producing an unbounded re-prompt loop.
+     *
+     * FAST-PATH CALLERS: an accepted destructive action can settle with NO
+     * warning at all (a Known snapshot / empty removal set, i.e. a no-op). Such
+     * a call still goes through this seam with `resetBudget = true` so the
+     * accepted action owns a fresh identity and budget; it passes
+     * `generation = WarningRetryOneShot.currentGeneration` for CORRELATION ONLY.
+     * This method NEVER touches [WarningRetryOneShot] (it never did): the
+     * one-shot generation advances only for warnings actually shown, via
+     * [tryAcceptWarning]. A no-warning fast path must therefore pass through
+     * here without calling [WarningRetryOneShot.onWarningInstalled].
+     *
+     * CANCELLED REQUESTS: a cancel/no-op must call [revoke] with the captured
+     * request id, NOT [clear], so a newer accepted action is never dropped.
      */
     fun install(
         action: WarningRestartAction,
@@ -277,11 +290,29 @@ internal class WarningRestartController {
      * The posted [body] closes over the host-liveness snapshot taken here; the
      * Activity also re-checks `isFinishing/isDestroyed` immediately before
      * invoking it, so a host that dies in between never delivers.
+     *
+     * [expectedRequestId] is the identity whose abort/WRITE is being handled.
+     * When non-null, this method fails WITHOUT posting or consuming budget if
+     * the live request is a different one — this is what stops a stale abort
+     * (e.g. a cancelled CLEAR) from scheduling a new restart for a live WRITE.
+     * Passing `null` keeps the original behavior for pre-existing callers.
+     *
+     * COMPATIBILITY: the 3-parameter overload keeps the [post] lambda LAST, so
+     * every existing `schedule(...) { tokenId, requestId, body -> ... }` trailing
+     * lambda call still compiles unchanged. Only callers that need identity
+     * binding pass the 4th [expectedRequestId] argument.
      */
     fun schedule(
         hostAlive: Boolean,
         maxRestarts: Int,
         post: (tokenId: Long, requestId: Long, body: () -> Unit) -> Unit,
+    ): Boolean = schedule(hostAlive, maxRestarts, post, expectedRequestId = null)
+
+    fun schedule(
+        hostAlive: Boolean,
+        maxRestarts: Int,
+        post: (tokenId: Long, requestId: Long, body: () -> Unit) -> Unit,
+        expectedRequestId: Long? = null,
     ): Boolean {
         if (!hostAlive || maxRestarts <= 0) return false
         var capturedRequest: WarningRestartRequest
@@ -289,6 +320,10 @@ internal class WarningRestartController {
         while (true) {
             val current = state.get()
             val request = current.request ?: return false
+            // Identity-bound abort: a stale caller must not touch a newer
+            // request's token, budget or scheduled state (checked inside the
+            // CAS so a concurrent install cannot be raced past it).
+            if (expectedRequestId != null && request.identity.id != expectedRequestId) return false
             // Same semantics as canAutoRestart(previousCount): one auto restart
             // per accepted request; ONLY a genuine entry tap re-arms via
             // install(resetBudget = true). Re-entry from a posted restart or a
@@ -338,6 +373,16 @@ internal class WarningRestartController {
     /** Request id to capture at a Retry tap (or when installing a dialog). */
     fun retryRequestId(): Long? = state.get().request?.identity?.id
 
+    /** Test/telemetry accessor: the live request id, if any. */
+    fun currentRequestId(): Long? = state.get().request?.identity?.id
+
+    /** True only for a non-null id that is still the live request identity. */
+    fun isLive(requestId: Long?): Boolean {
+        if (requestId == null) return false
+        val live = state.get().request ?: return false
+        return live.identity.id == requestId
+    }
+
     /**
      * Identity-bound equivalent of [deliver] for Retry taps: the captured id
      * must still be the live request, no Retry for this request may have been
@@ -358,6 +403,36 @@ internal class WarningRestartController {
         }
         callback()
         return true
+    }
+
+    /**
+     * CANCEL / NO-OP seam: conditionally drop ONLY [requestId]'s request.
+     *
+     * Unlike [clear], this never globally drops state: a stale or null id is a
+     * no-op that returns `false` with ZERO state mutation, so a cancel arriving
+     * late can never revoke a newer accepted action. On success the request is
+     * cleared, the token id is bumped (so any already-posted restart token is
+     * stale), the scheduled token/request ids and the consumed-Retry mark are
+     * cleared. [autoRestartsUsed] is deliberately RETAINED — a cancel is not a
+     * genuine entry tap and must not hand a fresh auto-restart budget to the
+     * next action.
+     */
+    fun revoke(requestId: Long?): Boolean {
+        if (requestId == null) return false
+        while (true) {
+            val current = state.get()
+            val live = current.request ?: return false
+            if (live.identity.id != requestId) return false
+            val next = current.copy(
+                request = null,
+                tokenId = current.tokenId + 1L,
+                scheduledTokenId = null,
+                scheduledRequestId = null,
+                consumedRetryRequestId = null,
+                // autoRestartsUsed intentionally carried, NOT reset.
+            )
+            if (state.compareAndSet(current, next)) return true
+        }
     }
 
     /** onDestroy: drop the live request and invalidate any queued token. */
