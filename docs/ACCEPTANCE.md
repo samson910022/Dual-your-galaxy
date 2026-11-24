@@ -76,13 +76,42 @@ Harness 共 60 個自動化測試（`app/src/androidTest`，16 個檔案 / 15 �
 | I1 | `InputRestoreTest`（query/選取保留 + Activity EditText 文字 + 通道行）；`activity_recreate_retainsNonDefaultChannelPreference`（ROOT）recreate 後仍顯示 | fake 計數 + EditText 文字 + 通道偏好（含非預設通道 recreate） |
 | W1 | `RemoveFlowTest.confirmRemove_success_uninstallsOnce`（VM 半邊：單次 uninstall、結果釘住） | `uninstallCalls == 1`；真機仍須驗 W1 |
 
-## 6. BBC 注入驗收紀錄（2026-11-17 雙裝置 pre-unification；2026-11-18 unified build 重驗）
+## 6. BBC 注入驗收紀錄（2026-11-17 雙裝置 pre-unification；2026-11-18 unified build 部分重驗）
 
-> **provenance 聲明（先讀）**：2026-11-17 的 BBC 實測在 **pre-unification build**（BBC 分支；政策 group `galaxydual_policy`）上做；其改變的讀者模型**已不再實作**。unified tree（`unify/bbc-on-main`）已遷移為共享 `dual_policy/extra_whitelist_packages` → `EffectivePolicyCache`（60s TTL 輪詢）→ `BbcInjector.mergeAvailableList`（`BBC_AVAILABLE_APPS_INJECTION=true`；`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘不變）。**2026-11-18 已於 S23 Ultra 以 unified build 完整重驗（BBC1–BBC3 重驗；BBC4/BBC5 caveated／UNVERIFIED（2026-11-18 17:21/17:22 安裝 + UI，pid=3568 僅 historical note，非目前 HEAD 通過）；Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身，資料清除）。** **BBC4/BBC5 已下修為 caveated／UNVERIFIED（下表同），pid=3568 僅 historical note；目前 HEAD（v0.1.0-beta.3／`fc579de3`）之 BBC 效應為 experimental／本版本未實機驗證，下列 11-17/11-18 舊 build 證據不用於驗證目前 HEAD。** 結論補錄如下；2026-11-17 段落作為 reference 保留。
+### 6.0 Evidence Matrix（版本化，唯一狀態來源）
+
+> **版本：v1（PR #91）；最後更新 2026-11-24；本 PR 為唯讀文件審查，所有 `private-only` raw log 未經 reviewer 獨立稽核。**
+>
+> **本矩陣為 BBC 證據狀態的唯一真相來源（single source of truth）；其餘保留歷史摘要與既有標記的檔案（README／HOOK／TAB7／USAGE／ARCHITECTURE 等）一律以本矩陣為準；既有 ☑/☐ 標記僅為歷史摘要，不得解讀為目前 HEAD 通過。**
+>
+> 狀態 enum：`POSITIVE-HISTORICAL`／`PARTIAL-POSITIVE`／`UNVERIFIED`／`NEGATIVE-CONFIRMED`／`DESTRUCTIVE-FAIL`／`NOT-TESTED`／`INCONCLUSIVE`。可重查性 enum：`repo-artifact`／`private-only-not-in-repo`／`user-report-only`／`JVM-only`／`CI-only`／`session-only-not-persisted`。每列均標「本 PR 是否獨立稽核：No」。
+
+| ID | Build / source | 日期時間 | 裝置 / ROM | 項目 | 觀察結果 | 狀態(enum) | 可重查性(enum) | 與目前 HEAD 的關係 | 限制 / 風險 | 引用 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| E-17-P-S23-BBC1 | pre-unification build（政策 group `galaxydual_policy`；reader 已退役） | 2026-11-17 22:54 | S23 Ultra / One UI 9、Android 17、DAAgent 3.7.00.0 | BBC hook 安裝 | `BBC-HOOK installed=1 (daagent, pid=21472)` | POSITIVE-HISTORICAL | private-only-not-in-repo | 僅歷史；非本版本（beta.3）驗收證據 | raw log 私有、reviewer 未獨立稽核；pid 屬 11-17 歷史 | `s23_bbc_evidence_20261117.log`；本 PR 是否獨立稽核：No |
+| E-17-P-S23-BBC2 | pre-unification build | 2026-11-17（空政策基線） | S23 Ultra / One UI 9 | 空政策基線 | `initial load: 0 package(s)`；callback 回傳 Samsung 原始物件（僅回傳物件位元一致） | POSITIVE-HISTORICAL | private-only-not-in-repo | 僅歷史；非本版本驗收證據 | 位元一致僅指回傳物件，不代表裝置行為不變 | `s23_bbc_evidence_20261117.log`；本 PR 是否獨立稽核：No |
+| E-17-P-S23-BBC3 | pre-unification build | 2026-11-17 23:01 | S23 Ultra / One UI 9 | 非空政策合併 | `BBC-HOOK merged +1 packages (total 7, pid=21472)`；ChatGPT 出現在清單 | POSITIVE-HISTORICAL | private-only-not-in-repo | 僅歷史；非本版本驗收證據 | raw log 私有、本 PR 未獨立稽核 | `s23_bbc_evidence_20261117.log`；本 PR 是否獨立稽核：No |
+| E-17-P-S23-BBC4 | pre-unification build | 2026-11-17 | S23 Ultra / One UI 9 | `pm path --user 95 com.openai.chatgpt` | 回應 base＋split dual APK paths | POSITIVE-HISTORICAL | private-only-not-in-repo | 僅 11-17 歷史；**不得被 11-18 的缺證下修** | raw log 私有、本 PR 未獨立稽核；11-17 與 11-18 為不同 build／不同 observations | `s23_bbc_evidence_20261117.log`；本 PR 是否獨立稽核：No |
+| E-17-P-S23-BBC5 | pre-unification build | 2026-11-17 | S23 Ultra / One UI 9 | 雙開 launch | 同時 `ps` 見 `u0_a431`＋`u95_a431`；分身 launch | POSITIVE-HISTORICAL | private-only-not-in-repo | 僅 11-17 歷史；**不得被 11-18 的缺證下修** | raw log 私有、本 PR 未獨立稽核 | `s23_bbc_evidence_20261117.log`；本 PR 是否獨立稽核：No |
+| E-17-P-S23-BBC6 | pre-unification build | 2026-11-17 | S23 Ultra / One UI 9 | 破壞性 deletion | 卸載分身＋SSAID 拒絕 | DESTRUCTIVE-FAIL | private-only-not-in-repo | 歷史事故，非本版本通過項 | 破壞性操作、資料全清；raw log 私有 | `BBC6_SSAID_INCIDENT.md`；本 PR 是否獨立稽核：No |
+| E-17-P-S7-LIST | pre-unification build（S7） | 2026-11-17 | Tab S7 / One UI 5、Android 13、DAAgent 3.3.00.0 | 清單可見／toggle（union no-op） | `installed=1`（pid 7812／18538／21602）；`merge added 0 packages`；Firefox/Gemini 列可見＋toggle 可操作 | POSITIVE-HISTORICAL | private-only-not-in-repo | 僅歷史；非本版本驗收證據 | **union no-op 非注入生效證明**；raw log 私有；分身安裝另見 E-17-P-S7-DUAL（UNVERIFIED／無持久化 u95 process 證據） | `s4_gate_true_bbc.log`；本 PR 是否獨立稽核：No |
+| E-17-P-S7-DUAL | pre-unification build（S7） | 2026-11-17（session） | Tab S7 / One UI 5 | 分身啟動（dual install） | `pm path --user 95` 回 dual paths＋`11_firefox_dual.png` first-run 畫面；**無持久化 `u95_*` process 證據** | UNVERIFIED | session-only-not-persisted | 僅 session；**不得與 S23 並列** | 未持久化、無 `ps` 旁證；不得宣稱 Firefox 已啟動雙開／u0 並存 | `s4_gate_true_bbc.log`；本 PR 是否獨立稽核：No |
+| E-18-U-S23-BBC1 | unified build `3e9ccede`／APK `953803c4…` | 2026-11-18 | S23 Ultra / One UI 9 | reader installed | `BBC-HOOK installed=1 (daagent, pid=29265)` | PARTIAL-POSITIVE | private-only-not-in-repo | reader 接線部分重驗；非本版本驗收 | raw log 私有、本 PR 未獨立稽核 | `s23_bbc_unified_20261118.log`；本 PR 是否獨立稽核：No |
+| E-18-U-S23-BBC2 | unified build `3e9ccede`／APK `953803c4…` | 2026-11-18 | S23 Ultra / One UI 9 | 空政策 callback | `BBC-HOOK callback … (pid=29265)`，不帶 `nonempty`／無 merged 行 | PARTIAL-POSITIVE | private-only-not-in-repo | 僅 reader 接線部分重驗 | raw log 私有、本 PR 未獨立稽核 | `s23_bbc_unified_20261118.log`；本 PR 是否獨立稽核：No |
+| E-18-U-S23-BBC3 | unified build `3e9ccede`／APK `953803c4…` | 2026-11-18 | S23 Ultra / One UI 9 | 非空政策 callback＋merged | `(nonempty, pid=1519)`＋`merged +1 packages (total 7, pid=1519)`；截圖 `s23u_02_bbc3.png` | PARTIAL-POSITIVE | private-only-not-in-repo | 僅 reader 接線部分重驗 | raw log＋截圖私有、本 PR 未獨立稽核 | `s23_bbc_unified_20261118.log`；本 PR 是否獨立稽核：No |
+| E-18-U-S23-BBC4 | unified build `3e9ccede`／APK `953803c4…` | 2026-11-18 17:56 | S23 Ultra / One UI 9 | `pm path --user 95` | 本機 log 回 dual APK paths，但未入 repo | UNVERIFIED | private-only-not-in-repo | 11-18 UNVERIFIED；非本版本驗收證據 | 本機 log 未入 repo、不可獨立重查 | `s23_bbc_unified_reenable_20261118.log`；本 PR 是否獨立稽核：No |
+| E-18-U-S23-BBC5 | unified build `3e9ccede`／APK `953803c4…` | 2026-11-18 17:22:20；22:31 截圖（22:31 為恢復後截圖，非 17:22 啟動旁證） | S23 Ultra / One UI 9 | 分身 launch | `am start --user 95` → pid=3568；22:31 截圖；**無同時 `ps` u95＋u0** | UNVERIFIED | private-only-not-in-repo | 11-18 UNVERIFIED；非本版本驗收證據 | pid 僅 historical note；無並存 process 證據、無持久化 `ps` | `s23_bbc_unified_20261118.log`；本 PR 是否獨立稽核：No |
+| E-18-U-S23-BBC6 | unified build `3e9ccede`／APK `953803c4…` | 2026-11-18 | S23 Ultra / One UI 9 | 空政策 deletion／SSAID／恢復 | 卸載分身、SSAID 拒絕；reboot＋toggle 恢復；資料全清 | DESTRUCTIVE-FAIL | private-only-not-in-repo | 歷史事故，非本版本通過項 | 「清空才刪」因果已撤回；raw log 私有 | `BBC6_SSAID_INCIDENT.md`；本 PR 是否獨立稽核：No |
+| E-20/21-DELETE | 非空政策冷啟動（11-20／11-21） | 2026-11-20／21 | S23 Ultra / One UI 9 | 系統 DELETE | 非空政策下遭 system uid 刪除 u95 分身；DELETE 早於回調 116–144ms | NEGATIVE-CONFIRMED | private-only-not-in-repo | 負向控制；不解讀為本版本通過 | 觸發機制未證實；raw log 私有、本 PR 未獨立稽核 | `BBC_COLDSTART_DELETE_INCIDENT.md`；本 PR 是否獨立稽核：No |
+| E-23-ABC | 11-23 三臂 A/B/C（不同 App build） | 2026-11-23 | S23 Ultra / One UI 9 | 對照臂 DELETE | A/B/C 皆出現 system uid DELETE；A/B 早於回調（−83/−99 ms、−69/−89 ms），C 無回調可比（process-start 代理、低精度 +103 ms）（ASSOCIATION，非因果） | NEGATIVE-CONFIRMED | private-only-not-in-repo | 負向控制關聯，非本版本通過 | 不同 build；prior data 未還原；C 臂非 pure Samsung baseline（其他 LSPosed/framework 修改仍在、scope row 事後還原、soft reboot）；非因果 | `BBC_COLDSTART_DELETE_INCIDENT.md`；本 PR 是否獨立稽核：No |
+| E-B3-HEAD | beta.3 source `fc579de3`／APK `98a3ce20…` | 2026-11-24 review | —（無實機） | BBC effect／tested-byte／manual matrix | 皆 NOT-TESTED／EXPERIMENTAL；CI #45228233599／#45233459919 | NOT-TESTED | CI-only | 即本版本；無實機、無 tested-apk-provenance | build 成功不等於裝置通過 | `docs/ACCEPTANCE.md` §1；本 PR 是否獨立稽核：No |
+| E-JVM-CI | 1924 JVM tests／build＋locale-instrumentation | 2026-11-18（orchestrator 記錄） | —（JVM／CI） | 程式碼與 CI 閘門 | 1924 JVM tests 全綠；build／locale-instrumentation SUCCESS | POSITIVE-HISTORICAL | JVM-only | code／CI only，非裝置證據 | 不證明 hook 安裝、callback 命中或裝置行為 | repo CI artifacts；本 PR 是否獨立稽核：No |
+
+> **provenance 聲明（先讀）**：2026-11-17 的 BBC 實測在 **pre-unification build**（BBC 分支；政策 group `galaxydual_policy`）上做；其改變的讀者模型**已不再實作**。unified tree（`unify/bbc-on-main`）已遷移為共享 `dual_policy/extra_whitelist_packages` → `EffectivePolicyCache`（60s TTL 輪詢）→ `BbcInjector.mergeAvailableList`（`BBC_AVAILABLE_APPS_INJECTION=true`；`NON_EMPTY_POLICY_EFFECTIVE_GATE=false` 封緘不變）。**2026-11-18 已於 S23 Ultra 以 unified build 部分重驗（BBC1–BBC3 正向紀錄；BBC4（`pm path` 17:56 本機 log，未入 repo）／BBC5（17:22:20 啟動，無並存 `ps`）皆 UNVERIFIED；BBC6 破壞性不通過；詳 §6.0／§8.3）。** Samsung BBC6 刪除分身後 SSAID 拒絕；恢復 = 裝置重啟 + Samsung 原生 toggle-on（見 BBC6_SSAID_INCIDENT.md）；BBC6=系統自動卸載分身，資料清除。狀態以 §6.0 矩陣為唯一真相來源；目前 HEAD（v0.1.0-beta.3／`fc579de3`）之 BBC 效應為 experimental／本版本未實機驗證，下列 11-17/11-18 舊 build 證據不用於驗證目前 HEAD。 結論補錄如下；2026-11-17 段落作為 reference 保留。
 
 > **2026-11-20/11-21 更新（優先於本文 11-18 結論）**：非空政策下 daagent 冷啟動仍遭 Samsung 以 system uid 刪除 u95 分身，DELETE 早於 BBC 回調 116–144ms，toggle-ON 可恢復但資料全清；11-18「清空才刪」與「回傳位元一致＝零行為變更」不足以描述冷啟動風險。詳 `BBC_COLDSTART_DELETE_INCIDENT.md`、issue #75（issue #75 已於 2026-11-21 更正為非空回調；仍以 BBC_COLDSTART_DELETE_INCIDENT.md 為準）。本節所有 11-18 列（含 BBC6）皆受此更新節制。
 
-> 裝置序列已遮蔽；路徑與截圖留本機。擷錄檔不入 repo。
+> 裝置序列已遮蔽；路徑與截圖留本機。擷錄檔不入 repo（本 PR 未獨立稽核）。
 
 ### 8.3 紀錄（S23 Ultra only，unified build）
 
@@ -94,16 +123,16 @@ Harness 共 60 個自動化測試（`app/src/androidTest`，16 個檔案 / 15 �
 | 版本 | `versionName=0.0.1` `versionCode=1` |
 | 裝置 | Galaxy S23 Ultra（SM-S9180，Android 17／One UI 9，DAAgent 3.7.00.0，Zygisk-LSPosed，KernelSU，user 0／95） |
 | 政策（裝置本機） | `com.openai.chatgpt`（unified 後重新勾選） |
-| 證據檔（本機） | `s23_bbc_unified_20261118.log`（unified 全部 BBC-HOOK 行 + pm path + ps，相對根 `s23ultra/`）；`s23u_01_baseline.png`／`s23u_02_bbc3.png`／`s23u_03_bbc6_cleared.png`／`s23u_04_bbc6_restored.png` |
+| 證據檔（本機） | `s23_bbc_unified_20261118.log`（unified 全部 BBC-HOOK 行 + pm path + ps，相對根 `s23ultra/`）；`s23u_01_baseline.png`／`s23u_02_bbc3.png`／`s23u_03_bbc6_cleared.png`／`s23u_04_bbc6_restored.png`（本機私有、不入 repo、本 PR 未獨立稽核） |
 
-| # | 操作 | 預期 | 實際（2026-11-18，unified build） | 通過 |
+| # | 操作 | 預期 | 實際（2026-11-18，unified build） | 歷史觀察／結果 |
 | --- | --- | --- | --- | --- |
 | BBC1 | daagent 啟動時 BBC hook 安裝 | `BBC-HOOK installed=1 (daagent, pid=…)` | ✅ `BBC-HOOK installed=1 (daagent, pid=29265)`（verbose mirror，force-stop daagent 後首次開頁） | ☑ |
 | BBC2 | 空政策 | BBC callback 回傳物件與 Samsung 原始物件位元一致（僅指回傳物件，不代表裝置行為不變；冷啟動刪除見 incident） | ✅ `BBC-HOOK callback getPossibleDualAppPackages (pid=29265)`（不帶 `nonempty`／無 merged 行） | ☑ |
 | BBC3 | 勾選政策 app → 重進頁面 | ChatGPT 出現在清單 | ✅ `BBC-HOOK callback getPossibleDualAppPackages (nonempty, pid=1519)`；**`BBC-HOOK merged +1 packages (total 7, pid=1519)`**；頁面截圖 `s23u_02_bbc3.png`（ChatGPT 列出現，可切換） | ☑ |
-| BBC4 | 切換 ChatGPT toggle → 等待安裝 | user 95 安裝 dual APK、無重啟需求 | ⚠️ `pm path --user 95 com.openai.chatgpt` 於 2026-11-18 **17:56 的 `s23_bbc_unified_reenable_20261118.log`（本機）** 量測：含 base＋split APK 多行輸出（`# exit=0`）；此 log **未由本 repo 收錄**，不可獨立驗證，僅有裝置端 session 記錄相映；本節不再將之視為可重查證據；pid=3568 僅 historical note | ☐（UNVERIFIED／caveat；非通過） |
-| BBC5 | launch 分身實例 | 雙開實例啟動、主 profile 並存 | ⚠️ 進程案由 `INVESTIGATION_SSAID_BBC6.md`（unified build 於 17:21–17:30 確有 u95 分身進程且系統未強制其退出）；本節**沒有同時 `ps` 擷錄 U95 + U0 的證據**；`s23u_05_chatgpt_working.png`（22:31 截圖）顯示分身以第一次啟動歡迎畫面可見，無崩潰；不得稱證據 `u95_a431 pid=10165` — 該 pid 為 user 自陳、未收錄 log；pid=3568 僅 historical note | ☐（UNVERIFIED／caveat；非通過） |
-| BBC6 | **破壞性卸載（不是回滾）：清空政策／冷啟動 deletion（資料全清）** | **11-18 觀察**：空政策 daagent 冷啟動與 `START DELETE PACKAGE (caller{1000})` 同時出現（11-18 BBC1 pid=29265 政策空；11-17 pre-unification BBC1 pid=21472 政策空）。**因果鏈已撤回**：原主張「空政策 → possible-list 空 → Samsung 刪除」被 2026-11-20/11-21 反證——兩次皆在非空政策（`nonempty` + `merged +1 total 7`）下遭系統 uid 刪除，且 DELETE 早於 BBC 回調 116–144ms；刪除觸發機制未證實（見 `BBC_COLDSTART_DELETE_INCIDENT.md` §5/§8）。**恢復**：toggle-ON 重裝即可（11-20/11-21 免重啟）；11-18 當次另以 `adb reboot` + Samsung「設定→雙開應用」切回 ON，22:30 **使用者回報**正常（`u95_a431 pid=10165` 為口述、未收錄；截圖 `s23u_05_chatgpt_working.png`）；資料全清、無法復原。 | ❌ 不通過、不得標 ☑；BBC6 屬破壞性指令；詳 `BBC6_SSAID_INCIDENT.md` 與 `BBC_COLDSTART_DELETE_INCIDENT.md` §8 |
+| BBC4 | 切換 ChatGPT toggle → 等待安裝 | user 95 安裝 dual APK、無重啟需求 | ⚠️ `pm path --user 95 com.openai.chatgpt` 於 2026-11-18 **17:56 的 `s23_bbc_unified_reenable_20261118.log`（本機）** 量測：含 base＋split APK 多行輸出（`# exit=0`）；此 log **未由本 repo 收錄**，不可獨立驗證，僅有裝置端 session 記錄相映；本節不再將之視為可重查證據（E-18-U-S23-BBC4；本 PR 未獨立稽核） | ☐（UNVERIFIED；非通過） |
+| BBC5 | launch 分身實例 | 雙開實例啟動、主 profile 並存 | ⚠️ 僅本機私有 session log（不入 repo、本 PR 未獨立稽核）記載 unified build 於 17:21–17:30 確有 u95 分身進程且系統未強制其退出；**session 觀察，無持久化 `ps` 證據；本節沒有同時 `ps` 擷錄 U95 + U0 的證據**；`s23u_05_chatgpt_working.png`（22:31 截圖）顯示分身以第一次啟動歡迎畫面可見，無崩潰；不得稱證據 `u95_a431 pid=10165` — 該 pid 為 user 自陳、未收錄 log；pid=3568 僅 historical note（E-18-U-S23-BBC5） | ☐（UNVERIFIED；非通過） |
+| BBC6 | **破壞性卸載（不是回滾）：清空政策／冷啟動 deletion（資料全清）** | **不應發生**：分身遭系統解除安裝／user-95 資料清除（破壞性，不得標 ☑） | **11-18 觀察**：空政策 daagent 冷啟動與 `START DELETE PACKAGE (caller{1000})` 同時出現（11-18 BBC1 pid=29265 政策空；11-17 pre-unification BBC1 pid=21472 政策空）。**因果鏈已撤回**：原主張「空政策 → possible-list 空 → Samsung 刪除」被 2026-11-20/11-21 反證——兩次皆在非空政策（`nonempty` + `merged +1 total 7`）下遭系統 uid 刪除，且 DELETE 早於 BBC 回調 116–144ms；刪除觸發機制未證實（見 `BBC_COLDSTART_DELETE_INCIDENT.md` §5/§8）。**恢復**：toggle-ON 重裝即可（11-20/11-21 免重啟）；11-18 當次另以 `adb reboot` + Samsung「設定→雙開應用」切回 ON，22:30 **使用者回報**正常（`u95_a431 pid=10165` 為口述、未收錄；截圖 `s23u_05_chatgpt_working.png`）；資料全清、無法復原。 | ❌ 不通過、不得標 ☑；BBC6 屬破壞性指令；詳 `BBC6_SSAID_INCIDENT.md` 與 `BBC_COLDSTART_DELETE_INCIDENT.md` §8 |
 | BBC7 | Knox／Secure Folder（user 150） | 零觸及、零查詢 | ✅ 全程未查詢 user 150；所有 `pm` 查詢僅 user 0／95 | ☑ |
 
 BBC6 注意事項（unified build）：
@@ -157,7 +186,7 @@ BBC6 注意事項（unified build）：
 
 擷錄指引：
 - S23 Ultra：BBC-HOOK 行只出現在 LSPosed verbose mirror：`adb shell su -c 'grep -E "BBC-HOOK|BBC-SPIKE|RemotePreferences" /data/adb/lspd/log/verbose_*.log'`；logcat 僅見 `adb logcat -d -s GalaxyDualHook`（unified build 不再印 `RemotePreferences initial load/updated`，pool/TTL 模式無此行）。
-- 擷錄檔命名不含序號，存放於本機裝置證據目錄（私有，不入 repo），不入 repo；本節證據欄位僅記檔名。
+- 擷錄檔命名不含序號，存放於本機裝置證據目錄（私有，不入 repo、本 PR 未獨立稽核）；本節證據欄位僅記檔名。
 
 ### 2026-11-23 實機唯讀觀察（F00/F06 仍 UNMEASURED／NOT a pass）
 
@@ -167,7 +196,7 @@ BBC6 注意事項（unified build）：
 - 政策狀態（LSPosed remote-prefs DB，唯讀）：非空 BBC 政策**已提交**（`dual_policy/extra_whitelist_packages` ＝ `{com.openai.chatgpt}`；另有 `galaxydual_policy/packages`）。執行期閘鍵 `bbc_injection_enabled` **缺席** → 依預設推斷為 **ON**；此為**由持久化狀態推斷，非 UI 確認**（「關於」對話框未抵達，toggle 狀態 UNMEASURED）。
 - u95 ChatGPT 分身：4 個 APK 路徑、`installed=true`、`ceDataInode=631837`、`firstInstallTime=2026-11-21 03:37:34`，但**已安裝卻故障**：啟動即崩潰 `IllegalStateException: Ssaid settings not accessible`（`SettingsProvider.generateSsaidLocked`）；持有人回報即使經 Samsung Dual Messenger toggle OFF→ON 重裝仍崩潰。資料大小 **UNMEASURED**（即使 `su -c` 下 `du`／`ls` 仍 Permission denied）。此 SSAID 崩潰與既有 incident 記錄一致，但**不證明亦不關閉 P0 因果問題**；根因位於硬禁止的 SSAID 區，**Scope B 修補禁止、未嘗試**。
 - F00（P0 冷啟動 DELETE）：**UNMEASURED** — 無冷啟動、無 DELETE chain／caller uid／時序／分身與資料存活數據。F06：**UNMEASURED** — 無延遲／IPC／sticky／Scope A 量測。三臂同基線對照（default BBC／confirmed-off runtime gate／Samsung baseline）仍是必要證據，缺一不可。
-- 證據（**不入 repo**，依本 repo 慣例）：目錄 `/mnt/seagate500g/opencode_tmp/device_evidence/`，共 54 檔（53 檔附 SHA-256 ＋ MANIFEST 自身）、約 81 MiB，含完整 LSPosed verbose log（181 行 BBC）、約 37 MB logcat dump（含崩潰堆疊）、截圖與 DB 快照；完整清單與每檔 SHA-256 見外部 `MANIFEST.md`，原始記錄為同目錄 `FINAL_device_observation.md`。
+- 證據（**不入 repo**，依本 repo 慣例）：目錄 `/mnt/seagate500g/opencode_tmp/device_evidence/`，共 54 檔（53 檔附 SHA-256 ＋ MANIFEST 自身）、約 81 MiB，含完整 LSPosed verbose log（181 行 BBC）、約 37 MB logcat dump（含崩潰堆疊）、截圖與 DB 快照；完整清單與每檔 SHA-256 見外部 `MANIFEST.md`（本 PR 未獨立稽核），原始記錄為同目錄 `FINAL_device_observation.md`。
 
 #### 觸發場景分析（非根因；信心分級）
 
@@ -217,7 +246,7 @@ BBC6 注意事項（unified build）：
 | **C｜本模組 BBC hook 完全缺席** | 僅移除本模組 2 條 LSPosed scope row；無硬重開機，以 `setprop ctl.restart zygote` 軟重開機套用；新 daagent pid 4523 **零** BBC log 行，framework／其他模組仍正常 | 03:29:30.206；同樣 caller／uid／user | 無 BBC 回調 → D−C 無法計算；D−E 以 process-start 為代理、**低精度**（無 hook 行），僅記 +103 ms 代理值 | clone ＋ 資料清除；available list 僅 Samsung 原生 5 個 app |
 
 **誠實解讀**：
-- **強關聯證據（ASSOCIATION，非因果證明）**：Samsung system-uid 的 DELETE 在 BBC 注入 ON、執行期 gate 確認 OFF、以及完全沒有 BBC hook 三種條件下**皆發生**，且一律早於任何 BBC 回調。這支持「刪除決策位於 Samsung `system_server`、與本模組 BBC 注入無關」的推論（issue #75），並**確認執行期 opt-out 不是刪除防護**。此為 negative-control association，**不是**已完成的安全根因研究，亦不構成任何合併閘門通過。
+- **強關聯證據（ASSOCIATION，非因果證明）**：Samsung system-uid 的 DELETE 在 BBC 注入 ON、執行期 gate 確認 OFF、以及完全沒有 BBC hook 三種條件下**皆發生**；A/B 臂 DELETE 早於 BBC 回調（D−E/D−C = −83/−99 ms、−69/−89 ms），C 臂**無 BBC 回調可比**（process-start 代理、低精度 +103 ms）。三臂皆為 system-uid DELETE 的**負向控制關聯（ASSOCIATION，非因果）**，支持「刪除決策位於 Samsung `system_server`、與本模組 BBC 注入無關」的推論（issue #75，§6.0 E-23-ABC），並**確認執行期 opt-out 不是刪除防護**。此為 negative-control association，**不是**已完成的安全根因研究，亦不構成任何合併閘門通過。
 - **DELETE 前的決策輸入仍 UNMEASURED**：三臂完成本身**不證明** P0 風險已排除、**不證明** BBC 預設設定安全、也不證明根因已定論；adb 無法讀取 `system_server` 內的 pre-DELETE 決策輸入，關聯與時序不等於因果。依 round-7b 維護者決策，此風險已作為 experimental limitation 接受揭露；本節不是 pass／安全結論，也不是 PR #74 合併門檻（不作任何通過或安全性的結論）。
 - **F06／其餘未測項仍 UNMEASURED／NOT a pass**：DAAgent UI callback 中 512 次 package-manager 查詢的 p50/p95/max 與 Binder IPC 次數（含 cold process）、15ms opt-out gate 的真實 Binder 延遲、政策 TTL／30 分鐘 sticky 在活躍 user-95 clone 下的 failover、Samsung Scope A warning／ROOT dialog，全部 **UNMEASURED／NOT a pass**；Android CI #334 手動模擬器矩陣略過；PR 最終 run #45103347110 與 main merge 後 #45113206916 皆 SUCCESS（build／locale-instrumentation 通過，manual emulator matrix 仍 **SKIPPED**）——二者為 **PR #74 歷史 run**，非目前 HEAD 錨點；目前 HEAD 為 beta.3（`fc579de3`，APK SHA256 `98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`），CI run #45228233599（Android CI／PR head `e5c61f51`：build＋locale-instrumentation SUCCESS、manual emulator matrix SKIPPED）與 #45233459919（Release／main push `fc579de3`：release＋publish SUCCESS，無 manual matrix job）為目前 HEAD 錨點，無 tested-byte provenance；JVM／CI 全綠不構成裝置通過。2026-11-23 破壞性 A/B/C 對照**不能替代**上述效能／UI／安全測試。
 
@@ -225,7 +254,7 @@ BBC6 注意事項（unified build）：
 
 **還原與重開機**：每個破壞性臂後皆以 `pm install-existing --user 95` 還原 baseline；Arm C 後另以 narrow restore 只回補本模組 2 條 scope row（共 19 條，其他模組未動），lspd 重啟 ＋ 軟重開機後 hook 重新生效（新 pid 4219 `installed=1`），clone 健康（SSAID=0）、gate ON、root 保留。**全程未使用硬重開機**（無 `adb reboot`／power cycle）。Scope B／SSAID／ABX 修補從未嘗試。還原僅限套件存在；user-95 資料於各破壞性臂皆已清除且未還原，故不聲稱回到相同 prior-data 基線。
 
-**證據（外部、不入 repo）**：`/mnt/seagate500g/opencode_tmp/device_evidence/r5_v2_coldstart_20261123_024013/` — 關鍵檔：`armA_result.md`／`armA_delete_chain.txt`／`armA_bbc_lines.txt`、`armB_result.md`／`armB2_delete_chain.txt`／`armB2_bbc_lines.txt`、`armC_result.md`／`armC_11_delete_chain.txt`／`armC_11_bbc_lines.txt`／`armC_restore_record.md`／`armC_20_bbc_lines.txt`／`armC_16_final.db`、`latest_build_verification.md`、`gate_log.md`；authorization／scope／soft-reboot 授權檔亦在該目錄。原始 logcat／verbose log／截圖／DB 快照留該目錄，依慣例不入 repo。
+**證據（外部、不入 repo）**：`/mnt/seagate500g/opencode_tmp/device_evidence/r5_v2_coldstart_20261123_024013/` — 關鍵檔：`armA_result.md`／`armA_delete_chain.txt`／`armA_bbc_lines.txt`、`armB_result.md`／`armB2_delete_chain.txt`／`armB2_bbc_lines.txt`、`armC_result.md`／`armC_11_delete_chain.txt`／`armC_11_bbc_lines.txt`／`armC_restore_record.md`／`armC_20_bbc_lines.txt`／`armC_16_final.db`、`latest_build_verification.md`、`gate_log.md`；authorization／scope／soft-reboot 授權檔亦在該目錄。原始 logcat／verbose log／截圖／DB 快照留該目錄，依慣例不入 repo、本 PR 未獨立稽核。
 
 ### 2026-11-17 紀錄（pre-unification build，reference）
 
@@ -242,19 +271,19 @@ provenance：pre-unification build 之 BBC 實測——政策 group `galaxydual_
 | 政策（裝置本機） | 裝置 2：`com.openai.chatgpt`；裝置 1：`com.shopee.tw`／`org.mozilla.firefox`／`com.google.android.apps.bard`（Gemini） |
 | 證據檔 | `s23_bbc_evidence_20261117.log`（S23）；`s4_gate_true_bbc.log`（Tab S7）；`s3_boot.txt:8`（Tab S7 政策空基線） |
 
-> **全表為 2026-11-17 pre-unification 舊 build 歷史紀錄，僅供溯源**：☑ 僅表示該次歷史觀察，**不用於驗證目前 HEAD（v0.1.0-beta.3／`fc579de3`）**；目前 BBC 效應為 experimental／本版本未實機驗證。BBC4/BBC5 為 caveated／UNVERIFIED（pid=3568 僅 historical note）。
+> **全表為 2026-11-17 pre-unification 舊 build 歷史紀錄，僅供溯源**：☑ 僅表示該次歷史觀察，**不用於驗證目前 HEAD（v0.1.0-beta.3／`fc579de3`）**；目前 BBC 效應為 experimental／本版本未實機驗證。**BBC4/BBC5 的 ☑ 僅代表 11-17 pre-unification 歷史觀察；11-18 unified 的 BBC4/BBC5 另列為 UNVERIFIED（見 §8.3／§6.0）；兩者皆非目前 HEAD 通過。** 狀態以 §6.0 矩陣為唯一真相來源。
 
-| # | 操作 | 實際（裝置 2 ／ 裝置 1） | 通過 |
+| # | 操作 | 實際（裝置 2 ／ 裝置 1） | 歷史觀察／結果 |
 | --- | --- | --- | --- |
-| BBC1 | BBC hook 安裝 | ✅ 2：`installed=1 (pid=21472)`（verbose mirror）；✅ 1：`installed=1 (pid=7812／18538／21602)`（logcat） | ☑ |
-| BBC2 | 政策空 | ✅ 2：`initial load: 0 package(s)` 基線；✅ 1：`s3_boot.txt:8` | ☑ |
-| BBC3 | 勾選→重進頁 | ✅ 2：`merged +1 packages (total 7, pid=21472)`、ChatGPT 出現；✅ 1：`merge added 0 packages (policy=3:…)`（Firefox/Bard 已在 Samsung 執行期白名單 → union no-op，非失敗） | ☑ |
-| BBC4 | 切換→安裝 | ✅ 2：`pm path --user 95 com.openai.chatgpt` 回應 dual APK paths | ☑ |
-| BBC5 | launch 分身 | ✅ 2：`ps` 同時見 u0_a431＋u95_a431 | ☑ |
-| BBC6 | 破壞性卸載（不是回滾） | ❌ 不得通過（見 BBC6_SSAID_INCIDENT.md） | ❌ |
-| BBC7 | Knox／Secure Folder（user 150） | ✅ 全程未查詢 user 150；`pm` 僅查 user 0／95 | ☑ |
+| BBC1 | BBC hook 安裝 | ✅ 2：`installed=1 (pid=21472)`（verbose mirror）；✅ 1：`installed=1 (pid=7812／18538／21602)`（logcat） | ☑（11-17 歷史觀察；raw log 私有、本 PR 未獨立稽核） |
+| BBC2 | 政策空 | ✅ 2：`initial load: 0 package(s)` 基線；✅ 1：`s3_boot.txt:8` | ☑（11-17 歷史觀察；raw log 私有、本 PR 未獨立稽核） |
+| BBC3 | 勾選→重進頁 | ✅ 2：`merged +1 packages (total 7, pid=21472)`、ChatGPT 出現；✅ 1：`merge added 0 packages (policy=3:…)`（Firefox/Bard 已在 Samsung 執行期白名單 → union no-op，非失敗） | ☑（11-17 歷史觀察；raw log 私有、本 PR 未獨立稽核） |
+| BBC4 | 切換→安裝 | ✅ 2：`pm path --user 95 com.openai.chatgpt` 回應 dual APK paths | ☑（11-17 歷史觀察；raw log 私有、本 PR 未獨立稽核） |
+| BBC5 | launch 分身 | ✅ 2：`ps` 同時見 u0_a431＋u95_a431 | ☑（11-17 歷史觀察；raw log 私有、本 PR 未獨立稽核） |
+| BBC6 | 破壞性卸載（不是回滾） | ❌ 不得通過（見 BBC6_SSAID_INCIDENT.md） | ❌（11-17 歷史事故；非通過項） |
+| BBC7 | Knox／Secure Folder（user 150） | ✅ 全程未查詢 user 150；`pm` 僅查 user 0／95 | ☑（11-17 歷史觀察；raw log 私有、本 PR 未獨立稽核） |
 
-附記（2026-11-17，因未持久化故更正）：Tab S7 之 Firefox 雙開 session 觀察存在（`pm path --user 95` 回應 dual APK paths 見於當次 session；`screencap 11_firefox_dual.png` 為 Firefox first-run 畫面），**但未持久化為檔案：無 `u95_a306` 或任何 u95_* 進程持久證據，一律不得引用**；BBC 注入不觸及 mutation 面（清單可見性）；安裝路徑永不掛勾。
+附記（2026-11-17，因未持久化故更正）：Tab S7 之 Firefox 雙開 session 觀察存在（`pm path --user 95` 回應 dual APK paths 見於當次 session；`screencap 11_firefox_dual.png` 為 Firefox first-run 畫面），**但未持久化為檔案：無 `u95_a306` 或任何 u95_* 進程持久證據，不得宣稱 Firefox 已啟動雙開／u0 並存**（E-17-P-S7-DUAL；本 PR 未獨立稽核）；BBC 注入不觸及 mutation 面（清單可見性）；安裝路徑永不掛勾。
 
 殘餘未測（誠實揭露）：
 - user 95 若由 ROM 指到其他 id，需以 `ps`/uid 前綴確認，勿假設 95。
