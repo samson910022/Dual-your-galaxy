@@ -464,7 +464,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 ### 2.1 安裝：主用戶＋雙開用戶都要裝
 
-> **安裝／升級警告（v0.1.0-beta.3）**：請先讀 [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3)。此版本為**全新安裝**：release applicationId `io.github.samson910022.galaxydualplus`，自建 debug APK 為 `io.github.samson910022.galaxydualplus.debug`（舊 id `com.galaxydual.plus` 的資料**不會遷移**）；**無內建匯入／匯出**，請先備份並**確認備份可還原**。**舊版管理 App 與其 LSPosed 模組不可與新版同時啟用**（一般既有雙開 App 不需刪除、資料也不會合併）。不同 applicationId／module id／remote-prefs authority 會被系統視為不同個體。停用／卸載／opt-out／重開機**都不是**刪除防護；beta.3 的 hook **可能早於首次 App UI 警告生效**。
+> **安裝／升級警告（v0.1.0-beta.3）**：請先讀 [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3)。此版本為**全新安裝**：release applicationId `io.github.samson910022.galaxydualplus`，自建 debug APK 為 `io.github.samson910022.galaxydualplus.debug`（舊 id `com.galaxydual.plus` 的資料**不會遷移**）；**無內建匯入／匯出**，請先備份並**確認備份可還原**。**舊版管理 App 與其 LSPosed 模組不可與新版同時啟用**（一般既有雙開 App 不需刪除、資料也不會合併）。不同 applicationId／module id／remote-prefs authority 會被系統視為不同個體。beta.2 → beta.3 沿用同一 `io.github.samson910022.galaxydualplus` id，屬 in-place 升級，不需移除該 id 的舊 build；不可共指的是舊 id `com.galaxydual.plus` 的管理 App／LSPosed 模組。停用／卸載／opt-out／重開機**都不是**刪除防護；beta.3 的 hook **可能早於首次 App UI 警告生效**。
 
 1. 主用戶（user 0）正常安裝本 App 的 APK（一般請用 [GitHub Release](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3) 的已簽章 `app-release.apk`；以下範例為自建 debug）。
 2. 查出雙開用戶的 userId（常見為 `95`，機型而異，以實際輸出為準）：

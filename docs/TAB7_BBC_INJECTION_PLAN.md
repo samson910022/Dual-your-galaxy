@@ -1,7 +1,7 @@
 <!-- MIT - Original spec by Dual your Galaxy contributors. No GPL content. -->
 # Spec：BBC/DAAgent 層 Dual Messenger 白名單擴充（Tab S7 / One UI 5）
 
-> **⚠ 歷史 spec／證據效力宣告（PR6 文件誠實性）**：本文為 2026-11-17／11-18 的**歷史 spec 與舊 build（pre-unification／unified）證據，僅供溯源**。**v0.1.0-beta.3 release source（annotated tag → `fc579de3`）之 BBC 清單注入效應為 experimental／not device-verified，本版本未實機驗證**。文中所有「BBC1–BBC5 通過」列皆屬舊 build 歷史紀錄，**不得視為本版本（beta.3）通過**；**11-18 unified 的 BBC4/5 皆 UNVERIFIED（`pm path` 17:56 本機 log 未入 repo／17:22:20 啟動無並存 `ps`）；11-17 BBC4/5 的 ☑ 僅為 pre-unification 歷史 observation，兩者皆非目前版本通過，且 11-17 正向觀察不得被 11-18 缺證下修**。目前狀態以 `docs/ACCEPTANCE.md` §6.0 Evidence Matrix（唯一狀態來源）／`docs/HOOK.md` 為準； deletion 風險深挖見 issue #75（[`BBC_COLDSTART_DELETE_INCIDENT.md`](BBC_COLDSTART_DELETE_INCIDENT.md)）與 issue #79。JVM／CI 全綠不等於裝置通過。
+> **⚠ 歷史 spec／證據效力宣告（PR #91 文件誠實性）**：本文為 2026-11-17／11-18 的**歷史 spec 與舊 build（pre-unification／unified）證據，僅供溯源**。**v0.1.0-beta.3 release source（annotated tag → `fc579de3`）之 BBC 清單注入效應為 experimental／not device-verified，本版本未實機驗證**。文中所有「BBC1–BBC5 通過」列皆屬舊 build 歷史紀錄，**不得視為本版本（beta.3）通過**；**11-18 unified 的 BBC4/5 皆 UNVERIFIED（`pm path` 17:56 本機 log 未入 repo／17:22:20 啟動無並存 `ps`）；11-17 BBC4/5 的 ☑ 僅為 pre-unification 歷史 observation，兩者皆非目前版本通過，且 11-17 正向觀察不得被 11-18 缺證下修**。目前狀態以 `docs/ACCEPTANCE.md` §6.0 Evidence Matrix（唯一狀態來源）／`docs/HOOK.md` 為準； deletion 根因研究見 issue #75（[`BBC_COLDSTART_DELETE_INCIDENT.md`](BBC_COLDSTART_DELETE_INCIDENT.md)）；效能與 Scope A 裝置驗收見 issue #79（H04）。JVM／CI 全綠不等於裝置通過。
 
 狀態：**Draft v2（待人審）**　|　日期：2026-11-17（v2：依 SPEC_REVIEW 28 項修正）　|　**2026-11-18：unified build 遷移紀錄見文末 Addendum B；本文多處仍引用 `galaxydual_policy`（pre-unification group），自 unified tree 起政策 group 改為 `dual_policy`／key `extra_whitelist_packages`。**　|　**效力以文首「歷史 spec／證據效力宣告」為準：本版本（beta.3）experimental／not device-verified。**
 裝置基準：SM-T870（Android 13, One UI 5, DAAgent 3.3.00.0, Vector v2.2 / API 102）。裝置序號不寫入 repo。
@@ -177,12 +177,14 @@ adb -s <serial> shell su -c 'stat -c %y /data/system/galaxydual_hook.active' 2>&
 
 ## 8. Project Structure
 
+> （historical as-implemented plan，已被 Addendum B 取代，僅供溯源）下列 `GalaxyDualApplication.kt`／`RemotePolicyState.kt`（連同 `RemotePolicyStateTest.kt`、`AppPolicyWriter.kt`）於 unified tree 已刪除，政策管線改為 `.GalaxyApp`＋`PolicyActivity`，見 Addendum B §4。
+
 ```
 hook/src/main/java/com/galaxydual/hook/BbcInjector.kt          # 新增（PRIMARY/SECONDARY 候選常數 + extend-only 合併 + BBC-HOOK entry log）
-hook/src/main/java/com/galaxydual/hook/RemotePolicyState.kt    # 新增（internal object；@Volatile cache；listener 不拋）
+hook/src/main/java/com/galaxydual/hook/RemotePolicyState.kt    # 新增（internal object；@Volatile cache；listener 不拋）（historical；已刪除，見 Addendum B）
 hook/src/main/java/com/galaxydual/hook/DualHook.kt             # 編輯（BBC-SPIKE + BBC 注入註冊 + remotePolicySnapshot seam）
 hook/src/main/java/com/galaxydual/hook/PolicySource.kt         # 編輯（接收 live remote seam；framework-free 決策不動）
-app/src/main/java/com/galaxydual/plus/GalaxyDualApplication.kt # 新增（Application.onCreate + XposedServiceHelper 註冊）
+app/src/main/java/com/galaxydual/plus/GalaxyDualApplication.kt # 新增（Application.onCreate + XposedServiceHelper 註冊）（historical；已刪除，見 Addendum B）
 app/src/main/.../<Policy UI>                                     # 新增（政策編輯/顯示；驗證輸入包名）
 app/build.gradle.kts                                             # 編輯（service:102.0.0 implementation）
 app/src/main/AndroidManifest.xml                                 # 編輯（<application android:name=...>）
@@ -255,6 +257,8 @@ internal fun mergeAvailableList(
 
 ## 13. 實作前必答（Open Questions）
 
+> （historical as-implemented plan，已被 Addendum B 取代，僅供溯源）以下為 2026-11-17 設計階段的待答清單；unified tree 的實際取捨見 Addendum B／C（例如政策編輯器已定案為 `PolicyActivity`、讀者模型改為 TTL 輪詢）。
+
 1. **「更多 UI 面」具體指哪些？**（CreateShortcutActivity 納入與否？其他面請指名）
 2. **SECONDARY 錨點（BBC `DaWrapper.getAllWhitelistedPackages`）掛不掛？** 預設 PRIMARY only；審定時明示
 3. **首個驗證種子包名？** 建議 `com.shopee.tw`（已安裝 enabled；user 95 無分身，正好 A/B 用得上）；種子預設空，裝機 A/B 時暫放
@@ -264,6 +268,8 @@ internal fun mergeAvailableList(
 7. **BBC service 依賴**：依賴 service AAR 自動合併 provider 而不特別宣告，還是明示 manifest provider＋`tools:ignore="ExportedContentProvider"`？（審核定案）
 
 ## 14. 實作 commit 序列（建議，各自審核）
+
+> （historical as-implemented plan，已被 Addendum B 取代，僅供溯源）以下為 2026-11-17 的建議序列；「即現有 uncommitted 修正」等用語已過期，實際提交與 unified tree 遷移見 Addendum B／C。
 
 1. `feat(hook): add Tab S7 DAAgent class candidate provenance (utils.DAUtility)`（即現有 uncommitted 修正；單獨 commit）
 2. `docs: add BBC/DAAgent injection spec`（本檔）
