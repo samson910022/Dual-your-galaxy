@@ -560,42 +560,77 @@ object PmOutputParser {
     //   (renames do not change authorization); only body lines carry
     //   error semantics. A genuine body `Failure [...]` line still fails.
     // - Issue #65 new-format name strip: the same display-only rule is
-    //   applied to `N: id=.., name=.., type=..` lines via
+    //   applied to `N: id=<id>, name=<label>, type=<token>` lines via
     //   sanitizeIdentityOutput(), so `name=Error` / `name=not found` (or a
-    //   comma/injected token inside the label) cannot trip ERROR_LINE. The
-    //   rest of each line is still scanned.
+    //   comma/injected token inside the label) cannot trip ERROR_LINE. Only
+    //   the name span is neutralized; the rest of each valid line is still
+    //   scanned verbatim. A structurally malformed row -- one whose LAST
+    //   `, type=` declaration is empty/non-canonical, where an EARLIER
+    //   declaration also carries the canonical `, flags=` / ` (flags=` suffix,
+    //   or whose display name carries a C0 control -- is left untouched and
+    //   ALSO fails the gate closed, even if ERROR_LINE matched nothing -- no
+    //   token from such a row may authorize.
     // exit != 0 is always failure here (unlike isSuccess, where the
     // ALREADY_EXISTS exemption is checked before exit and can still report
     // success on a non-zero exit).
     private val IDENTITY_HEADER_STRIP = Regex("UserInfo\\{\\d+:[^}:\\r\\n]*:[^}\\r\\n]*\\}")
 
-    // Issue #65: the new-ROM `cmd user list -v` format has no UserInfo{...}
-    // header -- it emits `N: id=<id>, name=<label>, type=<token>, flags=...`.
-    // `name=` is a display-only label (user renames never change
-    // authorization), so its content must never be scanned for ERROR_LINE
-    // semantics. The greedy `(.*)` runs to the LAST `, type=`, neutralizing
-    // the whole label even when it contains a comma or an injected `type=`
-    // token. ONLY that segment is replaced: the real `type=` token and the
-    // rest of the line are left intact, so a genuine `Failure [...]` body
-    // line still fails the strict gate (no whole-line exemption).
-    private val NEW_VERBOSE_NAME_SEGMENT = Regex(
-        """^([ \t]*\d+:[ \t]*id=\d+,[ \t]*name=)(.*)(,[ \t]*type=[^\s,]+)""",
-        RegexOption.MULTILINE,
+    // Issue #65 / P1a (fail-closed): the new-ROM `cmd user list -v` format has
+    // no UserInfo{...} header -- it emits `N: id=<id>, name=<label>,
+    // type=<token>, flags=...`. `name=` is a display-only label (user renames
+    // never change authorization), so ONLY the raw name span is replaced by a
+    // neutral placeholder. The old greedy `(.*)`-to-LAST-`, type=` sanitizer
+    // swallowed a genuine `Failure [...]` / second type declaration sitting
+    // after the label: the entire tail became part of the "display name" and
+    // the strict gate passed on a malformed row. The shared structured parser
+    // (VerboseUserRow) now locates the name span and requires the LAST
+    // `, type=` declaration to be the ONLY one with a canonical `, flags=` /
+    // ` (flags=` suffix AND to carry a non-empty token, with no C0 control in
+    // the display name. A malformed row is NOT neutralized at all and forces
+    // the gate closed, so a label-supplied declaration can never backfill an
+    // empty/non-canonical real field. A valid row keeps its whole remainder
+    // verbatim, so an error token in the type/flags/parent tail still fails
+    // (no whole-line exemption).
+    private data class SanitizedIdentity(
+        val text: String,
+        // True when at least one new-format row was structurally malformed.
+        // checkStrictLines fails closed on this signal even if ERROR_LINE
+        // found nothing (never let a token from a bad row authorize).
+        val malformedRow: Boolean,
     )
 
-    // Shared identity sanitizer: legacy display labels are removed by the
-    // header strip; new-format display labels are replaced by a neutral
-    // placeholder. Used by every strict identity gate.
-    private fun sanitizeIdentityOutput(output: String): String {
+    // Legacy display labels are removed by the header strip; new-format
+    // display labels are replaced by a neutral placeholder. Used by every
+    // strict identity gate. Pure string transform: no row is deleted, so
+    // error semantics in the tail remain visible to the ERROR_LINE scan.
+    private fun sanitizeIdentityOutput(output: String): SanitizedIdentity {
         val withoutLegacyHeaders = IDENTITY_HEADER_STRIP.replace(output, "")
-        return NEW_VERBOSE_NAME_SEGMENT.replace(withoutLegacyHeaders) { m ->
-            m.groupValues[1] + "<display-name>" + m.groupValues[3]
+        val sb = StringBuilder()
+        var malformedRow = false
+        // CR-preserving split (shared with SamsungProfileAdapter): a lone \r
+        // stays inside the row so the structured parser can fail it closed,
+        // while normal LF/CRLF output is handled identically to lines().
+        for (raw in VerboseUserRow.verboseLines(withoutLegacyHeaders)) {
+            val row = VerboseUserRow.parse(raw)
+            if (row == null || row.malformed) {
+                if (row?.malformed == true) malformedRow = true
+                // Leave a malformed row as-is: no neutralization, no exemption.
+                sb.append(raw)
+            } else {
+                sb.append(raw, 0, row.nameStart)
+                sb.append("<display-name>")
+                sb.append(raw, row.nameEnd, raw.length)
+            }
+            sb.append('\n')
         }
+        return SanitizedIdentity(sb.toString(), malformedRow)
     }
 
     private fun checkStrictLines(output: String, exit: Int): Boolean {
         if (exit != 0) return false
-        for (raw in output.lines()) {
+        val sanitized = sanitizeIdentityOutput(output)
+        if (sanitized.malformedRow) return false
+        for (raw in sanitized.text.lines()) {
             val line = raw.trim()
             if (line.isEmpty()) continue
             if (ERROR_LINE.any { it.containsMatchIn(line) }) return false
@@ -604,7 +639,7 @@ object PmOutputParser {
     }
 
     fun isIdentityChannelOk(output: String, exit: Int): Boolean =
-        checkStrictLines(sanitizeIdentityOutput(output), exit)
+        checkStrictLines(output, exit)
 
     // `pm list users` strict gate (Phase B P1-2, issue #21; owner re-review R3
     // blocking). Independent strict判定, no longer delegating to isSuccess:
@@ -625,7 +660,7 @@ object PmOutputParser {
     // (`cmd user list -v` / `dumpsys user` / `getprop`), while this gate
     // serves only the `pm list users` channel.
     fun isListUsersOutputOk(output: String, exit: Int): Boolean =
-        checkStrictLines(sanitizeIdentityOutput(output), exit)
+        checkStrictLines(output, exit)
 
     // Legacy entry point kept for compatibility: parses key=value token lines.
     // Example: "package:/data/app/xxx basePackage=com.foo userId=150 enabled=true".
