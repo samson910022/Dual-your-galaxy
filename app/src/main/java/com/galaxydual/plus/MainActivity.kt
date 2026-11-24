@@ -321,6 +321,17 @@ class MainActivity : ComponentActivity() {
     // 舊實例（只切斷 UI 回呼），Activity.onDestroy 再 dispose 最後一個，避免孤兒
     // 回呼持有舊 View。寫入序列化與在飛提交由 GalaxyApp 的 app 層級 coordinator 持有。
     private var bbcToggleController: BbcInjectionToggleController? = null
+    // PR #90 Phase C: app-scoped consent-intent fencing. A callback carrying an
+    // older sequence (stale dialog, superseded accept, post-rotation result) is
+    // dropped; the latest user intent always wins. Sequence values come from
+    // the app-scoped holder, so they stay monotonic across UI rebuilds.
+    private var activeBbcConsentSequence: Long = 0L
+    // Dedupe the honest "consent persistence Unknown" toast per intent (the
+    // existing unknownToastShown dedupes the separate effect-unknown toast).
+    private var consentFailureToastSequence: Long = -1L
+    // Collector of the app-scoped authorization state; cancelled on dialog
+    // rebuild so a stale row cannot be repainted by a dead View.
+    private var bbcConsentStateJob: Job? = null
     // PR-74 A3：pre-clear 警告／ROOT 二次確認／卸載驗證對話框 handle（onDestroy 釋放，
     // 避免舊 Activity 的 window 洩漏；與既有 export/settings dialog 同一生命周期語義）。
     private val destructiveDialogHandles = DestructiveDialogHandles()
@@ -713,6 +724,9 @@ class MainActivity : ComponentActivity() {
         // 銷毀後仍回呼 onRestored/onFailed（舊 CheckBox / Toast 已無效）。
         bbcToggleController?.dispose()
         bbcToggleController = null
+        // PR #90 Phase C: stop repainting a dead row from the app-scoped holder.
+        bbcConsentStateJob?.cancel()
+        bbcConsentStateJob = null
         // PR-74 A3 / R4-5：破壞性路徑四個對話框 handle 單次 best-effort dismiss + null
         // （含 probe-failed；單一 handle 失敗不阻斷後續。用 dismiss() 而非 cancel()，
         // 避免快銷毀中的 Activity 仍觸發對話框的 onCancel 回呼）。
@@ -851,19 +865,46 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // PR5 Phase B2 (#80)：首次把 BBC 注入開關切到 ON 前的 pre-activation opt-in。
-    // 與 riskDialog 相同模式自行保存 handle（R7b-1 共用 helper 回傳 Unit，取不到 handle），
-    // onDestroy 再 best-effort dismiss。對話框本身不寫任何偏好、也不碰 controller：
-    // 只有 positive 的 onAccept 才寫 opt-in 並（且僅且 Confirmed）繼續 onToggle；
-    // negative 與返回鍵/外部觸控取消一律走 onCancel（回復 OFF、零寫入）。
-    // show() 失敗時 fail-closed：直接 onCancel，绝不寫入或生效。
-    private fun showBbcPreactivationOptInDialog(onAccept: () -> Unit, onCancel: () -> Unit) {
+    // PR #90 Phase C: detach a previously shown consent dialog's callbacks
+    // BEFORE dismissing it, so a programmatic replacement/cancel/OFF cannot
+    // fire the superseded intent's onCancel. Dismiss-before-show is mandatory:
+    // two overlapping dialogs were otherwise both live with conflicting state.
+    private fun dismissBbcConsentDialogSilently() {
+        bbcPreactivationDialog?.let { dlg ->
+            try {
+                dlg.setOnCancelListener(null)
+                dlg.setOnDismissListener(null)
+                dlg.dismiss()
+            } catch (_: Exception) {
+                // Best effort: the window may already be gone.
+            }
+            if (bbcPreactivationDialog === dlg) bbcPreactivationDialog = null
+        }
+    }
+
+    // PR5 Phase B2 (#80) + PR #90 Phase C: the first ON on an ungranted install
+    // asks for pre-activation consent. The dialog itself NEVER writes a
+    // preference and NEVER touches the controller; only the positive callback
+    // schedules the opt-in write on the app-scoped IO lane and (only on
+    // Confirmed) continues to onToggle. Negative / back / outside / show-failure
+    // all go through onCancel: restore the confirmable pre-dialog state with
+    // ZERO writes and no "effect OFF" claim.
+    // Every callback is tagged with the intent sequence captured at show time;
+    // superseded/disposed/finishing callbacks are dropped by the caller.
+    private fun showBbcPreactivationOptInDialog(
+        intentSequence: Long,
+        onAccept: (Long) -> Unit,
+        onCancel: () -> Unit,
+    ) {
         if (isFinishing || isDestroyed) return
+        dismissBbcConsentDialogSilently()
         try {
             val dlg = AlertDialog.Builder(this)
                 .setTitle(R.string.settings_bbc_preactivation_dialog_title)
                 .setMessage(R.string.settings_bbc_preactivation_dialog_message)
-                .setPositiveButton(R.string.settings_bbc_preactivation_dialog_positive) { _, _ -> onAccept() }
+                .setPositiveButton(R.string.settings_bbc_preactivation_dialog_positive) { _, _ ->
+                    onAccept(intentSequence)
+                }
                 .setNegativeButton(R.string.settings_bbc_preactivation_dialog_negative) { _, _ -> onCancel() }
                 .setCancelable(true)
                 .setOnCancelListener { onCancel() }
@@ -871,6 +912,9 @@ class MainActivity : ComponentActivity() {
             bbcPreactivationDialog = dlg
             dlg.setOnDismissListener { if (bbcPreactivationDialog === dlg) bbcPreactivationDialog = null }
         } catch (_: Exception) {
+            bbcPreactivationDialog = null
+            // show() failure is fail-closed: cancel (restore, zero writes), never
+            // write the consent key and never claim an enabled effect.
             onCancel()
         }
     }
@@ -2604,53 +2648,105 @@ class MainActivity : ComponentActivity() {
     private fun buildBbcInjectionToggle(): View {
         // A fresh dialog rebuild disposes the previous controller's UI only;
         // the app-scoped coordinator/holder (and any in-flight commit) survives.
+        bbcConsentStateJob?.cancel()
         bbcToggleController?.dispose()
         val app = application as GalaxyApp
+        val consentHolder = app.bbcActivationConsentHolder
+        val initialConsentState = consentHolder.currentState()
+        val initialUi = initialConsentState.toggleUi()
         // D04: after commit(false)/throw the local mMap may be optimistically
         // polluted, so isBbcInjectionEnabled() is NOT authority. The app-scoped
         // holder's null means UNKNOWN from a prior failed write; render the
-        // honest "effect unknown" row regardless of the mMap read below.
+        // honest "effect unknown" row regardless of any preference read.
         val effectUnknownOnOpen = app.bbcToggleRuntimeState.confirmedOrUnknown == null
         val toggle = CheckBox(this).apply {
             text = getString(R.string.settings_bbc_injection_label)
-            // Read at dialog open; best-effort (store defaults true on any failure).
-            // DO NOT flip this to "restore" after a failed commit.
-            isChecked = bbcPolicyStore().isBbcInjectionEnabled()
+            // PR #90 Phase C: seed ONLY from the app-scoped authorization state.
+            // NotGranted => unchecked (fresh installs are OFF, no legacy
+            // default-true); Legacy => the captured runtime opt-out value;
+            // Granted => checked; Initializing/Unknown => neutral (checked==null,
+            // leave as-is) with retryable styling — never a fabricated OFF/ON.
+            initialUi.checked?.let { isChecked = it }
             minimumHeight = dp(48)
             setCompoundDrawablePadding(dp(8))
-            if (effectUnknownOnOpen) {
+            if (effectUnknownOnOpen || initialUi.neutral) {
                 alpha = 0.6f // visually unverified; still tappable
                 setTypeface(null, Typeface.ITALIC)
             }
         }
         val initialChecked = toggle.isChecked
+        // Last UI value we can honestly stand behind. Updated only when the box
+        // is programmatically settled or on a non-consent toggle; captured as
+        // the restore target when a consent dialog opens.
+        var lastSettledChecked = initialChecked
+        var consentDialogPending = false
+        var restoring = false
+        // onUnknown (D04) and the legacy onFailed toast path can both fire for
+        // the same failed commit; dedupe the toast per user intent.
+        var unknownToastShown = false
+
         val summary = TextView(this).apply {
-            text = if (effectUnknownOnOpen) {
+            text = if (effectUnknownOnOpen || initialUi.neutral) {
                 getString(R.string.settings_bbc_injection_effect_unknown)
             } else {
                 getString(R.string.settings_bbc_injection_summary)
             }
         }
+
+        fun setChecked(value: Boolean) {
+            restoring = true
+            toggle.isChecked = value
+            restoring = false
+            lastSettledChecked = value
+        }
+
         // E04: the app-scoped StateFlow replays its last applied mark to this
         // dialog and then delivers later marks, so a commit(false) -> Unknown
         // styling is cleared by a subsequent Confirmed in the SAME open dialog,
         // and a rebuilt dialog learns an in-flight commit's eventual outcome.
-        // Only the row presentation changes here: isChecked is never touched,
-        // so Unknown remains "not a rollback" (D04). Both summary strings carry
-        // the issue-#75 cold-start caveat.
+        // The EFFECT axis is separate from the CONSENT axis: `neutral` is the
+        // consent authorization being unresolved/fenced. Both render as the
+        // honest, retryable "unverified" presentation.
+        var consentNeutral = initialUi.neutral
         fun renderEffect(status: BbcEffectStatus) {
             val presentation = bbcEffectPresentationFor(status)
-            summary.text = getString(presentation.summaryRes)
-            toggle.alpha = if (presentation.dimmed) 0.6f else 1f
-            toggle.setTypeface(null, if (presentation.italic) Typeface.ITALIC else Typeface.NORMAL)
+            summary.text = getString(
+                if (consentNeutral) R.string.settings_bbc_injection_effect_unknown
+                else presentation.summaryRes,
+            )
+            toggle.alpha = if (presentation.dimmed || consentNeutral) 0.6f else 1f
+            toggle.setTypeface(
+                null,
+                if (presentation.italic || consentNeutral) Typeface.ITALIC else Typeface.NORMAL,
+            )
         }
-        // PR #74 R2 N05 + R3 D05：寫入序列化器現為 app 層級單例（跨對話框重建共用），
-        // controller 只保留 UI 狀態。restoring 守衛仍必要：controller 的 onRestored
-        // 會在 Main 設定 isChecked，不可再觸發一次 onToggle。
-        var restoring = false
-        // onUnknown (D04) and the legacy onFailed toast path can both fire for
-        // the same failed commit; dedupe the toast per user intent.
-        var unknownToastShown = false
+
+        fun renderConsentState(state: BbcActivationConsentState) {
+            val ui = state.toggleUi()
+            consentNeutral = ui.neutral
+            // Never overwrite the box while a consent dialog is pending: an
+            // inherited Confirmed (or an async resync) must not settle a state
+            // the user has not answered yet.
+            if (!consentDialogPending) ui.checked?.let(::setChecked)
+            val effectStatus = app.bbcToggleRuntimeState.effectStatus.value
+            renderEffect(effectStatus)
+            // P2 convergence: a Confirmed consent commit grants AUTHORIZATION
+            // only — it does NOT write the runtime opt-out preference. If the
+            // Activity that accepted was rotated away before its UI callback
+            // handed the enable to the controller, this rebuilt UI replays it
+            // EXACTLY ONCE (the holder consume is atomic). Without no confirmed
+            // effect mark yet, leaving the box ON would contradict effect OFF.
+            // "Matching" mark means Confirmed(true): a stale Confirmed(false)
+            // from a prior OFF is exactly the contradiction being repaired.
+            val alreadyEnabled = effectStatus is BbcEffectStatus.Confirmed && effectStatus.value
+            if (state is BbcActivationConsentState.Granted &&
+                !consentDialogPending &&
+                !alreadyEnabled &&
+                consentHolder.consumePendingEnableForReplay(consentHolder.currentGeneration())
+            ) {
+                bbcToggleController?.onToggle(true)
+            }
+        }
 
         fun markEffectUnknown() {
             // Keep the CheckBox at the user's last intent — never silently flip
@@ -2668,15 +2764,14 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // PR5 Phase B2 (#80): pre-activation consent. Event order on the FIRST ON:
-        //   user ON -> dialog -> positive -> opt-in commit (single key) ->
-        //   Confirmed -> controller.onToggle(true) -> existing serializer path.
-        // Cancel (button / back / outside) -> restore CheckBox to OFF, ZERO writes.
-        // commit(false)/throw -> Unknown: mark the row unverified + honest toast,
-        //   NO onToggle. A re-read of the optimistic mMap is never used as proof.
-        fun markPreactivationOptInFailed() {
+        // PR #90 Phase C: consent I/O failure is UNKNOWN, not "not persisted"
+        // and not "effect OFF". The holder has already installed the durable
+        // Unknown fence on the app IO lane; here we only render neutral and
+        // show a deduped, honest toast. NO onToggle and NO effect claim.
+        fun markPreactivationOptInFailed(seq: Long) {
             renderEffect(BbcEffectStatus.Unknown)
-            if (!isFinishing && !isDestroyed) {
+            if (consentFailureToastSequence != seq && !isFinishing && !isDestroyed) {
+                consentFailureToastSequence = seq
                 Toast.makeText(
                     this@MainActivity,
                     R.string.settings_bbc_preactivation_write_failed,
@@ -2685,21 +2780,53 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        fun acceptPreactivationOptIn(checked: Boolean) {
-            if (isFinishing || isDestroyed) return
-            val outcome = bbcPolicyStore().setBbcPreactivationOptInDetailed(true)
-            if (shouldApplyBbcToggleAfterOptIn(outcome is BbcWriteOutcome.Confirmed)) {
-                bbcToggleController?.onToggle(checked)
-            } else {
-                markPreactivationOptInFailed()
+        // PR #90 Phase C: the write is submitted to the app-scoped IO lane —
+        // never a blocking binder/versionCommitLock call on the Main thread.
+        // The outcome callback re-checks the intent sequence and Activity state
+        // before touching the UI; the holder has already folded the durable
+        // grant/fence in on the consumer thread.
+        fun acceptPreactivationOptIn(seq: Long, checked: Boolean) {
+            if (isFinishing || isDestroyed || seq != activeBbcConsentSequence) return
+            // P2: record the pending ENABLE app-scoped BEFORE enqueueing. A
+            // rotation can drop this Activity's callback; the rebuilt Activity
+            // must still converge the effect with the now-Granted checkbox.
+            val generation = consentHolder.currentGeneration()
+            consentHolder.notePendingEnable(seq, generation)
+            consentDialogPending = false
+            bbcToggleController?.setConsentPending(false)
+            dismissBbcConsentDialogSilently()
+            app.bbcToggleCoordinator.submitConsentWrite(
+                sequence = seq,
+                generation = generation,
+            ) { outcome ->
+                mainHandler.post {
+                    if (isFinishing || isDestroyed || seq != activeBbcConsentSequence) return@post
+                    when (outcome) {
+                        is BbcWriteOutcome.Confirmed -> {
+                            // Exactly-once handoff: a rebuilt UI may already
+                            // have replayed the enable while this was queued.
+                            if (consentHolder.consumePendingEnable(seq, generation)) {
+                                bbcToggleController?.onToggle(checked)
+                            }
+                        }
+                        BbcWriteOutcome.Unknown -> markPreactivationOptInFailed(seq)
+                    }
+                }
             }
         }
 
-        fun cancelPreactivationOptIn() {
-            if (isFinishing || isDestroyed) return
-            restoring = true
-            toggle.isChecked = false
-            restoring = false
+        // Cancel/back/outside/show-failure: restore the confirmable pre-dialog
+        // value with ZERO writes, invalidate the intent so a late commit result
+        // is dropped, and make NO claim about the hook effect.
+        fun cancelPreactivationOptIn(seq: Long) {
+            if (isFinishing || isDestroyed || seq != activeBbcConsentSequence) return
+            activeBbcConsentSequence = consentHolder.nextIntentSequence()
+            consentHolder.abandonIntent(seq)
+            consentDialogPending = false
+            bbcToggleController?.setConsentPending(false)
+            dismissBbcConsentDialogSilently()
+            setChecked(lastSettledChecked)
+            bbcToggleController?.restoreConsentUi(lastSettledChecked)
         }
 
         bbcToggleController = BbcInjectionToggleController(
@@ -2714,6 +2841,7 @@ class MainActivity : ComponentActivity() {
                 restoring = true
                 toggle.isChecked = lastGood
                 restoring = false
+                lastSettledChecked = lastGood
             },
             onUnknown = { markEffectUnknown() },
             onFailed = { markEffectUnknown() }, // legacy failure Toast path, now the Unknown message
@@ -2722,14 +2850,51 @@ class MainActivity : ComponentActivity() {
         toggle.setOnCheckedChangeListener { _, checked ->
             if (restoring) return@setOnCheckedChangeListener
             unknownToastShown = false
-            if (shouldRequestPreactivationOptIn(checked, bbcPolicyStore().isBbcPreactivationOptIn())) {
+            // OFF short-circuits BEFORE ANY consent read / state lookup: no
+            // binder, no commit lock, no consent query. Invalidate a pending
+            // dialog silently so a late accept cannot resurrect the grant.
+            if (!checked) {
+                val stale = activeBbcConsentSequence
+                if (stale != 0L) {
+                    activeBbcConsentSequence = consentHolder.nextIntentSequence()
+                    consentHolder.abandonIntent(stale)
+                }
+                consentDialogPending = false
+                bbcToggleController?.setConsentPending(false)
+                dismissBbcConsentDialogSilently()
+                setChecked(false)
+                bbcToggleController?.onToggle(false)
+                return@setOnCheckedChangeListener
+            }
+            // ON: authorization state is an app-scoped in-memory read — never a
+            // blocking preference read on the Main thread. Unresolved/Unknown
+            // states fail closed and demand consent again.
+            val state = consentHolder.currentState()
+            if (state.requiresConsentFor(checked)) {
+                val seq = consentHolder.nextIntentSequence()
+                activeBbcConsentSequence = seq
+                consentDialogPending = true
+                bbcToggleController?.setConsentPending(true)
                 showBbcPreactivationOptInDialog(
-                    onAccept = { acceptPreactivationOptIn(checked) },
-                    onCancel = ::cancelPreactivationOptIn,
+                    intentSequence = seq,
+                    onAccept = { acceptedSeq -> acceptPreactivationOptIn(acceptedSeq, checked) },
+                    onCancel = { cancelPreactivationOptIn(seq) },
                 )
             } else {
-                // Already opted in (or turning OFF): the controller is unchanged.
+                // Already Granted or Legacy-authorized: no consent demand.
+                setChecked(true)
                 bbcToggleController?.onToggle(checked)
+            }
+        }
+        // A fresh process starts Initializing until the bind-time authoritative
+        // read lands. Ask the app IO lane to resnow; the state collector below
+        // repaints the neutral row when it resolves.
+        if (initialConsentState is BbcActivationConsentState.Initializing) {
+            app.bbcToggleCoordinator.submitConsentRead()
+        }
+        bbcConsentStateJob = lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                consentHolder.state.collect { state -> renderConsentState(state) }
             }
         }
         return LinearLayout(this).apply {

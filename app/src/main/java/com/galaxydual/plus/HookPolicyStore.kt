@@ -687,6 +687,14 @@ class HookPolicyStore(
     // Direct-injected test backends default to absent / failed write.
     private val loadBbcPreactivationOptinRaw: () -> Boolean? = { null },
     private val saveBbcPreactivationOptinRaw: (Boolean) -> Boolean = { false },
+    // PR #90 Phase C: AUTHORITATIVE durable reads for the app-scoped consent
+    // holder. These are `contains()`-style reads from the CURRENT service
+    // generation's prefs instance, used only on bind/resync. A failed read is
+    // null (never "granted"); the holder additionally fences them by generation
+    // so a polluted local mMap from a failed commit can never clear Unknown.
+    // Direct-injected test backends default to absent / unreadable.
+    private val readBbcInstallClassificationRaw: () -> String? = { null },
+    private val readBbcPreactivationOptinAuthoritativeRaw: () -> Boolean? = { null },
 ) {
 
     // E07 (PR #74 R4): app-process-local, one-shot signal that a SUCCESSFUL
@@ -800,6 +808,28 @@ class HookPolicyStore(
         throw ce
     } catch (_: Throwable) {
         BbcWriteOutcome.Unknown
+    }
+
+    // PR #90 Phase C: authoritative durable classification read. Null = absent
+    // or unreadable (unresolved); never inferred from current packages/version.
+    internal fun readBbcInstallClassification(): String? = try {
+        readBbcInstallClassificationRaw()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
+    }
+
+    // PR #90 Phase C: authoritative opt-in read. Uses `contains()` so an absent
+    // key is a definite false and a read failure is null. This is NOT used as a
+    // grant source by itself: the holder only accepts it from the current
+    // service generation and never lets it clear a durable Unknown fence.
+    internal fun readBbcPreactivationOptInAuthoritative(): Boolean? = try {
+        readBbcPreactivationOptinAuthoritativeRaw()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
     }
 
     // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
@@ -1609,6 +1639,43 @@ fun remoteHookPolicyStore(
                     throw ce
                 } catch (_: Throwable) {
                     false
+                }
+            }
+        },
+        readBbcInstallClassificationRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    if (!prefs.contains(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION)) {
+                        null
+                    } else {
+                        prefs.getString(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION, null)
+                            ?: throw IllegalStateException("classification key present but unreadable")
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        readBbcPreactivationOptinAuthoritativeRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    if (!prefs.contains(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN)) {
+                        false // definite ABSENT => definitively not granted
+                    } else {
+                        prefs.getBoolean(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN, false)
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
                 }
             }
         },

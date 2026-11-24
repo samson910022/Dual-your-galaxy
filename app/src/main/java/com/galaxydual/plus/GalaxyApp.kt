@@ -16,6 +16,7 @@ import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -62,6 +63,15 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         )
     }
 
+    // PR #90 Phase C: the ONE app-scoped activation/consent holder. Seeded
+    // NEUTRAL (Initializing); only an authoritative bind/resync read or a
+    // Confirmed consent commit may grant. Deliberately NOT seeded from the
+    // legacy default-true runtime flag — that was the fresh-install ON bug.
+    // Survives every store/controller/Activity rebuild in this process.
+    internal val bbcActivationConsentHolder: BbcActivationConsentHolder by lazy {
+        BbcActivationConsentHolder()
+    }
+
     // PR #74 R3 D05: the ONE BBC write serializer for this app process. Built
     // once on the Application lifetime (NOT lifecycleScope) so a controller
     // rebuilt by a later dialog/Activity shares the same single consumer: an
@@ -78,7 +88,42 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
                     remotePreferences(PolicySource.POLICY_PREFS_NAME)
                 }.setBbcInjectionEnabledDetailed(enabled)
             },
+            // PR #90 Phase C: consent grant + authoritative resync share the
+            // SAME app-lifetime consumer / IO lane as the runtime opt-out. No
+            // binder or versionCommitLock wait ever happens on the Main thread.
+            consentCommit = {
+                remoteHookPolicyStore {
+                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
+                }.setBbcPreactivationOptInDetailed(true)
+            },
+            consentRead = { generation ->
+                val store = remoteHookPolicyStore {
+                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
+                }
+                BbcConsentAuthoritativeRead(
+                    serviceGeneration = generation,
+                    optInGranted = store.readBbcPreactivationOptInAuthoritative(),
+                    classification = store.readBbcInstallClassification(),
+                    legacyRuntimeEnabled = store.isBbcInjectionEnabled(),
+                )
+            },
+            consentHolder = bbcActivationConsentHolder,
         )
+    }
+
+    // PR #90 Phase C: monotonic service-instance generation for consent trust.
+    // A rebound binder exposes a different remote-prefs instance, so cached
+    // Granted/Legacy must be re-resolved; the durable Unknown fence survives.
+    private val bbcConsentServiceGeneration = AtomicLong(0L)
+
+    private fun bumpBbcConsentServiceGeneration() {
+        val generation = bbcConsentServiceGeneration.incrementAndGet()
+        bbcActivationConsentHolder.onServiceGenerationChanged(generation)
+    }
+
+    /** Resolve the consent state from durable keys on the app IO lane. */
+    private fun refreshBbcActivationConsent() {
+        bbcToggleCoordinator.submitConsentRead()
     }
 
     override fun onCreate() {
@@ -119,6 +164,10 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
     override fun onServiceBind(service: XposedService) {
         serviceRef.set(service)
+        // PR #90 Phase C: a newly bound service is a NEW prefs instance. Drop
+        // cached Granted/Legacy trust (but keep the durable Unknown fence) and
+        // resolve again from durable keys once classification is in place.
+        bumpBbcConsentServiceGeneration()
         // P0 (PR #90): best-effort durable install classification on the App's
         // writable channel. A failed attempt must NOT latch the one-shot flag —
         // a later bind retries. saveRaw independently guarantees that no draft
@@ -135,7 +184,13 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
                 // NoWrite (key already present) and a confirmed commit both
                 // satisfy the bind-time responsibility.
                 if (ok) installClassificationOnce.compareAndSet(false, true)
+                // Phase C: resolve authorization from the durable classification
+                // + opt-in keys on the app IO lane (never on Main, never from a
+                // cached local mMap).
+                refreshBbcActivationConsent()
             }
+        } else {
+            bbcClassificationScope.launch { refreshBbcActivationConsent() }
         }
         // 5.1.5:通知所有綁定監聽者 (例如刷新政策草稿)。
         // Never blocked by the binder commit above.
@@ -152,6 +207,10 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
                 clearPendingBbcClassification()
                 installClassificationOnce.set(false)
             }
+            // PR #90 Phase C: bump the consent trust generation. Granted/Legacy
+            // degrade to Initializing (must resync on next bind); a durable
+            // Unknown fence is intentionally preserved across binder death.
+            bumpBbcConsentServiceGeneration()
             // 通知監聽者服務已斷線,讓呼叫端重新評估 (fail-closed)。
             notifyServiceListeners()
         }

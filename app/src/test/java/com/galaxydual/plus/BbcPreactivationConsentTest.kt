@@ -19,30 +19,16 @@ import javax.xml.parsers.DocumentBuilderFactory
 
 class BbcPreactivationConsentTest {
 
-    // ---- pure decision seams (no Android framework) ----
+    // ---- the consent gate is now the app-scoped state machine (framework-free) ----
 
     @Test
-    fun consentGate_onlyAsksWhenTurningOnWithoutPriorOptIn() {
-        assertFalse(shouldRequestPreactivationOptIn(false, false))
-        assertFalse(shouldRequestPreactivationOptIn(false, true))
-        assertTrue("first ON on an unopted-in install must show the consent dialog",
-            shouldRequestPreactivationOptIn(true, false))
-        assertFalse("already opted-in installs must never be asked again",
-            shouldRequestPreactivationOptIn(true, true))
-    }
-
-    @Test
-    fun toggleProceedsOnlyWhenOptInCommitWasConfirmed() {
-        assertTrue(shouldApplyBbcToggleAfterOptIn(true))
-        assertFalse("Unknown opt-in write must never proceed to onToggle",
-            shouldApplyBbcToggleAfterOptIn(false))
-    }
-
-    @Test
-    fun decisionHelperIsFrameworkFree() {
-        val src = prodFile("BbcPreactivationConsent.kt").readText()
-        assertFalse("decision helper must stay JVM-testable without Android", src.contains("import android."))
-        assertFalse("decision helper must not reference UI widgets", src.contains("AlertDialog"))
+    fun consentStateMachineIsFrameworkFree() {
+        val src = prodFile("BbcActivationConsentState.kt").readText()
+        assertFalse("consent state machine must stay JVM-testable without Android",
+            src.contains("import android."))
+        assertFalse("consent state machine must not reference UI widgets", src.contains("AlertDialog"))
+        assertTrue("the fail-closed gate must live in the shared state machine",
+            src.contains("fun BbcActivationConsentState.requiresConsentFor"))
     }
 
     // ---- MainActivity wiring (source shape; mirrors RiskDisclosureSourceShapeTest) ----
@@ -77,15 +63,24 @@ class BbcPreactivationConsentTest {
     private val main by lazy { prodFile("MainActivity.kt").readText() }
 
     @Test
-    fun toggleListener_consultsOptInBeforeFirstOn() {
+    fun toggleListener_offShortCircuitsAndOnUsesAppScopedConsentState() {
         val listener = block(main, "toggle.setOnCheckedChangeListener")
         assertTrue("must guard programmatic restore", listener.contains("if (restoring)"))
-        assertTrue("must consult the pure gate", listener.contains("shouldRequestPreactivationOptIn(checked,"))
-        assertTrue("must read the persisted opt-in from the store",
-            listener.contains("isBbcPreactivationOptIn()"))
+        assertTrue("OFF must short-circuit BEFORE any consent read",
+            listener.contains("if (!checked)") && listener.contains("return@setOnCheckedChangeListener"))
+        assertTrue("ON must derive from the app-scoped authorization state",
+            listener.contains("consentHolder.currentState()"))
+        assertTrue("must use the fail-closed state-machine gate",
+            listener.contains("requiresConsentFor(checked)"))
         assertTrue("ungranted ON must show consent", listener.contains("showBbcPreactivationOptInDialog("))
-        assertTrue("already opted-in (or OFF) must still reach the unchanged controller",
+        assertTrue("already-authorized ON must still reach the unchanged controller",
             listener.contains("bbcToggleController?.onToggle(checked)"))
+        assertFalse("no blocking preference read on the Main-thread tap path",
+            listener.contains("isBbcPreactivationOptIn()"))
+        assertFalse("the old raw Boolean gate must be gone",
+            listener.contains("shouldRequestPreactivationOptIn("))
+        assertTrue("OFF must invalidate any pending consent dialog",
+            listener.contains("dismissBbcConsentDialogSilently()"))
     }
 
     @Test
@@ -98,6 +93,10 @@ class BbcPreactivationConsentTest {
         assertTrue(dialog.contains("setNegativeButton("))
         assertTrue("back/tap-outside cancel must also roll back",
             dialog.contains("setOnCancelListener { onCancel() }"))
+        assertTrue("an older dialog must be dismissed before showing a new one",
+            dialog.contains("dismissBbcConsentDialogSilently()"))
+        assertTrue("callbacks carry the captured intent sequence",
+            dialog.contains("onAccept(intentSequence)"))
         assertTrue(dialog.contains("bbcPreactivationDialog = dlg"))
         assertTrue("dismiss must clear only its own handle",
             dialog.contains("if (bbcPreactivationDialog === dlg) bbcPreactivationDialog = null"))
@@ -108,7 +107,8 @@ class BbcPreactivationConsentTest {
             dialog.contains("onToggle("))
 
         val positive = block(dialog, ".setPositiveButton(R.string.settings_bbc_preactivation_dialog_positive)")
-        assertTrue("positive must accept", positive.contains("onAccept()"))
+        assertTrue("positive must accept with the captured intent sequence",
+            positive.contains("onAccept(intentSequence)"))
         assertFalse("positive must not roll back", positive.contains("onCancel()"))
         val negative = block(dialog, ".setNegativeButton(")
         assertTrue("negative must cancel", negative.contains("onCancel()"))
@@ -136,30 +136,59 @@ class BbcPreactivationConsentTest {
     }
 
     @Test
-    fun acceptWritesOptInThenToggles_cancelRevertsOffWithoutWriting() {
+    fun consentFlow_usesAppScopedIOLaneAndDurableFence() {
+        // MainActivity no longer performs a blocking binder commit. The opt-in
+        // commit lives in the app-scoped coordinator (GalaxyApp) and its write
+        // key is still pinned there as a legitimate literal/contract check.
         val accept = block(main, "fun acceptPreactivationOptIn(")
-        assertTrue("accept must write the opt-in key",
-            accept.contains("setBbcPreactivationOptInDetailed(true)"))
-        assertTrue("accept must gate on the tri-state outcome",
-            accept.contains("shouldApplyBbcToggleAfterOptIn("))
+        assertTrue("accept must enqueue on the app-scoped IO lane",
+            accept.contains("submitConsentWrite("))
+        assertTrue("accept must fence with the captured service generation",
+            accept.contains("consentHolder.currentGeneration()"))
         assertTrue("confirmed opt-in must continue to the unchanged controller",
             accept.contains("bbcToggleController?.onToggle(checked)"))
-        assertTrue("failed opt-in write must be marked Unknown and not toggle",
-            accept.contains("markPreactivationOptInFailed()"))
-        assertTrue("the opt-in commit must happen BEFORE onToggle",
-            accept.indexOf("setBbcPreactivationOptInDetailed") < accept.indexOf("onToggle("))
+        assertTrue("Unknown must render the durable-fence failure path",
+            accept.contains("BbcWriteOutcome.Unknown -> markPreactivationOptInFailed(seq)"))
+        assertTrue("result must hop back to Main with a sequence guard",
+            accept.contains("mainHandler.post") && accept.contains("seq != activeBbcConsentSequence"))
+        assertFalse("no blocking preference write on Main",
+            accept.contains("setBbcPreactivationOptInDetailed("))
+        assertTrue("the opt-in write is ordered BEFORE the effect toggle",
+            accept.indexOf("submitConsentWrite(") < accept.indexOf("onToggle("))
 
+        val galaxy = prodFile("GalaxyApp.kt").readText()
+        assertTrue("the owner app must own the opt-in commit seam",
+            galaxy.contains("setBbcPreactivationOptInDetailed(true)"))
+        assertTrue("consent I/O must share the app serializer",
+            galaxy.contains("consentCommit = {"))
+
+        val store = prodFile("HookPolicyStore.kt").readText()
+        assertTrue("the durable opt-in key must still be written",
+            store.contains("PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN"))
+        assertFalse("grant must NOT fabricate the reserved classification",
+            store.contains("INSTALL_CLASSIFICATION_EXPLICITLY_GRANTED"))
+    }
+
+    @Test
+    fun cancelRestoresConfirmableStateWithZeroWrites() {
         val cancel = block(main, "fun cancelPreactivationOptIn(")
-        assertTrue(cancel.contains("restoring = true"))
-        assertTrue(cancel.contains("toggle.isChecked = false"))
-        assertTrue(cancel.contains("restoring = false"))
+        assertTrue("cancel must invalidate the intent so a late write is dropped",
+            cancel.contains("consentHolder.nextIntentSequence()"))
+        assertTrue(cancel.contains("consentHolder.abandonIntent(seq)"))
+        assertTrue("cancel must atomically restore the controller UI state",
+            cancel.contains("bbcToggleController?.restoreConsentUi(lastSettledChecked)"))
+        assertTrue(cancel.contains("setChecked(lastSettledChecked)"))
         assertFalse("cancel must never write the opt-in", cancel.contains("setBbcPreactivationOptIn"))
-        assertFalse("cancel must never call the effect toggle", cancel.contains("onToggle("))
+        assertFalse("cancel must never claim an effect toggle", cancel.contains("onToggle("))
+        assertFalse("cancel must never fabricate an OFF via a raw checkbox set",
+            cancel.contains("toggle.isChecked = false"))
 
         val failed = block(main, "fun markPreactivationOptInFailed(")
         assertTrue("failure must be rendered as Unknown", failed.contains("BbcEffectStatus.Unknown"))
         assertTrue("failure must show an honest toast",
             failed.contains("R.string.settings_bbc_preactivation_write_failed"))
+        assertTrue("failure toast must be deduped per intent",
+            failed.contains("consentFailureToastSequence != seq"))
         assertFalse("failure path must not write the effect key", failed.contains("setBbcInjectionEnabled"))
     }
 
