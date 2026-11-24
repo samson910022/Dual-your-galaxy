@@ -5544,7 +5544,11 @@ class DualViewModel(
                             }
                         }
                         is CloneOutcome.VerifyUnknown -> {
-                            _state.update {
+                            // PR #88 F3：VerifyUnknown 可能發生在寫前（core preDrift／
+                            // 身份證據消失）或寫後，install 是否執行並不確定。
+                            // 只有 FRESH 才降 STALE；UNKNOWN 不得被提升為 STALE。
+                            val now = nowWallMs()
+                            _state.update { st ->
                                 val (op, diag) = recordOp(
                                     opId = key,
                                     appKey = trimmed,
@@ -5553,14 +5557,22 @@ class DualViewModel(
                                     detail = res.detail,
                                     diagnose = res.toDiagnoseEvent(),
                                 )
-                                it.copy(
+                                val degraded =
+                                    if (st.inventory.freshness == InventoryFreshness.FRESH) {
+                                        st.inventory.toStaleOrUnknown(
+                                            now = now,
+                                            source = st.inventory.source,
+                                            targetId = st.inventory.targetId,
+                                        )
+                                    } else {
+                                        st.inventory
+                                    }
+                                st.copy(
                                     loading = false,
-                                    // #69：install 已執行但重驗未知 → 可能已寫入未驗證，
-                                    // FRESH 不得謊稱新鮮（比照批次 successful/unknown 路徑）；
-                                    // 只降 freshness，profiles/cloned/count/身份皆保留。
-                                    inventory = it.inventory.copy(
-                                        freshness = InventoryFreshness.STALE,
-                                    ),
+                                    // #69 / PR #88 F3：可能已寫入未驗證，FRESH 不得謊稱
+                                    // 新鮮（比照批次 successful/unknown 路徑）；只降
+                                    // freshness，profiles/cloned/count/身份皆保留。
+                                    inventory = degraded,
                                     lastOperation = op,
                                     diagnose = diag,
                                     // 理由 (本機回音原文)：msg 的包名回音顯示原文；
@@ -5618,10 +5630,12 @@ class DualViewModel(
                     // 例外逃逸：寫後是否執行未知 -> phase UNKNOWN (非 FAILED)，
                     // pinnedTarget 保留當次已知 dualId (取自 inventory，無則哨兵)，
                     // diagnose 為 VERIFY_UNKNOWN (寫後未查證，需重新查證，
-                    // 非 OP_FAILED)。
+                    // 非 OP_FAILED)。PR #88 F3：FRESH 亦須降非 FRESH；
+                    // UNKNOWN 不得被提升為 STALE。
+                    val now = nowWallMs()
                     val knownTarget =
                         _state.value.inventory.targetId.takeIf { it > NO_TARGET_ID } ?: NO_TARGET_ID
-                    _state.update {
+                    _state.update { st ->
                         val (op, diag) = recordOp(
                             opId = key,
                             appKey = trimmed,
@@ -5633,8 +5647,19 @@ class DualViewModel(
                                 techDetail = sanitizeForDisplay(e.message ?: "clone failed"),
                             ),
                         )
-                        it.copy(
+                        val degraded =
+                            if (st.inventory.freshness == InventoryFreshness.FRESH) {
+                                st.inventory.toStaleOrUnknown(
+                                    now = now,
+                                    source = st.inventory.source,
+                                    targetId = st.inventory.targetId,
+                                )
+                            } else {
+                                st.inventory
+                            }
+                        st.copy(
                             loading = false,
+                            inventory = degraded,
                             lastOperation = op,
                             diagnose = diag,
                             msg = "clone failed: " +
@@ -6469,13 +6494,27 @@ class DualViewModel(
                                             return@withLock
                                         }
                                         is VerifyState.Unknown -> {
-                                            // M3 補 diagnose：寫後無法查證為 VERIFY_UNKNOWN，
-                                            // techDetail 經 sanitizeForDisplay。
-                                            _state.update {
-                                                it.copy(
+                                            // PR #88 F3：這是「寫前」verifyState，core 的
+                                            // post-list fence 亦可在此回 Unknown（不必等寫入）。
+                                            // FRESH 必須降非 FRESH；UNKNOWN 不得被提升為 STALE。
+                                            // 不偽造 lastOperation：此處 uninstall 尚未執行。
+                                            val now = nowWallMs()
+                                            _state.update { current ->
+                                                val degraded =
+                                                    if (current.inventory.freshness == InventoryFreshness.FRESH) {
+                                                        current.inventory.toStaleOrUnknown(
+                                                            now = now,
+                                                            source = current.inventory.source,
+                                                            targetId = current.inventory.targetId,
+                                                        )
+                                                    } else {
+                                                        current.inventory
+                                                    }
+                                                current.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
+                                                    inventory = degraded,
                                                     diagnose = diagnoseEvent(
                                                         DiagnoseCode.VERIFY_UNKNOWN,
                                                         techDetail = sanitizeForDisplay(
@@ -6780,7 +6819,12 @@ class DualViewModel(
                                             }
                                         }
                                         is RemoveOutcome.VerifyUnknown -> {
-                                            _state.update {
+                                            // PR #88 F3：VerifyUnknown 可能發生在寫前（core
+                                            // preDrift／身份證據消失）或寫後，uninstall 是否
+                                            // 執行並不確定。只有 FRESH 才降 STALE；
+                                            // UNKNOWN 不得被提升為 STALE。
+                                            val now = nowWallMs()
+                                            _state.update { st ->
                                                 val (op, diag) = recordOp(
                                                     opId = key,
                                                     appKey = cur.pkg,
@@ -6789,16 +6833,24 @@ class DualViewModel(
                                                     detail = res.detail,
                                                     diagnose = res.toDiagnoseEvent(),
                                                 )
-                                                it.copy(
+                                                val degraded =
+                                                    if (st.inventory.freshness == InventoryFreshness.FRESH) {
+                                                        st.inventory.toStaleOrUnknown(
+                                                            now = now,
+                                                            source = st.inventory.source,
+                                                            targetId = st.inventory.targetId,
+                                                        )
+                                                    } else {
+                                                        st.inventory
+                                                    }
+                                                st.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
-                                                    // #69：uninstall 已執行但重驗未知 → 可能已寫入
-                                                    // 未驗證，FRESH 必須降 STALE（比照批次路徑）；
+                                                    // #69 / PR #88 F3：可能已寫入未驗證，
+                                                    // FRESH 必須降 STALE（比照批次路徑）；
                                                     // cloned/身份/count 皆保留，只降新鮮度。
-                                                    inventory = it.inventory.copy(
-                                                        freshness = InventoryFreshness.STALE,
-                                                    ),
+                                                    inventory = degraded,
                                                     lastOperation = op,
                                                     diagnose = diag,
                                                     // 理由 (本機回音原文)：msg 的包名回音顯示原文；
@@ -6879,8 +6931,10 @@ class DualViewModel(
                         // 例外逃逸：寫後是否執行未知 -> phase UNKNOWN (非 FAILED)，
                         // pinnedTarget 保留當次已知 dualId (pending 目標)，
                         // diagnose 為 VERIFY_UNKNOWN (寫後未查證，需重新查證，
-                        // 非 OP_FAILED).
-                        _state.update {
+                        // 非 OP_FAILED). PR #88 F3：FRESH 亦須降非 FRESH；
+                        // UNKNOWN 不得被提升為 STALE。
+                        val now = nowWallMs()
+                        _state.update { st ->
                             val (op, diag) = recordOp(
                                 opId = key,
                                 appKey = pendingAtCall.pkg,
@@ -6892,9 +6946,20 @@ class DualViewModel(
                                     techDetail = sanitizeForDisplay(e.message ?: "remove failed"),
                                 ),
                             )
-                            it.copy(
+                            val degraded =
+                                if (st.inventory.freshness == InventoryFreshness.FRESH) {
+                                    st.inventory.toStaleOrUnknown(
+                                        now = now,
+                                        source = st.inventory.source,
+                                        targetId = st.inventory.targetId,
+                                    )
+                                } else {
+                                    st.inventory
+                                }
+                            st.copy(
                                 loading = false,
                                 pendingRemove = null,
+                                inventory = degraded,
                                 lastOperation = op,
                                 diagnose = diag,
                                 msg = "remove failed: " +

@@ -255,7 +255,15 @@ class InventorySelectionTest {
     }
 
     private class FakeClock(var tick: Long = 0L) {
+        // One-shot clock bomb: the next now() call throws, which lands in a
+        // VM generic catch after the operation's outcome branch has run.
+        var throwOnce: Boolean = false
+
         fun now(): Long {
+            if (throwOnce) {
+                throwOnce = false
+                throw RuntimeException("clock boom")
+            }
             tick += 1
             return tick * 1000L
         }
@@ -2371,18 +2379,20 @@ class InventorySelectionTest {
     }
 
     // ====================================================================
-    // PR-74 independent review — RED 回歸測試 (issues #69 / #70)。
-    // 這些測試在目前生產碼上「必須失敗」；修復 production 後才應轉綠。
-    // 不要為了讓它們通過而放寬斷言——它們是規格。
+    // PR-74 independent review regression tests (issues #69 / #70) plus
+    // PR #88 F3 (UNKNOWN paths must degrade FRESH consistently). These lock
+    // the corrected production behavior; the two #69 tests below had their
+    // "intentionally RED / production 未修改" markers and stale line pointers
+    // removed once the production loci were fixed. Do not loosen assertions.
     // ====================================================================
 
-    // issue #69 (單筆 clone)：CloneOutcome.VerifyUnknown 分支
-    // DualViewModel.kt:5485-5508 只寫 lastOperation/diagnose/msg，從未呼叫
-    // toStaleOrUnknown()、從未碰 inventory。對照同檔 NoDual :5341、
-    // ChannelError :5394、InvalidPackage :5421、TargetMismatch :5517，
-    // 以及批次路徑 :13795 — 那些分支 FRESH 皆降 STALE。
-    // install 成功但 verify probe (pm list packages --user) 失敗 →
-    // VerifyUnknown 可能代表「已寫入未驗證」，FRESH 不得謊稱新鮮。
+    // issue #69 (single clone): CloneOutcome.VerifyUnknown now funnels through
+    // the canonical FRESH-guarded toStaleOrUnknown() degrade (same shape as
+    // requestRemove's VerifyState.Unknown branch), so a FRESH inventory drops
+    // to STALE while an UNKNOWN one is never promoted. Only freshness changes:
+    // cloned/count/target identity/source/queryTime are all preserved.
+    // install succeeded but the verify probe (pm list packages --user) failed →
+    // VerifyUnknown may mean "written but unverified", so FRESH must not lie.
     @Test
     fun singleCloneVerifyUnknown_downgradesFreshInventoryToStale() {
         val backend = MapBackend()
@@ -2393,6 +2403,9 @@ class InventorySelectionTest {
         vm.setSourceCatalog(listOf(SourceAppEntry("com.example.myst", "Myst", 0, false)))
         vm.refresh()
         await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        val before = vm.state.value.inventory
+        val beforeCloned = vm.state.value.cloned
+        val beforeProfiles = vm.state.value.profiles
         // 先在健康 probe 下取得 FRESH，此刻才讓 verify probe 失敗：
         // cloneVerified 的 install 成功，後續 verifyListProbe 回 Unknown。
         gw.failListPackages = true
@@ -2403,19 +2416,43 @@ class InventorySelectionTest {
         assertEquals(DiagnoseCode.VERIFY_UNKNOWN, st.diagnose?.code)
         assertEquals(listOf("com.example.myst"), gw.installCalls)
         assertEquals(
-            "#69 RED: single clone VerifyUnknown must downgrade FRESH inventory " +
-                "to STALE (fix locus: DualViewModel.kt:5485-5508)",
+            "#69: single clone VerifyUnknown must downgrade FRESH inventory to STALE",
             InventoryFreshness.STALE,
             st.inventory.freshness,
         )
+        // 只降新鮮度：其餘欄位（含 serial/queryTime/count）必須原樣保留。
+        assertEquals(before.source, st.inventory.source)
+        assertEquals(before.targetId, st.inventory.targetId)
+        assertEquals(before.targetSerial, st.inventory.targetSerial)
+        assertEquals(before.queryTimeMs, st.inventory.queryTimeMs)
+        assertEquals(before.count, st.inventory.count)
+        assertEquals(beforeCloned, st.cloned)
+        assertEquals(beforeProfiles, st.profiles)
+
+        // 清除失敗後 refresh：FRESH + ground truth 還原，且絕不重送 install。
+        gw.failListPackages = false
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.inventory.freshness == InventoryFreshness.FRESH &&
+                vm.state.value.inventory.targetId == before.targetId &&
+                vm.state.value.inventory.targetSerial == before.targetSerial
+        }
+        val recovered = vm.state.value.inventory
+        assertEquals(gw.installedForUser.size, recovered.count)
+        assertEquals(listOf("com.example.myst"), gw.installCalls)
+        // refresh 刻意保留 UNKNOWN 階段的 lastOperation/diagnose，不清空。
+        assertEquals(OpPhase.UNKNOWN, vm.state.value.lastOperation?.phase)
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
     }
 
-    // issue #69 (單筆 remove)：RemoveOutcome.VerifyUnknown 分支
-    // DualViewModel.kt:6706-6732 同樣只寫 lastOperation/diagnose/msg，
-    // 沒有 toStaleOrUnknown()。confirmRemove 的「寫前」verifyState 必須仍
-    // 回 Installed 才會真的執行 uninstall，故用 failListAfterUninstall 讓
-    // 只有 uninstall 之後的 verifyListProbe 變成 untrusted → VerifyUnknown，
-    // 精確命中 :6706（而不是寫前 VerifyState.Unknown 拒絕分支 :6404）。
+    // issue #69 (single remove): RemoveOutcome.VerifyUnknown now uses the same
+    // FRESH-guarded toStaleOrUnknown() degrade (never promotes UNKNOWN→STALE).
+    // confirmRemove's pre-write verifyState must still see Installed before the
+    // uninstall runs, so failListAfterUninstall flips the listing only after
+    // the uninstall → post-write verifyListProbe is untrusted → VerifyUnknown
+    // (this targets the RemoveOutcome.VerifyUnknown branch, not the pre-write
+    // VerifyState.Unknown refusal branch covered by the new test below).
     @Test
     fun singleRemoveVerifyUnknown_downgradesFreshInventoryToStale() {
         val backend = MapBackend()
@@ -2429,6 +2466,9 @@ class InventorySelectionTest {
         vm.setSourceCatalog(listOf(SourceAppEntry(pkg, "Chat", 0, false)))
         vm.refresh()
         await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        val before = vm.state.value.inventory
+        val beforeCloned = vm.state.value.cloned
+        val beforeProfiles = vm.state.value.profiles
         vm.requestRemove(pkg)
         await { vm.state.value.pendingRemove != null }
         vm.confirmRemove()
@@ -2438,11 +2478,167 @@ class InventorySelectionTest {
         assertEquals(OpPhase.UNKNOWN, st.lastOperation?.phase)
         assertEquals(DiagnoseCode.VERIFY_UNKNOWN, st.diagnose?.code)
         assertEquals(
-            "#69 RED: single remove VerifyUnknown must downgrade FRESH inventory " +
-                "to STALE (fix locus: DualViewModel.kt:6706-6732)",
+            "#69: single remove VerifyUnknown must downgrade FRESH inventory to STALE",
             InventoryFreshness.STALE,
             st.inventory.freshness,
         )
+        // 只降新鮮度：其餘欄位（含 serial/queryTime/count）必須原樣保留。
+        assertEquals(before.source, st.inventory.source)
+        assertEquals(before.targetId, st.inventory.targetId)
+        assertEquals(before.targetSerial, st.inventory.targetSerial)
+        assertEquals(before.queryTimeMs, st.inventory.queryTimeMs)
+        assertEquals(before.count, st.inventory.count)
+        assertEquals(beforeCloned, st.cloned)
+        assertEquals(beforeProfiles, st.profiles)
+
+        // 清除失敗後 refresh：FRESH + ground truth 還原，且絕不重送 uninstall。
+        gw.failListPackages = false
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.inventory.freshness == InventoryFreshness.FRESH &&
+                vm.state.value.inventory.targetId == before.targetId &&
+                vm.state.value.inventory.targetSerial == before.targetSerial
+        }
+        val recovered = vm.state.value.inventory
+        assertEquals(gw.installedForUser.size, recovered.count)
+        assertEquals(listOf(pkg), gw.uninstallCalls)
+        assertEquals(OpPhase.UNKNOWN, vm.state.value.lastOperation?.phase)
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, vm.state.value.diagnose?.code)
+    }
+
+    // PR #88 F3 locus A: confirmRemove's PRE-WRITE verifyState returning Unknown
+    // (reachable via core's post-list fence, without any write) must degrade a
+    // FRESH inventory, clear pendingRemove, emit VERIFY_UNKNOWN, NEVER uninstall,
+    // and must not fabricate a lastOperation (no write ran).
+    @Test
+    fun confirmRemove_preflightVerifyUnknown_degradesWithoutUninstall() {
+        val backend = MapBackend()
+        val pkg = "com.example.chat"
+        val gw = FakeRepo()
+        gw.installedForUser.add(pkg)
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry(pkg, "Chat", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        vm.requestRemove(pkg)
+        await { vm.state.value.pendingRemove != null }
+        val before = vm.state.value.inventory
+        val beforeCloned = vm.state.value.cloned
+        val beforeProfiles = vm.state.value.profiles
+        // exit=0 的不可信清單字串 → verifyListProbe Unknown，且不觸發 core retry 等待。
+        gw.failListPackages = true
+        vm.confirmRemove()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.pendingRemove == null &&
+                vm.state.value.diagnose?.code == DiagnoseCode.VERIFY_UNKNOWN
+        }
+        val st = vm.state.value
+        assertEquals("pre-write verify failure must never uninstall", 0, gw.uninstallCalls.size)
+        assertNull("pre-write refusal must not fabricate lastOperation", st.lastOperation)
+        assertEquals(InventoryFreshness.STALE, st.inventory.freshness)
+        assertEquals(before.source, st.inventory.source)
+        assertEquals(before.targetId, st.inventory.targetId)
+        assertEquals(before.targetSerial, st.inventory.targetSerial)
+        assertEquals(before.queryTimeMs, st.inventory.queryTimeMs)
+        assertEquals(before.count, st.inventory.count)
+        assertEquals(beforeCloned, st.cloned)
+        assertEquals(beforeProfiles, st.profiles)
+        assertTrue(st.msg.contains("remove result unknown"))
+    }
+
+    // PR #88 F3 locus D: an exception escaping the clone outcome branch (a
+    // one-shot clock bomb inside the Success branch, before its state update)
+    // lands in the generic catch UNKNOWN branch, which must degrade FRESH →
+    // STALE while recording a genuine UNKNOWN op. The install already ran;
+    // the catch must never resend it.
+    @Test
+    fun clone_genericCatchUnknown_downgradesFreshInventory() {
+        val backend = MapBackend()
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.myst", "Myst", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        val before = vm.state.value.inventory
+        clock.throwOnce = true
+        vm.clone("com.example.myst")
+        await { !vm.state.value.loading && vm.state.value.lastOperation != null }
+        val st = vm.state.value
+        assertEquals(OpPhase.UNKNOWN, st.lastOperation?.phase)
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, st.diagnose?.code)
+        assertEquals(InventoryFreshness.STALE, st.inventory.freshness)
+        assertEquals(before.targetId, st.inventory.targetId)
+        assertEquals(before.targetSerial, st.inventory.targetSerial)
+        assertEquals(before.count, st.inventory.count)
+        assertEquals(listOf("com.example.myst"), gw.installCalls)
+    }
+
+    // PR #88 F3 locus E: same contract for confirmRemove's generic catch —
+    // FRESH → STALE, UNKNOWN op recorded, pending cleared. The uninstall
+    // already ran (clock bomb inside the Success branch) and must not resend.
+    @Test
+    fun confirmRemove_genericCatchUnknown_downgradesFreshInventory() {
+        val backend = MapBackend()
+        val pkg = "com.example.chat"
+        val gw = FakeRepo()
+        gw.installedForUser.add(pkg)
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry(pkg, "Chat", 0, false)))
+        vm.refresh()
+        await { !vm.state.value.loading && vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        val before = vm.state.value.inventory
+        vm.requestRemove(pkg)
+        await { vm.state.value.pendingRemove != null }
+        clock.throwOnce = true
+        vm.confirmRemove()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.lastOperation != null &&
+                vm.state.value.pendingRemove == null
+        }
+        val st = vm.state.value
+        assertEquals(OpPhase.UNKNOWN, st.lastOperation?.phase)
+        assertEquals(DiagnoseCode.VERIFY_UNKNOWN, st.diagnose?.code)
+        assertEquals(InventoryFreshness.STALE, st.inventory.freshness)
+        assertEquals(before.targetId, st.inventory.targetId)
+        assertEquals(before.targetSerial, st.inventory.targetSerial)
+        assertEquals(before.count, st.inventory.count)
+        assertEquals(listOf(pkg), gw.uninstallCalls)
+    }
+
+    // PR #88 F3 invariant: the FRESH guard means a VerifyUnknown branch never
+    // PROMOTES an already-UNKNOWN inventory to STALE. The snapshot stays byte
+    // for byte unchanged (no source/queryTime/count/identity rewrite).
+    @Test
+    fun clone_verifyUnknownFromUnknownInventory_neverPromotesToStale() {
+        val backend = MapBackend()
+        val gw = FakeRepo(failListPackages = true)
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        await { vm.state.value.channelReady }
+        vm.setSourceCatalog(listOf(SourceAppEntry("com.example.myst", "Myst", 0, false)))
+        vm.refresh()
+        await {
+            !vm.state.value.loading &&
+                vm.state.value.inventory.freshness == InventoryFreshness.UNKNOWN &&
+                vm.state.value.inventory.targetId == 95
+        }
+        val before = vm.state.value.inventory
+        vm.clone("com.example.myst")
+        await { !vm.state.value.loading && vm.state.value.lastOperation != null }
+        val st = vm.state.value
+        assertEquals(OpPhase.UNKNOWN, st.lastOperation?.phase)
+        assertEquals(InventoryFreshness.UNKNOWN, st.inventory.freshness)
+        assertEquals(before, st.inventory)
+        assertEquals(listOf("com.example.myst"), gw.installCalls)
     }
 
     // issue #70：clearSelectionLocal() 在「選取本來就為空」時仍必須推進
