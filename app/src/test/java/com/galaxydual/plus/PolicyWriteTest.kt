@@ -2460,14 +2460,22 @@ class PolicyWriteTest {
         private inner class MinimalEditor : SharedPreferences.Editor {
             private val pending = mutableMapOf<String, Any?>()
             private val removed = mutableSetOf<String>()
-            override fun putString(key: String?, value: String?): SharedPreferences.Editor =
-                throw UnsupportedOperationException()
+            // P0: every draft write also commits the durable classification key.
+            override fun putString(key: String?, value: String?): SharedPreferences.Editor {
+                pending[key!!] = value
+                return this
+            }
             override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor {
                 pending[key!!] = values?.toMutableSet()
                 return this
             }
             override fun putInt(key: String?, value: Int): SharedPreferences.Editor =
                 throw UnsupportedOperationException()
+            // P0: a genuine upgrade also writes the migration marker atomically.
+            override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor {
+                pending[key!!] = value
+                return this
+            }
             // N04/N07: writer now requires putLong to succeed (fail-closed on
             // failure). Stage into pending like putStringSet so real-store-chain
             // tests that rely on successful saves keep passing.
@@ -2477,8 +2485,6 @@ class PolicyWriteTest {
                 return this
             }
             override fun putFloat(key: String?, value: Float): SharedPreferences.Editor =
-                throw UnsupportedOperationException()
-            override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor =
                 throw UnsupportedOperationException()
             override fun remove(key: String?): SharedPreferences.Editor {
                 removed.add(key!!)

@@ -3,6 +3,7 @@
 // these JVM wall-time pins are safety bounds, not device go/no-go claims.
 package com.galaxydual.hook
 
+import android.content.SharedPreferences
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -12,9 +13,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
-// PR5 Phase B1 (#80): JVM pins for the bounded pre-activation pref read, the
-// one-time migration marker write seam, and the final BBC effect AND.
+// PR5 Phase B1 (#80) / PR #90 Phase A (P0): JVM pins for the bounded pre-
+// activation pref read, the READ-ONLY decision, and the final BBC effect AND.
 // Framework-free (JUnit4 + java.util.concurrent); the executor is the real
 // zero-queue factory, so timeout / throw / contention exercise the real
 // wall-time path (mirrors BbcGateBoundedWaitTest for the legacy opt-out read).
@@ -23,7 +25,36 @@ class BbcPreactivationBoundedTest {
     private fun newExecutor(name: String): ThreadPoolExecutor =
         PolicyRefreshBudget.newPolicyRefreshExecutor(name)
 
-    private val failClosed = BbcPreactivationPrefs(null, false, null)
+    private val failClosed = BbcPreactivationPrefs(null, null, null)
+
+    private class FakeRemotePrefs(
+        private val values: Map<String, Any?>,
+    ) : SharedPreferences {
+        var editCalls = 0
+            private set
+
+        override fun getAll(): MutableMap<String, *> = LinkedHashMap(values)
+        override fun getString(key: String?, defValue: String?): String? = values[key] as? String ?: defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
+            @Suppress("UNCHECKED_CAST")
+            return (values[key] as? Set<String>)?.toMutableSet() ?: defValues
+        }
+        override fun getInt(key: String?, defValue: Int): Int = (values[key] as? Int) ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long = (values[key] as? Long) ?: defValue
+        override fun getFloat(key: String?, defValue: Float): Float = (values[key] as? Float) ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = (values[key] as? Boolean) ?: defValue
+        override fun contains(key: String?): Boolean = values.containsKey(key)
+        override fun edit(): SharedPreferences.Editor {
+            editCalls++
+            throw AssertionError("Hook remote prefs are READ-ONLY (libxposed API 102)")
+        }
+        override fun registerOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+    }
 
     // ---- bounded reader: timeout / throw / contention -> no snapshot ----
 
@@ -36,7 +67,7 @@ class BbcPreactivationBoundedTest {
             val result = readBbcPreactivationBounded(executor, DualHook.BBC_GATE_MAX_MS) {
                 entered.countDown()
                 release.await(2, TimeUnit.SECONDS) // far past the ceiling
-                BbcPreactivationPrefs(true, false, null)
+                BbcPreactivationPrefs(true, null, null)
             }
             assertTrue("reader must have entered", entered.await(1, TimeUnit.SECONDS))
             assertNull(result) // timeout -> no usable snapshot, not the reader's opt-in
@@ -67,7 +98,7 @@ class BbcPreactivationBoundedTest {
             assertNull(
                 readBbcPreactivationBounded(executor, 0L) {
                     called.set(true)
-                    BbcPreactivationPrefs(true, false, null)
+                    BbcPreactivationPrefs(true, null, null)
                 },
             )
             assertFalse(called.get())
@@ -92,7 +123,7 @@ class BbcPreactivationBoundedTest {
             val startMs = System.nanoTime() / 1_000_000L
             val result = readBbcPreactivationBounded(executor, DualHook.BBC_GATE_MAX_MS) {
                 called.set(true)
-                BbcPreactivationPrefs(true, false, null)
+                BbcPreactivationPrefs(true, null, null)
             }
             val elapsedMs = System.nanoTime() / 1_000_000L - startMs
 
@@ -108,7 +139,7 @@ class BbcPreactivationBoundedTest {
     @Test
     fun fastSnapshot_returnsValue() {
         val executor = newExecutor("test-bbc-pre-fast")
-        val snapshot = BbcPreactivationPrefs(true, false, null)
+        val snapshot = BbcPreactivationPrefs(true, null, null)
         try {
             assertEquals(snapshot, readBbcPreactivationBounded(executor, DualHook.BBC_GATE_MAX_MS) { snapshot })
         } finally {
@@ -116,54 +147,54 @@ class BbcPreactivationBoundedTest {
         }
     }
 
-    // ---- decision + one-time migration marker write seam ----
+    // ---- P0 read-only decision (no marker writer exists any more) ----
 
     @Test
-    fun legacyDraftWithoutMarker_opensAndWritesMarkerOnce() {
-        var writes = 0
+    fun preUpgradeClassificationWithTrustedMarkerOpens() {
+        // REWRITTEN: a draft alone never opened the gate. The App-owned durable
+        // classification + trusted marker is the only legacy basis.
         val open = bbcPreactivationDecisionOpen(
             compileTimeGate = true,
-            prefs = BbcPreactivationPrefs(null, true, null),
-            writeMigrationMarker = { writes++ },
+            prefs = BbcPreactivationPrefs(
+                null,
+                PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                true,
+            ),
         )
         assertTrue(open)
-        assertEquals(1, writes)
     }
 
     @Test
-    fun failClosedSnapshot_closesAndNeverWritesMarker() {
-        var writes = 0
-        val open = bbcPreactivationDecisionOpen(
-            compileTimeGate = true,
-            prefs = failClosed, // any read failure maps here
-            writeMigrationMarker = { writes++ },
+    fun preUpgradeClassificationWithoutMarkerStaysClosed() {
+        assertFalse(
+            bbcPreactivationDecisionOpen(
+                compileTimeGate = true,
+                prefs = BbcPreactivationPrefs(
+                    null,
+                    PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                    null,
+                ),
+            ),
         )
-        assertFalse(open)
-        assertEquals(0, writes)
     }
 
     @Test
-    fun explicitOptOut_neverWritesMarker() {
-        var writes = 0
-        val open = bbcPreactivationDecisionOpen(
-            compileTimeGate = true,
-            prefs = BbcPreactivationPrefs(false, true, null),
-            writeMigrationMarker = { writes++ },
-        )
-        assertFalse(open)
-        assertEquals(0, writes)
+    fun failClosedSnapshot_closes() {
+        assertFalse(bbcPreactivationDecisionOpen(compileTimeGate = true, prefs = failClosed))
     }
 
     @Test
-    fun markerWriterThrow_doesNotChangeTheDecisionAndNeverThrows() {
-        val open = bbcPreactivationDecisionOpen(
-            compileTimeGate = true,
-            prefs = BbcPreactivationPrefs(null, true, null),
-            writeMigrationMarker = { throw IllegalStateException("write failed") },
+    fun explicitOptOut_closesEvenForMigratedClassification() {
+        assertFalse(
+            bbcPreactivationDecisionOpen(
+                compileTimeGate = true,
+                prefs = BbcPreactivationPrefs(
+                    false,
+                    PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                    true,
+                ),
+            ),
         )
-        // The write failure is counted/logged by the production callback; this
-        // call's gate result is final and must not be flipped by it.
-        assertTrue(open)
     }
 
     // ---- final effect AND: compile-time × preactivation × hybrid ----
@@ -231,34 +262,75 @@ class BbcPreactivationBoundedTest {
     }
 
     @Test
-    fun timeoutThroughEffectGate_failsClosedWithoutMarkerWrite() {
+    fun timeoutThroughEffectGate_failsClosedWithNoWrites() {
         // End-to-end shape of the production bbcGateOpen lambda: the bounded
-        // preactivation snapshot times out -> no decision, no marker write,
+        // preactivation snapshot times out -> no decision, no writes at all,
         // hybrid stage is skipped, overall gate CLOSED.
         val release = CountDownLatch(1)
         val executor = newExecutor("test-bbc-pre-effect-timeout")
-        var writes = 0
         try {
             val open = bbcEffectGateOpen(
                 compileTimeGate = true,
                 preactivationOpen = {
                     val snapshot = readBbcPreactivationBounded(executor, DualHook.BBC_GATE_MAX_MS) {
                         release.await(2, TimeUnit.SECONDS)
-                        BbcPreactivationPrefs(true, false, null)
+                        BbcPreactivationPrefs(true, null, null)
                     }
-                    if (snapshot == null) {
-                        false
-                    } else {
-                        bbcPreactivationDecisionOpen(true, snapshot) { writes++ }
-                    }
+                    snapshot != null && bbcPreactivationDecisionOpen(true, snapshot)
                 },
                 hybridOpen = { true },
             )
             assertFalse(open)
-            assertEquals(0, writes)
         } finally {
             release.countDown()
             executor.shutdownNow()
         }
+    }
+
+    @Test
+    fun genuineUpgradeWithRuntimeOptOut_finalEffectClosed() {
+        // HIGH-3: production boundary. The owner App has written a genuine
+        // upgrade's durable classification + marker, so the preactivation stage
+        // legitimately OPENS. But bbc_injection_enabled=false is ANDed by the
+        // REAL hybrid gate, so the FINAL effect must stay CLOSED. No hand-built
+        // booleans: both stages use the production readers/helpers.
+        val prefs = FakeRemotePrefs(
+            mapOf(
+                PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION to
+                    PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED to true,
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES to setOf("com.example.old"),
+                PolicySource.POLICY_KEY_EXTRA_VERSION to 7L,
+                PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED to false,
+            ),
+        )
+
+        val preactivationOpen = {
+            bbcPreactivationDecisionOpen(true, BbcPreactivationHookReader.read(prefs))
+        }
+        assertTrue("genuine upgrade opens the preactivation stage", preactivationOpen())
+
+        val hybridOpen = {
+            bbcInjectionGateOpen(
+                compileTimeGate = true,
+                nowMs = { 1_000L },
+                stickyState = AtomicReference<Long?>(null),
+            ) {
+                readBbcInjectionEnabled(object : BbcInjectionPrefsView {
+                    override fun getBoolean(key: String, defValue: Boolean): Boolean =
+                        prefs.getBoolean(key, defValue)
+                })
+            }
+        }
+        assertFalse("explicit runtime opt-out wins", hybridOpen())
+        assertFalse(
+            "final effect = preactivation AND hybrid; runtime opt-out wins",
+            bbcEffectGateOpen(
+                compileTimeGate = true,
+                preactivationOpen = preactivationOpen,
+                hybridOpen = hybridOpen,
+            ),
+        )
+        assertEquals("zero writes on the whole gate path", 0, prefs.editCalls)
     }
 }

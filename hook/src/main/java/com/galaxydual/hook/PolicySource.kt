@@ -89,6 +89,45 @@ object PolicySource {
     const val POLICY_KEY_BBC_PREACTIVATION_OPTIN = "bbc_preactivation_optin"
     const val POLICY_KEY_BBC_LEGACY_MIGRATED = "bbc_legacy_migrated"
 
+    // PR #90 Phase A (P0): DURABLE install classification. The owner App writes
+    // this key (in the writable XposedService remote-prefs channel) BEFORE any
+    // new-generation packages/version write, under the same versionCommitLock.
+    // The Hook only READS it: current packages/version bytes can NEVER be used
+    // as proof of pre-activation consent (a fresh install's ordinary save would
+    // otherwise open the gate). RENAMING THIS KEY OR ANY OF ITS VALUES ABANDONS
+    // PERSISTED CLASSIFICATION AND CAN SILENTLY CHANGE MIGRATION BEHAVIOUR —
+    // breaking change, NEVER rename casually; requires an explicit reviewed
+    // migration plan. Values below are the complete documented vocabulary:
+    //   PRE_UPGRADE_EXISTING          - draft already existed before upgrade;
+    //                                   written atomically with the legacy
+    //                                   migration marker=true by the App.
+    //   NEW_GENERATION_NOT_CONSENTED  - no pre-existing draft; OFF until an
+    //                                   explicit opt-in is recorded.
+    //   MIGRATED                      - RESERVED / accepted by the reader+gate,
+    //                                   but NOT YET WRITTEN by any current writer.
+    //   EXPLICITLY_GRANTED            - RESERVED / accepted by the reader+gate,
+    //                                   but NOT YET WRITTEN by any current writer.
+    // P2 vocabulary note: a value being accepted does NOT imply a live writer.
+    // Only PRE_UPGRADE_EXISTING and NEW_GENERATION_NOT_CONSENTED are currently
+    // produced (by the owner App); the two reserved states exist so an older
+    // persisted value can be read without failing closed. Readers MUST NOT
+    // assume MIGRATED / EXPLICITLY_GRANTED have a producer in this build.
+    // The Hook accepts only these exact strings; an unknown value fails closed.
+    const val POLICY_KEY_INSTALL_CLASSIFICATION = "install_classification"
+    const val INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING = "PRE_UPGRADE_EXISTING"
+    const val INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED = "NEW_GENERATION_NOT_CONSENTED"
+    const val INSTALL_CLASSIFICATION_MIGRATED = "MIGRATED"
+    const val INSTALL_CLASSIFICATION_EXPLICITLY_GRANTED = "EXPLICITLY_GRANTED"
+
+    // Single source of truth for "is this a classification value we trust?"
+    // (invalid/present-but-unknown values fail closed on both sides).
+    val INSTALL_CLASSIFICATION_VALUES: Set<String> = setOf(
+        INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+        INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
+        INSTALL_CLASSIFICATION_MIGRATED,
+        INSTALL_CLASSIFICATION_EXPLICITLY_GRANTED,
+    )
+
     // Pluggable remote-policy reader (Stage H2-P1 seam; Phase 4 hardened).
     //
     // Default is empty (observe-only). DualHook wires a RemotePreferences-backed

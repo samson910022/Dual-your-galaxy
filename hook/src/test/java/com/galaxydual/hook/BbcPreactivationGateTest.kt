@@ -6,132 +6,119 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-// PR5 Phase A (#80): pure decision table for the real, Hook-side pre-activation
-// BBC opt-in. No Android / SharedPreferences / I/O here — these pins cover the
-// decision only; wiring the remote-prefs readers is a later phase.
+// PR5 Phase A (#80) / PR #90 Phase A (P0): pure decision table for the real,
+// Hook-side pre-activation BBC opt-in. No Android / SharedPreferences / I/O.
 //
-// Product decision (breaking change):
-//  - New install: key absent OR read failure => effect OFF (fail closed) until
-//    the app writes an explicit pre-activation opt-in.
-//  - Existing install: a non-empty legacy draft (extra_whitelist_packages or
-//    extra_whitelist_version) with no migration marker => treat as legacy
-//    opted-in (effect ON) and ask the caller to write bbc_legacy_migrated=true.
-//    Never delete / clear / rewrite the existing policy rules.
-//  - Explicit opt-out (the new optin key false, or the legacy
-//    bbc_injection_enabled=false at the outer AND) always wins => OFF.
-//  - The compile-time gate is only a final AND emergency kill switch, no longer
-//    the source of "default on".
+// P0: the Hook is READ-ONLY and no longer infers anything from current
+// packages/version. ONLY the durable App-owned classification (plus an
+// explicit opt-in / opt-out and the trusted marker) can decide the effect.
 class BbcPreactivationGateTest {
+
+    private val preUpgrade = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING
+    private val newGeneration = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED
+    private val migratedClass = PolicySource.INSTALL_CLASSIFICATION_MIGRATED
+    private val granted = PolicySource.INSTALL_CLASSIFICATION_EXPLICITLY_GRANTED
 
     @Test
     fun newInstallWithAbsentOptInIsClosed() {
-        // No optin key, no legacy draft, no migration marker => fresh install:
-        // BBC injection must stay off until the user opts in before activation.
-        val d = bbcPreactivationGate(
-            compileTimeGate = true,
-            optIn = null,
-            legacyPolicyPresent = false,
-            migrated = null,
-        )
+        // No opt-in, no classification, no marker => fresh install: OFF.
+        val d = bbcPreactivationGate(true, null, null, null)
         assertFalse(d.effectOpen)
-        assertFalse(d.writeMigrationMarker)
     }
 
     @Test
-    fun optInReadFailureIsClosed() {
-        // The signature deliberately merges "key absent" and "read failure"
-        // into null. On a fresh install (no legacy basis) both fail closed: a
-        // transient IPC failure must never be treated as consent. On an
-        // existing install the separate legacy-migration rule below applies
-        // even when this read failed (we must not silently shrink old rules).
-        val d = bbcPreactivationGate(true, null, false, null)
-        assertFalse(d.effectOpen)
-        assertFalse(d.writeMigrationMarker)
+    fun staleMarkerWithoutClassificationStaysClosed() {
+        // HIGH-2: a marker from an old Hook (or a stale persisted value) is NOT
+        // authorization. The gate is pure, so "optIn read failure" is simply
+        // optIn=null here; the genuine read-failure case is pinned in the
+        // reader test (optInReadFailureIsNull).
+        assertFalse(bbcPreactivationGate(true, null, null, true).effectOpen)
+        assertFalse(bbcPreactivationGate(true, null, newGeneration, true).effectOpen)
     }
 
     @Test
-    fun explicitOptInOpensWithoutMarker() {
-        val d = bbcPreactivationGate(true, true, false, null)
-        assertTrue(d.effectOpen)
-        assertFalse(d.writeMigrationMarker)
+    fun explicitOptInOpens() {
+        assertTrue(bbcPreactivationGate(true, true, null, null).effectOpen)
+        assertTrue(bbcPreactivationGate(true, true, newGeneration, false).effectOpen)
     }
 
     @Test
     fun explicitOptOutClosesWithHighestPriority() {
-        // false wins over a migration marker and over a legacy draft: an
-        // explicit opt-out is never overridden by legacy/opt-in state.
-        val withMarker = bbcPreactivationGate(true, false, true, true)
-        assertFalse(withMarker.effectOpen)
-        assertFalse(withMarker.writeMigrationMarker)
-
-        val withLegacy = bbcPreactivationGate(true, false, true, null)
-        assertFalse(withLegacy.effectOpen)
-        assertFalse(withLegacy.writeMigrationMarker)
-
-        val fresh = bbcPreactivationGate(true, false, false, null)
-        assertFalse(fresh.effectOpen)
-        assertFalse(fresh.writeMigrationMarker)
+        // false wins over every classification and marker combination.
+        for (classification in arrayOf(null, preUpgrade, newGeneration, migratedClass, granted, "BOGUS")) {
+            for (marker in arrayOf(null, false, true)) {
+                assertFalse(
+                    "opt-out must win for classification=$classification marker=$marker",
+                    bbcPreactivationGate(true, false, classification, marker).effectOpen,
+                )
+            }
+        }
     }
 
     @Test
-    fun legacyDraftWithoutMarkerOpensAndRequestsMigrationMarker() {
-        // Existing install with a non-empty policy draft and no migration marker:
-        // keep the effect ON and ask the caller to persist the marker. The draft
-        // itself is NOT deleted / cleared / rewritten by this decision.
-        val d = bbcPreactivationGate(true, null, true, null)
-        assertTrue(d.effectOpen)
-        assertTrue(d.writeMigrationMarker)
+    fun draftWithoutTrustedClassificationStaysClosed() {
+        // OLD contract: packages/version alone opened the gate and requested a
+        // Hook-side marker write. NEW contract: a draft is never evidence. Only
+        // the App-written PRE_UPGRADE_EXISTING classification + trusted marker
+        // can open; there is no write request in the decision any more.
+        assertFalse(bbcPreactivationGate(true, null, null, null).effectOpen)
+        assertFalse(bbcPreactivationGate(true, null, preUpgrade, null).effectOpen)
+        assertFalse(bbcPreactivationGate(true, null, preUpgrade, false).effectOpen)
+        assertTrue(bbcPreactivationGate(true, null, preUpgrade, true).effectOpen)
     }
 
     @Test
-    fun legacyDraftWithMarkerOpensWithoutRewrite() {
-        // A previously migrated install carries the marker: effect stays ON,
-        // but no marker write is needed (idempotent, no repeated I/O).
-        val d = bbcPreactivationGate(true, null, true, true)
-        assertTrue(d.effectOpen)
-        assertFalse(d.writeMigrationMarker)
+    fun newGenerationNotConsentedIsAlwaysClosed() {
+        for (marker in arrayOf(null, false, true)) {
+            assertFalse(bbcPreactivationGate(true, null, newGeneration, marker).effectOpen)
+        }
     }
 
     @Test
-    fun migratedMarkerAloneOpensAfterPolicyCleared() {
-        // migrated=true is the PERSISTENT state of an already-migrated install.
-        // It stays open even after the user later clears the policy draft:
-        // clearing rules is not an opt-out (use the explicit opt-out key), and
-        // we must not silently revoke consent already given before activation.
-        val d = bbcPreactivationGate(true, null, false, true)
-        assertTrue(d.effectOpen)
-        assertFalse(d.writeMigrationMarker)
+    fun migratedAndExplicitlyGrantedClassificationsOpen() {
+        for (marker in arrayOf(null, false, true)) {
+            assertTrue(bbcPreactivationGate(true, null, migratedClass, marker).effectOpen)
+            assertTrue(bbcPreactivationGate(true, null, granted, marker).effectOpen)
+        }
     }
 
     @Test
-    fun migratedMarkerFalseOnFreshInstallIsClosed() {
-        // An explicit marker=false is not "migrated": it must never open the gate.
-        val d = bbcPreactivationGate(true, null, false, false)
-        assertFalse(d.effectOpen)
-        assertFalse(d.writeMigrationMarker)
+    fun unknownClassificationFailsClosed() {
+        assertFalse(bbcPreactivationGate(true, null, "SOMETHING_ELSE", true).effectOpen)
     }
 
     @Test
-    fun compileTimeGateClosedAlwaysClosesWithoutMarkerWrites() {
-        // The compile-time constant is retained only as a final AND emergency
-        // switch: false overrides every other input, including an explicit
-        // opt-in and a pending legacy migration.
+    fun preUpgradeWithTrustedMarkerStaysOpenForAnyOptInAbsentState() {
+        assertTrue(bbcPreactivationGate(true, null, preUpgrade, true).effectOpen)
+    }
+
+    @Test
+    fun compileTimeGateClosedAlwaysCloses() {
+        // The compile-time constant is only a final AND emergency switch.
         for (optIn in arrayOf(null, false, true)) {
-            for (legacy in arrayOf(false, true)) {
-                for (migrated in arrayOf(null, false, true)) {
-                    val d = bbcPreactivationGate(false, optIn, legacy, migrated)
-                    assertFalse(d.effectOpen)
-                    assertFalse(d.writeMigrationMarker)
+            for (classification in arrayOf(null, preUpgrade, newGeneration, migratedClass, granted)) {
+                for (marker in arrayOf(null, false, true)) {
+                    assertFalse(
+                        bbcPreactivationGate(false, optIn, classification, marker).effectOpen,
+                    )
                 }
             }
         }
     }
 
     @Test
-    fun breakingChangeSensitiveKeyLiteralsAreStable() {
-        // Renaming either key abandons persisted consent / migration state.
-        // Pinning the literals makes that a deliberate, reviewed change.
+    fun migrationSafetyKeyLiteralsArePinned() {
+        // MIGRATION-SAFETY PIN (not a behavior test): renaming any of these
+        // strings abandons persisted consent / classification state.
         assertEquals("bbc_preactivation_optin", PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN)
         assertEquals("bbc_legacy_migrated", PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED)
+        assertEquals("install_classification", PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION)
+        assertEquals("PRE_UPGRADE_EXISTING", preUpgrade)
+        assertEquals("NEW_GENERATION_NOT_CONSENTED", newGeneration)
+        assertEquals("MIGRATED", migratedClass)
+        assertEquals("EXPLICITLY_GRANTED", granted)
+        assertTrue(PolicySource.INSTALL_CLASSIFICATION_VALUES.containsAll(
+            listOf(preUpgrade, newGeneration, migratedClass, granted),
+        ))
     }
 }

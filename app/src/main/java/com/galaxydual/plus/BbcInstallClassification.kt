@@ -1,0 +1,263 @@
+// MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
+//
+// PR #90 Phase A (P0): durable install classification — OWNER APP ONLY.
+//
+// The Hook's remote preferences are READ-ONLY in hooked apps (libxposed API
+// 102), so the migration marker can only be persisted through the App's
+// writable XposedService.getRemotePreferences channel. Current packages/version
+// bytes are written by ordinary fresh-install saves and can NEVER be used as
+// proof of consent; a durable classification must be established at/before the
+// first new-generation draft write.
+//
+// Two entry points, ONE decision:
+//  1. [ensureBbcInstallClassification] (GalaxyApp.onServiceBind): if the key is
+//     absent, commits the classification (+ marker for a genuine upgrade) in
+//     its own edit/commit. No packages/version key is touched, so an old draft
+//     stays byte-identical.
+//  2. [planBbcInstallClassificationForWrite] (start of HookPolicyStore.saveRaw,
+//     inside versionCommitLock): decides BEFORE any draft write; the caller
+//     adds the same key/value (+ marker) to the SAME editor/commit as
+//     packages/version. Single transaction = no window where a draft exists
+//     without a classification. A FAILED commit may pollute the daemon's
+//     optimistic local mMap (classification included) while persisting nothing;
+//     the app-scoped [pendingBbcClassification] then forces the retry to re-add
+//     the SAME key/value (+ marker) even when classificationValue() reads that
+//     polluted local value as "known". Cleared only on a CONFIRMED commit.
+//
+// Framework-free core: [planBbcInstallClassification] only sees the small
+// [BbcClassificationReads] seam; JVM tests can fake every failure mode.
+package com.galaxydual.plus
+
+import android.content.SharedPreferences
+import com.galaxydual.hook.PolicySource
+import com.galaxydual.hook.VersionPrefsView
+import com.galaxydual.hook.VersionProbeResult
+import com.galaxydual.hook.probeVersion
+import java.lang.ref.WeakReference
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
+
+// The value vocabulary lives in PolicySource (hook) so both sides share one
+// source of truth. Aliases keep app-side code readable.
+internal val BbcInstallClassificationValues: Set<String> = PolicySource.INSTALL_CLASSIFICATION_VALUES
+internal const val PRE_UPGRADE_EXISTING: String = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING
+internal const val NEW_GENERATION_NOT_CONSENTED: String = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED
+
+// Exactly the reads the decision needs. Throws signal a read failure; a null
+// classification value means the key is ABSENT. versionProbe() uses the shared
+// probeVersion vocabulary; its adapter MUST rethrow CancellationException
+// (probeVersion itself folds CE into Unavailable).
+internal interface BbcClassificationReads {
+    fun classificationValue(): String?
+    fun packagesNonEmpty(): Boolean
+    fun versionProbe(): VersionProbeResult
+}
+
+// Outcome of the decision. The caller owns the editor/commit (so it can share
+// one transaction with the draft write). NoWrite means "key already present
+// with a trusted value — leave it unchanged" (idempotent). FailClosed means
+// "write nothing"; the caller must fail closed rather than invent evidence.
+internal sealed interface BbcClassificationPlan {
+    data object NoWrite : BbcClassificationPlan
+    data class Write(val value: String, val marker: Boolean) : BbcClassificationPlan
+    data object FailClosed : BbcClassificationPlan
+}
+
+// PR #90 P0 retry safety: the optimistic-local-mMap trap.
+//
+// A false/throwing commit can flush classification (+ marker) into THIS
+// process's local SharedPreferences mMap while the daemon persists nothing.
+// On the retry, classificationValue() then reads that local value as "known"
+// and a naive planner returns NoWrite — the retry commits packages/version
+// WITHOUT classification/marker, leaving an unclassified durable draft and a
+// permanently CLOSED Hook. Remember the intent in process memory instead.
+//
+// Keyed by prefs IDENTITY (weak ref + ===): a rebound service gets a different
+// prefs instance and must NOT inherit a stale intent. All access is confined to
+// callers holding versionCommitLock. Cleared ONLY after a confirmed successful
+// commit, on service death, or implicitly on process restart (new reference).
+internal data class PendingBbcClassification(
+    private val prefsRef: WeakReference<SharedPreferences>,
+    val value: String,
+    val marker: Boolean,
+) {
+    fun matches(prefs: SharedPreferences): Boolean = prefsRef.get() === prefs
+
+    companion object {
+        fun of(prefs: SharedPreferences, plan: BbcClassificationPlan.Write) =
+            PendingBbcClassification(WeakReference(prefs), plan.value, plan.marker)
+    }
+}
+
+internal val pendingBbcClassification = AtomicReference<PendingBbcClassification?>(null)
+
+/** Drops the intent (service death / process restart / test isolation). */
+internal fun clearPendingBbcClassification() {
+    pendingBbcClassification.set(null)
+}
+
+// Only the PERMANENT, process-level overflow latch aborts every write. A normal
+// failed commit latches a per-instance poison fence (to hide the optimistic
+// mMap) but writes MUST stay possible so the pending intent can be re-committed.
+private fun poisonOverflowLatched(): Boolean = try {
+    remotePoison.get().overflow
+} catch (_: Throwable) {
+    true // cannot verify the permanent latch => fail closed
+}
+
+// The plan used by BOTH the bind-time writer and every draft write. A pending
+// intent for this exact prefs instance overrides the local-mMap-based read:
+// re-add the SAME key/value (+ marker) so a retry cannot silently drop it.
+internal fun planBbcInstallClassificationForWrite(prefs: SharedPreferences): BbcClassificationPlan {
+    if (poisonOverflowLatched()) return BbcClassificationPlan.FailClosed
+    pendingBbcClassification.get()?.let { pending ->
+        if (pending.matches(prefs)) return BbcClassificationPlan.Write(pending.value, pending.marker)
+        clearPendingBbcClassification() // stale intent from a dead/rebound service
+    }
+    return planBbcInstallClassificationForPrefs(prefs).also { plan ->
+        if (plan is BbcClassificationPlan.Write) {
+            pendingBbcClassification.set(PendingBbcClassification.of(prefs, plan))
+        }
+    }
+}
+
+// Writes ONLY the classification key (+ marker for a genuine upgrade) into an
+// already-created editor — never the policy draft keys.
+internal fun applyBbcClassificationPlan(
+    editor: SharedPreferences.Editor,
+    plan: BbcClassificationPlan.Write,
+) {
+    editor.putString(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION, plan.value)
+    if (plan.marker) {
+        editor.putBoolean(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED, true)
+    }
+}
+
+// Pure classifier. Rules:
+//  - classification key present with a KNOWN value => NoWrite (idempotent;
+//    an unknown value is FailClosed but is never overwritten).
+//  - absent + pre-existing draft (packages non-empty OR version Present) =>
+//    Write(PRE_UPGRADE_EXISTING, marker=true).
+//  - absent + no pre-existing draft => Write(NEW_GENERATION_NOT_CONSENTED, false).
+//  - any read failure / Unavailable version / unknown present value =>
+//    FailClosed (write nothing). An Invalid (CCE/short) version key is not a
+//    usable draft proof and is NOT a transport failure: it degrades to no
+//    version evidence so the existing corrupt-version repair can proceed.
+//  - CancellationException always propagates (never a non-committal outcome).
+internal fun planBbcInstallClassification(reads: BbcClassificationReads): BbcClassificationPlan = try {
+    val existing = reads.classificationValue()
+    if (existing != null) {
+        if (existing in BbcInstallClassificationValues) BbcClassificationPlan.NoWrite
+        else BbcClassificationPlan.FailClosed
+    } else {
+        // A corrupt package-set value (ClassCastException) is not usable draft
+        // evidence, not a transport failure: degrade to "no packages evidence"
+        // so the corrupt-version repair can still proceed. Matches the real
+        // SharedPreferences adapter; defended here too for the framework-free seam.
+        val packagesNonEmpty = try {
+            reads.packagesNonEmpty()
+        } catch (_: ClassCastException) {
+            false
+        }
+        val version = reads.versionProbe()
+        if (version is VersionProbeResult.Unavailable) {
+            BbcClassificationPlan.FailClosed
+        } else {
+            val preUpgrade = packagesNonEmpty || version is VersionProbeResult.Present
+            if (preUpgrade) {
+                BbcClassificationPlan.Write(PRE_UPGRADE_EXISTING, marker = true)
+            } else {
+                BbcClassificationPlan.Write(NEW_GENERATION_NOT_CONSENTED, marker = false)
+            }
+        }
+    }
+} catch (ce: CancellationException) {
+    throw ce
+} catch (_: Throwable) {
+    BbcClassificationPlan.FailClosed
+}
+
+// Shared adapter from real SharedPreferences to the framework-free reads.
+// CancellationException from the version probe is captured and rethrown;
+// a ClassCastException on the package set means "no usable draft evidence"
+// (repair must still be possible), every other throwable is a read failure.
+private fun classificationReads(prefs: SharedPreferences): BbcClassificationReads {
+    val versionCancellation = AtomicReference<CancellationException?>(null)
+    return object : BbcClassificationReads {
+        override fun classificationValue(): String? {
+            if (!prefs.contains(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION)) return null
+            // Present but unreadable / wrong type => throw => fail closed.
+            return prefs.getString(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION, null)
+                ?: throw IllegalStateException("classification key present but unreadable")
+        }
+
+        override fun packagesNonEmpty(): Boolean = try {
+            // getAll() is a single copy (no extra getStringSet trip through the
+            // poison-fenced draft reader) — classification must NEVER be
+            // inferred from a torn/fenced draft read.
+            val value = prefs.all[PolicySource.POLICY_KEY_EXTRA_PACKAGES]
+            value is Set<*> && value.isNotEmpty()
+        } catch (cce: ClassCastException) {
+            false // corrupt draft value: not usable as migration evidence
+        }
+
+        override fun versionProbe(): VersionProbeResult {
+            val probe = probeVersion(object : VersionPrefsView {
+                override fun containsVersion(): Boolean = try {
+                    prefs.contains(PolicySource.POLICY_KEY_EXTRA_VERSION)
+                } catch (ce: CancellationException) {
+                    versionCancellation.set(ce)
+                    throw ce
+                }
+
+                override fun readVersion(defValue: Long): Long = try {
+                    prefs.getLong(PolicySource.POLICY_KEY_EXTRA_VERSION, defValue)
+                } catch (ce: CancellationException) {
+                    versionCancellation.set(ce)
+                    throw ce
+                }
+            })
+            versionCancellation.get()?.let { throw it }
+            return probe
+        }
+    }
+}
+
+/** Plan for the classification write from the raw prefs reads. */
+internal fun planBbcInstallClassificationForPrefs(prefs: SharedPreferences): BbcClassificationPlan {
+    // Permanent process-level latch: no classification decision is trustworthy.
+    if (poisonOverflowLatched()) return BbcClassificationPlan.FailClosed
+    return planBbcInstallClassification(classificationReads(prefs))
+}
+
+// Bind-time binding. Uses the same process-wide commit lock as the policy
+// writer and the other BBC single-key writers. CE from provider or any read
+// propagates; every other Throwable maps to binder-absent / fail-closed.
+internal fun ensureBbcInstallClassification(provider: () -> SharedPreferences?): Boolean {
+    val prefs: SharedPreferences = try {
+        provider()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
+    } ?: return false
+
+    return synchronized(versionCommitLock) {
+        when (val plan = planBbcInstallClassificationForWrite(prefs)) {
+            BbcClassificationPlan.NoWrite -> true
+            BbcClassificationPlan.FailClosed -> false
+            is BbcClassificationPlan.Write -> try {
+                val editor = prefs.edit()
+                applyBbcClassificationPlan(editor, plan)
+                val committed = editor.commit()
+                // Keep the pending intent until the daemon CONFIRMS persistence.
+                if (committed) clearPendingBbcClassification()
+                committed
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                false
+            }
+        }
+    }
+}

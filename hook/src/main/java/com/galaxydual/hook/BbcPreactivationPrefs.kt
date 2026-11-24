@@ -1,35 +1,46 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 package com.galaxydual.hook
 
-// PR5 Phase B1 (#80): framework-free reader for the Hook-side, real
-// pre-activation BBC opt-in. No SharedPreferences, no Android, no I/O — the
-// caller adapts the real remote prefs to [BbcPreactivationPrefsView] exactly
-// once and passes the resulting snapshot to bbcPreactivationGate(). JVM tests
-// pin every mapping in BbcPreactivationPrefsTest.kt.
+// PR5 Phase B1 (#80) / PR #90 Phase A (P0): framework-free reader for the
+// Hook-side, real pre-activation BBC opt-in. No SharedPreferences, no Android,
+// no I/O — the caller adapts the real remote prefs to [BbcPreactivationPrefsView]
+// exactly once and passes the resulting snapshot to bbcPreactivationGate().
+// JVM tests pin every mapping in BbcPreactivationPrefsTest.kt.
 //
-// THE FAILURE MAPPING IS ALL-OR-NOTHING (orchestrator handoff):
-//   any read failure -> optIn = null, legacyPolicyPresent = false, migrated = null
-// Rationale: a transient remote-prefs outage must NEVER be converted into
-// "existing install" (which would open the effect AND write the migration
-// marker). A short outage only PAUSES the effect; it is not a policy shrink.
+// P0: `legacyPolicyPresent` (inferred from current packages/version) is GONE.
+// Those bytes are written by ordinary fresh-install saves and are therefore
+// NOT consent evidence. The only durable, App-owned authorization signal is
+// [classification]; the Hook merely reads it and never writes anything.
+//
+// THE FAILURE MAPPING IS ALL-OR-NOTHING:
+//   any read failure / invalid classification -> optIn = null,
+//   classification = null, migrated = null
+// A transient remote-prefs outage must NEVER be converted into "existing
+// install" or into an authorization. An ABSENT classification key is a normal
+// pre-rollout state: it stays null (not a failure) and fails closed at the
+// gate. A PRESENT but unknown value is a failure and masks the whole snapshot.
 // This reader never writes anything and never touches the policy draft.
-internal data class BbcPreactivationPrefs(
+// Kept PUBLIC only because it is the return value of the public read-only
+// bridge BbcPreactivationHookReader used by the cross-module (`:app`) test.
+data class BbcPreactivationPrefs(
     val optIn: Boolean?,
-    val legacyPolicyPresent: Boolean,
+    val classification: String?,
     val migrated: Boolean?,
 )
 
-// Minimal view of the four raw remote-prefs reads the decision needs.
-// Production adapts the real SharedPreferences once in DualHook;
-// JVM tests supply a fake that can make any read throw.
+// Minimal view of the raw remote-prefs reads the decision needs.
+// Production adapts the real SharedPreferences once in
+// BbcPreactivationHookReader; JVM tests supply a fake that can make any read
+// throw. INTERNAL: the cross-module test uses the public read-only bridge.
 internal interface BbcPreactivationPrefsView {
     fun getBoolean(key: String, defValue: Boolean): Boolean
+    fun getString(key: String): String?
     fun getStringSet(key: String): Set<String>?
     fun contains(key: String): Boolean
     fun getLong(key: String, defValue: Long): Long
 }
 
-// Reads the opt-in / legacy / migration signals from one snapshot.
+// Reads the opt-in / classification / migration signals from one snapshot.
 // Never throws: every read is guarded, and a single failure maps the WHOLE
 // snapshot to the fail-closed triple above.
 //
@@ -37,10 +48,11 @@ internal interface BbcPreactivationPrefsView {
 //  - optIn / migrated: absent key => null. getBoolean is called with defValue
 //    = false ONLY after contains() confirmed the key; a throw => null. The old
 //    defValue=true "absent means consent" mapping is deliberately gone.
-//  - legacyPolicyPresent: true iff the package set is non-empty OR the version
-//    key is a usable Present (probeVersion's vocabulary: >= 1). Invalid (< 1 /
-//    wrong type) or Unavailable (transport throw) are FAILURES, not proof of a
-//    legacy install, so they map the whole snapshot to fail-closed.
+//  - classification: absent => null (no failure, gate fails closed); present
+//    with a value outside PolicySource.INSTALL_CLASSIFICATION_VALUES => failure.
+//  - packages / version: still READ, but ONLY as failure detectors (e.g. a
+//    corrupt version key must fail the whole snapshot). They are NEVER used to
+//    infer a legacy install / consent — see BbcPreactivationGate.
 internal fun readBbcPreactivationPrefs(view: BbcPreactivationPrefsView): BbcPreactivationPrefs {
     var failed = false
 
@@ -63,10 +75,24 @@ internal fun readBbcPreactivationPrefs(view: BbcPreactivationPrefsView): BbcPrea
         else view.getBoolean(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED, false)
     }
 
-    val packagesNonEmpty = read {
-        val set = view.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
-        set != null && set.isNotEmpty()
-    } ?: false
+    val classification = read {
+        if (!view.contains(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION)) {
+            null
+        } else {
+            val value = view.getString(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION)
+            if (value == null || value !in PolicySource.INSTALL_CLASSIFICATION_VALUES) {
+                failed = true // present but unreadable / unknown => fail closed
+            }
+            value
+        }
+    }
+
+    // Failure detectors only (no legacy inference): a hostile package set or a
+    // corrupt/unavailable version key must mask the whole snapshot.
+    val packagesReadable = read {
+        view.getStringSet(PolicySource.POLICY_KEY_EXTRA_PACKAGES)
+        true
+    }
 
     // Reuse the shared version-probe vocabulary (no second "is this key
     // really present?" implementation). probeVersion itself never throws, but
@@ -84,10 +110,10 @@ internal fun readBbcPreactivationPrefs(view: BbcPreactivationPrefsView): BbcPrea
         failed = true
     }
 
-    if (failed) return BbcPreactivationPrefs(null, false, null)
+    if (failed || packagesReadable != true) return BbcPreactivationPrefs(null, null, null)
     return BbcPreactivationPrefs(
         optIn = optIn,
-        legacyPolicyPresent = packagesNonEmpty || version is VersionProbeResult.Present,
+        classification = classification,
         migrated = migrated,
     )
 }

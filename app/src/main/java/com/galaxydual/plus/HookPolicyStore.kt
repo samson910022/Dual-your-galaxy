@@ -185,6 +185,9 @@ internal fun logPoisonOverflowOnce(where: String) {
 
 internal fun resetRemotePoisonForTests() {
     remotePoison.set(PoisonState(emptyMap(), 0))
+    // P0: the app-scoped retry intent is process state too; test isolation must
+    // clear it alongside the poison fence (production clears on service death).
+    clearPendingBbcClassification()
     try {
         poisonOverflowOnceLogged.set(false)
     } catch (_: Throwable) {
@@ -1194,6 +1197,21 @@ fun remoteHookPolicyStore(
                     // is deadlock-free because the poison primitives take no lock
                     // (only an AtomicReference CAS, no re-entry into this lock).
                     val ok: Boolean = synchronized(versionCommitLock) {
+                        // P0 (PR #90): decide the durable install classification
+                        // at the VERY START of the write, BEFORE touching any
+                        // packages/version bytes. The resulting key/value (and,
+                        // for a genuine upgrade, the migration marker) go into
+                        // the SAME atomic editor/commit as the draft below —
+                        // no window where a fresh draft exists unclassified.
+                        // A pending intent from a FAILED commit (whose optimistic
+                        // local mMap now reads "known") is re-added here so the
+                        // retry cannot drop classification/marker. The permanent
+                        // overflow latch maps to FailClosed and aborts the whole
+                        // write; CE propagates (save()/clear() promise it).
+                        val classificationPlan = planBbcInstallClassificationForWrite(prefs)
+                        if (classificationPlan is BbcClassificationPlan.FailClosed) {
+                            return@synchronized false
+                        }
                         // Phase A P0 policy_version 同步寫入（與包集合同一 commit
                         // 原子落盤）：每次 save/clear 單調 +1。舊草稿遷移：版本鍵
                         // 缺席視為 0（下次寫入即 1）；非空舊草稿無版本仍被 hook
@@ -1277,6 +1295,15 @@ fun remoteHookPolicyStore(
                         } catch (e: Throwable) {
                             throw e
                         }
+                        // P0: same transaction as packages/version. Only the
+                        // classification key (+ marker for a real upgrade) is
+                        // added — never remove/putStringSet/putLong the old
+                        // draft from this classification write. A pending intent
+                        // is expressed as a Write plan, so it is re-added even
+                        // when classificationValue() reads a polluted local value.
+                        if (classificationPlan is BbcClassificationPlan.Write) {
+                            applyBbcClassificationPlan(ed, classificationPlan)
+                        } // NoWrite: key already durably present, leave unchanged
                         try {
                             ed.putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, newVer)
                         } catch (ce: CancellationException) {
@@ -1299,6 +1326,9 @@ fun remoteHookPolicyStore(
                         }
                     }
                     if (ok) {
+                        // Confirmed daemon persistence: the retry intent (if any)
+                        // is satisfied and must not be re-added to future drafts.
+                        clearPendingBbcClassification()
                         poisonToken?.let { token ->
                             val cleared = clearPoison(prefs, token)
                             if (cleared) {

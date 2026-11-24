@@ -15,11 +15,13 @@ import com.galaxydual.hook.PolicySource
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
@@ -107,15 +109,49 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         }
     }
 
+    // PR #90 P0: bind-time classification performs a BLOCKING binder commit.
+    // Run it on the app's IO scope so it can never delay bind notification;
+    // HookPolicyStore.saveRaw remains the correctness gate (it re-plans and
+    // re-adds any pending intent before EVERY draft write).
+    internal val bbcClassificationScope: CoroutineScope by lazy {
+        CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    }
+
     override fun onServiceBind(service: XposedService) {
         serviceRef.set(service)
+        // P0 (PR #90): best-effort durable install classification on the App's
+        // writable channel. A failed attempt must NOT latch the one-shot flag —
+        // a later bind retries. saveRaw independently guarantees that no draft
+        // is ever written without a durable classification.
+        if (!installClassificationOnce.get()) {
+            bbcClassificationScope.launch {
+                val ok = try {
+                    ensureBbcInstallClassification { remotePreferences(PolicySource.POLICY_PREFS_NAME) }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
+                }
+                // NoWrite (key already present) and a confirmed commit both
+                // satisfy the bind-time responsibility.
+                if (ok) installClassificationOnce.compareAndSet(false, true)
+            }
+        }
         // 5.1.5:通知所有綁定監聽者 (例如刷新政策草稿)。
+        // Never blocked by the binder commit above.
         notifyServiceListeners()
     }
 
     override fun onServiceDied(service: XposedService) {
         // 原子 CAS：只清同一 instance，避免新 binder 被舊的 death 回調清掉。
         if (serviceRef.compareAndSet(service, null)) {
+            // PR #90 P0: a rebound service exposes a DIFFERENT remote-prefs
+            // instance. Drop the old intent and re-arm bind-time classification
+            // so the new service cannot inherit stale process state.
+            synchronized(versionCommitLock) {
+                clearPendingBbcClassification()
+                installClassificationOnce.set(false)
+            }
             // 通知監聽者服務已斷線,讓呼叫端重新評估 (fail-closed)。
             notifyServiceListeners()
         }
@@ -138,6 +174,11 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
     companion object {
         private val serviceRef = AtomicReference<XposedService?>(null)
+
+        // P0 (PR #90): latched only after a bind-time classification SUCCEEDS
+        // (or is already present). Reset on active service death so a new
+        // service/rebind retries; saveRaw owns the retry-before-write path.
+        private val installClassificationOnce = AtomicBoolean(false)
 
         // 5.1.5:service 綁定監聽者 (CopyOnWriteArrayList 供併發安全)。
         // Phase 4:改 private + add/remove 封裝,避免外部直接 mutable 存取。

@@ -2,21 +2,17 @@
 package com.galaxydual.hook
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
-// PR5 Phase B1 (#80): framework-free reader for the Hook-side pre-activation
-// prefs. No Android / SharedPreferences / I/O here — a fake view supplies the
-// four raw reads so the mapping (absent / value / failure -> fail-closed
-// triple) is pinned without a device.
+// PR5 Phase B1 (#80) / PR #90 Phase A (P0): framework-free reader for the
+// Hook-side pre-activation prefs. A fake view supplies the raw reads so every
+// mapping (absent / value / failure -> snapshot) is pinned without a device.
 //
-// CRITICAL MAPPING (handoff): a read failure must never be converted into
-// "existing install". Any field that fails makes the WHOLE snapshot a failure:
-//   optIn = null, legacyPolicyPresent = false, migrated = null.
-// That is what prevents a transient IPC outage from opening the gate AND from
-// writing the migration marker. No policy draft/version is ever touched here.
+// P0 contract: packages/version are NEVER a legacy/consent basis. Only the
+// App-written durable classification is an authorization input; any read
+// failure (including an unknown classification value) masks the WHOLE snapshot
+// so the gate fails closed and no write is ever requested.
 class BbcPreactivationPrefsTest {
 
     private class FakeBbcPrefsView(
@@ -33,6 +29,11 @@ class BbcPreactivationPrefsTest {
         override fun getBoolean(key: String, defValue: Boolean): Boolean {
             check(key)
             return values[key] as? Boolean ?: defValue
+        }
+
+        override fun getString(key: String): String? {
+            check(key)
+            return values[key] as? String
         }
 
         override fun getStringSet(key: String): Set<String>? {
@@ -53,6 +54,7 @@ class BbcPreactivationPrefsTest {
     }
 
     private fun viewOf(vararg pairs: Pair<String, Any?>) = FakeBbcPrefsView(mapOf(*pairs))
+    private val failClosed = BbcPreactivationPrefs(null, null, null)
 
     @Test
     fun optInTrue() {
@@ -74,8 +76,7 @@ class BbcPreactivationPrefsTest {
     fun optInAbsentIsNull() {
         // Key absent must NOT inherit defValue=true (that was the old
         // fail-open behavior). Absence means "no consent recorded".
-        val p = readBbcPreactivationPrefs(FakeBbcPrefsView())
-        assertNull(p.optIn)
+        assertNull(readBbcPreactivationPrefs(FakeBbcPrefsView()).optIn)
     }
 
     @Test
@@ -83,62 +84,81 @@ class BbcPreactivationPrefsTest {
         val p = readBbcPreactivationPrefs(
             FakeBbcPrefsView(throwing = setOf(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN)),
         )
-        assertNull(p.optIn)
+        assertEquals(failClosed, p)
     }
 
     @Test
-    fun legacyNonEmptyPackages() {
+    fun classificationAbsentIsNullButNotAFailure() {
+        // Pre-rollout / bind-not-yet-established state: null classification,
+        // but opt-in and marker can still be read normally (the gate decides).
         val p = readBbcPreactivationPrefs(
-            viewOf(PolicySource.POLICY_KEY_EXTRA_PACKAGES to setOf("com.example.one")),
+            viewOf(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN to true),
         )
-        assertTrue(p.legacyPolicyPresent)
+        assertNull(p.classification)
+        assertEquals(true, p.optIn)
     }
 
     @Test
-    fun legacyEmptyPackagesIsNotABasis() {
+    fun everyKnownClassificationValueIsRead() {
+        for (value in PolicySource.INSTALL_CLASSIFICATION_VALUES) {
+            val p = readBbcPreactivationPrefs(
+                viewOf(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION to value),
+            )
+            assertEquals(value, p.classification)
+        }
+    }
+
+    @Test
+    fun unknownClassificationValueFailsTheWholeSnapshot() {
+        // REWRITTEN (P0): an unexpected value is never treated as a legacy basis.
         val p = readBbcPreactivationPrefs(
-            viewOf(PolicySource.POLICY_KEY_EXTRA_PACKAGES to emptySet<String>()),
+            viewOf(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION to "SOMETHING_ELSE"),
         )
-        assertFalse(p.legacyPolicyPresent)
+        assertEquals(failClosed, p)
     }
 
     @Test
-    fun legacyVersionOnly() {
+    fun packagesAndVersionAloneAreNotClassificationEvidence() {
+        // REWRITTEN legacyVersionOnly / legacyNonEmptyPackages: an ordinary
+        // fresh-install save writes these bytes, but they must never become
+        // migration evidence for the Hook.
         val p = readBbcPreactivationPrefs(
-            viewOf(PolicySource.POLICY_KEY_EXTRA_VERSION to 1L),
+            viewOf(
+                PolicySource.POLICY_KEY_EXTRA_PACKAGES to setOf("com.example.one"),
+                PolicySource.POLICY_KEY_EXTRA_VERSION to 1L,
+            ),
         )
-        assertTrue(p.legacyPolicyPresent)
+        assertNull(p.classification)
+        assertEquals(false, bbcPreactivationGate(true, p.optIn, p.classification, p.migrated).effectOpen)
     }
 
     @Test
-    fun noLegacyBasis() {
-        val p = readBbcPreactivationPrefs(FakeBbcPrefsView())
-        assertFalse(p.legacyPolicyPresent)
+    fun classificationReadFailureFailsTheWholeSnapshot() {
+        val p = readBbcPreactivationPrefs(
+            FakeBbcPrefsView(throwing = setOf(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION)),
+        )
+        assertEquals(failClosed, p)
     }
 
     @Test
-    fun legacyPackagesReadFailureIsFalse() {
+    fun packagesReadFailureFailsWholeSnapshot() {
         val p = readBbcPreactivationPrefs(
             FakeBbcPrefsView(throwing = setOf(PolicySource.POLICY_KEY_EXTRA_PACKAGES)),
         )
-        assertFalse(p.legacyPolicyPresent)
-        // Whole-snapshot failure: never convert a failed read into "legacy install".
-        assertEquals(BbcPreactivationPrefs(null, false, null), p)
+        assertEquals(failClosed, p)
     }
 
     @Test
-    fun legacyVersionReadFailureIsFalse() {
+    fun versionReadFailureFailsWholeSnapshot() {
         val p = readBbcPreactivationPrefs(
             FakeBbcPrefsView(throwing = setOf(PolicySource.POLICY_KEY_EXTRA_VERSION)),
         )
-        assertFalse(p.legacyPolicyPresent)
-        assertEquals(BbcPreactivationPrefs(null, false, null), p)
+        assertEquals(failClosed, p)
     }
 
     @Test
     fun migratedAbsentIsNull() {
-        val p = readBbcPreactivationPrefs(FakeBbcPrefsView())
-        assertNull(p.migrated)
+        assertNull(readBbcPreactivationPrefs(FakeBbcPrefsView()).migrated)
     }
 
     @Test
@@ -150,32 +170,31 @@ class BbcPreactivationPrefsTest {
     }
 
     @Test
-    fun migratedReadFailureIsNull() {
+    fun migratedReadFailureFailsTheWholeSnapshot() {
         val p = readBbcPreactivationPrefs(
             FakeBbcPrefsView(throwing = setOf(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED)),
         )
-        assertNull(p.migrated)
+        assertEquals(failClosed, p)
     }
 
     @Test
-    fun corruptVersionIsAFailureNotALegacyBasis() {
+    fun corruptVersionIsAFailure() {
         // probeVersion vocabulary: present but < 1 is Invalid (corrupt), not
-        // a usable version proof. It must fail closed, never count as legacy.
+        // usable proof. It must fail closed, never count as a legacy basis.
         val p = readBbcPreactivationPrefs(
             viewOf(PolicySource.POLICY_KEY_EXTRA_VERSION to 0L),
         )
-        assertEquals(BbcPreactivationPrefs(null, false, null), p)
+        assertEquals(failClosed, p)
     }
 
     @Test
     fun anyFieldFailureMasksEvenSuccessfullyReadFields() {
-        // opt-in / legacy / migrated were all readable, but a single failing
-        // probe (version) makes the snapshot fail closed as a whole — that is
-        // what guarantees no marker write and no opening on a transient outage.
         val p = readBbcPreactivationPrefs(
             FakeBbcPrefsView(
                 values = mapOf(
                     PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN to true,
+                    PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION to
+                        PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
                     PolicySource.POLICY_KEY_EXTRA_PACKAGES to setOf("com.example.one"),
                     PolicySource.POLICY_KEY_EXTRA_VERSION to 1L,
                     PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED to true,
@@ -183,12 +202,12 @@ class BbcPreactivationPrefsTest {
                 throwing = setOf(PolicySource.POLICY_KEY_EXTRA_VERSION),
             ),
         )
-        assertEquals(BbcPreactivationPrefs(null, false, null), p)
+        assertEquals(failClosed, p)
     }
 
     @Test
     fun allReadsThrowNeverThrowsAndReturnsFailClosed() {
         val p = readBbcPreactivationPrefs(FakeBbcPrefsView(throwOnAll = true))
-        assertEquals(BbcPreactivationPrefs(null, false, null), p)
+        assertEquals(failClosed, p)
     }
 }

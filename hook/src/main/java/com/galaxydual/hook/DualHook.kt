@@ -76,15 +76,15 @@ internal fun readBbcInjectionEnabledBounded(
     null
 }
 
-// --- PR5 Phase B1 (#80): bounded pre-activation read + final effect AND ---
+// --- PR5 Phase B1 (#80) / PR #90 Phase A (P0): bounded pre-activation read ---
 // Same bounded-read mechanism as readBbcInjectionEnabledBounded: submit on a
 // caller-injected zero-queue executor with a REAL wall-time ceiling, so an IPC
-// stall can never pin the hooked caller. Generic so the whole pre-activation
-// task (snapshot read + Phase A decision + one-time marker write) can run
-// inside the ceiling; null (timeout / task throw / submit contention / zero
-// budget) means "no usable result" -> fail closed. Framework-free and
-// executor-injected so JVM tests exercise the real wall-time path (see
-// BbcPreactivationBoundedTest). Never throws.
+// stall can never pin the hooked caller. The worker is STRICTLY READ-ONLY
+// (snapshot read + Phase A decision); there is no marker write on the hot path
+// any more. null (timeout / task throw / submit contention / zero budget)
+// means "no usable result" -> fail closed. Framework-free and executor-injected
+// so JVM tests exercise the real wall-time path (see BbcPreactivationBoundedTest).
+// Never throws.
 internal fun <T> readBbcPreactivationBounded(
     executor: java.util.concurrent.ExecutorService,
     timeoutMs: Long,
@@ -99,35 +99,15 @@ internal fun <T> readBbcPreactivationBounded(
     null
 }
 
-// Applies the Phase A decision to one snapshot and performs the one-time
-// migration write through an injected callback. The writer runs at most once
-// and ONLY when the pure decision asks for it; a throwing writer is swallowed
-// (the production callback counts/logs) and never changes effectOpen. The
-// production writer goes through the framework-free, single-key seam in
-// BbcMigrationMarkerWriter.kt: ONLY POLICY_KEY_BBC_LEGACY_MIGRATED is ever
-// written, and the editor has no remove/clear — never the policy draft /
-// version (no silent policy shrink).
-internal inline fun bbcPreactivationDecisionOpen(
+// Applies the P0 decision to one READ-ONLY snapshot. There is deliberately no
+// write callback: PR #90 removed the Hook-side migration marker writer entirely
+// (libxposed API 102 remote prefs are read-only in hooked apps). The owner App
+// persists the durable classification + marker atomically before any draft
+// write; this function only reads the snapshot and returns the gate result.
+internal fun bbcPreactivationDecisionOpen(
     compileTimeGate: Boolean,
     prefs: BbcPreactivationPrefs,
-    writeMigrationMarker: () -> Unit,
-): Boolean {
-    val decision = bbcPreactivationGate(
-        compileTimeGate,
-        prefs.optIn,
-        prefs.legacyPolicyPresent,
-        prefs.migrated,
-    )
-    if (decision.writeMigrationMarker) {
-        try {
-            writeMigrationMarker()
-        } catch (_: Throwable) {
-            // Counting/logging belongs to the injected writer; the decision is
-            // final and a failed write must not alter this call's gate result.
-        }
-    }
-    return decision.effectOpen
-}
+): Boolean = BbcPreactivationHookReader.effectOpen(compileTimeGate, prefs)
 
 // Final BBC effect AND, ordered so the compile-time emergency switch is judged
 // exactly ONCE:
@@ -1016,7 +996,7 @@ class DualHook : XposedModule() {
     // preactivation opt-in／legacy 遷移決策 × 執行期 opt-out 偏好。
     // dual_policy/bbc_injection_enabled 缺席仍走 defValue=true，但此鍵已不是
     // 「預設開」的依據 —— 生效前同意由 BbcPreactivationGate 的 opt-in／legacy
-    // 遷移規則治理（B1 已接線 remote prefs 讀取與單鍵 migration marker 寫入）。
+    // 遷移規則治理（B1 已接線 remote prefs 唯讀；P0 已移除 Hook 端 marker 寫入）。
     // 偏好讀取走既有 remote prefs accessor（getRemotePreferences 在同一行程對
     // 同一 group 為快取查表，非新增 binder IPC），只有布林讀；null/拋出交給
     // 混合規則：首次失敗即 fail-closed，已確認 OFF 後 30 分鐘內的失敗亦維持
@@ -1036,84 +1016,28 @@ class DualHook : XposedModule() {
         null
     }
 
-    // PR5 Phase B1 (#80): adapt the real remote prefs to the framework-free
-    // view ONCE, then delegate to readBbcPreactivationPrefs. A framework
-    // absence / throw maps to the ALL-FAIL-CLOSED snapshot — never to
-    // "existing install". No writes here; no policy draft is touched.
+    // PR5 Phase B1 / PR #90 Phase A (P0): adapt the real remote prefs through
+    // the PUBLIC, strictly read-only adapter. A framework absence / throw maps
+    // to the ALL-FAIL-CLOSED snapshot — never to "existing install". No writes
+    // here (no edit()), no policy draft is touched.
     private fun bbcPreactivationPrefsNow(): BbcPreactivationPrefs = try {
-        val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
-        if (prefs == null) {
-            BbcPreactivationPrefs(null, false, null)
-        } else {
-            readBbcPreactivationPrefs(object : BbcPreactivationPrefsView {
-                override fun getBoolean(key: String, defValue: Boolean): Boolean =
-                    prefs.getBoolean(key, defValue)
-
-                override fun getStringSet(key: String): Set<String>? =
-                    prefs.getStringSet(key, LinkedHashSet<String>())
-
-                override fun contains(key: String): Boolean = prefs.contains(key)
-                override fun getLong(key: String, defValue: Long): Long =
-                    prefs.getLong(key, defValue)
-            })
-        }
+        BbcPreactivationHookReader.read(getRemotePreferences(PolicySource.POLICY_PREFS_NAME))
     } catch (_: Throwable) {
-        BbcPreactivationPrefs(null, false, null)
+        BbcPreactivationPrefs(null, null, null)
     }
 
-    // One-time legacy migration: delegate to the framework-free, single-key
-    // seam (writeBbcLegacyMigrationMarker in BbcMigrationMarkerWriter.kt). The
-    // seam's editor exposes no remove/clear, so the policy draft (packages/
-    // version) cannot be deleted, cleared or rewritten — no silent policy
-    // shrink (ADR decision 2). commit() is used instead of apply() so a binder
-    // /persist failure is visible as a false result and can be counted; this
-    // runs inside the bounded worker, so it never pins the hooked caller.
-    // A failed write is counted + logged but NEVER changes the current gate
-    // decision (the effect stays open for this call).
-    private fun writeBbcLegacyMigrationMarker() {
-        var failure: Throwable? = null
-        val ok = try {
-            val prefs = getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
-                ?: throw IllegalStateException("remote prefs unavailable")
-            val realEditor = prefs.edit()
-            writeBbcLegacyMigrationMarker(object : BbcMigrationMarkerEditor {
-                override fun putBoolean(key: String, value: Boolean) {
-                    realEditor.putBoolean(key, value)
-                }
-
-                override fun commit(): Boolean = realEditor.commit()
-            })
-        } catch (t: Throwable) {
-            failure = t
-            false
-        }
-        if (!ok) {
-            try {
-                bbcMigrationMarkerWriteFailures.incrementAndGet()
-            } catch (_: Throwable) {
-            }
-            if (bbcCache.shouldLogFailure()) {
-                try {
-                    logi("BBC legacy migration marker write failed: ${failure?.let { shortEx(it) }.orEmpty()}")
-                } catch (_: Throwable) {
-                }
-            }
-        }
-    }
-
-    // B1 bounded pre-activation gate: read the snapshot AND apply the Phase A
-    // decision (including the single-key marker write) inside ONE dedicated
-    // zero-queue executor task with a real wall-time ceiling. No remote-prefs
-    // IPC — read or write — ever runs on the hooked caller thread; a stalled
-    // task degrades to CLOSED. compileTimeGate=true because bbcEffectGateOpen
-    // already enforced the emergency switch before calling this (single
-    // judgment point). Never throws.
+    // B1 bounded pre-activation gate: read the snapshot AND apply the P0 decision
+    // inside ONE dedicated zero-queue executor task with a real wall-time ceiling.
+    // No remote-prefs IPC — READ OR WRITE — ever runs on the hooked caller thread.
+    // The worker performs ZERO writes; the owner App owns all persistence.
+    // A stalled task degrades to CLOSED. compileTimeGate=true because
+    // bbcEffectGateOpen already enforced the emergency switch before calling
+    // this (single judgment point). Never throws.
     private fun bbcPreactivationOpenNow(timeoutMs: Long = BBC_GATE_MAX_MS): Boolean = try {
         readBbcPreactivationBounded(bbcPreactivationExecutor, timeoutMs) {
             bbcPreactivationDecisionOpen(
                 compileTimeGate = true,
                 prefs = bbcPreactivationPrefsNow(),
-                writeMigrationMarker = { writeBbcLegacyMigrationMarker() },
             )
         } ?: false
     } catch (_: Throwable) {
@@ -1152,13 +1076,13 @@ class DualHook : XposedModule() {
             // inside the guarded section, so a slow pref read is charged to the
             // same 50ms deadline budget instead of running outside it.
             //
-            // PR5 Phase B1 (#80) FINAL BBC EFFECT AND — bbcEffectGateOpen judges
-            // the compile-time emergency switch exactly ONCE (false => ZERO pref
-            // reads / ZERO marker writes, keeping the historic zero-runtime-read
-            // pin), then ANDs:
-            //   1. preactivationOpen = bbcPreactivationGate's decision on the
-            //      bounded remote-prefs snapshot (optin / legacy / migrated),
-            //      including the single-key migration marker write;
+            // PR5 Phase B1 / PR #90 Phase A (P0) FINAL BBC EFFECT AND —
+            // bbcEffectGateOpen judges the compile-time emergency switch exactly
+            // ONCE (false => ZERO pref reads / ZERO writes, keeping the historic
+            // zero-runtime-read pin), then ANDs:
+            //   1. preactivationOpen = bbcPreactivationGate's READ-ONLY decision
+            //      on the bounded remote-prefs snapshot (optin / durable
+            //      classification / trusted migration marker). No writes at all;
             //   2. hybridOpen        = bbcInjectionGateOpen's runtime rule on the
             //      legacy bbc_injection_enabled opt-out (sticky/CAS/clock
             //      failures all fail closed since Phase A).
@@ -2211,11 +2135,6 @@ class DualHook : XposedModule() {
         // behind a stuck worker. Bounded to BBC_GATE_MAX_MS per call.
         private val bbcPreactivationExecutor: java.util.concurrent.ThreadPoolExecutor =
             PolicyRefreshBudget.newPolicyRefreshExecutor("GalaxyDual-bbc-preactivation-read")
-
-        // B1 observability only: one-time legacy migration marker write
-        // failures. Never drives logic; monotonic, process-lifetime.
-        internal val bbcMigrationMarkerWriteFailures =
-            java.util.concurrent.atomic.AtomicLong(0L)
 
         // Remote-capability latch (P2-1): only true is latched forever; false
         // is cooldown-gated and re-probed (see RemoteCapabilityLatch). The
