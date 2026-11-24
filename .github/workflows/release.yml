@@ -87,6 +87,8 @@ jobs:
       # Excluded: ci-retry-guard.test.sh (release job does not use the retry guard
       # around gradle invocations). All other release-critical checkers are run.
       - name: Release gate self-tests (fail-fast)
+        env:
+          PR60_SIGNER_TEST_REQUIRE_SDK: "1"
         run: |
           set -e
           echo "== DEX class_def checker self-test =="
