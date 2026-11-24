@@ -338,8 +338,8 @@ def parse_class_def_descriptors(dex_bytes):
     # would let an empty/malformed sibling dex slip through unchecked, which is
     # exactly the kind of silent degradation this gate exists to prevent.
     # Empirical baseline from review mutation testing: the debug APK's six
-    # dexes carry 3629/122/89/49/571/1 class_defs and the release APK's single
-    # dex carries 4094 — no empty dex today, so this rule has produced no false
+    # dexes carry 3629/122/129/49/737/1 class_defs and the release APK's two
+    # dexes carry 4650/1 — no empty dex today, so this rule has produced no false
     # negatives. If a future R8/D8 configuration emits a legitimately empty
     # classes*.dex, RE-EVALUATE this rule explicitly; do not silently narrow it
     # to the target-bearing dex.
