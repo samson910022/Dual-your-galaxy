@@ -41,6 +41,7 @@ DEXes used by the fail-closed tests:
   trailer / pad_data     append raw bytes to the data section / skip 4-byte pad
   extra_strings, extra_types
 """
+import io
 import os
 import re
 import struct
@@ -269,6 +270,44 @@ def write_apk(path, members):
                 zf.writestr(name, payload)
 
 
+def write_apk_with_nul_names(path, nul_members, normal_members=()):
+    """Write an APK whose member names contain embedded NUL bytes.
+
+    zipfile.writestr() truncates a name at the first NUL, so NUL names cannot
+    be written directly. Instead each is written as a SAME-LENGTH placeholder
+    into an in-memory ZIP, then the placeholder bytes are patched in the raw
+    archive (they occur twice: local header + central directory). Equal byte
+    lengths keep all offsets, sizes and CRCs valid.
+
+    nul_members: [(placeholder, raw_name, payload), ...]
+    normal_members: [(name, payload), ...] written verbatim.
+    """
+    buffer = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for placeholder, _raw_name, payload in nul_members:
+                zf.writestr(placeholder, payload)
+            for name, payload in normal_members:
+                zf.writestr(name, payload)
+
+    data = buffer.getvalue()
+    for placeholder, raw_name, _payload in nul_members:
+        placeholder_bytes = placeholder.encode("utf-8")
+        raw_bytes = raw_name.encode("utf-8")
+        if len(placeholder_bytes) != len(raw_bytes):
+            raise ValueError(f"placeholder {placeholder!r} and raw name {raw_name!r} "
+                             "must have the same byte length")
+        count = data.count(placeholder_bytes)
+        assert count == 2, (f"expected exactly 2 raw occurrences of "
+                            f"{placeholder_bytes!r} (local header + central "
+                            f"directory), got {count}")
+        data = data.replace(placeholder_bytes, raw_bytes)
+
+    with open(path, "wb") as handle:
+        handle.write(data)
+
+
 def xposed_members(module_id=MODULE_ID, version=VERSION_NAME):
     """The xposed metadata members expected by verify-release-artifacts.sh."""
     return [
@@ -427,6 +466,23 @@ def build_all(outdir):
     dup_member_other = dex("dup-member-other.dex", [OTHER])
     apk("duplicate-member.apk", [("classes.dex", positive),
                                  ("classes.dex", dup_member_other)])
+
+    # R1: Python's ZipInfo.filename is truncated at the first NUL, so a raw
+    # member name `classes.dex\x00tail` looks canonical to a name-based gate
+    # and a valid positive DEX payload can false-pass. Both fixtures below
+    # require genuine raw-ZIP byte patching (see write_apk_with_nul_names).
+    write_apk_with_nul_names(
+        os.path.join(outdir, "nul-member-name.apk"),
+        [("classes.dexXtail", "classes.dex\x00tail", positive)])
+    written.append("nul-member-name.apk")
+    # A clean primary defining OTHER must not mask the NUL-bearing secondary
+    # that holds TARGET.
+    write_apk_with_nul_names(
+        os.path.join(outdir, "nul-secondary-with-primary.apk"),
+        [("classes2.dexXtail", "classes2.dex\x00tail", multi_secondary)],
+        [("classes.dex", multi_primary)])
+    written.append("nul-secondary-with-primary.apk")
+
     apk("bad-magic.apk", [("classes.dex", bad_magic)])
     apk("bad-version.apk", [("classes.dex", bad_version)])
     apk("file-size-small.apk", [("classes.dex", file_small)])

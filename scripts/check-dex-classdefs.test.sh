@@ -65,12 +65,24 @@ bad_case() {
 }
 
 # Run the checker; assert both exit code and a required output substring.
+# An optional `--no-found` after the needle also requires no FOUND class_def
+# line (used for the NUL-member false-pass fixtures).
 assert_case() {
   local name="$1" apk="$2" expected="$3" needle="$4"
   shift 4
-  local output rc=0
+  local no_found=0
+  if [ "${1:-}" = "--no-found" ]; then
+    no_found=1
+    shift
+  fi
+  local output rc=0 ok=1
   output="$(python3 "$CHECKER" "$apk" "$@" 2>&1)" || rc=$?
-  if [ "$rc" -eq "$expected" ] && printf '%s\n' "$output" | grep -qF -- "$needle"; then
+  if [ "$rc" -ne "$expected" ]; then ok=0; fi
+  if ! printf '%s\n' "$output" | grep -qF -- "$needle"; then ok=0; fi
+  if [ "$no_found" -eq 1 ] && printf '%s\n' "$output" | grep -qF -- "FOUND class_def"; then
+    ok=0
+  fi
+  if [ "$ok" -eq 1 ]; then
     pass_case "$name (exit $rc, pinned '$needle')"
   else
     bad_case "$name (expected exit $expected + pinned '$needle', got exit $rc)" "$output"
@@ -188,6 +200,20 @@ assert_case "non-canonical classes1.dex with valid primary" \
 
 assert_case "duplicate ZIP member classes.dex" "$SUITE_TMP/duplicate-member.apk" 1 \
   "duplicate ZIP member 'classes.dex'" "$TARGET"
+
+# R1: ZipInfo.filename truncates at the first NUL, so a raw name
+# `classes.dex\x00tail` looked canonical and a valid positive DEX payload
+# false-passed. Pin both the generic message and the raw repr (four literal
+# chars backslash-x-0-0) and require no FOUND line at all.
+assert_case "NUL byte in primary ZIP member name" \
+  "$SUITE_TMP/nul-member-name.apk" 1 \
+  "NUL byte in ZIP member name 'classes.dex\\x00tail'" --no-found "$TARGET"
+
+# Same guard must fire for a NUL-bearing secondary name even when a clean,
+# canonical classes.dex is present.
+assert_case "NUL byte in secondary ZIP member name" \
+  "$SUITE_TMP/nul-secondary-with-primary.apk" 1 \
+  "NUL byte in ZIP member name" "$TARGET"
 
 # --- strict DEX structural validation --------------------------------------
 assert_case "bad magic version xyz" "$SUITE_TMP/bad-magic.apk" 1 \

@@ -29,12 +29,13 @@
 # per missing descriptor and exits 1.
 #
 # Fail closed (::error:: + exit 1) on: unreadable/corrupt APK, missing or
-# duplicated primary DEX, non-canonical or duplicated DEX member names, a gap
-# in secondary DEX numbering, unreadable members, truncated DEX, bad magic or
-# unsupported version, wrong file_size/header_size/endian_tag, out-of-range or
-# misaligned/overlapping tables, malformed data section/MUTF-8, duplicate
-# class_idx or descriptor, and class_defs_size=0. There is deliberately NO
-# grep/raw-byte fallback — that fallback is exactly the false positive above.
+# duplicated primary DEX, non-canonical or duplicated DEX member names, ZIP
+# member names containing a NUL byte, a gap in secondary DEX numbering,
+# unreadable members, truncated DEX, bad magic or unsupported version, wrong
+# file_size/header_size/endian_tag, out-of-range or misaligned/overlapping
+# tables, malformed data section/MUTF-8, duplicate class_idx or descriptor,
+# and class_defs_size=0. There is deliberately NO grep/raw-byte fallback —
+# that fallback is exactly the false positive above.
 #
 # Importable API (used by scripts/check-dex-classdefs.test.sh):
 #   count_class_defs(dex_bytes, descriptor) -> int
@@ -334,8 +335,11 @@ def iter_classes_dex(apk_path):
 
     Only `classes.dex` (exactly one) and contiguous `classes2.dex`,
     `classes3.dex`, ... are accepted. Any other `classes[0-9]*.dex` name raises
-    DexError instead of being silently skipped or counted. Reads go through
-    the ZipInfo object so duplicate member names cannot alias each other.
+    DexError instead of being silently skipped or counted. All name checks use
+    the RAW member name (orig_filename), because ZipInfo.filename is truncated
+    at the first NUL and a NUL-bearing name could otherwise masquerade as
+    `classes.dex`. Reads go through the ZipInfo object so duplicate member
+    names cannot alias each other.
     """
     try:
         with zipfile.ZipFile(apk_path) as zf:
@@ -343,7 +347,13 @@ def iter_classes_dex(apk_path):
             secondaries = {}
             seen_names = set()
             for info in zf.infolist():
-                name = info.filename
+                name = getattr(info, "orig_filename", info.filename)
+                # Reject before any name matching or zf.read. Do NOT also
+                # reject name != info.filename: zipfile normalizes Windows
+                # backslashes in filename, which would false-positive on
+                # legitimate entries authored on Windows.
+                if "\x00" in name:
+                    raise DexError(f"NUL byte in ZIP member name {name!r} in {apk_path}")
                 if not ANY_CLASSES_DEX_RE.fullmatch(name):
                     continue
                 if name in seen_names:
@@ -373,12 +383,13 @@ def iter_classes_dex(apk_path):
 
             ordered = [primaries[0]] + [secondaries[number] for number in sorted(secondaries)]
             for info in ordered:
+                name = getattr(info, "orig_filename", info.filename)
                 try:
-                    yield info.filename, zf.read(info)
+                    yield name, zf.read(info)
                 except DexError:
                     raise
                 except Exception as exc:
-                    raise DexError(f"unable to read {info.filename} from {apk_path}: {exc}") from exc
+                    raise DexError(f"unable to read {name} from {apk_path}: {exc}") from exc
     except DexError:
         raise
     except Exception as exc:
