@@ -128,11 +128,12 @@ class PolicyActivity : ComponentActivity() {
     // pending+generation+ack(in-memory session-scoped)+expanded+SAVING/RECONCILING cancel語義+旋轉保留+onDestroy dismiss)。
     // Editor 至少 dialog 欄位化＋onDestroy dismiss＋onSaveInstanceState 世代保留（見下）。
     private var policyConfirmDialog: AlertDialog? = null
-    // #78:風險揭露對話框與編輯器空集導引對話框的 handle。共用 RiskNotice helper
-    // 現在回傳 show() 的 handle，於此持有並在 onDestroy best-effort dismiss，
-    // 避免舊 Activity window 洩漏／BadToken（與 MainActivity.riskDialog 同源）。
-    private var riskDialog: AlertDialog? = null
-    private var editorEmptyGuideDialog: AlertDialog? = null
+    // #78 / #89 D2b：風險揭露對話框與編輯器空集導引對話框的 handle 改由 slot 持有。
+    // 共用 RiskNotice helper 回傳 show() 的 handle（失敗為 null），slot 保證 null
+    // 不覆寫有效 handle、單一 flight 不孤兒化、dismiss callback 有 identity guard；
+    // onDestroy 透過 slot best-effort dismiss，避免舊 Activity window 洩漏／BadToken。
+    private val riskDialogSlot = DialogSlot<AlertDialog>()
+    private val editorEmptyGuideDialogSlot = DialogSlot<AlertDialog>()
     private val policyConfirmState = PolicyConfirmDialogState()
     // PR-74 A3：pre-clear 警告／ROOT 二次確認／卸載驗證對話框 handle（onDestroy 釋放，
     // 與 MainActivity 同源；先前 show() 後丟棄 handle 致舊 Activity window 洩漏）。
@@ -222,15 +223,19 @@ class PolicyActivity : ComponentActivity() {
     private fun showEditorEmptyGuide() {
         if (isFinishing || isDestroyed) return
         try {
-            editorEmptyGuideDialog = AlertDialog.Builder(this)
+            val dlg = AlertDialog.Builder(this)
                 .setTitle(R.string.policy_editor_empty_guide_title)
                 .setMessage(R.string.policy_editor_empty_guide_message)
                 .setCancelable(true)
                 .setPositiveButton(R.string.policy_editor_empty_guide_go_main) { _, _ -> finish() }
                 .setNegativeButton(R.string.dialog_cancel, null)
-                .show().also { dlg ->
-                    dlg.setOnDismissListener { if (editorEmptyGuideDialog === dlg) editorEmptyGuideDialog = null }
-                }
+                .show()
+            editorEmptyGuideDialogSlot.install(
+                dlg,
+                isShowing = { it.isShowing },
+                bindDismiss = { d, cb -> d.setOnDismissListener { cb() } },
+                discard = { it.dismiss() },
+            )
         } catch (_: RuntimeException) {
             // Best effort: 對話框失敗不影響 ticks（已還原／未寫入）。
         }
@@ -448,10 +453,15 @@ class PolicyActivity : ComponentActivity() {
             gravity = Gravity.CENTER_VERTICAL
             isClickable = true
             setOnClickListener {
-                // #78: keep the shared helper's handle for onDestroy cleanup.
-                riskDialog = showRiskDetailsDialog(this@PolicyActivity)?.also { dlg ->
-                    dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
-                }
+                // #78 / D2b: hand the shared helper's handle to the slot (null on
+                // failure never overwrites a live handle) for onDestroy cleanup.
+                val dlg = showRiskDetailsDialog(this@PolicyActivity)
+                riskDialogSlot.install(
+                    dlg,
+                    isShowing = { it.isShowing },
+                    bindDismiss = { d, cb -> d.setOnDismissListener { cb() } },
+                    discard = { it.dismiss() },
+                )
             }
         })
 
@@ -607,20 +617,12 @@ class PolicyActivity : ComponentActivity() {
         // （含 probe-failed；與 MainActivity.onDestroy 同口徑，單一失敗不阻斷後續。
         // 用 dismiss() 而非 cancel()，避免快銷毀中的 Activity 仍觸發 onCancel 回呼）。
         dismissAllDestructiveHandles(destructiveDialogHandles) { it.dismiss() }
-        // #78: risk gate / risk details / editor empty-guide handles — use
-        // dismiss() (not cancel()) so a dying Activity does not fire onCancel.
-        try {
-            riskDialog?.dismiss()
-        } catch (_: Exception) {
-            // Best effort: the window is going away anyway.
-        }
-        riskDialog = null
-        try {
-            editorEmptyGuideDialog?.dismiss()
-        } catch (_: Exception) {
-            // Best effort: the window is going away anyway.
-        }
-        editorEmptyGuideDialog = null
+        // #78 / D2b: risk gate / risk details / editor empty-guide handles.
+        // DialogSlot.clear nulls the field FIRST then best-effort dismiss()es
+        // (never cancel(), so a dying Activity does not fire onCancel); a throwing
+        // dismiss cannot strand the handle or block the other slot.
+        riskDialogSlot.clear { it.dismiss() }
+        editorEmptyGuideDialogSlot.clear { it.dismiss() }
         policyConfirmState.onPendingCleared()
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
@@ -939,10 +941,16 @@ class PolicyActivity : ComponentActivity() {
             startEditorWriteWarning(candidate)
         }
         if (shouldShowRiskGate(riskAckStore.isAcknowledged())) {
-            // #78: track the ack-gate handle just like Main's riskDialog.
-            riskDialog = showRiskAckGate(this, riskAckStore) { proceed() }?.also { dlg ->
-                dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
-            }
+            // #78 / D2b: track the ack-gate handle in the same slot as Main.
+            // 失敗回 null 不覆寫既有 handle；positive 的 async ack + host-alive
+            // re-check 仍在共用 helper 內，行為不變。
+            val dlg = showRiskAckGate(this, riskAckStore) { proceed() }
+            riskDialogSlot.install(
+                dlg,
+                isShowing = { it.isShowing },
+                bindDismiss = { d, cb -> d.setOnDismissListener { cb() } },
+                discard = { it.dismiss() },
+            )
         } else {
             proceed()
         }

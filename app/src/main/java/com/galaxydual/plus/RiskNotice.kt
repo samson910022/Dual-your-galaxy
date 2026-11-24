@@ -20,9 +20,10 @@
 // - RiskAckStore 介面與 shouldShowRiskGate 為純 Kotlin seam (無 Android 型別)，
 //   JVM 可用 Map-backed fake 直接測試；Android framework 僅出現在 SharedPreferences
 //   綁定 (以下以完整名稱限定，不進 import) 與兩個對話框函式。
-// - #78:兩個對話框 helper 回傳 AlertDialog?（show 的 handle，失敗/dying host 為
-//   null），由呼叫的 Activity 持有並在 onDestroy best-effort dismiss。Main 仍用
-//   同語意的 private wrapper 持有 handle，Editor 直接保存本檔 helper 的回傳值。
+// - #78 / #89 D2b:兩個對話框 helper 回傳 AlertDialog?（show 的 handle，失敗/dying
+//   host 為 null），呼叫的 Activity 把回傳值交給 [DialogSlot.install]（null 不覆寫
+//   既有 handle），並在 onDestroy 經 DialogSlot.clear best-effort dismiss。Main 仍用
+//   同語意的 private wrapper，Editor 直接把本檔 helper 的回傳值裝入 slot。
 // - PR #89 Phase D1 (R2, fail-open):SharedPreferences 是行程內快取。AOSP 的
 //   EditorImpl.commit() 先 commitToMemory() 更新 mMap (getBoolean 立刻變 true)，
 //   之後才寫磁碟；commit(false)/寫入失敗/逾時都不回滾 mMap。兩個 Activity 共用

@@ -55,8 +55,12 @@ class RiskDisclosureUiTest {
         false
     }
 
+    // PR #89 D2b:MainActivity.riskDialog was replaced by DialogSlot<AlertDialog>.
+    // Read the slot's current handle instead of the removed field; the slot's
+    // identity-guarded dismiss callback nulls it, so null still means "not
+    // tracked / not showing" exactly as the old nullable field did.
     private fun riskDialogOn(activity: MainActivity): AlertDialog? =
-        field(activity, "riskDialog") as? AlertDialog
+        (field(activity, "riskDialogSlot") as? DialogSlot<*>)?.current as? AlertDialog
 
     private fun riskDialog(scenario: ActivityScenario<MainActivity>): AlertDialog? {
         var dialog: AlertDialog? = null
@@ -68,7 +72,7 @@ class RiskDisclosureUiTest {
         HarnessPoll.await(10_000) {
             var ok = false
             scenario.onActivity { activity ->
-                val d = field(activity, "riskDialog") as? AlertDialog
+                val d = riskDialogOn(activity)
                 ok = if (showing) d?.isShowing == true else (d == null || !d.isShowing)
             }
             ok

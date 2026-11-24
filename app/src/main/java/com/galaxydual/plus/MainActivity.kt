@@ -359,8 +359,10 @@ class MainActivity : ComponentActivity() {
     private val riskAckStore: RiskAckStore by lazy {
         getSharedPreferences(RISK_ACK_PREFS_NAME, MODE_PRIVATE).riskAckStore()
     }
-    // 風險對話框 handle：onDestroy best-effort dismiss，避免舊 Activity window 洩漏／BadToken。
-    private var riskDialog: AlertDialog? = null
+    // PR #89 D2b (#78)：風險對話框 handle 由 slot 統一持有。show() 失敗回 null 時
+    // 不覆寫既有 handle；single-flight 擋下第二個對話框；dismiss callback 由 slot
+    // 以 identity 守護綁定。onDestroy 透過 slot best-effort dismiss。
+    private val riskDialogSlot = DialogSlot<AlertDialog>()
 
     private lateinit var statusPillText: TextView
     private lateinit var statusPillDot: ImageView
@@ -675,14 +677,10 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         settingsDialog = null
-        // PR #74 R7b-2 (M1)：風險 gate／詳細說明對話框 handle best-effort 釋放
-        // （舊 Activity window 洩漏／BadToken 防護；與上面既有 dialog 同一語義）。
-        try {
-            riskDialog?.dismiss()
-        } catch (_: Exception) {
-            // Best effort: the window is going away anyway.
-        }
-        riskDialog = null
+        // PR #74 R7b-2 (M1) / #89 D2b：風險 gate／詳細說明對話框 handle best-effort
+        // 釋放（舊 Activity window 洩漏／BadToken 防護；slot 先清空再 dismiss()，
+        // 不用 cancel()，見 DialogSlot.clear）。
+        riskDialogSlot.clear { it.dismiss() }
         // PR #74 R2 N05：終止 BBC 開關係統的單一 consumer，避免它在 Activity
         // 銷毀後仍回呼 onRestored/onFailed（舊 CheckBox / Toast 已無效）。
         bbcToggleController?.dispose()
@@ -774,8 +772,12 @@ class MainActivity : ComponentActivity() {
                 .setPositiveButton(R.string.dialog_close, null)
                 .setCancelable(true)
                 .show()
-            riskDialog = dlg
-            dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
+            riskDialogSlot.install(
+                dlg,
+                isShowing = { it.isShowing },
+                bindDismiss = { d, cb -> d.setOnDismissListener { cb() } },
+                discard = { it.dismiss() },
+            )
         } catch (_: Exception) {
             // fail-safe：不改變任何狀態。
         }
@@ -798,8 +800,12 @@ class MainActivity : ComponentActivity() {
                 .setNegativeButton(R.string.dialog_cancel, null)
                 .setCancelable(true)
                 .show()
-            riskDialog = dlg
-            dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
+            riskDialogSlot.install(
+                dlg,
+                isShowing = { it.isShowing },
+                bindDismiss = { d, cb -> d.setOnDismissListener { cb() } },
+                discard = { it.dismiss() },
+            )
         } catch (_: Exception) {
             // fail-closed：show 失敗即不標記、不繼續。
         }
