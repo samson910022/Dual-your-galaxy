@@ -162,10 +162,10 @@ BBC-SPIKE FAIL: BBC library not resolvable on this ROM
 
 ## 7. Commands
 
-> 本節指令僅供 11-17／11-18 歷史復現；**一般安裝請改用 [README 快速開始](../README.md)／[GitHub Release](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3)**，並先讀[安裝／升級警告（v0.1.0-beta.3）](../README.md)（全新安裝僅相對於舊 id `com.galaxydual.plus`（beta.2→beta.3 同 id 為 in-place 升級）、無資料／偏好遷移、無內建匯入匯出、先備份並確認可還原；新舊管理 App 與其 LSPosed 模組不可同時啟用，一般既有雙開 App 不需刪除；停用／卸載／opt-out／重開機不是刪除防護；自建 debug id `io.github.samson910022.galaxydualplus.debug` 與 module id 不一致；hook 可能早於首次 App UI 警告）。以下為歷史指令，非目前版本的安裝建議。
+> 本節指令僅供 11-17／11-18 歷史復現。**先確認目前安裝的 id**：若是舊 id `com.galaxydual.plus` → 全新安裝、不遷移舊資料、不可與新 id 共存、先備份並確認可還原；若已是 `io.github.samson910022.galaxydualplus`（含 beta.2 → beta.3）→ **同 id、同簽章 in-place 升級，不需卸載**，Android 通常會就地保留該管理 App 的資料，但**不保證 Samsung 分身或其資料完好**。Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 迁移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。（其餘 caveat：無資料／偏好自動遷移、無內建匯入匯出、先備份並確認可還原；新舊管理 App 與其 LSPosed 模組不可同時啟用；停用／卸載／opt-out／重開機不是刪除防護；自建 debug id `io.github.samson910022.galaxydualplus.debug` 是不同套件，且與 `module.prop` 的 module id 不一致、不保證被 LSPosed 正確載入；hook 可能早於首次 App UI 警告；beta.3 BBC experimental／本版本未實機驗證、pre-activation opt-in 版本限定。）**已發布的 Release page 仍有舊身分／A/B/C 文字；maintainer 同步前以本警告與 repo 內 `docs/RELEASE_NOTES_beta3.md` 為準。** 一般安裝請改用 [README 快速開始](../README.md) 的已簽章 `app-release.apk`／[GitHub Release](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3)，並先讀[安裝／升級警告（v0.1.0-beta.3）](../README.md)。以下為選配 debug／歷史復現指令，非目前版本的安裝建議。
 
 ```bash
-# ⚠️ 僅供歷史復現；一般安裝見 README 快速開始／GitHub Release 並先讀安裝／升級警告：https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3
+# ⚠️ 一般安裝請用已簽章 app-release.apk；本指令為選配 debug／歷史復現，見 README 快速開始／GitHub Release 並先讀安裝／升級警告：https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ./gradlew :hook:testDebugUnitTest assembleDebug --console=plain
 adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk   # serial 不入 repo

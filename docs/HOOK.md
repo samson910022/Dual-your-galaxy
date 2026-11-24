@@ -464,9 +464,13 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 ### 2.1 安裝：主用戶＋雙開用戶都要裝
 
-> **安裝／升級警告（v0.1.0-beta.3）**：請先讀 [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3)。**先確認你現在裝的是哪個 id**：若是舊 id `com.galaxydual.plus` → 這是全新安裝、不遷移舊資料、不可與新 id 共存、先備份並確認可還原；若已是 `io.github.samson910022.galaxydualplus`（含 beta.2→beta.3）→ 同 id in-place 升級，不需移除該 id 的舊 build，資料就地保留。release applicationId `io.github.samson910022.galaxydualplus`，自建 debug APK 為 `io.github.samson910022.galaxydualplus.debug`（舊 id `com.galaxydual.plus` 的資料**不會遷移**）；**無內建匯入／匯出**，請先備份並**確認備份可還原**。**舊版管理 App 與其 LSPosed 模組不可與新版同時啟用**（一般既有雙開 App 不需刪除、資料也不會合併）。不同 applicationId／module id／remote-prefs authority 會被系統視為不同個體。beta.2 → beta.3 沿用同一 `io.github.samson910022.galaxydualplus` id，屬 in-place 升級，不需移除該 id 的舊 build；不可共指的是舊 id `com.galaxydual.plus` 的管理 App／LSPosed 模組。停用／卸載／opt-out／重開機**都不是**刪除防護；beta.3 的 hook **可能早於首次 App UI 警告生效**。
+> **安裝／升級警告（v0.1.0-beta.3）— 請先讀完本警告再點 Release 連結：**
+> **先確認目前安裝的 id**：若是舊 id `com.galaxydual.plus` → 全新安裝、不遷移舊資料、不可與新 id 共存、先備份並確認可還原；若已是 `io.github.samson910022.galaxydualplus`（含 beta.2 → beta.3）→ **同 id、同簽章 in-place 升級，不需卸載**，Android 通常會就地保留該管理 App 的資料，但**不保證 Samsung 分身或其資料完好**。
+> Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 迁移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。
+> release applicationId `io.github.samson910022.galaxydualplus`，自建 debug APK 為 `io.github.samson910022.galaxydualplus.debug`（是**不同套件**；舊 id `com.galaxydual.plus` 的資料**不會遷移**），其 applicationId 與 `module.prop` 的 module id `io.github.samson910022.galaxydualplus` 不一致（已知限制、不保證被 LSPosed 正確載入）。**無內建匯入／匯出**，請先備份並**確認備份可還原**。**新舊管理 App／LSPosed 模組不可同時啟用**（一般既有雙開 App 不需為此迁移**手動移除**，資料也不會合併）；不同 applicationId／module id／remote-prefs authority 會被系統視為不同個體。停用／卸載／opt-out／重開機**都不是**刪除防護；beta.3 的 hook **可能早於首次 App UI 警告生效**。BBC 清單注入仍為 experimental／本版本未實機驗證，LSPosed 寫入通道仍為 NoOp 佔位。**截至 v0.1.0-beta.3（`fc579de3`）尚無 pre-activation opt-in；PR #90 合併後以 `docs/HOOK.md` §1.4／ADR 為準。**
+> **已發布的 Release page 目前仍有舊身分／A/B/C 文字；maintainer 同步更新前，以本警告與 repo 內 `docs/RELEASE_NOTES_beta3.md` 為準。**
 
-1. 主用戶（user 0）正常安裝本 App 的 APK（一般請用 [GitHub Release](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3) 的已簽章 `app-release.apk`；以下範例為自建 debug）。
+1. 主用戶（user 0）安裝本 App 的**已簽章 release** `app-release.apk`（applicationId `io.github.samson910022.galaxydualplus`；一般使用者請用 [GitHub Release](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3) 的版本化 asset）。若已裝同一 id（beta.2 → beta.3），直接覆蓋更新即可，不需卸載。
 2. 查出雙開用戶的 userId（常見為 `95`，機型而異，以實際輸出為準）：
    ```bash
    adb shell pm list users
@@ -474,17 +478,27 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
    #     UserInfo{0:Owner:13} running
    #     UserInfo{95:DUAL_APP:400} running
    ```
-3. 在雙開用戶內同樣安裝一份（以 `95` 為例）：
+3. **一般雙開用戶路徑**：把與 step 1 **同一個已簽章 `app-release.apk`** 裝到 user 95（以 `95` 為例，`<路徑>` 為你下載的 asset 路徑）：
    ```bash
-   # ⚠️ 安裝／升級警告見本節上方（release notes：https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3）；一般安裝請用 signed release
-   adb install --user 95 app/build/outputs/apk/debug/app-debug.apk
+   # 一般安裝：與 step 1 相同的 signed release APK（新安裝）
+   adb install --user 95 <路徑>/app-release.apk
+   # 已裝同一 id 時更新（明確為更新指令，不是實機驗證宣稱）
+   adb install -r --user 95 <路徑>/app-release.apk
    ```
 
-   **`--user 95` 裝的是管理 App 本體的第二份獨立資料**，僅供 LSPosed 按用戶作用域啟用之用途，**不能用來寫政策**——政策只能由 owner user（user 0）寫入（見 [docs/USAGE.md](USAGE.md) §「政策寫入流程／只有 owner user（user 0）能寫入／清除草稿」）。這份資料**不會與 user 0 的資料合併，也不會與舊 id 版本合併**。自建 debug APK 的 applicationId 為 `io.github.samson910022.galaxydualplus.debug`，與 `module.prop` 的 id `io.github.samson910022.galaxydualplus` 不一致（**已知限制，如實揭露**：LSPosed 以 module id 辨識模組，debug 包不保證被正確載入）；一般使用請用 signed release APK。
+   **`--user 95` 裝的是管理 App 本體的第二份獨立資料**，僅供 LSPosed 按用戶作用域啟用之用途，**不能用來寫政策**——政策只能由 owner user（user 0）寫入（見 [docs/USAGE.md](USAGE.md) §「政策寫入流程／只有 owner user（user 0）能寫入／清除草稿」）。這份資料**不會與 user 0 的資料合併，也不會與舊 id 版本合併**。
+
+**開發用（選配）debug 範例** — 一般使用者請用上方 signed release 路徑；以下僅供開發／歷史復現：
+
+> ⚠️ **執行前警告**：自建 debug APK 的 applicationId 為 `io.github.samson910022.galaxydualplus.debug`，是**不同套件**，與 `module.prop` 的 id `io.github.samson910022.galaxydualplus` 不一致（**已知限制，如實揭露**：LSPosed 以 module id 辨識模組，**不保證被正確載入**）；一般使用者請用上面的 signed release 路徑。
+>
+> ```bash
+> adb install --user 95 app/build/outputs/apk/debug/app-debug.apk
+> ```
 
 ### 2.2 LSPosed 勾選（＋ App 內通道選擇）
 
-> **安裝／升級警告（v0.1.0-beta.3）**：勾選作用域／重開機前請先讀 [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3) 與本文件 §2.1／[docs/USAGE.md](USAGE.md)「安裝」節警告：全新安裝僅相對於舊 id `com.galaxydual.plus`（beta.2→beta.3 同 id 為 in-place 升級）、**無資料／偏好自動遷移**、無內建匯入匯出，先備份並確認可還原；**舊版管理 App 與其 LSPosed 模組不可與新版同時啟用**（一般既有雙開 App 不需刪除、資料不會合併）；停用／卸載／opt-out／重開機不是刪除防護，beta.3 hook 可能早於首次 App UI 警告生效。
+> **安裝／升級警告（v0.1.0-beta.3）**：勾選作用域／重開機前請先讀本文件 §2.1／[docs/USAGE.md](USAGE.md)「安裝」節的完整警告與 repo 內 `docs/RELEASE_NOTES_beta3.md`：全新安裝僅相對於舊 id `com.galaxydual.plus`（beta.2→beta.3 同 id 為 in-place 升級、**不需卸載**）、**無資料／偏好自動遷移**、無內建匯入匯出，先備份並確認可還原；**舊版管理 App 與其 LSPosed 模組不可與新版同時啟用**。Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 迁移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。停用／卸載／opt-out／重開機不是刪除防護，beta.3 hook 可能早於首次 App UI 警告生效。**已發布的 Release page 仍有舊身分／A/B/C 文字；maintainer 同步前以上述警告與 `docs/RELEASE_NOTES_beta3.md` 為準。**
 
 1. 打開 LSPosed 管理器 → 模組 → 勾選 **Dual your Galaxy**（LSPosed 模組）並啟用；此名稱即 App 顯示名稱——`module.prop` 無 `name` 鍵、hook manifest 無 `android:label`，以 App 的 label 為準。
 2. 作用域（Scope）勾選以下兩項（H4：自家包自報已退場，file marker 為唯一訊號）：
@@ -500,7 +514,7 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
 
 ### 2.3 重啟需求
 
-> **安裝／升級警告（v0.1.0-beta.3）**：重開機**不是**刪除防護；一般安裝／升級請先讀 [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3) 與 §2.1 警告（全新安裝僅相對於舊 id `com.galaxydual.plus`（beta.2→beta.3 同 id 為 in-place 升級）、無資料遷移／內建匯入匯出、先備份並確認可還原；新舊管理 App 與其 LSPosed 模組不可同時啟用，一般既有雙開 App 不需刪除）。
+> **安裝／升級警告（v0.1.0-beta.3）**：重開機**不是**刪除防護；一般安裝／升級請先讀 §2.1 完整警告與 repo 內 `docs/RELEASE_NOTES_beta3.md`（全新安裝僅相對於舊 id `com.galaxydual.plus`，beta.2→beta.3 同 id 為 in-place 升級、**不需卸載**；無資料遷移／內建匯入匯出、先備份並確認可還原；新舊管理 App 與其 LSPosed 模組不可同時啟用）。Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App 不需為此套件 id 迁移而**手動移除**，且這**不表示**分身「不受影響」——本 App 沒有刪除防護。**已發布的 Release page 仍有舊身分／A/B/C 文字；maintainer 同步前以上述警告與 `docs/RELEASE_NOTES_beta3.md` 為準。**
 
 - **首次啟用／改動作用域後必須重啟**：`system_server` 注入只在開機時發生，
   不重啟等於沒 hook。建議直接完整重啟手機（軟重啟若管理器支援亦可）。
@@ -627,7 +641,12 @@ Marker 實測現況（S24 [S24 已驗證]，root 讀取；五層之 marker 歷�
   the Stage-1 gate stays sealed: a code-level gate (`PolicySource.NON_EMPTY_POLICY_EFFECTIVE_GATE`, default `false`) keeps
   `effective(...)` fail-closed (returns empty when closed) — this is a code gate, not device verification, and Stage 1 defaults remain unchanged;
   the fail-closed gate seam remains unit-tested.
-- **Install / upgrade warning (v0.1.0-beta.3):** See [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3). Check which id you currently have: if the old id `com.galaxydual.plus`, this is a clean install — no migration of old data, no coexistence with the new id, back up first and verify the backup is restorable; if already `io.github.samson910022.galaxydualplus` (including beta.2 → beta.3), this is an in-place upgrade of the same id — do not remove the older build of that id, and data is kept in place. Release applicationId `io.github.samson910022.galaxydualplus`, locally built debug APK `io.github.samson910022.galaxydualplus.debug`; no migration from the old id `com.galaxydual.plus`, no built-in import/export. Back up first and verify the backup is restorable. Do **not** enable the legacy management App / LSPosed module together with the new one (ordinary dual apps are **not** affected and need not be removed). Disabling, uninstalling, opting out or rebooting are **not** a deletion guard; the beta.3 hook may act before the first in-app warning. Install the APK in both owner and dual (e.g. user 95) users — the `--user 95` copy is a separate second copy of the management App's own data for LSPosed per-user scope only and cannot write policy (owner user 0 only, see `docs/USAGE.md`); enable the module (`Dual your Galaxy`, LSPosed module; `module.prop` id `io.github.samson910022.galaxydualplus`, while a locally built debug APK has `io.github.samson910022.galaxydualplus.debug` — a known mismatch) with `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
+- **Install / upgrade warning (v0.1.0-beta.3) — read this entire warning before following the Release link:**
+  **Check which id you currently have**: if the old id `com.galaxydual.plus`, this is a clean install — no migration of old data, no coexistence with the new id, back up first and verify the backup is restorable; if already `io.github.samson910022.galaxydualplus` (including beta.2 → beta.3), this is a same-id, same-signer in-place upgrade — **do not uninstall**; Android ordinarily keeps that management App's data in place, but this is **not** a promise that Samsung clones or their data remain intact.
+  Samsung may automatically delete clones and permanently erase their data; ordinary existing dual apps **do not need to be manually removed** for this package-id migration — this is **not** a claim that they are unaffected, and this App provides **no deletion guard**.
+  Release applicationId `io.github.samson910022.galaxydualplus`, locally built debug APK `io.github.samson910022.galaxydualplus.debug` — a different package, and its applicationId does not match the `module.prop` module id `io.github.samson910022.galaxydualplus` (known limitation, not guaranteed to load correctly in LSPosed); no migration from the old id `com.galaxydual.plus` (preferences / policy draft / risk ACK are not carried over), no built-in import/export. Back up first and verify the backup is restorable. Do **not** enable the legacy management App / LSPosed module together with the new one (ordinary dual apps need not be manually removed for this migration, and data is not merged). Disabling, uninstalling, opting out or rebooting are **not** a deletion guard; the beta.3 hook may act before the first in-app warning. BBC available-list injection is experimental / not device-verified on this version; as of v0.1.0-beta.3 (`fc579de3`) there is no pre-activation opt-in (after PR #90 merges, `docs/HOOK.md` §1.4 / the ADR are authoritative).
+  **The published Release page still has the old identity / A/B/C wording; until the maintainer syncs it, rely on this warning and the repo's `docs/RELEASE_NOTES_beta3.md`.** After the sync, see [v0.1.0-beta.3 release notes](https://github.com/samson910022/Dual-your-galaxy/releases/tag/v0.1.0-beta.3).
+  Install the same signed `app-release.apk` in both owner and dual (e.g. user 95) users — `adb install --user 95 <path>/app-release.apk` (or `adb install -r --user 95 <path>/app-release.apk` to update an already-installed same-id copy); the `--user 95` copy is a separate second copy of the management App's own data for LSPosed per-user scope only and cannot write policy (owner user 0 only, see `docs/USAGE.md`). A locally built debug APK is an optional developer-only path (different package, module-id mismatch, no guaranteed LSPosed load). Enable the module (`Dual your Galaxy`, LSPosed module; `module.prop` id `io.github.samson910022.galaxydualplus`) with `system` + daagent scopes in LSPosed, then reboot. Never touches Knox.
 - The marker proves hook installation only, not policy effect (empty=>observe-only on the callback
   return object, not a guarantee of device safety — cold-start deletion see `BBC_COLDSTART_DELETE_INCIDENT.md`;
   static-final holder fields may remain `ObserveOnly`, reflection failures `Skipped`; see
