@@ -26,6 +26,8 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -207,17 +209,66 @@ class PolicyRepairHintTest {
         }
     }
 
+    // PR #89 Phase C: models a slow SharedPreferences.commit(). The FIRST save
+    // (the background mark) signals entry then blocks on releaseSave while
+    // holding repairHintIoLock; the SECOND save (the UI ack's clear) completes
+    // normally. `writes` counts only PHYSICAL commits, so a stale task that is
+    // skipped by the pre-save ticket fence contributes no entry.
+    private class LatchedFirstSaveStore : RepairHintStore {
+        private val map = HashMap<String, Any>()
+        val writes = CopyOnWriteArrayList<RepairHintState>()
+        val saveEntered = CountDownLatch(1)
+        val releaseSave = CountDownLatch(1)
+        private val calls = AtomicInteger(0)
+
+        override fun load(): RepairHintState = synchronized(this) {
+            RepairHintState(
+                active = map[REPAIR_HINT_KEY_ACTIVE] as? Boolean ?: false,
+                generation = map[REPAIR_HINT_KEY_GENERATION] as? Long ?: 0L,
+                repairedVersion = map[REPAIR_HINT_KEY_REPAIRED_VERSION] as? Long ?: -1L,
+            )
+        }
+
+        override fun save(state: RepairHintState): Boolean {
+            val call = calls.incrementAndGet()
+            writes.add(state)
+            if (call == 1) {
+                saveEntered.countDown()
+                try {
+                    if (!releaseSave.await(5, TimeUnit.SECONDS)) return false
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+            }
+            synchronized(this) {
+                map[REPAIR_HINT_KEY_ACTIVE] = state.active
+                map[REPAIR_HINT_KEY_GENERATION] = state.generation
+                map[REPAIR_HINT_KEY_REPAIRED_VERSION] = state.repairedVersion
+            }
+            return true
+        }
+    }
+
     private val vms = CopyOnWriteArrayList<DualViewModel>()
     private val coords = CopyOnWriteArrayList<PolicyTxCoordinator>()
 
     @Before
     fun setUp() {
+        // PR #89 Phase C: make BOTH test-created and GalaxyApp-created
+        // coordinators deterministic. With the global override installed, every
+        // pre-existing synchronous assertion (including the Phase A/B latch
+        // tests) sees IO run inline on the calling thread exactly as before.
+        // The new responsiveness tests temporarily clear it to exercise the
+        // real app-owned IO executor.
+        RepairHintIoOwner.dispatchOverrideForTests = { task -> task() }
         Dispatchers.setMain(Dispatchers.Unconfined)
         resetRemotePoisonForTests()
     }
 
     @After
     fun tearDown() {
+        RepairHintIoOwner.dispatchOverrideForTests = null
         for (vm in vms) {
             try { vm.dispose() } catch (_: Exception) { }
             try { vm.viewModelScope.cancel() } catch (_: Exception) { }
@@ -556,9 +607,10 @@ class PolicyRepairHintTest {
     // commit(false)/exceptions), treat unknown durability as UNKNOWN-active (bias
     // toward repeating the warning), never equate in-memory `persisted.active`
     // with a durable save, and serialize repair-hint commits with
-    // `repairHintIoLock` (physical commit stays OFF the coordinator monitor;
-    // it is NOT dispatched to a background IO owner — callers are the VM IO
-    // dispatcher / UI thread).
+    // `repairHintIoLock` (physical commit stays OFF the coordinator monitor).
+    // PR #89 Phase C: the physical commit now runs on the app-owned
+    // RepairHintIoOwner executor; this test class installs a synchronous
+    // dispatch override in setUp so all of these assertions stay deterministic.
     // =====================================================================
 
     // Faithful-enough SharedPreferences fake: Android's commitToMemory() updates
@@ -1709,5 +1761,190 @@ class PolicyRepairHintTest {
         coord.acknowledgeRepairHint()
         assertFalse("a later clear still publishes", coord.repairHint.value)
         assertTrue(coord.repairHintDurableForTests)
+    }
+
+    // =====================================================================
+    // PR #89 Phase C (R4): UI responsiveness. The production SharedPreferences
+    // commit() happens on an app-owned IO thread, NOT on the UI click thread.
+    // These tests clear the global synchronous override so the REAL executor is
+    // used, and use latches (never sleeps) to pin the blocking window.
+    // =====================================================================
+
+    @Test
+    fun uiAckDoesNotBlockWhileBackgroundSaveIsLatched() {
+        RepairHintIoOwner.dispatchOverrideForTests = null
+        val store = LatchedFirstSaveStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        val uiReturned = CountDownLatch(1)
+        val monitorOpReturned = CountDownLatch(1)
+
+        try {
+            // A background repair (DualViewModel Dispatchers.IO surrogate) owns
+            // the single IO thread and latches inside save(). Its dispatched
+            // task holds repairHintIoLock across the pause — the exact condition
+            // that used to block a UI click on the coordinator monitor/lock.
+            val markThread = Thread {
+                coord.markRepairHint(repairedVersion = 1L)
+            }.apply { isDaemon = true; name = "phase-c-background-mark" }
+            markThread.start()
+            assertTrue("the background save must latch", store.saveEntered.await(3, TimeUnit.SECONDS))
+            assertTrue("the save is still latched", store.releaseSave.count > 0L)
+
+            // UI surrogate: acknowledgeRepairHint() must return after the fused
+            // decision + flow publication, WITHOUT waiting for the latched save.
+            val uiThread = Thread {
+                try {
+                    coord.acknowledgeRepairHint()
+                } finally {
+                    uiReturned.countDown()
+                }
+            }.apply { isDaemon = true; name = "phase-c-ui-surrogate" }
+            uiThread.start()
+            assertTrue(
+                "UI ack must return within a bounded time while the background save is latched",
+                uiReturned.await(300, TimeUnit.MILLISECONDS),
+            )
+            uiThread.join(3_000L)
+            assertFalse("UI surrogate thread must have finished", uiThread.isAlive)
+            assertTrue("the background save is STILL latched after the UI ack returned", store.releaseSave.count > 0L)
+            assertFalse("pending-ack rule: flow hides at the decision, not after fsync", coord.repairHint.value)
+
+            // A third operation taking the coordinator monitor must also finish
+            // while save() is latched: save() is never called under `this`.
+            val monitorThread = Thread {
+                try {
+                    coord.repairHintPersistedState
+                } finally {
+                    monitorOpReturned.countDown()
+                }
+            }.apply { isDaemon = true; name = "phase-c-monitor-reader" }
+            monitorThread.start()
+            assertTrue(
+                "a monitor-taking operation must complete while save() is latched",
+                monitorOpReturned.await(300, TimeUnit.MILLISECONDS),
+            )
+            monitorThread.join(3_000L)
+            assertFalse("monitor reader must have finished", monitorThread.isAlive)
+
+            // FIFO sentinel on the same single-thread owner: it can only run
+            // AFTER the queued ack task has fully executed its outcome fence.
+            val ackTaskDone = CountDownLatch(1)
+            RepairHintIoOwner.dispatch { ackTaskDone.countDown() }
+
+            store.releaseSave.countDown()
+            markThread.join(3_000L)
+            assertFalse("background mark thread must have finished", markThread.isAlive)
+            assertTrue("the dispatched ack task must complete", ackTaskDone.await(3, TimeUnit.SECONDS))
+
+            assertEquals("only the mark and the ack physically commit", 2, store.writes.size)
+            // The mark entered save() before the ack was decided, so its physical
+            // write is allowed to land; only its OUTCOME is fenced as stale. The
+            // ack's later commit is the last write on disk.
+            assertTrue("the first physical write is the mark's active state", store.writes[0].active)
+            assertFalse("the newest ack owns the last disk write", store.writes.last().active)
+            assertFalse("disk holds the newest ack's inactive state", store.load().active)
+            assertFalse("mirror follows the newest ticket", coord.repairHintPersistedState.active)
+            assertFalse("flow stays hidden", coord.repairHint.value)
+            assertTrue("only the newest ticket certifies durability", coord.repairHintDurableForTests)
+        } finally {
+            store.releaseSave.countDown()
+            RepairHintIoOwner.dispatchOverrideForTests = { task -> task() }
+        }
+    }
+
+    @Test
+    fun staleSaveIsSkippedWhenNewerAckIsEnqueuedWhileOlderIoTaskIsLatched() {
+        RepairHintIoOwner.dispatchOverrideForTests = null
+        val store = GatedInterleavingRepairHintStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        // The seam now runs INSIDE the dispatched task, before repairHintIoLock.
+        // Park the older mark's task there so a newer ack can be enqueued while
+        // the older writer is latched but has NOT yet touched the store.
+        val olderLatched = CountDownLatch(1)
+        val releaseOlder = CountDownLatch(1)
+        val oneShot = AtomicBoolean(true)
+        coord.beforeRepairHintIoLockSeamForTests = {
+            if (oneShot.compareAndSet(true, false)) {
+                olderLatched.countDown()
+                try {
+                    releaseOlder.await(5, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+
+        val uiReturned = CountDownLatch(1)
+        try {
+            val markThread = Thread {
+                coord.markRepairHint(repairedVersion = 1L)
+            }.apply { isDaemon = true; name = "phase-c-stale-mark" }
+            markThread.start()
+            assertTrue("older IO task must reach the pre-IO-lock seam", olderLatched.await(3, TimeUnit.SECONDS))
+
+            // Enqueue the newer ack from the UI surrogate while the older task is
+            // latched; it must return immediately.
+            val uiThread = Thread {
+                try {
+                    coord.acknowledgeRepairHint()
+                } finally {
+                    uiReturned.countDown()
+                }
+            }.apply { isDaemon = true; name = "phase-c-stale-ack-ui" }
+            uiThread.start()
+            assertTrue("UI ack must return while the older IO task is latched", uiReturned.await(300, TimeUnit.MILLISECONDS))
+            uiThread.join(3_000L)
+            assertFalse("UI surrogate thread must have finished", uiThread.isAlive)
+
+            val ackTaskDone = CountDownLatch(1)
+            RepairHintIoOwner.dispatch { ackTaskDone.countDown() }
+
+            releaseOlder.countDown()
+            assertTrue("the queued ack task must finish", ackTaskDone.await(3, TimeUnit.SECONDS))
+            markThread.join(3_000L)
+            assertFalse("mark thread must have finished", markThread.isAlive)
+
+            // The pre-save ticket fence runs inside the task: the stale mark's
+            // physical save is SKIPPED entirely, so the only commit is the ack.
+            assertEquals("stale save must be skipped physically (only the ack commits)", 1, store.writes.size)
+            assertFalse("the sole physical write is the ack's clear", store.writes.last().active)
+            assertFalse("disk holds the ack's inactive state", store.load().active)
+            assertFalse("mirror follows the newest ticket", coord.repairHintPersistedState.active)
+            assertTrue("the newest ticket certifies durability", coord.repairHintDurableForTests)
+        } finally {
+            releaseOlder.countDown()
+            coord.beforeRepairHintIoLockSeamForTests = null
+            RepairHintIoOwner.dispatchOverrideForTests = { task -> task() }
+        }
+    }
+
+    @Test
+    fun productionDispatchDefaultsToAsyncOwnerThread() {
+        // Production behavior assertion: with the override cleared, dispatch()
+        // must NOT run the task on the caller thread. This is what keeps a UI
+        // click from paying for SharedPreferences.commit().
+        RepairHintIoOwner.dispatchOverrideForTests = null
+        try {
+            val caller = Thread.currentThread()
+            val ranOn = AtomicReference<Thread>()
+            val done = CountDownLatch(1)
+            RepairHintIoOwner.dispatch {
+                try {
+                    ranOn.set(Thread.currentThread())
+                } finally {
+                    done.countDown()
+                }
+            }
+            assertTrue("production dispatch must actually run the task", done.await(3, TimeUnit.SECONDS))
+            val ioThread = ranOn.get() ?: throw AssertionError("dispatched task never ran")
+            assertFalse("production dispatch must not run inline on the caller", ioThread === caller)
+            assertEquals("the app-owned IO thread name", "repair-hint-io", ioThread.name)
+            assertTrue("the IO owner thread must be a daemon", ioThread.isDaemon)
+        } finally {
+            RepairHintIoOwner.dispatchOverrideForTests = { task -> task() }
+        }
     }
 }

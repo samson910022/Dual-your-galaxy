@@ -50,6 +50,11 @@ class GalaxyAppTest {
 
     @Before
     fun setUp() {
+        // PR #89 Phase C: GalaxyApp creates the production coordinator, but this
+        // JVM test must keep the pre-Phase-C synchronous IO behavior so all
+        // existing assertions remain valid. The override is global so both
+        // test-created and GalaxyApp-created coordinators are covered.
+        RepairHintIoOwner.dispatchOverrideForTests = { task -> task() }
         app = GalaxyApp()
         // Reset any existing static serviceRef
         val serviceRefField = GalaxyApp::class.java.getDeclaredField("serviceRef").apply {
@@ -61,6 +66,7 @@ class GalaxyAppTest {
 
     @After
     fun tearDown() {
+        RepairHintIoOwner.dispatchOverrideForTests = null
         val serviceRefField = GalaxyApp::class.java.getDeclaredField("serviceRef").apply {
             isAccessible = true
         }
