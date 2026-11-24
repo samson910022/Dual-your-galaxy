@@ -17,25 +17,6 @@ fail() {
   exit 1
 }
 
-# DEX-entry guard retained from the historical grep-based checks: fail fast
-# when an APK carries no classes*.dex member. The class-presence decision
-# itself is delegated to scripts/check-dex-classdefs.py (real class_def_item
-# counts, not raw descriptor-string hits) — there is deliberately no grep
-# fallback here (issue #67).
-require_dex_entries() {
-  local apk="$1" dex_count
-  # Anchor to the whole archive member name, matching the parser's
-  # DEX_NAME_RE.fullmatch: 'assets/classes.dex', 'myclasses.dex' and
-  # 'classes.dex.bak' must NOT satisfy the guard. Use `unzip -Z1` (names only)
-  # and `grep -Ec` with `|| true` so a zero count exits the substitution
-  # cleanly under `set -euo pipefail` (grep returns 1 when count is 0); the
-  # resulting "0" is then caught by the explicit check below.
-  dex_count="$(unzip -Z1 "$apk" | grep -Ec '^classes[0-9]*\.dex$' || true)"
-  if [ "${dex_count:-0}" -eq 0 ]; then
-    fail "No DEX entries found in $apk"
-  fi
-}
-
 if [ "$#" -eq 0 ]; then
   echo "::error::usage: $0 <apk>..." >&2
   exit 2
@@ -239,9 +220,10 @@ print("OK: no sharedUserId in APK binary AndroidManifest.xml")
   #    reference), so an APK with zero class_def_item entries for the class
   #    passed the gate. scripts/check-dex-classdefs.py resolves
   #    class_def_item -> type_ids -> string_ids and counts actual definitions;
-  #    no grep fallback is kept. The DEX-entry presence guard + fail-fast
-  #    semantics are unchanged (require_dex_entries above).
-  require_dex_entries "$apk"
+  #    it is the sole DEX-policy authority here — it also fails closed on
+  #    missing/duplicated/non-canonical classes*.dex entries, gaps in secondary
+  #    numbering, corrupt tables and class_defs_size=0. There is deliberately
+  #    no second, looser shell name guard and no grep fallback (issue #67).
   if ! python3 "$SCRIPT_DIR/check-dex-classdefs.py" "$apk" 'Lrikka/shizuku/ShizukuProvider;'; then
     fail "ShizukuProvider class_def not found in DEX of $apk"
   fi
@@ -263,8 +245,9 @@ print("OK: no sharedUserId in APK binary AndroidManifest.xml")
   echo "FOUND DualHook entry in java_init.list"
 
   # 5. DualHook survives into the DEX as a real class_def (same #67 hardening
-  #    as step 2: class_def parsing, no descriptor-string grep fallback).
-  require_dex_entries "$apk"
+  #    as step 2: scripts/check-dex-classdefs.py is the sole DEX-policy
+  #    authority — class_def parsing, no descriptor-string grep fallback and
+  #    no separate shell DEX-name guard).
   if ! python3 "$SCRIPT_DIR/check-dex-classdefs.py" "$apk" 'Lcom/galaxydual/hook/DualHook;'; then
     fail "DualHook class_def not found in DEX of $apk"
   fi

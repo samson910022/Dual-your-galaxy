@@ -370,6 +370,7 @@ def build_all(outdir):
     bad_endian = bytearray(positive)
     struct.pack_into("<I", bad_endian, OFF_ENDIAN_TAG, 0xDEADBEEF)
     bad_endian = _write_dex(outdir, "bad-endian.dex", bytes(bad_endian))
+    written.append("bad-endian.dex")
     truncated_header = _write_dex(outdir, "truncated-header.dex", positive[:50])
     written.append("truncated-header.dex")
 
@@ -450,6 +451,13 @@ def build_all(outdir):
         ("integration-missing-shizuku", missing),
     ):
         apk(f"{name}.apk", xposed_members() + [("classes.dex", dex_payload)])
+    # A gap in secondary DEX numbering (no classes2.dex) with otherwise valid
+    # content and full xposed metadata. Both targets are present and no member
+    # is duplicated, so the ONLY defect is the name-level multi-dex policy —
+    # this proves check-dex-classdefs.py enforces it through the wrapper too.
+    apk("integration-numbering-gap.apk",
+        xposed_members() + [("classes.dex", multi_primary),
+                            ("classes3.dex", multi_secondary)])
     return written
 
 
