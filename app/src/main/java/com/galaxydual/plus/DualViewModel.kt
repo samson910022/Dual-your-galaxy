@@ -7018,8 +7018,16 @@ class DualViewModel(
         // PR-37 Phase B #2：補觸恢復攜帶當下 verified (id, serial) 配對。
         val target = SelectionTarget(inv.targetId, inv.targetSerial)
         if (selectionRestoredForTarget == target) return
+        // #70 queued-restore token：在入隊（launch）當下快照 gen。clearSelectionLocal
+        // 是同步 UI 方法、不持 opMutex，故可能在此之後、restore 真正取得 mutex
+        // 之前推進 gen；攜帶此快照才能讓晚到的 restore 自我作廢（見
+        // restoreSelectionLocked 的 expectedGen 守衛）。不為此另加 catalog/請求
+        // token——catalog 引用與 verified 身份的維度已由守衛 (b)(c) 覆蓋。
+        val expectedGen = selectionGen.get()
         viewModelScope.launch {
-            opMutex.withLock { restoreSelectionLocked(target.id, target.serial) }
+            opMutex.withLock {
+                restoreSelectionLocked(target.id, target.serial, expectedGen = expectedGen)
+            }
         }
     }
 
@@ -13128,6 +13136,8 @@ class DualViewModel(
     // - PR-37 Phase B #2：serial 綁定——調用端傳 id，本體以 inventory 的 serial
     //   配對驗證（inventory id == targetId 才取其 serial，否則 null 嚴格比對，
     //   外來 id 永不借用他目標的 serial）。
+    // 顯式恢復刻意不帶 expectedGen token（null）：使用者本次明確請求就是最新
+    // 意圖，不應被入隊後的其他選取變更作廢；此路徑仍受 (a)(b)(c) 守衛約束。
     fun restoreSelection(targetId: Int, availableKeys: Set<String>? = null) {
         viewModelScope.launch {
             val inv = _state.value.inventory
@@ -13154,10 +13164,16 @@ class DualViewModel(
     //     當前 catalog（交集仍有效）；
     // (c) 當前 (id,serial) 仍等於起始 verified 身份且等於本次請求目標（防
     //     請求外 stale＋中途遷移）。
+    // #70 queued-restore token：expectedGen 是「入隊當下」的 selectionGen 快照
+    //（僅 setSourceCatalog 自動補觸傳入；refresh／公開 restoreSelection 傳 null）。
+    // 攜此 token 的 restore 若在等待 opMutex 期間被 clearSelectionLocal 等方法
+    // 推進 gen，即使鎖內 startGen 讀到的是清除後的新值也必須放棄，避免晚到的
+    // 佇列 restore 把已清空的選取重新填回。null 表示顯式恢復，不受此 token 約束。
     private suspend fun restoreSelectionLocked(
         targetId: Int,
         targetSerial: Int? = null,
         availableKeys: Set<String>? = null,
+        expectedGen: Long? = null,
     ) {
         val store = selectionStore ?: return
         if (targetId <= NO_TARGET_ID) return
@@ -13176,6 +13192,10 @@ class DualViewModel(
         // (setSourceCatalog 補觸或下一次 refresh/restore) 仍可重試。
         if (cur.sourceCatalog.isEmpty()) return
         val startGen = selectionGen.get()
+        // #70：入隊快照失效早拒——等待 opMutex 期間若 gen 已變（典型為
+        // clearSelectionLocal），連 store I/O 都不做，直接放棄（不燒 marker、
+        // 不碰持久化）。鎖內 startGen 已被重新讀取，故此處比較 expectedGen 即可。
+        if (expectedGen != null && expectedGen != startGen) return
         val startCatalog = cur.sourceCatalog
         val startVerified =
             SelectionTarget(cur.inventory.targetId, cur.inventory.targetSerial)
@@ -13207,6 +13227,12 @@ class DualViewModel(
         val latest = _state.value
         // (a) 選取仍允許自動恢復：為空且期間無任何選取變更（gen 守 ABA）。
         if (latest.selectedKeys.isNotEmpty() || selectionGen.get() != startGen) return
+        // (a2) #70 queued-restore token：入隊快照必須仍等於提交當下的 gen。
+        // 攜 token 的 restore 在等待 opMutex 之前若已被 clear 推進 gen，其
+        // startGen 是鎖內重新讀的新值，(a) 攔不到；唯有比對入隊快照才能擋住
+        // 晚到的佇列 restore 重新填回已清空的選取。此守衛不燒 marker、
+        // 不刪持久化，也不影響後續不帶 token 的顯式 restoreSelection()。
+        if (expectedGen != null && selectionGen.get() != expectedGen) return
         // (b) catalog 未變：引用同一實例＋交集仍有效。
         if (latest.sourceCatalog !== startCatalog) return
         val curKeys = latest.sourceCatalog.map { it.appKey }.toSet()

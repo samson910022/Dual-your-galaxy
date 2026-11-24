@@ -2694,4 +2694,89 @@ class InventorySelectionTest {
         await { chatA in vm.state.value.selectedKeys }
         assertEquals(setOf(chatA), vm.state.value.selectedKeys)
     }
+
+    // PR #88 F4 / issue #70：真實 UI 入口 setSourceCatalog 的自動補觸恢復必須
+    // 攜帶「入隊當下」的 gen 快照。第一個 restore 持有 opMutex 卡在 loadRaw 時，
+    // 後續兩個 restore 排在 mutex 上；使用者 clearSelectionLocal()（同步、不持
+    // mutex）在其後推進 gen。若無快照守衛，後兩者鎖內 startGen 讀到的是清除後
+    // 的新值，(a) ABA 守衛攔不到，會把已清空的選取重新填回並燒掉 marker。
+    @Test
+    fun setSourceCatalog_queuedRestore_abortsAfterClearAndKeepsMarkerUnburned() {
+        val backend = MapBackend()
+        val chatA = "0:com.example.chat"
+        val gw = FakeRepo()
+        val clock = FakeClock()
+        val vm = makeVm(gw, clock, backend.store())
+        try {
+            await { vm.state.value.channelReady }
+            vm.setSourceCatalog(listOf(SourceAppEntry("com.example.chat", "Chat", 0, false)))
+            vm.refresh()
+            await {
+                !vm.state.value.loading &&
+                    vm.state.value.inventory.freshness == InventoryFreshness.FRESH &&
+                    vm.state.value.inventory.targetId == 95
+            }
+            // 以排在 opMutex 上的 cancelSavedSelection 當 drain barrier，確保
+            // refresh 的 FRESH 自動 restore（此刻 store 仍空）已完全結束，
+            // 才寫入快照；否則它可能讀到新快照並提前還原、燒掉 marker。
+            vm.cancelSavedSelection()
+            await { vm.state.value.msg.contains("已取消保存選取") }
+            assertTrue(vm.state.value.selectedKeys.isEmpty())
+            assertTrue(
+                backend.store().save(SELECTION_SOURCE_CATALOG, 95, setOf(chatA), 2000L, 15),
+            )
+            val savedRaw = backend.map[SELECTION_KEY]
+            assertNotNull(savedRaw)
+
+            backend.blockLoad = true
+            try {
+                // restore #1：取得 opMutex 後卡在 IO 層 loadRaw。
+                vm.setSourceCatalog(
+                    listOf(SourceAppEntry("com.example.chat", "Chat", 0, false)),
+                )
+                assertTrue(
+                    backend.loadEntered.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                )
+                // restore #2 / #3：在 clear 之前排進 opMutex（全新 list 實例，
+                // 讓守衛 (b) 的 catalog 引用比較在它們鎖內仍成立）。
+                vm.setSourceCatalog(
+                    listOf(SourceAppEntry("com.example.chat", "Chat", 0, false)),
+                )
+                vm.setSourceCatalog(
+                    listOf(SourceAppEntry("com.example.chat", "Chat", 0, false)),
+                )
+                // 三個 restore 皆未完成時清空（同步、不持 mutex）。
+                vm.clearSelectionLocal()
+                assertTrue(vm.state.value.selectedKeys.isEmpty())
+            } finally {
+                backend.loadRelease.countDown()
+            }
+            // persist(-1) 排在所有 restore 之後：其 msg 完成即 mutex 已排空。
+            vm.persistSelection(-1)
+            await { vm.state.value.msg.contains("no dual profile") }
+            assertEquals(
+                "#70 F4: queued setSourceCatalog restores must not repopulate after clear",
+                emptySet<String>(),
+                vm.state.value.selectedKeys,
+            )
+            assertEquals(emptyList<String>(), gw.installCalls)
+            assertEquals(emptyList<String>(), gw.uninstallCalls)
+            assertEquals(
+                "invalidated restore must not delete the persisted snapshot",
+                savedRaw,
+                backend.map[SELECTION_KEY],
+            )
+
+            // 鑑別子：marker 未被燒掉 → 後續不帶 token 的顯式 restore 仍可還原。
+            //（buggy 版本的 stale restore 會燒 marker，使此 restore 變 no-op。）
+            backend.blockLoad = false
+            vm.clearSelectionLocal()
+            vm.restoreSelection(95)
+            await { vm.state.value.selectedKeys == setOf(chatA) }
+            assertEquals(setOf(chatA), vm.state.value.selectedKeys)
+        } finally {
+            backend.blockLoad = false
+            backend.loadRelease.countDown()
+        }
+    }
 }
