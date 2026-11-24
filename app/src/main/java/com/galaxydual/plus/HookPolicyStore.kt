@@ -687,14 +687,21 @@ class HookPolicyStore(
     // Direct-injected test backends default to absent / failed write.
     private val loadBbcPreactivationOptinRaw: () -> Boolean? = { null },
     private val saveBbcPreactivationOptinRaw: (Boolean) -> Boolean = { false },
-    // PR #90 Phase C: AUTHORITATIVE durable reads for the app-scoped consent
-    // holder. These are `contains()`-style reads from the CURRENT service
+    // PR #90 Phase C (+ final fixer): AUTHORITATIVE durable reads for the app-scoped
+    // consent holder. These are `contains()`-style reads from the CURRENT service
     // generation's prefs instance, used only on bind/resync. A failed read is
     // null (never "granted"); the holder additionally fences them by generation
     // so a polluted local mMap from a failed commit can never clear Unknown.
+    // The migration marker completes the opt-in/classification pair: the app
+    // must not authorize Legacy on PRE_UPGRADE_EXISTING without it.
     // Direct-injected test backends default to absent / unreadable.
     private val readBbcInstallClassificationRaw: () -> String? = { null },
     private val readBbcPreactivationOptinAuthoritativeRaw: () -> Boolean? = { null },
+    // Final fixer: the migration marker is a SECOND durable proof for a genuine
+    // upgrade (PRE_UPGRADE_EXISTING). Like the opt-in key, read it with
+    // contains() so absent is a definite false and a read failure is null.
+    // Direct-injected test backends default to absent / unreadable.
+    private val readBbcLegacyMigratedAuthoritativeRaw: () -> Boolean? = { null },
 ) {
 
     // E07 (PR #74 R4): app-process-local, one-shot signal that a SUCCESSFUL
@@ -826,6 +833,17 @@ class HookPolicyStore(
     // service generation and never lets it clear a durable Unknown fence.
     internal fun readBbcPreactivationOptInAuthoritative(): Boolean? = try {
         readBbcPreactivationOptinAuthoritativeRaw()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
+    }
+
+    // Final fixer: authoritative migration-marker read, mirroring the opt-in
+    // read above. `contains()` => absent is a definite false; a read failure is
+    // null and never authorizes Legacy. Only used by the app consent resync.
+    internal fun readBbcLegacyMigratedAuthoritative(): Boolean? = try {
+        readBbcLegacyMigratedAuthoritativeRaw()
     } catch (ce: CancellationException) {
         throw ce
     } catch (_: Throwable) {
@@ -1347,18 +1365,24 @@ fun remoteHookPolicyStore(
                         // the optimistic mMap update inside commit() is always
                         // fenced by a visible gen bump. No commit => no poison.
                         poisonToken = prePoison(prefs)
-                        try {
+                        val committed = try {
                             ed.commit()
                         } catch (ce: CancellationException) {
                             throw ce
                         } catch (e: Throwable) {
                             throw e
                         }
+                        if (committed) {
+                            // Confirmed daemon persistence: the retry intent (if
+                            // any) is satisfied and must not be re-added to
+                            // future drafts. Inside versionCommitLock, matching
+                            // the documented single-writer invariant with the
+                            // planner that installed the pending intent.
+                            clearPendingBbcClassification()
+                        }
+                        committed
                     }
                     if (ok) {
-                        // Confirmed daemon persistence: the retry intent (if any)
-                        // is satisfied and must not be re-added to future drafts.
-                        clearPendingBbcClassification()
                         poisonToken?.let { token ->
                             val cleared = clearPoison(prefs, token)
                             if (cleared) {
@@ -1671,6 +1695,28 @@ fun remoteHookPolicyStore(
                         false // definite ABSENT => definitively not granted
                     } else {
                         prefs.getBoolean(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN, false)
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        // Final fixer: the one-time migration marker, read with contains() from
+        // the CURRENT service instance. The App writes it in the SAME commit as
+        // PRE_UPGRADE_EXISTING; a failed commit can pollute the local mMap with
+        // both keys, so the holder fences this read by generation as well.
+        readBbcLegacyMigratedAuthoritativeRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    if (!prefs.contains(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED)) {
+                        false // definite ABSENT => never migrated
+                    } else {
+                        prefs.getBoolean(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED, false)
                     }
                 } catch (ce: CancellationException) {
                     throw ce

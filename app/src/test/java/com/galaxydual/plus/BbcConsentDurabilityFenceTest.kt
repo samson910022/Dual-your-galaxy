@@ -24,6 +24,7 @@ import org.junit.Test
 
 private val optinKey = PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN
 private val classKey = PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION
+private val markerKey = PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class BbcConsentDurabilityFenceTest {
@@ -48,6 +49,21 @@ class BbcConsentDurabilityFenceTest {
             return true
         }
 
+        /**
+         * Owner-App bind-time classification: BOTH keys go into the optimistic
+         * local map first. A failed commit leaves them there while the daemon's
+         * durable map stays untouched — exactly the pollution the holder must
+         * not authorize Legacy from.
+         */
+        fun commitClassification(classification: String, marker: Boolean): Boolean {
+            local[classKey] = classification
+            local[markerKey] = marker
+            if (!commitOk) return false
+            durable[classKey] = classification
+            durable[markerKey] = marker
+            return true
+        }
+
         /** New binder instance: daemon truth, no pollution from the old mMap. */
         fun freshInstance(): FakePrefs = FakePrefs(durable)
 
@@ -55,6 +71,7 @@ class BbcConsentDurabilityFenceTest {
             serviceGeneration = generation,
             optInGranted = if (contains(optinKey)) getBoolean(optinKey, false) else false,
             classification = if (contains(classKey)) getString(classKey, null) else null,
+            migrated = if (contains(markerKey)) getBoolean(markerKey, false) else false,
             legacyRuntimeEnabled = true,
         )
     }
@@ -122,6 +139,95 @@ class BbcConsentDurabilityFenceTest {
         assertEquals("raw local mMap must never upgrade the fence",
             BbcActivationConsentState.Unknown, holder.currentState())
         h.dispose()
+    }
+
+    @Test
+    fun failedClassificationCommit_neverAuthorizesLegacy_fromPollutedLocalMap() = runTest {
+        // Upgrade install: the owner App's bind-time durable classification
+        // commit fails. The local mMap is polluted with PRE_UPGRADE + marker;
+        // the daemon persisted NEITHER key.
+        val durable = mutableMapOf<String, Any>()
+        val service = FakePrefs(durable)
+        service.commitOk = false
+        assertFalse(service.commitClassification(
+            PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING, marker = true,
+        ))
+        assertEquals(PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING, service.local[classKey])
+        assertEquals(true, service.local[markerKey])
+        assertFalse("daemon persisted no classification", durable.containsKey(classKey))
+        assertFalse("daemon persisted no migration marker", durable.containsKey(markerKey))
+
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        // GalaxyApp feeds the FAILED outcome to the holder and MUST NOT resync
+        // from this polluted read. Even if a stale caller does, the fence holds.
+        holder.markInstallClassificationFailed(1L)
+        holder.resolve(service.authoritativeRead(1L))
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+        assertTrue(holder.currentState().requiresConsentFor(true))
+        assertNull(holder.currentState().toggleUi().checked)
+
+        val a = harness(holder, coordinator(holder, service))
+        a.userToggle(true)
+        assertEquals("a polluted upgrade must still demand consent", 1, a.dialogsShown.size)
+        assertEquals(0, a.toggleCalls.size)
+        a.dispose()
+
+        // Retry on a NEW service generation with a confirmed durable commit:
+        // classification + marker are both present in the daemon's map.
+        service.commitOk = true
+        assertTrue(service.commitClassification(
+            PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING, marker = true,
+        ))
+        holder.onServiceGenerationChanged(2L)
+        val b = harness(holder, coordinator(holder, service))
+        b.coordinator.submitConsentRead()
+        testScheduler.advanceUntilIdle()
+        assertEquals(BbcActivationConsentState.Legacy(true), holder.currentState())
+        assertEquals(true, b.lastSettledChecked)
+        assertFalse(holder.currentState().requiresConsentFor(true))
+        b.userToggle(true)
+        b.userToggle(false)
+        assertEquals("a durable legacy migration must not demand consent", 0, b.dialogsShown.size)
+        assertEquals(listOf(true, false), b.toggleCalls)
+        b.dispose()
+    }
+
+    @Test
+    fun staleBindClassificationFailureCannotFenceCurrentGeneration() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(newService().authoritativeRead(1L))
+        assertEquals(BbcActivationConsentState.NotGranted, holder.currentState())
+
+        // Binder death + rebind: generation 2 is backed by a NEW prefs instance.
+        holder.onServiceGenerationChanged(2L)
+        holder.resolve(newService().authoritativeRead(2L))
+        assertEquals(BbcActivationConsentState.NotGranted, holder.currentState())
+
+        // The old bind's IO attempt finishes late and records its failure with
+        // the DEAD generation. GalaxyApp now samples the generation from the
+        // same IO snapshot as the prefs instance, but even if a stale caller
+        // reports the dead generation, it must NOT fence the current instance.
+        holder.markInstallClassificationFailed(1L)
+        assertEquals("a dead generation must not fence the current one",
+            BbcActivationConsentState.NotGranted, holder.currentState())
+        holder.resolve(newService().authoritativeRead(2L))
+        assertEquals(BbcActivationConsentState.NotGranted, holder.currentState())
+
+        // A failure attributed to the CURRENT generation DOES fence: the
+        // optimistic PRE_UPGRADE + marker local read from that same polluted
+        // instance can then never authorize Legacy.
+        val pollutedCurrent = FakePrefs(mutableMapOf<String, Any>())
+        pollutedCurrent.commitOk = false
+        assertFalse(pollutedCurrent.commitClassification(
+            PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING, marker = true,
+        ))
+        holder.markInstallClassificationFailed(2L)
+        holder.resolve(pollutedCurrent.authoritativeRead(2L))
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+        assertTrue(holder.currentState().requiresConsentFor(true))
+        assertNull(holder.currentState().toggleUi().checked)
     }
 
     @Test
@@ -219,7 +325,7 @@ class BbcConsentDurabilityFenceTest {
         b.accept()
         testScheduler.advanceUntilIdle()
         assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
-        holder.resolve(BbcConsentAuthoritativeRead(2L, true, null, true))
+        holder.resolve(BbcConsentAuthoritativeRead(2L, true, null, null, true))
         assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
         b.dispose()
 
@@ -251,7 +357,7 @@ class BbcConsentDurabilityFenceTest {
         assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
 
         // Same-gen raw local read=true (the polluted mMap) is rejected.
-        holder.resolve(BbcConsentAuthoritativeRead(1L, true, null, true))
+        holder.resolve(BbcConsentAuthoritativeRead(1L, true, null, null, true))
         assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
 
         // Confirmed write on the current generation DOES grant.

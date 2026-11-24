@@ -400,8 +400,10 @@
     <string name="settings_bbc_injection_effect_unknown">Effect unknown — restart the hook process (or reboot) and verify. This switch is NOT a Samsung cold-start deletion guard.</string>
     <!-- PR #74 R7b-3: version-tagged experimental / not-device-verified label for the BBC main effect. -->
     <string name="settings_bbc_injection_experimental_notice">Experimental: the BBC main effect is not device-verified on this version (%1$s). No general effectiveness or data-safety guarantee.</string>
-    <!-- PR5 Phase B2 (#80): one-time BBC pre-activation opt-in (persisted after acceptance; never asked again). -->
-    <string name="settings_bbc_preactivation_dialog_title">One-time consent before enabling BBC injection</string>
+    <!-- PR5 Phase B2 (#80): one-time GRANT on first enable, persisted after
+         acceptance; it may be re-confirmed if persistence is Unknown or the
+         service rebinds, so this is NOT "never asked again". -->
+    <string name="settings_bbc_preactivation_dialog_title">One-time grant on first enable of BBC injection (may be re-confirmed if persistence is unknown)</string>
     <string name="settings_bbc_preactivation_dialog_message">You are about to turn on BBC injection. On new installs the Hook keeps the BBC effect OFF until this pre-activation consent is durably written; accepting is two phases: first a consent key in dual_policy, then — only after it is confirmed — your chosen BBC toggle setting. A partial success is possible: if the consent is persisted but the toggle write outcome is UNKNOWN, do not assume a rollback or that the effect is on; re-verify (a hook-process restart or reboot may be needed).\n\nCancel, Back, or tapping outside writes nothing and returns the UI to its last known state; that does NOT prove the Hook effect is off.\n\nThis consent is NOT a guard against Samsung\'s cold-start deletion — that deletion happens before the BBC callback (issue #75). The BBC main effect is still experimental and not device-verified on this version; no general effectiveness or data-safety guarantee.</string>
     <string name="settings_bbc_preactivation_dialog_positive">I understand, save consent and continue</string>
     <string name="settings_bbc_preactivation_dialog_negative">Cancel, keep last known state</string>

@@ -404,7 +404,7 @@
     <string name="settings_bbc_injection_effect_unknown">生效狀態未知——請重啟 Hook 行程（或開機）後再核對；此開關不是 Samsung 冷啟動刪除防護。</string>
     <!-- PR #74 R7b-3: version-tagged experimental / not-device-verified label for the BBC main effect. -->
     <string name="settings_bbc_injection_experimental_notice">實驗性：BBC 主要效果尚未於此版本（%1$s）實機確認；不保證普遍生效，也不保證資料安全。</string>
-    <!-- PR5 Phase B2 (#80): 首次 BBC 注入 pre-activation opt-in（接受一次即持久，不再重複問）。 -->
+    <!-- PR5 Phase B2 (#80): 首次 BBC 注入 pre-activation opt-in（接受後同意會持久化；但若持久化結果未知或服務重新綁定，可能再次要求確認，並非「從此不再問」）。 -->
     <string name="settings_bbc_preactivation_dialog_title">首次啟用 BBC 注入前的明確同意</string>
     <string name="settings_bbc_preactivation_dialog_message">你即將開啟 BBC 注入。新安裝在 App 持久化這份 pre-activation 同意之前，Hook 的 BBC 效應維持關閉；接受時分兩階段：先寫入 consent 鍵到 dual_policy，成功持久化後才寫入你選擇的 BBC 開關設定。兩階段可能只有前半段成功：若同意已持久化但開關寫入結果未知，不能假設已回滾或已生效，請重新核對（可能需重啟 Hook 行程或開機）。\n\n取消、返回鍵或點擊對話框外皆不寫入任何鍵，畫面回到最後已知狀態；這不證明 Hook 效應已關閉。\n\n請注意：這份同意「不是」Samsung 冷啟動刪除的防護——刪除早於 BBC 回調（issue #75）；BBC 主要效果仍屬實驗性，尚未於此版本實機驗證，不保證普遍生效，也不保證資料安全。</string>
     <string name="settings_bbc_preactivation_dialog_positive">我了解，寫入同意並繼續</string>

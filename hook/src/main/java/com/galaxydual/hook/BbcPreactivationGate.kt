@@ -24,7 +24,7 @@ package com.galaxydual.hook
 // BREAKING-CHANGE SENSITIVITY: the policy keys and classification values in
 // PolicySource must be renamed only with an explicit migration plan; renaming
 // abandons persisted consent / classification state. See
-// docs/ADR_bbc_preactivation_optin.md (docs are updated in a later phase).
+// docs/ADR_bbc_preactivation_optin.md.
 // INTERNAL: only the strictly read-only BbcPreactivationHookReader is public
 // for the cross-module (:app) regression test.
 internal data class BbcPreactivationDecision(

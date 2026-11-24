@@ -37,7 +37,8 @@ class BbcActivationConsentStateMachineTest {
         optIn: Boolean?,
         classification: String? = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
         runtime: Boolean = false,
-    ) = BbcConsentAuthoritativeRead(generation, optIn, classification, runtime)
+        migrated: Boolean? = null,
+    ) = BbcConsentAuthoritativeRead(generation, optIn, classification, migrated, runtime)
 
     /** Shared app-scoped coordinator on one TestScheduler, as in BbcToggleConcurrencyTest. */
     private fun TestScope.newCoordinator(
@@ -171,6 +172,7 @@ class BbcActivationConsentStateMachineTest {
             read(
                 1L, optIn = false,
                 classification = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                migrated = true, // the Hook-equivalent durable marker is required
                 runtime = true,
             ),
         )
@@ -185,6 +187,101 @@ class BbcActivationConsentStateMachineTest {
         assertEquals("legacy installs never see the consent dialog", 0, h.dialogsShown.size)
         assertEquals(listOf(false, true), h.toggleCalls)
         h.dispose()
+    }
+
+    @Test
+    fun preUpgradeWithoutDurableMarker_neverAuthorizesLegacy() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(
+            read(
+                1L, optIn = false,
+                classification = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                migrated = null, // marker absent/unreadable: same rule as the Hook gate
+                runtime = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Initializing, holder.currentState())
+        assertTrue(holder.currentState().requiresConsentFor(true))
+        holder.resolve(
+            read(
+                1L, optIn = false,
+                classification = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                migrated = false,
+                runtime = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Initializing, holder.currentState())
+
+        // MIGRATED opens without a marker; it is the durable classification.
+        holder.resolve(
+            read(
+                1L, optIn = false,
+                classification = PolicySource.INSTALL_CLASSIFICATION_MIGRATED,
+                runtime = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Legacy(true), holder.currentState())
+        assertFalse(holder.currentState().requiresConsentFor(true))
+    }
+
+    @Test
+    fun failedCommitOnCurrentGeneration_advancesExistingUnknownFence() {
+        val h = BbcActivationConsentHolder()
+        h.onServiceGenerationChanged(1)
+        h.markConsentWriteOutcome(BbcWriteOutcome.Unknown, 1, 1) // fence@1
+        assertEquals(BbcActivationConsentState.Unknown, h.currentState())
+        h.onServiceGenerationChanged(2) // Unknown preserved, fence@1
+        h.markConsentWriteOutcome(BbcWriteOutcome.Unknown, 2, 2) // failed commit on CURRENT gen
+        h.resolve(read(2, true, null, migrated = true)) // polluted read must not clear it
+        assertEquals(
+            "a same-generation read must never clear a fence raised on that generation",
+            BbcActivationConsentState.Unknown,
+            h.currentState(),
+        )
+
+        // Only a Confirmed commit on gen 2 clears that fence.
+        assertTrue(h.markConsentWriteOutcome(BbcWriteOutcome.Confirmed(true), 3, 2))
+        assertEquals(BbcActivationConsentState.Granted, h.currentState())
+
+        // The other clearing path: a NEWER-generation authoritative read.
+        val g = BbcActivationConsentHolder()
+        g.onServiceGenerationChanged(1)
+        g.markConsentWriteOutcome(BbcWriteOutcome.Unknown, 1, 1)
+        g.onServiceGenerationChanged(2)
+        g.markConsentWriteOutcome(BbcWriteOutcome.Unknown, 2, 2)
+        g.resolve(read(2, true))
+        assertEquals(BbcActivationConsentState.Unknown, g.currentState())
+        g.onServiceGenerationChanged(3)
+        g.resolve(read(3, true))
+        assertEquals(BbcActivationConsentState.Granted, g.currentState())
+    }
+
+    @Test
+    fun lateBindClassificationFailure_doesNotDowngradeGrantedOrLegacy() {
+        val granted = BbcActivationConsentHolder()
+        granted.onServiceGenerationChanged(1L)
+        granted.resolve(read(1L, optIn = true))
+        assertEquals(BbcActivationConsentState.Granted, granted.currentState())
+        granted.markInstallClassificationFailed(1L)
+        assertEquals("a late bind-time failure must not undo a confirmed grant",
+            BbcActivationConsentState.Granted, granted.currentState())
+
+        val legacy = BbcActivationConsentHolder()
+        legacy.onServiceGenerationChanged(2L)
+        legacy.resolve(
+            read(
+                2L, optIn = false,
+                classification = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                migrated = true,
+                runtime = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Legacy(true), legacy.currentState())
+        legacy.markInstallClassificationFailed(2L)
+        assertEquals("a late bind-time failure must not undo a durable Legacy resync",
+            BbcActivationConsentState.Legacy(true), legacy.currentState())
+        assertFalse(legacy.currentState().requiresConsentFor(true))
     }
 
     @Test
@@ -303,7 +400,9 @@ class BbcActivationConsentStateMachineTest {
         val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
+        val readEntered = CountDownLatch(1)
         var commitThread = ""
+        var readThread = ""
         try {
             val holder = BbcActivationConsentHolder()
             holder.onServiceGenerationChanged(1L)
@@ -316,6 +415,11 @@ class BbcActivationConsentStateMachineTest {
                     entered.countDown()
                     release.await() // genuinely blocking binder-style seam
                     BbcWriteOutcome.Confirmed(true)
+                },
+                consentRead = { generation ->
+                    readThread = Thread.currentThread().name
+                    readEntered.countDown()
+                    read(generation, false)
                 },
                 consentHolder = holder,
             )
@@ -334,6 +438,14 @@ class BbcActivationConsentStateMachineTest {
             withTimeout(5_000L) { while (holder.currentState() !is BbcActivationConsentState.Granted) yield() }
             withTimeout(5_000L) { while (h.toggleCalls.isEmpty()) yield() }
             assertEquals(listOf(true), h.toggleCalls)
+
+            // The authoritative consent READ lane must be just as off-Main as
+            // the write, and must share the same app-scoped IO consumer.
+            coordinator.submitConsentRead {}
+            assertTrue("consent read must start", readEntered.await(5, TimeUnit.SECONDS))
+            assertTrue("consent read must run on the IO lane: $readThread",
+                readThread.contains("bbc-consent-io"))
+            assertFalse("consent read must not run on Main", readThread == mainThread)
             h.dispose()
         } finally {
             appScope.cancel()

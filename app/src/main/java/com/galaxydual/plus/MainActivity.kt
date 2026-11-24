@@ -2648,6 +2648,10 @@ class MainActivity : ComponentActivity() {
     private fun buildBbcInjectionToggle(): View {
         // A fresh dialog rebuild disposes the previous controller's UI only;
         // the app-scoped coordinator/holder (and any in-flight commit) survives.
+        // A still-pending consent dialog from the old view must be dismissed
+        // SILENTLY at rebuild start: its callbacks belong to a dead intent and
+        // a late accept must never write a grant for this rebuilt toggle.
+        dismissBbcConsentDialogSilently()
         bbcConsentStateJob?.cancel()
         bbcToggleController?.dispose()
         val app = application as GalaxyApp
@@ -2887,7 +2891,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         // A fresh process starts Initializing until the bind-time authoritative
-        // read lands. Ask the app IO lane to resnow; the state collector below
+        // read lands. Ask the app IO lane to resync; the state collector below
         // repaints the neutral row when it resolves.
         if (initialConsentState is BbcActivationConsentState.Initializing) {
             app.bbcToggleCoordinator.submitConsentRead()

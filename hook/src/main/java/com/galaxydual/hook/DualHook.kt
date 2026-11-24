@@ -240,9 +240,10 @@ internal fun bbcInjectionGateOpenWithSticky(
     return BbcGateDecision(open, nextOffAtMs)
 }
 
-// This is the HYBRID runtime rule only. The complete BBC effect AND is
-// bbcEffectGateOpen below: compile-time switch × pre-activation opt-in gate ×
-// this hybrid rule (whose remote-prefs I/O wiring landed in PR5 Phase B1).
+// This is the HYBRID runtime rule only. The FINAL production BBC effect AND is
+// bbcCoherentEffectGateBounded -> bbcCoherentEffectDecision: one coherent
+// getAll() snapshot feeds BOTH the pre-activation gate and this hybrid rule,
+// behind one bounded read (no second pref read, no marker write).
 // The runtime read is LAZY so a compile-time-closed gate keeps
 // its historic zero-pref-read / zero-IPC path. nowMs/ttlMs/stickyState are
 // injectable for JVM tests; production uses the process-local AtomicReference

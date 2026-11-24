@@ -11,7 +11,9 @@
   - App consent：`BbcActivationConsentState.kt`、`BbcToggleCoordinator.kt`、`MainActivity.kt`，
     以及 `app/src/main/res/values*/strings.xml`。
   - Hook 接線：`hook/src/main/java/com/galaxydual/hook/DualHook.kt`
-    （`bbcEffectGateOpen()`／`BbcPreactivationHookReader.readCoherent()`）。**Hook 側沒有任何
+    （`bbcCoherentEffectGateBounded()` → `bbcCoherentEffectDecision()`，搭配
+    `readBbcPreactivationBounded()` 的單一 `getAll()` coherent snapshot 與
+    `BbcPreactivationHookReader.readCoherent()`）。**Hook 側沒有任何
     migration marker writer**；API 102 在 hooked app 取得的 remote preferences 是唯讀的。
   - 測試：`BbcPreactivationGateTest`、`BbcPreactivationPrefsTest`、`BbcCoherentGateTest`、
     `BbcPreactivationReadOnlyTest`、`BbcPreactivationClassificationTest`（production writer →
@@ -19,9 +21,10 @@
     `BbcConsentDurabilityFenceTest`、`BbcPreactivationConsentTest`；
     `BbcStickyPolicyTest`／`BbcGateBoundedWaitTest` 隨 fail-closed 決策更新。
 
-## 背景
+## 背景（OLD／released-beta 行為，非目前 HEAD）
 
-出貨行為是 `BBC_AVAILABLE_APPS_INJECTION=true`（compile-time）加上
+以下描述的是**舊版／已 released beta 的出貨行為**，保留只為說明本 ADR 的動機，
+**不是目前 HEAD 的行為**。舊版是 `BBC_AVAILABLE_APPS_INJECTION=true`（compile-time）加上
 `dual_policy/bbc_injection_enabled` 缺席／首次讀取失敗一律視為 `true`，
 因此 Hook **可能早於 App 首次風險警告或確認就生效**。App 的 `RiskNotice`
 checkbox 只是 app-private pref，不是 Hook 的 gate；Hook 只認 remote prefs。
@@ -44,6 +47,10 @@ fail-closed，並把 legacy 判定從「目前的草稿 bytes」改為 App 持�
    （不刪除、不清空、不改寫）。commit 失敗、binder 未 bind、重試中都不構成 migration
    證據；App 的 pending intent 會在重試時重新寫入相同鍵值，直到 `Confirmed` 為止。
    Hook 端 API 102 remote prefs 唯讀，**不聲稱 Hook 曾完成任何 marker 寫入**。
+   App 授權端比照 Hook gate：`PRE_UPGRADE_EXISTING` 亦須 authoritative marker
+   read 為 `true` 才進入 `Legacy`（`MIGRATED`／`EXPLICITLY_GRANTED` 不需要）；
+   bind-time 分類 commit 失敗時，App 不從被污染的 local mMap resync，而是對該
+   generation 安裝 Unknown fence，直到較新 service instance 的 durable resync。
 3. **明確 opt-out 永遠優先。** `bbc_injection_enabled=false` 或新 optin 鍵為
    `false` → OFF，優先於分類／遷移狀態。
 4. **App checkbox 不是 gate。** `RiskNotice` 只是 app-private 提示狀態；Hook 只認
@@ -94,7 +101,9 @@ fail-closed，並把 legacy 判定從「目前的草稿 bytes」改為 App 持�
   （都在其可寫入的 `XposedService` remote-prefs 通道），Hook 端唯讀；不聲稱 Hook
   端曾完成任何寫入。
 - 既有 hybrid 測試中「首次讀取失敗 fail-open」的預期已如實改為 fail-closed；
-  沒有刪除任何測試。
+  沒有丟棄任何 hybrid fail-open 預期。API 102 marker-writer 測試
+  (`BbcMigrationMarkerTest.kt`) 已隨其 production writer 一併移除（Hook 唯讀），
+  並由 read-only／owner-write 測試取代。
 - **已知限制（App opt-in commit Unknown 與冷行程）**：`commit(false)`／拋錯時如實
   回報 Unknown 且不寫 BBC 開關；本地 mMap 可能被樂觀污染，但 durable fence 不允許
   同 generation 的讀取或污染值清除 Unknown。因此**不能**宣稱「Hook 一定不提前

@@ -29,11 +29,18 @@ class BbcPreactivationBoundedTest {
 
     private class FakeRemotePrefs(
         private val values: Map<String, Any?>,
+        private val blockingGetAll: CountDownLatch? = null,
     ) : SharedPreferences {
         var editCalls = 0
             private set
+        var getAllCalls = 0
+            private set
 
-        override fun getAll(): MutableMap<String, *> = LinkedHashMap(values)
+        override fun getAll(): MutableMap<String, *> {
+            getAllCalls++
+            blockingGetAll?.await(2, TimeUnit.SECONDS)
+            return LinkedHashMap(values)
+        }
         override fun getString(key: String?, defValue: String?): String? = values[key] as? String ?: defValue
         override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? {
             @Suppress("UNCHECKED_CAST")
@@ -263,24 +270,27 @@ class BbcPreactivationBoundedTest {
 
     @Test
     fun timeoutThroughEffectGate_failsClosedWithNoWrites() {
-        // End-to-end shape of the production bbcGateOpen lambda: the bounded
-        // preactivation snapshot times out -> no decision, no writes at all,
-        // hybrid stage is skipped, overall gate CLOSED.
+        // The REAL production gate path: bbcCoherentEffectGateBounded submits
+        // ONE readBbcPreactivationBounded task whose single getAll() blocks past
+        // the deadline. No usable snapshot => bbcCoherentEffectDecision closes
+        // the gate, the hybrid stage is skipped, and ZERO writes are attempted.
         val release = CountDownLatch(1)
         val executor = newExecutor("test-bbc-pre-effect-timeout")
+        val hybridCalled = AtomicBoolean(false)
+        val prefs = FakeRemotePrefs(emptyMap(), blockingGetAll = release)
         try {
-            val open = bbcEffectGateOpen(
+            val open = bbcCoherentEffectGateBounded(
                 compileTimeGate = true,
-                preactivationOpen = {
-                    val snapshot = readBbcPreactivationBounded(executor, DualHook.BBC_GATE_MAX_MS) {
-                        release.await(2, TimeUnit.SECONDS)
-                        BbcPreactivationPrefs(true, null, null)
+                readBoundedSnapshot = {
+                    readBbcPreactivationBounded(executor, DualHook.BBC_GATE_MAX_MS) {
+                        BbcPreactivationHookReader.readCoherent(prefs)
                     }
-                    snapshot != null && bbcPreactivationDecisionOpen(true, snapshot)
                 },
-                hybridOpen = { true },
+                hybridOpen = { hybridCalled.set(true); true },
             )
-            assertFalse(open)
+            assertFalse("a timed-out coherent snapshot must close the gate", open)
+            assertFalse("no snapshot means the hybrid stage is never decided", hybridCalled.get())
+            assertEquals("the hook path must never attempt a write", 0, prefs.editCalls)
         } finally {
             release.countDown()
             executor.shutdownNow()

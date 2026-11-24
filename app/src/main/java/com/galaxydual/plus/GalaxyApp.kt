@@ -104,6 +104,11 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
                     serviceGeneration = generation,
                     optInGranted = store.readBbcPreactivationOptInAuthoritative(),
                     classification = store.readBbcInstallClassification(),
+                    // Final fixer: PRE_UPGRADE_EXISTING needs the SAME durable
+                    // marker the Hook gate requires. Both keys are contains()-read
+                    // from the current service instance; the holder still fences
+                    // them by generation.
+                    migrated = store.readBbcLegacyMigratedAuthoritative(),
                     legacyRuntimeEnabled = store.isBbcInjectionEnabled(),
                 )
             },
@@ -174,20 +179,53 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         // is ever written without a durable classification.
         if (!installClassificationOnce.get()) {
             bbcClassificationScope.launch {
-                val ok = try {
-                    ensureBbcInstallClassification { remotePreferences(PolicySource.POLICY_PREFS_NAME) }
+                // Final fixer: resolve the prefs instance AND sample the service
+                // generation INSIDE this IO coroutine, never on Main. Sampling
+                // on Main could pair a DEAD generation with a NEW prefs instance
+                // after binder death/rebind: the failure would then be recorded
+                // against the old generation (generation guard no-ops) while
+                // the new instance's optimistic mMap was polluted with
+                // PRE_UPGRADE + marker, letting a later read falsely resolve
+                // Legacy. CancellationException always propagates; every other
+                // throwable fails closed as binder-absent.
+                val prefs = try {
+                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+                val generation = bbcConsentServiceGeneration.get()
+                val ok = if (prefs == null) false else try {
+                    ensureBbcInstallClassification { prefs }
                 } catch (ce: CancellationException) {
                     throw ce
                 } catch (_: Throwable) {
                     false
                 }
-                // NoWrite (key already present) and a confirmed commit both
-                // satisfy the bind-time responsibility.
-                if (ok) installClassificationOnce.compareAndSet(false, true)
-                // Phase C: resolve authorization from the durable classification
-                // + opt-in keys on the app IO lane (never on Main, never from a
-                // cached local mMap).
-                refreshBbcActivationConsent()
+                if (generation != bbcConsentServiceGeneration.get()) {
+                    // A rebind landed while the attempt was in flight: this
+                    // attempt may have touched a now-dead prefs instance. Let
+                    // the newer bind's own attempt own the state; do not latch
+                    // the one-shot, refresh, or fence from its outcome.
+                } else if (ok) {
+                    // NoWrite (key already present) and a confirmed commit both
+                    // satisfy the bind-time responsibility.
+                    installClassificationOnce.compareAndSet(false, true)
+                    // Phase C: resolve authorization from durable keys only after
+                    // the classification is confirmed durable, on the app IO lane
+                    // (never on Main, never from a cached local mMap).
+                    refreshBbcActivationConsent()
+                } else {
+                    // Final fixer: a FAILED bind-time classification may have
+                    // left PRE_UPGRADE_EXISTING + marker in THIS instance's local
+                    // mMap while the daemon persisted NOTHING. Do NOT resync from
+                    // that read: fence this generation as Unknown so no legacy
+                    // checkbox or consent skip can be authorized by optimistic
+                    // pollution. A newer instance retry may clear the fence via
+                    // an authoritative read.
+                    bbcActivationConsentHolder.markInstallClassificationFailed(generation)
+                }
             }
         } else {
             bbcClassificationScope.launch { refreshBbcActivationConsent() }

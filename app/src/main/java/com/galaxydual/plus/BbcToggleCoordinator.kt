@@ -88,7 +88,7 @@ internal class BbcToggleCoordinator(
      * time so a stale service instance cannot certify consent.
      */
     private val consentRead: suspend (Long) -> BbcConsentAuthoritativeRead = { generation ->
-        BbcConsentAuthoritativeRead(generation, null, null, true)
+        BbcConsentAuthoritativeRead(generation, null, null, null, true)
     },
     /** The one app-scoped authorization holder; shared across all UI rebuilds. */
     internal val consentHolder: BbcActivationConsentHolder = BbcActivationConsentHolder(),
@@ -211,7 +211,7 @@ internal class BbcToggleCoordinator(
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (_: Throwable) {
-                        BbcConsentAuthoritativeRead(generation, null, null, true)
+                        BbcConsentAuthoritativeRead(generation, null, null, null, true)
                     }
                     // Resolve on the IO consumer thread: no Main-thread binder
                     // read, and a local mMap value can never clear the fence

@@ -14,6 +14,7 @@ import com.galaxydual.hook.PolicySource
 import kotlinx.coroutines.CancellationException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -200,5 +201,39 @@ class HookPolicyStorePreactivationTest {
     @Test(expected = CancellationException::class)
     fun optinReadPropagatesCancellationLikeTheExistingBbcReader() {
         remoteHookPolicyStore { throw CancellationException("cancelled") }.isBbcPreactivationOptIn()
+    }
+
+    @Test
+    fun persistedThenReplyThrows_isUnknownEvenThoughKeyIsVisible() {
+        // The fake flushes the optimistic map BEFORE the reply throws: a real
+        // daemon may have persisted the key while the binder reply was lost.
+        // The commit outcome must stay honest (Unknown / ambiguous), and a
+        // follow-up read is NOT an acknowledgement.
+        val prefs = OptinPrefs()
+        prefs.commitThrows = true
+        val store = remoteHookPolicyStore { prefs }
+        val outcome = store.setBbcPreactivationOptInDetailed(true)
+        assertTrue("a lost reply must be Unknown, never Confirmed", outcome is BbcWriteOutcome.Unknown)
+        assertTrue("the optimistic map may already show the key", prefs.data[OPTIN_KEY] == true)
+        assertTrue("a read of the optimistic map is not confirmation", store.isBbcPreactivationOptIn())
+        assertEquals(true, store.readBbcPreactivationOptInAuthoritative())
+        assertEquals("ambiguous commit: still only Unknown", BbcWriteOutcome.Unknown, outcome)
+        assertFalse("the Boolean wrapper must not lie either", store.setBbcPreactivationOptIn(true))
+    }
+
+    @Test
+    fun migrationMarkerAuthoritativeRead_usesContainsAndFailsClosed() {
+        val prefs = OptinPrefs()
+        val store = remoteHookPolicyStore { prefs }
+        assertEquals(false, store.readBbcLegacyMigratedAuthoritative()) // definite absent
+        prefs.data[PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED] = true
+        assertEquals(true, store.readBbcLegacyMigratedAuthoritative())
+        prefs.data[PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED] = false
+        assertEquals(false, store.readBbcLegacyMigratedAuthoritative())
+        prefs.booleanReadThrows = true
+        assertNull("a failed marker read must be null, never a grant",
+            store.readBbcLegacyMigratedAuthoritative())
+        assertNull("no service instance means unreadable",
+            remoteHookPolicyStore { null }.readBbcLegacyMigratedAuthoritative())
     }
 }

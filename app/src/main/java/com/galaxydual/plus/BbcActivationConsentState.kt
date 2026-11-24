@@ -66,11 +66,15 @@ internal sealed interface BbcActivationConsentState {
  * [optInGranted] `null` means the read could not be performed authoritatively
  * (binder absent / throw). It must never be coerced to "granted".
  * [classification] `null` means the key is absent or unreadable.
+ * [migrated] is the authoritative, `contains()`-based read of the one-time
+ * migration marker. `PRE_UPGRADE_EXISTING` authorizes ONLY when this is `true`
+ * (the same rule the Hook gate applies); `null`/`false` fails closed.
  */
 internal data class BbcConsentAuthoritativeRead(
     val serviceGeneration: Long,
     val optInGranted: Boolean?,
     val classification: String?,
+    val migrated: Boolean?,
     val legacyRuntimeEnabled: Boolean,
 )
 
@@ -98,8 +102,10 @@ internal fun BbcActivationConsentState.toggleUi(): BbcActivationToggleUi = when 
 // Classification vocabulary shared with the Hook gate. EXPLICITLY_GRANTED is
 // RESERVED (Phase A): we only ever READ it; the grant path writes the opt-in
 // key and never fabricates that classification value.
+// PRE_UPGRADE_EXISTING is deliberately NOT here: like BbcPreactivationGate it
+// needs the migration marker as a second durable proof. Only MIGRATED (and
+// EXPLICITLY_GRANTED below) opens without a marker read.
 private val LEGACY_CLASSIFICATIONS = setOf(
-    PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
     PolicySource.INSTALL_CLASSIFICATION_MIGRATED,
 )
 
@@ -117,7 +123,11 @@ private val LEGACY_CLASSIFICATIONS = setOf(
  *  - A same-generation read can NEVER upgrade [Unknown] — the local mMap may
  *    have been optimistically polluted by a failed commit. Only a read from a
  *    newer service generation (after [onServiceGenerationChanged]) may, via
- *    [resolve], clear the fence.
+ *    [resolve], clear the fence. A failed bind-time classification commit
+ *    ([markInstallClassificationFailed]) installs that fence so a polluted
+ *    PRE_UPGRADE + marker local read can never be mistaken for [Legacy].
+ *  - [Legacy] mirrors the Hook gate: PRE_UPGRADE_EXISTING needs the durable
+ *    migration marker too; only MIGRATED/EXPLICITLY_GRANTED open without it.
  *  - A generation change drops Granted/Legacy to [Initializing] (must resync)
  *    but PRESERVES [Unknown] (the fence outlives binder death/reconnect).
  *  - [abandonIntent] advances the outcome fence (cancel / OFF / show failure)
@@ -252,6 +262,9 @@ internal class BbcActivationConsentHolder {
             read.optInGranted == true -> BbcActivationConsentState.Granted
             read.classification == PolicySource.INSTALL_CLASSIFICATION_EXPLICITLY_GRANTED ->
                 BbcActivationConsentState.Granted
+            read.classification == PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING &&
+                read.migrated == true ->
+                BbcActivationConsentState.Legacy(read.legacyRuntimeEnabled)
             read.classification in LEGACY_CLASSIFICATIONS ->
                 BbcActivationConsentState.Legacy(read.legacyRuntimeEnabled)
             read.classification == PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED ->
@@ -262,6 +275,42 @@ internal class BbcActivationConsentHolder {
         val fenceGeneration = if (next is BbcActivationConsentState.Unknown) read.serviceGeneration else -1L
         fenced.set(Fenced(next, cur.generation, cur.appliedIntentSequence, fenceGeneration))
         _state.value = next
+    }
+
+    /**
+     * The owner App's bind-time durable install-classification commit FAILED.
+     * The optimistic local mMap may now contain PRE_UPGRADE_EXISTING plus the
+     * migration marker while the daemon persisted neither; feeding that read
+     * into [resolve] would falsely authorize [BbcActivationConsentState.Legacy].
+     *
+     * Install a same-generation Unknown fence instead: no local read from this
+     * generation can lift it, and no consent is skipped. Only an authoritative
+     * resync from a NEWER service instance (after a successful retry) may
+     * clear it. An already-authorized [BbcActivationConsentState.Granted] /
+     * [BbcActivationConsentState.Legacy] is left untouched: a late bind-time
+     * failure must not regress a confirmed grant or a durable Legacy resync.
+     * This does NOT touch the user-intent sequence — a bind-time bookkeeping
+     * failure is not a consent-write outcome and must not invalidate a newer
+     * user intent.
+     */
+    @Synchronized
+    fun markInstallClassificationFailed(generation: Long) {
+        val cur = fenced.get()
+        if (generation != cur.generation) return // a dead instance cannot pollute this one
+        // A late async failure (e.g. an older bind's commit completing after a
+        // Confirmed consent grant or a durable Legacy resync) must never
+        // DOWNGRADE an already-authorized state. This is fail-closed UX only:
+        // it can never turn a denied/unknown state into a grant.
+        if (cur.state is BbcActivationConsentState.Granted ||
+            cur.state is BbcActivationConsentState.Legacy
+        ) return
+        if (cur.state is BbcActivationConsentState.Unknown &&
+            cur.fenceGeneration >= generation
+        ) return
+        fenced.set(
+            Fenced(BbcActivationConsentState.Unknown, cur.generation, cur.appliedIntentSequence, generation),
+        )
+        _state.value = BbcActivationConsentState.Unknown
     }
 
     /**
@@ -292,7 +341,15 @@ internal class BbcActivationConsentHolder {
         if (stale) return false
         val next = if (grants) BbcActivationConsentState.Granted else BbcActivationConsentState.Unknown
         val fenceGeneration = if (next is BbcActivationConsentState.Unknown) {
-            if (cur.state is BbcActivationConsentState.Unknown) {
+            if (generation == cur.generation) {
+                // A failed commit on the CURRENT generation polluted THIS
+                // prefs instance's local mMap. Even if an older Unknown fence
+                // was preserved across a rebind, it must advance to the
+                // current generation: only a NEWER instance may now clear it.
+                cur.generation
+            } else if (cur.state is BbcActivationConsentState.Unknown) {
+                // Dead-generation reply while already fenced: keep the older
+                // fence rather than weakening it.
                 cur.fenceGeneration
             } else {
                 // A generation mismatch means the only evidence came from the
