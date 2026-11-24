@@ -642,6 +642,161 @@ class Issue65ParserRegressionTest {
         )
     }
 
+    // ---- R9: contradictory/invalid evidence never authorizes a Confirm ----
+
+    // The decisive R9 PoC: the FIRST row carries two different parents in one
+    // block. parseOneBlock downgrades it to UNKNOWN but retains parent 0 /
+    // serial 15 for diagnosis; the second row is a clean CLONE(0,15). Without
+    // the evidenceInvalid flag the resolver sees UNKNOWN(0,15) + CLONE(0,15)
+    // on verbose, CLONE(0,15) on dumpsys, agreeing parent/serial and prop 95
+    // and would Confirm. The FIRST value must never authorize.
+    private val r9ConflictingParentsRow =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) (parentId=10) serialNo=15"
+    private val r9GoodCloneRow =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15"
+
+    private fun r9ResolveTarget(vararg claimLines: String): VerifiedDualTarget? =
+        SamsungProfileAdapter.resolveDualTarget(
+            SamsungProfileAdapter.parseUserListVerbose(claimLines.joinToString("\n")) +
+                SamsungProfileAdapter.parseDumpsysUser(r2Dumpsys),
+            propertyId = 95,
+        )
+
+    @Test
+    fun r9_conflictingParentsInOneRowPlusGoodClone_flagsAndRefuses() {
+        val claims = SamsungProfileAdapter.parseUserListVerbose(
+            listOf(r9ConflictingParentsRow, r9GoodCloneRow).joinToString("\n"),
+        ).filter { it.userId == 95 }
+        assertEquals("both same-id claims must survive", 2, claims.size)
+        val invalid = claims.single { it.evidenceInvalid }
+        assertEquals(ProfileUserType.UNKNOWN, invalid.userType)
+        assertEquals(IdentityConfidence.LOW, invalid.confidence)
+        assertEquals("first parent retained for diagnosis only", 0, invalid.parentId)
+        assertEquals("first serial retained for diagnosis only", 15, invalid.serial)
+        val good = claims.single { !it.evidenceInvalid }
+        assertEquals(ProfileUserType.CLONE, good.userType)
+        assertEquals(0, good.parentId)
+        assertEquals(15, good.serial)
+
+        val resolution = r2Resolve(r9ConflictingParentsRow, r9GoodCloneRow)
+        assertTrue("contradictory evidence must refuse: $resolution", resolution is DualResolution.Refused)
+        assertTrue((resolution as DualResolution.Refused).reason.contains("contradictory evidence"))
+        assertNull("no serial-bound target may be built", r9ResolveTarget(r9ConflictingParentsRow, r9GoodCloneRow))
+        assertNull(
+            "the public verified-target path must also stay null",
+            PmOutputParser.resolveDualTargetVerified(
+                listOf(r9ConflictingParentsRow, r9GoodCloneRow).joinToString("\n"),
+                r2Dumpsys,
+                propertyId = 95,
+            ),
+        )
+    }
+
+    @Test
+    fun r9_conflictingParentsOrdersAreIndependent() {
+        for (rows in listOf(
+            listOf(r9ConflictingParentsRow, r9GoodCloneRow),
+            listOf(r9GoodCloneRow, r9ConflictingParentsRow),
+        )) {
+            val parsed = SamsungProfileAdapter.parseUserListVerbose(rows.joinToString("\n"))
+                .filter { it.userId == 95 }
+            assertEquals(2, parsed.size)
+            assertEquals("exactly one flagged claim in either order", 1, parsed.count { it.evidenceInvalid })
+            // Only the FIRST value (0) is retained for diagnosis; the
+            // conflicting 10 is deliberately dropped from the claim. That is
+            // why the flag, not the value comparison, must veto.
+            assertEquals(setOf<Int?>(0), parsed.map { it.parentId }.toSet())
+            assertEquals(0, parsed.single { it.evidenceInvalid }.parentId)
+            val resolution = r2Resolve(*rows.toTypedArray())
+            assertTrue("both orders must refuse: $resolution", resolution !is DualResolution.Confirmed)
+            assertNull("both orders must yield a null target", r9ResolveTarget(*rows.toTypedArray()))
+        }
+    }
+
+    @Test
+    fun r9_conflictingSerialsInOneRowPlusGoodClone_refuses() {
+        val conflictingSerialRow =
+            "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15 serialNo=99"
+        for (rows in listOf(
+            listOf(conflictingSerialRow, r9GoodCloneRow),
+            listOf(r9GoodCloneRow, conflictingSerialRow),
+        )) {
+            val claims = SamsungProfileAdapter.parseUserListVerbose(rows.joinToString("\n"))
+                .filter { it.userId == 95 }
+            assertEquals(2, claims.size)
+            val invalid = claims.single { it.evidenceInvalid }
+            assertEquals(ProfileUserType.UNKNOWN, invalid.userType)
+            assertEquals("first serial retained for diagnosis only", 15, invalid.serial)
+            assertEquals(0, invalid.parentId)
+            val resolution = r2Resolve(*rows.toTypedArray())
+            assertTrue("serial conflict must refuse: $resolution", resolution is DualResolution.Refused)
+            assertFalse(resolution is DualResolution.Confirmed)
+            assertNull(r9ResolveTarget(*rows.toTypedArray()))
+        }
+    }
+
+    @Test
+    fun r9_conflictingTypeInLegacyBlockPlusGoodClone_refuses() {
+        val conflictingType = listOf(
+            "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+            "    parentId=0",
+            "    userType=android.os.usertype.profile.CLONE",
+            "    userType=android.os.usertype.profile.PRIVATE",
+        )
+        for (rows in listOf(
+            conflictingType + listOf(r9GoodCloneRow),
+            listOf(r9GoodCloneRow) + conflictingType,
+        )) {
+            val claims = SamsungProfileAdapter.parseUserListVerbose(rows.joinToString("\n"))
+                .filter { it.userId == 95 }
+            assertEquals(2, claims.size)
+            val invalid = claims.single { it.evidenceInvalid }
+            assertEquals("ambiguous type must be UNKNOWN", ProfileUserType.UNKNOWN, invalid.userType)
+            assertEquals(0, invalid.parentId)
+            assertEquals(15, invalid.serial)
+            val resolution = r2Resolve(*rows.toTypedArray())
+            assertTrue("type conflict must refuse: $resolution", resolution !is DualResolution.Confirmed)
+            assertFalse(resolution is DualResolution.Confirmed)
+            assertNull(r9ResolveTarget(*rows.toTypedArray()))
+        }
+    }
+
+    @Test
+    fun r9_unknownClaimInEitherChannelVetoesConfirmed() {
+        // verbose UNKNOWN (a legacy block with parent/serial but no type line)
+        // alongside a clean CLONE row: the UNKNOWN carries plausible values
+        // and must still veto.
+        val unknownVerbose = listOf(
+            "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+            "    parentId=0",
+        )
+        for (rows in listOf(
+            r9GoodCloneRow + "\n" + unknownVerbose.joinToString("\n"),
+            unknownVerbose.joinToString("\n") + "\n" + r9GoodCloneRow,
+        )) {
+            val resolution = r2Resolve(rows)
+            assertTrue("UNKNOWN verbose must veto: $resolution", resolution !is DualResolution.Confirmed)
+            assertNull(r9ResolveTarget(rows))
+        }
+
+        // dumpsys UNKNOWN on the target id vetoes a clean verbose CLONE.
+        val unknownDumpsys = listOf(
+            "Users:",
+            "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:",
+            "    userType=android.os.usertype.full.SYSTEM",
+            "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+            "    parentId=0",
+        ).joinToString("\n")
+        val candidates = SamsungProfileAdapter.parseUserListVerbose(r9GoodCloneRow) +
+            SamsungProfileAdapter.parseDumpsysUser(unknownDumpsys)
+        val dumpsysResolution = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("UNKNOWN dumpsys must veto: $dumpsysResolution", dumpsysResolution !is DualResolution.Confirmed)
+        assertNull(
+            "the public verified-target path must be null with UNKNOWN dumpsys",
+            PmOutputParser.resolveDualTargetVerified(r9GoodCloneRow, unknownDumpsys, propertyId = 95),
+        )
+    }
+
     // ---- R6: composite label / displayName scope ----
 
     @Test
