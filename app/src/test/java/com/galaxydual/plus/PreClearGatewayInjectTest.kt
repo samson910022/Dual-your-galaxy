@@ -310,11 +310,15 @@ class PreClearGatewayInjectTest {
         fresh: VerifiedTarget? = VerifiedTarget(95, 7, 0),
         reprobe: DualProbeResult = DualProbeResult.Ok(listOf("com.a.app")),
         private val capturedInstalled: Set<String> = setOf("com.a.app"),
+        private val actionAlive: () -> Boolean = { true },
     ) {
         val gw = FakeGateway(CmdResult(0, "", ""))
         var liveTarget: PreClearDualTarget? = live
         var freshTarget: VerifiedTarget? = fresh
         var freshError: Throwable? = null
+        // G4: flip the originating action's liveness from inside the fresh
+        // fetch (a real suspend point) to exercise the POST-await re-check.
+        var onFreshFetch: () -> Unit = {}
         // R2-5 (N10)：Continue 重驗的 reprobe seam + proceed／政策寫入計數。
         var reprobeResult: DualProbeResult = reprobe
         var reprobeError: Throwable? = null
@@ -330,10 +334,12 @@ class PreClearGatewayInjectTest {
                 resolveLiveTarget = { liveTarget },
                 fetchFreshVerifiedTarget = {
                     freshError?.let { throw it }
+                    onFreshFetch()
                     freshTarget
                 },
                 // FakeGateway call log：abort 路徑必須 0 呼叫 uninstall。
                 uninstall = { p, uid -> uninstallDualApps(p, uid, gw) },
+                actionAlive = actionAlive,
             )
 
         // 仿真 showPreClearWarning Positive 的 dispatch：只有 ProceedOk 才 onProceed
@@ -503,6 +509,27 @@ class PreClearGatewayInjectTest {
         h.freshError = IllegalStateException("identity channel boom")
         assertNull(runBlocking { h.run() })
         assertEquals(0, h.gw.calls)
+    }
+
+    @Test
+    fun rootUninstall_deadOriginatingAction_abortsWithoutUninstall() {
+        // G4: the confirm's action is already dead by the time the fence runs.
+        // The trailing identity re-check must fail closed with ZERO uninstall.
+        val h = FenceHarness(actionAlive = { false })
+        assertNull(runBlocking { h.run() })
+        assertEquals("dead action must never reach the irreversible uninstall", 0, h.gw.calls)
+    }
+
+    @Test
+    fun rootUninstall_actionSupersededDuringFreshFetch_abortsWithoutUninstall() {
+        // G4 race: the action is live when the fence starts, but a newer
+        // action supersedes it WHILE the fresh fetch suspends. A check placed
+        // only before the await would miss this and still uninstall.
+        val alive = AtomicBoolean(true)
+        val h = FenceHarness(actionAlive = { alive.get() })
+        h.onFreshFetch = { alive.set(false) }
+        assertNull(runBlocking { h.run() })
+        assertEquals("superseded action must never reach uninstall", 0, h.gw.calls)
     }
 
     // ---- R2-5 (N10)：非 ROOT Continue 的 serial-bound + membership 重驗 ----

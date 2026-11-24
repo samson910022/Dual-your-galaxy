@@ -8679,6 +8679,10 @@ internal suspend fun rootUninstallIfTargetStillValid(
     resolveLiveTarget: () -> PreClearDualTarget?,
     fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
     uninstall: suspend (List<String>, Int) -> Boolean,
+    // G4: the originating action may be revoked/superseded while the fresh
+    // fetch above suspends. Re-check identity immediately before the
+    // irreversible uninstall; the default keeps all JVM callers compiling.
+    actionAlive: () -> Boolean = { true },
 ): Int? {
     val live: PreClearDualTarget? = try {
         resolveLiveTarget()
@@ -8709,6 +8713,13 @@ internal suspend fun rootUninstallIfTargetStillValid(
     // uninstall 本身的失敗沿用既有「只記 log、仍讓後續驗證決定」語意（成敗回傳值
     // 不影響 fence 結論），只有 cancellation 透傳。
     val effectiveUid = captured!!.userId
+    // G4: the fresh fetch is a suspend point — a newer action (or a cancel)
+    // can supersede this confirm while we await it. Fail closed with ZERO
+    // uninstall when the originating action is no longer live.
+    if (!actionAlive()) {
+        preClearLog("root-uninstall aborted: originating action no longer live")
+        return null
+    }
     try {
         uninstall(installed, effectiveUid)
     } catch (e: CancellationException) {
@@ -9247,6 +9258,7 @@ internal fun showPreClearWarning(
                                         resolveLiveTarget = resolveLiveTarget,
                                         fetchFreshVerifiedTarget = fetchFreshVerifiedTarget,
                                         uninstall = { pkgs, uid -> uninstallDualApps(pkgs, uid) },
+                                        actionAlive = actionAlive,
                                     )
                                 } catch (e: CancellationException) {
                                     throw e

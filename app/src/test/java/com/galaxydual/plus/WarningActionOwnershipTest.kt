@@ -47,12 +47,16 @@ class WarningActionOwnershipTest {
         val oneShot = WarningRetryOneShot()
         val posted = mutableListOf<Posted>()
         val hits = mutableListOf<String>()
+        // Effect ledger: controller-level proof that the stale CLEAR token
+        // runs ZERO clear VM work and the fresh WRITE token runs exactly one.
+        var clearVmCalls = 0
+        var writeVmCalls = 0
 
         val clear = controller.install(
             action = WarningRestartAction.CLEAR,
             candidateKey = null,
             generation = oneShot.currentGeneration,
-            callback = { hits.add("clear") },
+            callback = { clearVmCalls++; hits.add("clear") },
             resetBudget = true,
         )
         assertTrue(controller.schedule(true, MAX_AUTO_WARNING_RESTARTS, capture(posted)))
@@ -70,7 +74,7 @@ class WarningActionOwnershipTest {
             action = WarningRestartAction.WRITE,
             candidateKey = "pkg.fast",
             generation = oneShot.currentGeneration,
-            callback = { hits.add("write:pkg.fast") },
+            callback = { writeVmCalls++; hits.add("write:pkg.fast") },
             resetBudget = true,
         )
         assertEquals(
@@ -85,6 +89,8 @@ class WarningActionOwnershipTest {
         posted[0].body()
         assertFalse(controller.deliver(posted[0].tokenId, posted[0].requestId, true))
         assertTrue("no destructive clear from a cancelled request", hits.isEmpty())
+        assertEquals("stale CLEAR token must run ZERO clear VM effects", 0, clearVmCalls)
+        assertEquals("stale CLEAR token must not run WRITE effects either", 0, writeVmCalls)
 
         // Current identity is WRITE and a fresh schedule is WRITE-bound.
         assertEquals(WarningRestartAction.WRITE, controller.currentIdentity?.action)
@@ -102,6 +108,8 @@ class WarningActionOwnershipTest {
         assertEquals(posted[0].tokenId + 3, posted[1].tokenId)
         posted[1].body()
         assertEquals(listOf("write:pkg.fast"), hits)
+        assertEquals("still ZERO clear VM effects after the WRITE settles", 0, clearVmCalls)
+        assertEquals("fresh WRITE token runs exactly one WRITE VM effect", 1, writeVmCalls)
     }
 
     // revoke() must be identity-conditional: stale/null ids change NOTHING,
@@ -157,6 +165,64 @@ class WarningActionOwnershipTest {
 
         // Re-revoking an already-revoked id is false (no live request).
         assertFalse(controller.revoke(live.identity.id))
+    }
+
+    // A cancel is NOT a genuine entry tap: revoke(A) must retain the budget A
+    // already consumed. A carried-over re-install (resetBudget=false) still
+    // hits the cap; only a later real tap (resetBudget=true) re-arms it.
+    // This fails outright if revoke() resets autoRestartsUsed.
+    @Test
+    fun revokeRetainsAutoRestartBudget() {
+        val controller = WarningRestartController()
+        val posted = mutableListOf<Posted>()
+        val budget = 1
+
+        assertFalse("null is never a live request", controller.isLive(null))
+
+        // A (genuine tap): spend the single allowed auto restart.
+        val a = controller.install(
+            action = WarningRestartAction.CLEAR,
+            candidateKey = null,
+            generation = 1,
+            callback = {},
+            resetBudget = true,
+        )
+        assertTrue(controller.isLive(a.identity.id))
+        assertTrue(controller.schedule(true, budget, capture(posted)))
+        assertEquals(1, posted.size)
+        assertFalse("cap reached for A", controller.schedule(true, budget, capture(posted)))
+        assertEquals("still one post at the cap", 1, posted.size)
+
+        // Cancelling A must not hand the next action a fresh budget.
+        assertTrue(controller.revoke(a.identity.id))
+        assertFalse("revoked id is not live", controller.isLive(a.identity.id))
+        assertFalse("null is still not live", controller.isLive(null))
+        assertNull(controller.currentIdentity)
+
+        // B (re-entry via auto restart / Retry settle): carries the budget.
+        val b = controller.install(
+            action = WarningRestartAction.WRITE,
+            candidateKey = "pkg.carry",
+            generation = 1,
+            callback = {},
+            resetBudget = false,
+        )
+        assertTrue(controller.isLive(b.identity.id))
+        assertFalse("revoke must retain the consumed budget", controller.schedule(true, budget, capture(posted)))
+        assertEquals("no post from an exhausted carried budget", 1, posted.size)
+
+        // C (genuine tap): re-arm and schedule succeeds.
+        val c = controller.install(
+            action = WarningRestartAction.WRITE,
+            candidateKey = "pkg.fresh",
+            generation = 1,
+            callback = {},
+            resetBudget = true,
+        )
+        assertTrue(controller.isLive(c.identity.id))
+        assertTrue("fresh tap must re-arm the budget", controller.schedule(true, budget, capture(posted)))
+        assertEquals(2, posted.size)
+        assertEquals(c.identity.id, posted[1].requestId)
     }
 
     // A stale abort (from the cancelled CLEAR) must not schedule a new restart

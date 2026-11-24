@@ -167,6 +167,44 @@ class WarningRetryLifecycleSourceTest {
         return out
     }
 
+    // G4: whole-lambda slice for `onCancel = { ... }`. The warning cancel
+    // bodies are one-liners that embed a NESTED `{ onCancel() }`, so reading
+    // only to the next newline misses side effects appended after that nested
+    // brace (and would miss a multi-line body entirely). Match braces instead.
+    private fun cancelLambda(body: String, from: Int): String {
+        val open = body.indexOf('{', from)
+        assertTrue("onCancel lambda must open", open >= 0)
+        var depth = 0
+        for (i in open until body.length) {
+            when (body[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return body.substring(from, i + 1)
+                }
+            }
+        }
+        throw AssertionError("onCancel lambda never closes")
+    }
+
+    private fun assertCancelsAreIdentityBound(name: String, body: String) {
+        for (idx in indicesOf(body, "onCancel = {")) {
+            val lambda = cancelLambda(body, idx)
+            assertEquals(
+                "$name dialog onCancel must have exactly one cancelAcceptedWarning(actionId)",
+                1,
+                indicesOf(lambda, "cancelAcceptedWarning(actionId)").size,
+            )
+            for (forbidden in listOf(
+                "setPendingClearConfirm(",
+                "pendingClearConfirm =",
+                "showWarningRetryGuidance(",
+            )) {
+                assertFalse("$name dialog onCancel must not contain $forbidden", lambda.contains(forbidden))
+            }
+        }
+    }
+
     @Test
     fun restartRequestInstalledOnlyAtAcceptSeam_noMutablePendingSlot() {
         val acceptGuard =
@@ -322,18 +360,10 @@ class WarningRetryLifecycleSourceTest {
         for ((name, body) in listOf("clear" to clearRequest, "write" to writeRequest)) {
             val cancelSites = indicesOf(body, "onCancel = {")
             assertEquals("$name request must expose exactly three warning dialogs", 3, cancelSites.size)
-            for (idx in cancelSites) {
-                val newline = body.indexOf('\n', idx)
-                val line = body.substring(idx, if (newline < 0) body.length else newline)
-                assertTrue(
-                    "$name dialog onCancel must route through cancelAcceptedWarning",
-                    line.contains("cancelAcceptedWarning(actionId)"),
-                )
-                assertFalse(
-                    "$name dialog onCancel must not touch pendingClearConfirm directly",
-                    line.contains("setPendingClearConfirm("),
-                )
-            }
+            // G4: scan the WHOLE lambda, not just its first line. The nested
+            // `{ onCancel() }` means a stray side effect could follow on the
+            // same line or on a later line of a multi-line body.
+            assertCancelsAreIdentityBound(name, body)
         }
         assertEquals(
             "all six Main dialog cancels route through cancelAcceptedWarning",
@@ -387,18 +417,9 @@ class WarningRetryLifecycleSourceTest {
         val body = block(editor, "private fun requestEditorWriteWarning(")
         val cancelSites = indicesOf(body, "onCancel = {")
         assertEquals("editor request must expose exactly three warning dialogs", 3, cancelSites.size)
-        for (idx in cancelSites) {
-            val newline = body.indexOf('\n', idx)
-            val line = body.substring(idx, if (newline < 0) body.length else newline)
-            assertTrue(
-                "editor dialog onCancel must route through cancelAcceptedWarning",
-                line.contains("cancelAcceptedWarning(actionId)"),
-            )
-            assertFalse(
-                "editor dialog onCancel must not touch pendingClearConfirm directly",
-                line.contains("setPendingClearConfirm("),
-            )
-        }
+        // G4: same whole-lambda scan as Main, so a nested callback cannot hide
+        // a trailing setPendingClearConfirm / guidance side effect.
+        assertCancelsAreIdentityBound("editor", body)
         assertEquals(
             "all three Editor dialog cancels route through cancelAcceptedWarning",
             3,
