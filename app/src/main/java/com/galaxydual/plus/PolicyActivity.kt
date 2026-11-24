@@ -128,6 +128,11 @@ class PolicyActivity : ComponentActivity() {
     // pending+generation+ack(in-memory session-scoped)+expanded+SAVING/RECONCILING cancel語義+旋轉保留+onDestroy dismiss)。
     // Editor 至少 dialog 欄位化＋onDestroy dismiss＋onSaveInstanceState 世代保留（見下）。
     private var policyConfirmDialog: AlertDialog? = null
+    // #78:風險揭露對話框與編輯器空集導引對話框的 handle。共用 RiskNotice helper
+    // 現在回傳 show() 的 handle，於此持有並在 onDestroy best-effort dismiss，
+    // 避免舊 Activity window 洩漏／BadToken（與 MainActivity.riskDialog 同源）。
+    private var riskDialog: AlertDialog? = null
+    private var editorEmptyGuideDialog: AlertDialog? = null
     private val policyConfirmState = PolicyConfirmDialogState()
     // PR-74 A3：pre-clear 警告／ROOT 二次確認／卸載驗證對話框 handle（onDestroy 釋放，
     // 與 MainActivity 同源；先前 show() 後丟棄 handle 致舊 Activity window 洩漏）。
@@ -217,13 +222,15 @@ class PolicyActivity : ComponentActivity() {
     private fun showEditorEmptyGuide() {
         if (isFinishing || isDestroyed) return
         try {
-            AlertDialog.Builder(this)
+            editorEmptyGuideDialog = AlertDialog.Builder(this)
                 .setTitle(R.string.policy_editor_empty_guide_title)
                 .setMessage(R.string.policy_editor_empty_guide_message)
                 .setCancelable(true)
                 .setPositiveButton(R.string.policy_editor_empty_guide_go_main) { _, _ -> finish() }
                 .setNegativeButton(R.string.dialog_cancel, null)
-                .show()
+                .show().also { dlg ->
+                    dlg.setOnDismissListener { if (editorEmptyGuideDialog === dlg) editorEmptyGuideDialog = null }
+                }
         } catch (_: RuntimeException) {
             // Best effort: 對話框失敗不影響 ticks（已還原／未寫入）。
         }
@@ -262,7 +269,8 @@ class PolicyActivity : ComponentActivity() {
         // R4-1 (E01/E02)：移除 force-proceed；這裡不建 consent／pending。若日後重建，
         // 必須傳 noRemovalKnown=false（Unknown 的 delta=∅ 是偽空）。
         if (!snap.known) {
-            if (pendingClearConfirm) return
+            // #77: re-arm the Retry token only after the re-entry guard accepts.
+            if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return
             setPendingClearConfirm(true)
             pendingWarningConsent = null
             showPreClearProbeFailedWarning(
@@ -281,7 +289,8 @@ class PolicyActivity : ComponentActivity() {
             }
             return
         }
-        if (pendingClearConfirm) return
+        // #77: accepted new warning — only now may the Retry generation advance.
+        if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return
         setPendingClearConfirm(true)
         lifecycleScope.launch {
             // Phase B：與 MainActivity 同口徑——僅 Ok(empty) 直接放行，
@@ -438,7 +447,12 @@ class PolicyActivity : ComponentActivity() {
             minimumHeight = dp(48)
             gravity = Gravity.CENTER_VERTICAL
             isClickable = true
-            setOnClickListener { showRiskDetailsDialog(this@PolicyActivity) }
+            setOnClickListener {
+                // #78: keep the shared helper's handle for onDestroy cleanup.
+                riskDialog = showRiskDetailsDialog(this@PolicyActivity)?.also { dlg ->
+                    dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
+                }
+            }
         })
 
         counterView = TextView(this).apply {
@@ -593,6 +607,20 @@ class PolicyActivity : ComponentActivity() {
         // （含 probe-failed；與 MainActivity.onDestroy 同口徑，單一失敗不阻斷後續。
         // 用 dismiss() 而非 cancel()，避免快銷毀中的 Activity 仍觸發 onCancel 回呼）。
         dismissAllDestructiveHandles(destructiveDialogHandles) { it.dismiss() }
+        // #78: risk gate / risk details / editor empty-guide handles — use
+        // dismiss() (not cancel()) so a dying Activity does not fire onCancel.
+        try {
+            riskDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        riskDialog = null
+        try {
+            editorEmptyGuideDialog?.dismiss()
+        } catch (_: Exception) {
+            // Best effort: the window is going away anyway.
+        }
+        editorEmptyGuideDialog = null
         policyConfirmState.onPendingCleared()
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
@@ -765,7 +793,14 @@ class PolicyActivity : ComponentActivity() {
             warningRestartGuard.reset() // 未 post，必須歸還 guard
             return
         }
-        Handler(Looper.getMainLooper()).post {
+        // P2: reuse the Activity-owned Handler (also used by search debounce)
+        // so onDestroy's removeCallbacksAndMessages(null) really cancels this
+        // callback; a fresh Handler here leaked the dying Activity.
+        handler.post {
+            if (isFinishing || isDestroyed) {
+                warningRestartGuard.reset()
+                return@post
+            }
             try {
                 pendingWarningRestart?.invoke()
             } catch (_: Exception) {
@@ -807,8 +842,9 @@ class PolicyActivity : ComponentActivity() {
         if (fromUserTap) {
             autoRestartCount.set(0)
         }
-        // R6-1 (G01): re-arm on EVERY installed warning, including auto re-entry.
-        warningRetryOneShot.onWarningInstalled()
+        // #77 (H02): the retry token is armed at the ACCEPT site inside
+        // requestEditorWriteWarning, never here — a stale auto-restart is
+        // rejected by that guard and must not burn the generation.
         requestEditorWriteWarning(
             candidate = candidate,
             proceed = { binding, frozen -> performWritePolicy(binding, frozen) },
@@ -903,7 +939,10 @@ class PolicyActivity : ComponentActivity() {
             startEditorWriteWarning(candidate)
         }
         if (shouldShowRiskGate(riskAckStore.isAcknowledged())) {
-            showRiskAckGate(this, riskAckStore) { proceed() }
+            // #78: track the ack-gate handle just like Main's riskDialog.
+            riskDialog = showRiskAckGate(this, riskAckStore) { proceed() }?.also { dlg ->
+                dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
+            }
         } else {
             proceed()
         }

@@ -879,4 +879,114 @@ class BbcToggleConcurrencyTest {
             io.close()
         }
     }
+
+    // --- Phase C / #81: sequence fence BEFORE commit ---------------------------
+
+    /**
+     * #81: the FIRST commit (the newer sequence) blocks on a real latch; any
+     * LATER commit (the stale sequence) records that it actually reached disk.
+     * Latches/volatiles are pure handshakes — no sleeps, no cancellable gates.
+     */
+    private class SequenceOrderSink(initial: Boolean) {
+        @Volatile
+        var persisted: Boolean = initial
+            private set
+
+        @Volatile
+        var staleCommitEnded = false
+            private set
+
+        private val events = Collections.synchronizedList(mutableListOf<String>())
+        private val calls = AtomicInteger(0)
+        private val newerStarted = CountDownLatch(1)
+        private val releaseNewer = CountDownLatch(1)
+
+        suspend fun commit(value: Boolean): BbcWriteOutcome = withContext(NonCancellable) {
+            val idx = calls.getAndIncrement()
+            events.add("start:$value")
+            if (idx == 0) {
+                newerStarted.countDown()
+                releaseNewer.await() // genuinely blocking, never cancelled mid-call
+            } else {
+                staleCommitEnded = true // BUG SIGNAL: the fenced-out write ran
+            }
+            events.add("end:$value")
+            persisted = value
+            BbcWriteOutcome.Confirmed(value)
+        }
+
+        fun awaitNewerStarted() = check(newerStarted.await(5, TimeUnit.SECONDS))
+        fun releaseNewerWrite() = releaseNewer.countDown()
+        fun snapshot(): List<String> = synchronized(events) { events.toList() }
+    }
+
+    /**
+     * Two callers can assign sequences with nextSequence() in one order but
+     * reach submit() in the OPPOSITE order. CONFLATED then queues the older
+     * sequence behind the newer commit; without a pre-commit fence the older
+     * value is written LAST and overwrites the user's final intent (#81).
+     *
+     * Determinism: the newer commit holds a real single-thread IO writer on a
+     * CountDownLatch; a separate thread submits the older sequence and latches
+     * only after trySend() returned. Releasing the latch is the sole scheduling
+     * decision. Both outcomes expose a positive drain signal — the buggy build
+     * ends the stale commit, the fixed build increments skippedWrites() — so
+     * there is no timeout-based negative assertion and no wall-clock sleep.
+     */
+    @Test
+    fun staleSequenceSubmittedWhileNewerCommitBlocked_neverReachesDisk() = runBlocking {
+        val io = newIoDispatcher()
+        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val submitter = Executors.newSingleThreadExecutor { r -> Thread(r, "bbc-c81-submitter") }
+        val sink = SequenceOrderSink(initial = false)
+        try {
+            val state = BbcToggleRuntimeState(initialConfirmed = false)
+            val coordinator = BbcToggleCoordinator(
+                scope = appScope, state = state, commit = { sink.commit(it) }, io = io,
+            )
+
+            // Sequence assigned FIRST but submitted LAST; the newer one is
+            // assigned second yet submitted first — exactly the #81 race.
+            val staleSeq = state.nextSequence()
+            val freshSeq = state.nextSequence()
+            assertEquals(1L, staleSeq)
+            assertEquals(2L, freshSeq)
+            val staleCallbackCalls = AtomicInteger(0)
+            val freshCallbackCalls = AtomicInteger(0)
+
+            coordinator.submit(freshSeq, true) { freshCallbackCalls.incrementAndGet() }
+            sink.awaitNewerStarted() // newer commit is in flight and blocked
+
+            val submitReturned = CountDownLatch(1)
+            submitter.execute {
+                coordinator.submit(staleSeq, false) { staleCallbackCalls.incrementAndGet() }
+                submitReturned.countDown()
+            }
+            check(submitReturned.await(5, TimeUnit.SECONDS))
+
+            sink.releaseNewerWrite()
+
+            // Positive drain barrier in both worlds; bounded only as a deadlock
+            // guard, never used to decide pass/fail.
+            withTimeout(5_000L) {
+                while (coordinator.skippedWrites() == 0 && !sink.staleCommitEnded) yield()
+            }
+
+            assertEquals("newer value must be the final persisted value", true, sink.persisted)
+            assertEquals("only the newer value may reach the store",
+                listOf("start:true", "end:true"), sink.snapshot())
+            assertEquals(1, freshCallbackCalls.get())
+            assertEquals("stale write must never notify its caller", 0, staleCallbackCalls.get())
+            assertEquals(
+                "older sequence must be rejected BEFORE commit()",
+                1, coordinator.skippedWrites(),
+            )
+            assertEquals(2L, coordinator.latestSequence())
+        } finally {
+            sink.releaseNewerWrite() // idempotent: no latch-blocked thread survives a failure
+            submitter.shutdownNow()
+            appScope.cancel()
+            io.close()
+        }
+    }
 }

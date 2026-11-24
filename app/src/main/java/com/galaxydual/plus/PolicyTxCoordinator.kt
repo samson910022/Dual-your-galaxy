@@ -100,6 +100,8 @@ class PolicyTxCoordinator internal constructor(
     // coordinator in a restarted app process seeds this live StateFlow from the
     // persisted marker AT CONSTRUCTION (before any VM attaches). No hook PID /
     // high-water re-derivation is attempted (no IPC surface; DEVICE-UNVERIFIED).
+    // #76: in-memory `persisted.active` is NOT evidence of a durable save — the
+    // separate [persistedDurable] flag gates the idempotent early-return.
     private val _repairHint = MutableStateFlow(false)
     val repairHint: StateFlow<Boolean> = _repairHint.asStateFlow()
 
@@ -107,6 +109,18 @@ class PolicyTxCoordinator internal constructor(
     // process restarts; repairedVersion records the version the repair commit wrote
     // (-1 when the caller does not supply one, as in current production).
     private var persisted: RepairHintState = RepairHintState(false, 0L, -1L)
+
+    // #76: false = the last write's commit(false)/exception or a recovered load
+    // left durability UNKNOWN. markRepairHint must then RETRY instead of returning.
+    private var persistedDurable = true
+    private var repairHintWriteSeq = 0L
+    // Serializes hint commits without holding the coordinator monitor (#76).
+    private val repairHintIoLock = Any()
+
+    // PR4 review (Required 1, follow-up): JVM-only hook parked AFTER writeId is
+    // issued but BEFORE the IO lock is acquired. A two-thread test uses it to pin
+    // the exact stale-write window the pre-save fence closes. null in production.
+    internal var beforeRepairHintIoLockSeamForTests: (() -> Unit)? = null
 
     init {
         val loaded = try {
@@ -116,7 +130,16 @@ class PolicyTxCoordinator internal constructor(
         }
         if (loaded != null) {
             persisted = loaded
+            persistedDurable = try {
+                repairHintStore?.loadWasRecovered()?.not() ?: true
+            } catch (_: Throwable) {
+                false
+            }
             if (loaded.active) _repairHint.value = true
+        } else {
+            // No store = pure in-memory coordinator; nothing to verify. A store
+            // that threw on load leaves durability UNKNOWN (biased to warning).
+            persistedDurable = repairHintStore == null
         }
     }
 
@@ -126,48 +149,116 @@ class PolicyTxCoordinator internal constructor(
 
     /**
      * Raise the app-scoped hint after a successful Invalid->v1 repair commit.
-     * Idempotent: an already-active marker never bumps [RepairHintState.generation].
+     * Idempotent: an ALREADY-DURABLE active marker never bumps
+     * [RepairHintState.generation]; an active-but-unconfirmed marker retries the
+     * same state instead of silently skipping the durable write (#76).
+     *
+     * State mutation happens under the coordinator monitor; the SharedPreferences
+     * commit runs OUTSIDE it so a slow disk write never blocks other coordinator
+     * operations. On failure the live warning stays raised and a later mark retries.
      */
-    @Synchronized
     fun markRepairHint(repairedVersion: Long = -1L) {
-        if (persisted.active) {
-            // Already active: keep the live truth raised, no generation bump.
-            _repairHint.value = true
-            return
+        val next = synchronized(this) {
+            if (persisted.active && persistedDurable) {
+                // Verified durable: keep the live truth raised, no generation bump.
+                _repairHint.value = true
+                null
+            } else {
+                val candidate = if (persisted.active) {
+                    // Active in memory but never confirmed durable: retry verbatim.
+                    persisted
+                } else {
+                    RepairHintState(
+                        active = true,
+                        generation = persisted.generation + 1L,
+                        repairedVersion = repairedVersion,
+                    )
+                }
+                persisted = candidate
+                _repairHint.value = true
+                candidate
+            }
         }
-        applyRepairHint(
-            RepairHintState(
-                active = true,
-                generation = persisted.generation + 1L,
-                repairedVersion = repairedVersion,
-            ),
-        )
+        if (next != null) persistRepairHint(next)
     }
 
     /** Explicit user acknowledgement. The ONLY production clear. */
-    @Synchronized
-    fun acknowledgeRepairHint() {
-        applyRepairHint(persisted.copy(active = false))
-    }
+    fun acknowledgeRepairHint() = applyRepairHintClear()
 
     // TEST-ONLY / FUTURE-IPC SEAM. Deliberately NEVER called in production.
     // A future binder contract would have to supply VERIFIED hook identity before
     // an identity-based auto-clear could be justified; nothing here claims any
     // on-device verification or observes the hook process's PID / high-water.
-    @Synchronized
-    internal fun clearOnVerifiedHookRebirth() {
-        applyRepairHint(persisted.copy(active = false))
+    internal fun clearOnVerifiedHookRebirth() = applyRepairHintClear()
+
+    private fun applyRepairHintClear() {
+        val next = synchronized(this) {
+            val candidate = persisted.copy(active = false)
+            persisted = candidate
+            _repairHint.value = false
+            candidate
+        }
+        persistRepairHint(next)
     }
 
-    @Synchronized
-    private fun applyRepairHint(next: RepairHintState) {
-        persisted = next
-        _repairHint.value = next.active
-        try {
-            repairHintStore?.save(next)
-        } catch (_: Throwable) {
-            // Best effort: the in-process live state stays authoritative for this
-            // process (fail-safe bias toward repeating the warning).
+    // #76: the durable write is deliberately OUTSIDE the @Synchronized monitor.
+    // Only the in-memory decision is serialized; commit() runs under a separate
+    // IO lock so concurrent callers cannot interleave two SharedPreferences edits.
+    private fun persistRepairHint(next: RepairHintState) {
+        val store = repairHintStore ?: return
+        val writeId = synchronized(this) {
+            repairHintWriteSeq += 1L
+            // Unverified until commit() actually reports success.
+            persistedDurable = false
+            repairHintWriteSeq
+        }
+        beforeRepairHintIoLockSeamForTests?.invoke()
+        val durable = synchronized(repairHintIoLock) {
+            // PR4 review (Required 1, follow-up): the post-save seq check below
+            // protects only the IN-MEMORY outcome. A writer whose writeId is
+            // already stale by the time it reaches this IO lock must not touch
+            // the store at all — otherwise an older mark can still land
+            // active=true on disk ON TOP OF a newer ack's clear. Re-read the seq
+            // under `this` for a happens-before-safe snapshot, then release that
+            // monitor BEFORE save() so the physical commit stays off it.
+            if (synchronized(this) { writeId != repairHintWriteSeq }) {
+                false // stale: skip the physical commit entirely; do NOT touch store
+            } else {
+                try {
+                    store.save(next)
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+        }
+        // PR4 review (Required 1): a save result may arrive AFTER a newer write
+        // has already settled. Applying such a stale result can resurrect an
+        // acknowledged hint (A: mark/save(false) preempted after releasing the
+        // IO lock; B: ack/save(true) settles; A then re-raises the warning).
+        //
+        // Linearization point: [repairHintWriteSeq] is issued under THIS monitor
+        // at entry, and the SAME monitor is re-entered here to read the current
+        // seq and apply the outcome as one atomic step. The seq is mutated only
+        // inside `synchronized(this)`, so this read is a consistent snapshot:
+        // any write that started after ours has already bumped the seq by the
+        // time we get here. A stale result (writeId != seq) is therefore ignored
+        // in FULL — it touches neither [persisted], [_repairHint], nor
+        // [persistedDurable] that the newer write may already have certified.
+        synchronized(this) {
+            if (writeId == repairHintWriteSeq) {
+                if (!durable) {
+                    // Unknown durability: never hide an already-raised warning,
+                    // and keep the mirror active so the next mark retries.
+                    if (!persisted.active) {
+                        persisted = persisted.copy(active = true)
+                        _repairHint.value = true
+                    }
+                    persistedDurable = false
+                } else {
+                    // Only the newest write may certify the mirror as durable.
+                    persistedDurable = true
+                }
+            }
         }
     }
 
@@ -1630,6 +1721,11 @@ class PolicyTxCoordinator internal constructor(
         try {
             persisted = RepairHintState(false, 0L, -1L)
             _repairHint.value = false
+            // PR4 review (Optional 3): a fresh test coordinator must also forget
+            // any prior write generation/durability verdict, otherwise a leftover
+            // writeId could make the next persist look stale (or look verified).
+            persistedDurable = true
+            repairHintWriteSeq = 0L
             repairHintStore?.save(persisted)
         } catch (_: Exception) {
             // Best effort.

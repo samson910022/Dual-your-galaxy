@@ -150,6 +150,50 @@ class RiskDisclosureSourceShapeTest {
         assertTrue("onDestroy must clear riskDialog", onDestroy.contains("riskDialog = null"))
     }
 
+    // #78: the shared helpers must hand the dialog back to the caller so the
+    // host Activity can release it. Returning Unit leaks the window on destroy.
+    @Test
+    fun sharedRiskHelpers_returnDismissableHandle() {
+        val details = block(riskNotice, "internal fun showRiskDetailsDialog(")
+        assertTrue("shared details helper must return AlertDialog?", details.contains("AlertDialog?"))
+        assertTrue("shared details helper must return the show() handle", details.contains("return try {"))
+
+        val gate = block(riskNotice, "internal fun showRiskAckGate(")
+        assertTrue("shared ack gate must return AlertDialog?", gate.contains("AlertDialog?"))
+        assertTrue("shared ack gate must return the show() handle", gate.contains("return try {"))
+        // Phase A ack-store contract must survive this change.
+        assertTrue("ack gate must still persist acknowledgement", gate.contains("store.markAcknowledged()"))
+    }
+
+    // #78: PolicyActivity has the same handle/lifetime obligation as MainActivity,
+    // for BOTH the risk dialogs and the newly found editor empty-guide dialog.
+    @Test
+    fun editorRiskAndEmptyGuideHandles_dismissedOnDestroy() {
+        assertTrue("editor must declare a riskDialog handle", editor.contains("private var riskDialog: AlertDialog? = null"))
+        assertTrue(
+            "editor must declare an empty-guide handle",
+            editor.contains("private var editorEmptyGuideDialog: AlertDialog? = null"),
+        )
+
+        val onCreate = block(editor, "override fun onCreate(")
+        assertTrue("editor details entry must capture the shared handle", onCreate.contains("riskDialog = showRiskDetailsDialog("))
+
+        val write = block(editor, "private fun onWritePolicyClicked()")
+        assertTrue("editor ack gate must capture the shared handle", write.contains("riskDialog = showRiskAckGate("))
+        assertTrue("editor empty-guide must capture its handle", write.contains("showEditorEmptyGuide("))
+        val emptyGuide = block(editor, "private fun showEditorEmptyGuide()")
+        assertTrue("showEditorEmptyGuide must store its handle", emptyGuide.contains("editorEmptyGuideDialog ="))
+
+        val onDestroy = block(editor, "override fun onDestroy()")
+        assertTrue("onDestroy must dismiss editor riskDialog", onDestroy.contains("riskDialog?.dismiss()"))
+        assertTrue("onDestroy must clear editor riskDialog", onDestroy.contains("riskDialog = null"))
+        assertTrue(
+            "onDestroy must dismiss editor empty-guide dialog",
+            onDestroy.contains("editorEmptyGuideDialog?.dismiss()"),
+        )
+        assertTrue("onDestroy must clear editor empty-guide dialog", onDestroy.contains("editorEmptyGuideDialog = null"))
+    }
+
     @Test
     fun existingDestructiveGuardsRemainReferenced() {
         for (token in listOf(

@@ -13,6 +13,7 @@
 // Real hint TextView rendering/tap in Main+Editor is DEVICE-UNVERIFIED.
 package com.galaxydual.plus
 
+import android.content.SharedPreferences
 import androidx.lifecycle.viewModelScope
 import com.galaxydual.core.DualRepository
 import com.galaxydual.core.NoOpGateway
@@ -22,6 +23,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -79,10 +82,79 @@ class PolicyRepairHintTest {
             generation = map[REPAIR_HINT_KEY_GENERATION] as? Long ?: 0L,
             repairedVersion = map[REPAIR_HINT_KEY_REPAIRED_VERSION] as? Long ?: -1L,
         )
-        override fun save(state: RepairHintState) {
+        override fun save(state: RepairHintState): Boolean {
             map[REPAIR_HINT_KEY_ACTIVE] = state.active
             map[REPAIR_HINT_KEY_GENERATION] = state.generation
             map[REPAIR_HINT_KEY_REPAIRED_VERSION] = state.repairedVersion
+            return true
+        }
+    }
+
+    // PR4 review (Required 1): deterministic interleaving fake. The FIRST save
+    // (the mark's active=true write) re-enters the coordinator from inside save()
+    // to perform the ack, then reports false (commit(false)). JVM monitors are
+    // reentrant, so the nested ack can take the SAME ioLock the mark already
+    // holds. This pins the exact preemption window of the review scenario: the
+    // mark's save RESULT is only reported to the coordinator AFTER a newer ack
+    // has fully settled (writeId=2), so a stale mark outcome (writeId=1) could
+    // otherwise re-raise the acknowledged hint.
+    private class InterleavingRepairHintStore : RepairHintStore {
+        private val map = HashMap<String, Any>()
+        var coordinator: PolicyTxCoordinator? = null
+        var saveCount = 0
+            private set
+        var markCommitFailed = false
+            private set
+
+        override fun load(): RepairHintState = synchronized(this) {
+            RepairHintState(
+                active = map[REPAIR_HINT_KEY_ACTIVE] as? Boolean ?: false,
+                generation = map[REPAIR_HINT_KEY_GENERATION] as? Long ?: 0L,
+                repairedVersion = map[REPAIR_HINT_KEY_REPAIRED_VERSION] as? Long ?: -1L,
+            )
+        }
+
+        override fun save(state: RepairHintState): Boolean = synchronized(this) {
+            saveCount++
+            if (saveCount == 1) {
+                markCommitFailed = true
+                // A later ack linearizes BEFORE this failed result is handed back.
+                coordinator?.acknowledgeRepairHint()
+                false
+            } else {
+                // Ack's save: durable, exactly like a successful commit().
+                map[REPAIR_HINT_KEY_ACTIVE] = state.active
+                map[REPAIR_HINT_KEY_GENERATION] = state.generation
+                map[REPAIR_HINT_KEY_REPAIRED_VERSION] = state.repairedVersion
+                true
+            }
+        }
+    }
+
+    // PR4 review (Required 1, follow-up): NON-reentrant variant. The mark thread
+    // is parked by the production seam AFTER writeId=1 is issued but BEFORE it
+    // takes repairHintIoLock; a REAL second thread then completes the ack
+    // (writeId=2) and lands its clear on disk. The reentrant fake above cannot
+    // cover this window because it re-enters from inside save(), i.e. after the
+    // IO lock is already held.
+    private class GatedInterleavingRepairHintStore : RepairHintStore {
+        private val map = HashMap<String, Any>()
+        val writes = CopyOnWriteArrayList<RepairHintState>()
+
+        override fun load(): RepairHintState = synchronized(this) {
+            RepairHintState(
+                active = map[REPAIR_HINT_KEY_ACTIVE] as? Boolean ?: false,
+                generation = map[REPAIR_HINT_KEY_GENERATION] as? Long ?: 0L,
+                repairedVersion = map[REPAIR_HINT_KEY_REPAIRED_VERSION] as? Long ?: -1L,
+            )
+        }
+
+        override fun save(state: RepairHintState): Boolean = synchronized(this) {
+            writes.add(state)
+            map[REPAIR_HINT_KEY_ACTIVE] = state.active
+            map[REPAIR_HINT_KEY_GENERATION] = state.generation
+            map[REPAIR_HINT_KEY_REPAIRED_VERSION] = state.repairedVersion
+            true
         }
     }
 
@@ -415,5 +487,329 @@ class PolicyRepairHintTest {
         val vm = makeVm(FakeStore(setOf("com.x.app")).store, coord2)
         assertTrue(vm.repairHintFromApp.value)
         assertTrue(hintStore.load().active)
+    }
+
+    // =====================================================================
+    // #76 RED REGRESSION TESTS - RepairHintStore durability (historical)
+    //
+    // Historical note: these were authored as RED tests at 5621769a. Against the
+    // PRE-FIX API/behavior they failed on assertion because:
+    //   * `applyRepairHint()` set `persisted = next` BEFORE `save()` and ignored
+    //     the commit Boolean, so a failed save still left the live coordinator
+    //     "active" in memory while nothing was durable; a new coordinator loaded
+    //     inactive and stopped warning.
+    //   * `load()` caught ANY Throwable and returned RepairHintState(false,0,-1),
+    //     hiding an ALREADY-PERSISTED active hint after restart.
+    // With the #76 fix applied they are now GREEN. The current API already has
+    // `RepairHintStore.save()` returning Boolean and `loadWasRecovered()`.
+    //
+    // #76 fix direction (now implemented): verify durability (propagate
+    // commit(false)/exceptions), treat unknown durability as UNKNOWN-active (bias
+    // toward repeating the warning), never equate in-memory `persisted.active`
+    // with a durable save, and serialize repair-hint commits with
+    // `repairHintIoLock` (physical commit stays OFF the coordinator monitor;
+    // it is NOT dispatched to a background IO owner — callers are the VM IO
+    // dispatcher / UI thread).
+    // =====================================================================
+
+    private open class DurabilityPrefs(
+        initial: Map<String, Any?> = emptyMap(),
+        var commitOk: Boolean = true,
+    ) : SharedPreferences {
+        val durable = LinkedHashMap<String, Any?>(initial)
+        var commitCount = 0
+            private set
+        var applyCount = 0
+            private set
+        var lastCommitted: Map<String, Any?> = emptyMap()
+            private set
+
+        protected open fun readBooleanValue(key: String?, defValue: Boolean): Boolean =
+            (durable[key] as? Boolean) ?: defValue
+        protected open fun readLongValue(key: String?, defValue: Long): Long =
+            (durable[key] as? Long) ?: defValue
+
+        override fun getAll(): MutableMap<String, *> = LinkedHashMap(durable)
+        override fun getString(key: String?, defValue: String?): String? = durable[key] as? String ?: defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+            durable[key] as? MutableSet<String> ?: defValues
+        override fun getInt(key: String?, defValue: Int): Int = durable[key] as? Int ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long = readLongValue(key, defValue)
+        override fun getFloat(key: String?, defValue: Float): Float = durable[key] as? Float ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = readBooleanValue(key, defValue)
+        override fun contains(key: String?): Boolean = durable.containsKey(key)
+
+        override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
+            private val pending = LinkedHashMap<String, Any?>()
+
+            override fun putString(key: String?, value: String?): SharedPreferences.Editor { pending[key!!] = value; return this }
+            override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor { pending[key!!] = values; return this }
+            override fun putInt(key: String?, value: Int): SharedPreferences.Editor { pending[key!!] = value; return this }
+            override fun putLong(key: String?, value: Long): SharedPreferences.Editor { pending[key!!] = value; return this }
+            override fun putFloat(key: String?, value: Float): SharedPreferences.Editor { pending[key!!] = value; return this }
+            override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor { pending[key!!] = value; return this }
+            override fun remove(key: String?): SharedPreferences.Editor { pending.remove(key); return this }
+            override fun clear(): SharedPreferences.Editor { pending.clear(); return this }
+            override fun commit(): Boolean {
+                commitCount++
+                lastCommitted = LinkedHashMap(pending)
+                // commit(false): the pending write is DISCARDED, like a real
+                // SharedPreferences whose disk write failed. This is the signal
+                // the current production save() throws away.
+                if (commitOk) durable.putAll(pending)
+                pending.clear()
+                return commitOk
+            }
+            override fun apply() {
+                applyCount++
+                durable.putAll(pending)
+                pending.clear()
+            }
+        }
+
+        override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener?) = Unit
+    }
+
+    // Models a corrupt `active` key: getBoolean(REPAIR_HINT_KEY_ACTIVE, ...) throws.
+    // PR4 review (Required 2): the fail-closed `active = true` arm of load() had
+    // no test — a mutation to `false` went undetected by all five RED tests.
+    private class ThrowingActivePrefs(initial: Map<String, Any?>) : DurabilityPrefs(initial) {
+        override fun readBooleanValue(key: String?, defValue: Boolean): Boolean {
+            if (key == REPAIR_HINT_KEY_ACTIVE) {
+                throw IllegalStateException("simulated corrupt active-key read")
+            }
+            return super.readBooleanValue(key, defValue)
+        }
+    }
+
+    // Models a durable `active=true` marker whose optional `repaired_version`
+    // key is corrupt, so getLong(REPAIR_HINT_KEY_REPAIRED_VERSION, ...) throws.
+    private class ThrowingRepairedVersionPrefs(initial: Map<String, Any?>) : DurabilityPrefs(initial) {
+        override fun readLongValue(key: String?, defValue: Long): Long {
+            if (key == REPAIR_HINT_KEY_REPAIRED_VERSION) {
+                throw IllegalStateException("simulated corrupt SharedPreferences read")
+            }
+            return super.readLongValue(key, defValue)
+        }
+    }
+
+    @Test
+    fun commitFalseBeforeMark_keepsWarningInNewCoordinatorSameProcess() {
+        // #76 RED: commit(false) is ignored. Coordinator 1 marks active IN MEMORY
+        // (persisted = next before save()) but durable store stays inactive.
+        // A NEW COORDINATOR IN THE SAME PROCESS, sharing the same prefs instance,
+        // then loads inactive and stops warning. Fix: failed/UNKNOWN durability
+        // must remain UNKNOWN-active so the warning survives a coordinator swap —
+        // in-memory active must never be confused with a verified durable save.
+        //
+        // LIMITATION: this reuses the same in-memory prefs/store instance, so it
+        // models a new coordinator in the same process, NOT a real process restart.
+        // When NO write ever landed durably (commit(false) discarded the pending
+        // edit), a genuine process restart has nothing on disk to recover from —
+        // durability cannot survive a cold start without a successful commit.
+        // The honest contract here is UNKNOWN-active within the process; true
+        // cross-process survival is covered by the successful-commit tests above.
+        val prefs = DurabilityPrefs(commitOk = false)
+        val store = prefs.repairHintStore()
+
+        val coord1 = PolicyTxCoordinator(repairHintStore = store)
+        coord1.markRepairHint(repairedVersion = 1L)
+        assertTrue("live coordinator warns right after the repair", coord1.repairHint.value)
+        assertEquals("a durable save was attempted", 1, prefs.commitCount)
+        assertFalse(
+            "commit(false) left nothing durable",
+            prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean ?: false,
+        )
+
+        // New coordinator IN THE SAME PROCESS, same app-private prefs instance.
+        val coord2 = PolicyTxCoordinator(repairHintStore = store)
+        assertTrue(
+            "#76 RED: warning must stay visible in the new coordinator even though the durable save failed " +
+                "(unknown durability must stay UNKNOWN-active, never silently inactive)",
+            coord2.repairHint.value,
+        )
+    }
+
+    @Test
+    fun activePersistedThenGetLongThrows_stillWarns() {
+        // #76 RED: `load()` swallows ANY Throwable and returns the DEFAULT
+        // inactive state, hiding an ALREADY-PERSISTED active hint. Here active=true
+        // and generation=1 ARE durable, but reading repaired_version throws.
+        // A fresh coordinator must still warn (UNKNOWN-active bias toward
+        // repeating the warning); a corrupt optional read must not auto-clear a
+        // hint that was already durably active.
+        val prefs = ThrowingRepairedVersionPrefs(
+            mapOf(
+                REPAIR_HINT_KEY_ACTIVE to true,
+                REPAIR_HINT_KEY_GENERATION to 1L,
+            ),
+        )
+        val store = prefs.repairHintStore()
+
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        assertTrue(
+            "#76 RED: a corrupt field read must not downgrade a persisted active hint to inactive",
+            coord.repairHint.value,
+        )
+        assertTrue(
+            "#76 RED: the coordinator's persisted mirror must stay active (UNKNOWN-active) after the read failure",
+            coord.repairHintPersistedState.active,
+        )
+    }
+
+    @Test
+    fun activeKeyReadThrows_failClosedToWarning() {
+        // PR4 review (Required 2): mutation M3 flipped load()'s fail-closed
+        // `active = true` to `false` and all five RED tests stayed green. This
+        // pins that branch directly: a throwing getBoolean(active) must be
+        // reported active, must mark the load as recovered, and must seed a
+        // fresh coordinator with a visible warning (a corrupt read never
+        // auto-clears an existing hint).
+        val prefs = ThrowingActivePrefs(emptyMap())
+        val store = prefs.repairHintStore()
+
+        val loaded = store.load()
+        assertTrue(
+            "#76: a throwing getBoolean(active) must fail closed to active=true",
+            loaded.active,
+        )
+        assertTrue(
+            "#76: a throwing getBoolean(active) must mark the load as recovered",
+            store.loadWasRecovered(),
+        )
+
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        assertTrue(
+            "#76: a new coordinator seeded from a failed active read must warn",
+            coord.repairHint.value,
+        )
+        assertTrue("UNKNOWN-active mirror must stay active", coord.repairHintPersistedState.active)
+    }
+
+    @Test
+    fun staleMarkFailure_doesNotResurrectHintAfterNewerAckSucceeds() {
+        // PR4 review (Required 1): A(mark, writeId=1) save(false) is preempted
+        // after releasing the IO lock; B(ack, writeId=2) save(true) settles
+        // first; A's stale failure result must NOT re-raise the hint, flip the
+        // persisted mirror, or clobber the newer durability verdict.
+        val store = InterleavingRepairHintStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        store.coordinator = coord
+
+        coord.markRepairHint(repairedVersion = 1L)
+
+        assertEquals("mark save then ack save", 2, store.saveCount)
+        assertTrue("the mark's save really reported failure", store.markCommitFailed)
+        assertFalse(
+            "ack's durable clear must win: no resurrected warning",
+            coord.repairHint.value,
+        )
+        assertFalse("the in-memory mirror must stay cleared", coord.repairHintPersistedState.active)
+        assertFalse("the durable store must stay cleared", store.load().active)
+        val fresh = PolicyTxCoordinator(repairHintStore = store)
+        assertFalse("the warning must not revive in a later coordinator either", fresh.repairHint.value)
+    }
+
+    @Test
+    fun staleMarkCannotWriteActiveOnDiskAfterNewerAckOnAnotherThread() {
+        // PR4 review (Required 1, follow-up): non-reentrant interleaving of two
+        // REAL threads. The mark is parked after writeId=1 is issued but before
+        // it takes repairHintIoLock; a separate ack thread then issues writeId=2
+        // and commits active=false. Releasing the mark must skip its physical
+        // save — the old code only fenced the in-memory RESULT, so the stale
+        // active=true could still land on disk last.
+        val store = GatedInterleavingRepairHintStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        val markEnteredSeam = CountDownLatch(1)
+        val releaseMark = CountDownLatch(1)
+        val seamArmed = AtomicBoolean(true)
+        coord.beforeRepairHintIoLockSeamForTests = {
+            // Only the FIRST writer (the mark) parks; the later ack passes through.
+            if (seamArmed.compareAndSet(true, false)) {
+                markEnteredSeam.countDown()
+                try {
+                    releaseMark.await(5, TimeUnit.SECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+        }
+
+        val markThread = Thread {
+            coord.markRepairHint(repairedVersion = 1L)
+        }.apply { isDaemon = true; name = "repair-hint-mark" }
+
+        val ackDone = CountDownLatch(1)
+        try {
+            markThread.start()
+            assertTrue("mark must reach the pre-IO-lock seam", markEnteredSeam.await(3, TimeUnit.SECONDS))
+
+            // A DIFFERENT real thread settles the ack while the mark is parked.
+            val ackThread = Thread {
+                try {
+                    coord.acknowledgeRepairHint()
+                } finally {
+                    ackDone.countDown()
+                }
+            }.apply { isDaemon = true; name = "repair-hint-ack" }
+            ackThread.start()
+            assertTrue("ack must complete while the mark is parked", ackDone.await(3, TimeUnit.SECONDS))
+            ackThread.join(3_000L)
+            assertFalse("ack thread must have finished", ackThread.isAlive)
+
+            releaseMark.countDown()
+            markThread.join(3_000L)
+            assertFalse("mark thread must have finished", markThread.isAlive)
+
+            assertEquals("only the ack may physically commit", 1, store.writes.size)
+            assertFalse("the durable value must stay the ack's false", store.load().active)
+            assertFalse("no resurrected warning", coord.repairHint.value)
+            assertFalse("the in-memory mirror must stay cleared", coord.repairHintPersistedState.active)
+            val fresh = PolicyTxCoordinator(repairHintStore = store)
+            coords.add(fresh)
+            assertFalse("later coordinator must stay quiet too", fresh.repairHint.value)
+        } finally {
+            releaseMark.countDown()
+            coord.beforeRepairHintIoLockSeamForTests = null
+            markThread.join(3_000L)
+        }
+    }
+
+    @Test
+    fun failedFirstSave_thenSecondMark_retriesPersist() {
+        // #76 RED: markRepairHint() early-returns when the in-memory
+        // `persisted.active` is true, so a second notification after a FAILED
+        // first save never retries the durable write. Fix: a failed/undurable
+        // save must not count as persisted-active; the second mark must retry
+        // and eventually land (verified durability, no in-memory=durable).
+        val prefs = DurabilityPrefs(commitOk = false)
+        val store = prefs.repairHintStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+
+        coord.markRepairHint(repairedVersion = 1L)
+        assertEquals("first mark attempts exactly one commit", 1, prefs.commitCount)
+        assertFalse(
+            "first commit(false) is not durable",
+            prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean ?: false,
+        )
+
+        // Storage is writable now; a later repair notification must re-persist.
+        prefs.commitOk = true
+        coord.markRepairHint(repairedVersion = 2L)
+
+        assertEquals(
+            "#76 RED: a second mark after a failed save must retry persistence " +
+                "(in-memory active must not be treated as durable)",
+            2,
+            prefs.commitCount,
+        )
+        assertEquals(
+            "#76 RED: the retried save must actually land",
+            true,
+            prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean ?: false,
+        )
     }
 }

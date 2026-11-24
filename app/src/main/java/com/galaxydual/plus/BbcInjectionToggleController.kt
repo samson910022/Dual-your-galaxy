@@ -153,7 +153,11 @@ internal class BbcInjectionToggleController(
         // Confirmed sync below must not overwrite it once a tap exists.
         lastUiValue = checked
         // Sequence is assigned at USER-INTENT time from app-scoped state, so it
-        // keeps increasing even when this controller is rebuilt.
+        // keeps increasing even when this controller is rebuilt. Production
+        // taps come from Main, but CONFLATED does not guarantee submit() order
+        // matches nextSequence() order across threads; the coordinator
+        // re-checks this sequence BEFORE commit (#81) so a superseded intent
+        // can never be the last value written to disk.
         val seq = coordinator.state.nextSequence()
         lastSubmittedSequence = seq
         coordinator.submit(seq, checked) { outcome ->

@@ -38,6 +38,16 @@ import kotlinx.coroutines.withContext
  * CONFLATED slot before it is dequeued never gets a result callback: its
  * outcome is irrelevant because a newer intent superseded it.
  *
+ * #81: CONFLATED does NOT guarantee that submit() order matches nextSequence()
+ * order — two callers can be descheduled between assigning their sequence and
+ * submitting it. The consumer therefore re-checks the fence BEFORE commit():
+ * a write whose sequence is older than the latest issued intent is discarded
+ * wholesale (no commit, no mark, no callback). Without this, state.mark()'s
+ * result-only fence would let a stale value land on disk LAST.
+ *
+ * 此 fence 假設 production Main-confined（submit 由 Main thread 呼叫）；跨執行緒下
+ * CONFLATED 仍有微小遺失窗口（sequence 指派與 send 之間仍可能被交錯）。
+ *
  * Cancellation of a controller's UI must NOT cancel this consumer or an
  * in-flight commit; `dispose()` on the controller only detaches UI callbacks.
  * A [CancellationException] from [commit] is propagated to the app scope (and
@@ -69,8 +79,27 @@ internal class BbcToggleCoordinator(
     // is exactly one consumer below, so commits are serialized process-wide.
     private val writes = Channel<Write>(Channel.CONFLATED)
 
+    /** Test seam only: writes dropped by the pre-commit sequence fence (C1/#81). */
+    @Volatile
+    private var skippedWrites: Int = 0
+
     private val consumer: Job = scope.launch {
         for (write in writes) {
+            // #81: the sequence belongs to the USER INTENT (assigned before
+            // submit), not to the queue position. A multi-threaded caller can
+            // nextSequence() in one order and submit() in the opposite order,
+            // and CONFLATED keeps the last SEND, which may be the older intent.
+            // Re-check against the latest ISSUED sequence right here, before the
+            // non-cancellable commit — state.mark() below only fences the
+            // result, which is too late to protect the persisted preference.
+            // latestSequence() starts at 0 and nextSequence() increments it, so
+            // the first write (sequence 1) always passes; only strictly older
+            // writes are dropped.
+            if (write.sequence < state.latestSequence()) {
+                skippedWrites++ // test seam; skipped writes commit/mark/callback nothing
+                continue
+            }
+
             val outcome = try {
                 // A synchronous, non-cancellable commit is never abandoned
                 // mid-call by UI disposal: the app scope outlives every UI.
@@ -106,4 +135,7 @@ internal class BbcToggleCoordinator(
 
     /** Test seam: the app-lifetime consumer must survive controller disposal. */
     internal fun isConsumerActive(): Boolean = consumer.isActive
+
+    /** Test seam: how many dequeued writes the sequence fence rejected before commit. */
+    internal fun skippedWrites(): Int = skippedWrites
 }

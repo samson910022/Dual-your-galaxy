@@ -141,3 +141,25 @@ internal class WarningRetryOneShot {
     /** Test accessor: the generation advances once per installed warning. */
     val currentGeneration: Int get() = ref.get().generation
 }
+
+/**
+ * #77 (H02): arm the per-warning one-shot ONLY when a new warning request is
+ * actually accepted by the re-entry guard (`consentResetAllowedForNewWarning`,
+ * i.e. `!pendingClearConfirm`). The old code called [WarningRetryOneShot.onWarningInstalled]
+ * unconditionally at every `start*Warning` entry, including stale auto-restarts
+ * that the guard then rejected. Such a rejected restart burned the generation,
+ * so the live Retry tap's captured token no longer matched and its legitimate
+ * re-entry was silently dropped. Gating the re-arm on the same accept decision
+ * keeps one retry per *installed* warning without weakening the duplicate guard.
+ *
+ * Framework-free (no android.* import) so the rejected-restart contract is
+ * directly JVM-testable; both Activities call this at their accept sites.
+ */
+internal fun tryAcceptWarning(
+    oneShot: WarningRetryOneShot,
+    newWarningAllowed: Boolean,
+): Boolean {
+    if (!newWarningAllowed) return false
+    oneShot.onWarningInstalled()
+    return true
+}

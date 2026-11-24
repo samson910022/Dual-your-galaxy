@@ -691,6 +691,8 @@ class MainActivity : ComponentActivity() {
         // （含 probe-failed；單一 handle 失敗不阻斷後續。用 dismiss() 而非 cancel()，
         // 避免快銷毀中的 Activity 仍觸發對話框的 onCancel 回呼）。
         dismissAllDestructiveHandles(destructiveDialogHandles) { it.dismiss() }
+        // P2: cancel pending warning restarts posted on the Activity-owned Handler.
+        mainHandler.removeCallbacksAndMessages(null)
         try {
             catalogJob?.cancel()
         } catch (_: Exception) {
@@ -757,10 +759,11 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---- PR #74 R7b-2 (M1)：風險揭露 gate 與對話框 ----
-    // R7b-1 的共用 helper（showRiskDetailsDialog / showRiskAckGate）回傳 Unit，無法取得
-    // 對話框 handle。為在 onDestroy 釋放 handle 並讓 instrumentation 可觀測，於此以
-    // 完全相同的資源／語意建立對話框；決策仍走共用 shouldShowRiskGate + riskAckStore
-    // （單一來源、JVM 可測），取消（含返回鍵）恆為零寫入、零 ack。
+    // 共用 helper（showRiskDetailsDialog / showRiskAckGate，#78）已回傳 show() 的
+    // handle；Main 保留同語意 private wrapper 以維持既有 source-shape 契約
+    // （RiskDisclosureSourceShapeTest 檢查這些 entry 呼叫同名的 private wrapper）。
+    // 決策仍走共用 shouldShowRiskGate + riskAckStore（單一來源、JVM 可測），取消
+    // （含返回鍵）恆為零寫入、零 ack。
 
     private fun showRiskDetailsDialog(activity: Activity) {
         if (activity.isFinishing || activity.isDestroyed) return
@@ -6385,7 +6388,15 @@ class MainActivity : ComponentActivity() {
             warningRestartGuard.reset() // 未 post，必須歸還 guard
             return
         }
-        Handler(Looper.getMainLooper()).post {
+        // P2: post on the Activity-owned Handler so onDestroy can cancel the
+        // callback. A per-call main-Looper Handler here is unreachable by
+        // onDestroy and keeps this dying Activity alive until delivery.
+        mainHandler.post {
+            // Host may have been destroyed between schedule and delivery.
+            if (isFinishing || isDestroyed) {
+                warningRestartGuard.reset()
+                return@post
+            }
             try {
                 pendingWarningRestart?.invoke()
             } catch (_: Exception) {
@@ -6431,8 +6442,9 @@ class MainActivity : ComponentActivity() {
         if (fromUserTap) {
             autoRestartCount.set(0)
         }
-        // R6-1 (G01): re-arm on EVERY installed warning, including auto re-entry.
-        warningRetryOneShot.onWarningInstalled()
+        // #77 (H02): the retry token is armed at the ACCEPT site inside
+        // requestPreWriteWarning (after the re-entry guard), never here — a
+        // stale auto-restart passes through this entry but is rejected there.
         val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, frozen ->
             vm.requestPolicyWriteForWarning(frozen, binding, consent = pendingWarningConsent)
         }
@@ -6446,8 +6458,8 @@ class MainActivity : ComponentActivity() {
         if (fromUserTap) {
             autoRestartCount.set(0)
         }
-        // R6-1 (G01): re-arm on EVERY installed warning, including auto re-entry.
-        warningRetryOneShot.onWarningInstalled()
+        // #77 (H02): retry token armed only by the accept seam inside
+        // requestPreClearWarning (see startWriteWarning for the rationale).
         val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, _ ->
             confirmClearWithConsent(binding)
         }
@@ -6607,7 +6619,8 @@ class MainActivity : ComponentActivity() {
         // 只提供「重新整理 snapshot + 取消」。若日後要在此建 consent，必須傳
         // noRemovalKnown=false（Unknown 的 delta=∅ 是偽空，D03 fail-open）。
         if (!snap.known) {
-            if (pendingClearConfirm) return
+            // #77: re-arm the Retry token only after the re-entry guard accepts.
+            if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return
             setPendingClearConfirm(true)
             pendingWarningConsent = null
             showPreClearProbeFailedWarning(
@@ -6636,7 +6649,8 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
-        if (pendingClearConfirm) return
+        // #77: accepted new warning — only now may the Retry generation advance.
+        if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return
         setPendingClearConfirm(true)
         lifecycleScope.launch {
             // Phase B：probe 回傳 DualProbeResult（Ok/Failed），不再以空清單吞失敗。
@@ -6745,7 +6759,8 @@ class MainActivity : ComponentActivity() {
         // R4-1 (E01/E02)：Unknown 只提供「重新整理 + 取消」，不建造 consent／pending。
         // 舊 force-proceed 若重建 consent，必須傳 noRemovalKnown=false（delta=∅ 為偽空）。
         if (!snap.known) {
-            if (pendingClearConfirm) return
+            // #77: re-arm the Retry token only after the re-entry guard accepts.
+            if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return
             setPendingClearConfirm(true)
             pendingWarningConsent = null
             showPreClearProbeFailedWarning(
@@ -6774,7 +6789,8 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
-        if (pendingClearConfirm) return
+        // #77: accepted new warning — only now may the Retry generation advance.
+        if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return
         setPendingClearConfirm(true)
         lifecycleScope.launch {
             // R05/NEW-1：同 requestPreClearWarning，uid 來自 verified target。
