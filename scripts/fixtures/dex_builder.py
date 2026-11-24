@@ -394,6 +394,19 @@ def build_all(outdir):
     apk("multi.apk", [("classes.dex", multi_primary),
                       ("classes2.dex", multi_secondary)])
 
+    # 11-member multi-dex (classes.dex + classes2..classes11.dex): secondary
+    # indices with two digits are canonical ART names, so classes10.dex and
+    # classes11.dex must be accepted. Each member has its own, distinct
+    # class_def so the cross-DEX duplicate guard stays satisfied; the target
+    # is defined ONLY in the last member, classes11.dex.
+    eleven_descriptors = [f"Lcom/example/multidex11/Dex{i};" for i in range(1, 11)]
+    eleven_descriptors.append(TARGET)
+    eleven_members = [("classes.dex", build_dex([eleven_descriptors[0]]))]
+    eleven_members += [(f"classes{number}.dex",
+                        build_dex([eleven_descriptors[number - 1]]))
+                       for number in range(2, 12)]
+    apk("eleven-dex.apk", eleven_members)
+
     # --- multi-dex enumeration / structural mutation negatives -------------
     apk("dup-classidx.apk", [("classes.dex", dup_classidx)])
     apk("dup-descriptor-within.apk", [("classes.dex", dup_descriptor)])
@@ -444,11 +457,18 @@ def build_all(outdir):
         xposed_members() + [("classes.dex", multi_primary),
                             ("classes2.dex", multi_secondary)])
     # Negative variants isolate each release-artifact gate without changing
-    # any of the metadata members.
+    # any of the metadata members. Both descriptor strings and both type_ids
+    # are retained in each DEX; ONLY the removed target's class_def is gone.
+    # This mirrors the real acceptance scenario, where a stale descriptor
+    # string/type reference must still not satisfy the class_def gate.
+    missing_shizuku_dex = dex("integration-missing-shizuku.dex", [TARGET, OTHER],
+                              types=[0, 1], class_idxs=[1])
+    missing_dualhook_dex = dex("integration-missing-dualhook.dex", [TARGET, OTHER],
+                               types=[0, 1], class_idxs=[0])
     for name, dex_payload in (
         ("integration-zero-classdefs", negative),
-        ("integration-missing-dualhook", positive),
-        ("integration-missing-shizuku", missing),
+        ("integration-missing-dualhook", missing_dualhook_dex),
+        ("integration-missing-shizuku", missing_shizuku_dex),
     ):
         apk(f"{name}.apk", xposed_members() + [("classes.dex", dex_payload)])
     # A gap in secondary DEX numbering (no classes2.dex) with otherwise valid

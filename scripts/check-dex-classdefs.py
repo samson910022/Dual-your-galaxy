@@ -49,7 +49,7 @@ HEADER_SIZE = 112          # 0x70; class_defs data lives past this header
 ENDIAN_LITTLE = 0x12345678  # tag read little-endian -> little-endian tables
 ENDIAN_BIG = 0x78563412     # tag read little-endian -> big-endian tables
 PRIMARY_DEX = "classes.dex"
-SECONDARY_DEX_RE = re.compile(r"classes([2-9][0-9]*)\.dex")
+SECONDARY_DEX_RE = re.compile(r"classes(1[0-9]+|[2-9][0-9]*)\.dex")
 ANY_CLASSES_DEX_RE = re.compile(r"classes[0-9]*\.dex")
 DEX_VERSIONS = frozenset(f"{version:03d}".encode("ascii") for version in range(35, 41))
 

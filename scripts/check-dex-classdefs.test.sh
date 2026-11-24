@@ -130,6 +130,13 @@ assert_case "multi-dex target only in classes2.dex" "$SUITE_TMP/multi.apk" 0 \
 assert_case "multi-dex primary entry still reported" "$SUITE_TMP/multi.apk" 0 \
   "FOUND class_def $OTHER in classes.dex (count=1)" "$TARGET" "$OTHER"
 
+# 5b. Two-digit secondary indices (classes10.dex / classes11.dex) are canonical
+# Android multi-dex names: an 11-DEX APK with the target only in classes11.dex
+# must pass, with the FOUND line pinned to that exact member.
+assert_case "multi-dex target only in classes11.dex (11 members)" \
+  "$SUITE_TMP/eleven-dex.apk" 0 \
+  "FOUND class_def $TARGET in classes11.dex" "$TARGET"
+
 # 6. CLI accepts multiple descriptors in one invocation, exit 0.
 assert_case "multiple descriptors CLI" "$SUITE_TMP/both.apk" 0 \
   "FOUND class_def $OTHER in classes.dex (count=1)" "$TARGET" "$OTHER"
