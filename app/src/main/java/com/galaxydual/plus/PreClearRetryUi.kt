@@ -242,8 +242,9 @@ internal class WarningRestartController {
      *
      * FAST-PATH CALLERS: an accepted destructive action can settle with NO
      * warning at all (a Known snapshot / empty removal set, i.e. a no-op). Such
-     * a call still goes through this seam with `resetBudget = true` so the
-     * accepted action owns a fresh identity and budget; it passes
+     * a call still goes through this seam, and `resetBudget` mirrors
+     * `fromUserTap`: `true` for a genuine tap, `false` for an auto/Retry re-entry
+     * (which carries over the consumed auto-restart budget). It passes
      * `generation = WarningRetryOneShot.currentGeneration` for CORRELATION ONLY.
      * This method NEVER touches [WarningRetryOneShot] (it never did): the
      * one-shot generation advances only for warnings actually shown, via
@@ -370,7 +371,11 @@ internal class WarningRestartController {
         return true
     }
 
-    /** Request id to capture at a Retry tap (or when installing a dialog). */
+    /**
+     * Legacy/test accessor for the live request id. Production captures the
+     * accept-time `actionId` (threaded into install/schedule/consumeRetry and
+     * the dialog identity gates) instead; do not use this to correlate a settle.
+     */
     fun retryRequestId(): Long? = state.get().request?.identity?.id
 
     /** Test/telemetry accessor: the live request id, if any. */

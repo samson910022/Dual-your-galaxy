@@ -177,9 +177,11 @@ class WarningRestartControllerTest {
         assertEquals(listOf("editor:b,c"), hits)
     }
 
-    // (e) Known / empty fast paths never install a request at all.
+    // (e) A fresh controller owns no request until an accept seam installs one;
+    // Known/empty fast paths DO install an identity through that seam. With no
+    // install at all, nothing can be scheduled, delivered or retried.
     @Test
-    fun knownAndEmptyFastPath_neverInstalls() {
+    fun freshController_withoutAcceptedAction_neverInstalls() {
         val controller = WarningRestartController()
         val posted = mutableListOf<Posted>()
         val hits = mutableListOf<String>()

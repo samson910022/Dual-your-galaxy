@@ -9090,8 +9090,11 @@ internal fun <T> dismissDialogHandle(handle: T?, dismiss: (T) -> Unit): T? {
 // 兩者在二次確認 OK 點擊當下經 rootUninstallIfTargetStillValid 做 serial-bound fence；
 // 只有 preClearTargetStillValid 對 live 與 fresh 皆成立才執行 uninstall／re-probe，
 // 否則完全不執行、發出 fail-closed 訊息並 onCancel 還原 UI 狀態。
-// 三個新參數皆無預設值：任何新呼叫端都必須明確提供 fence 來源與 dialog holder
-// （fail-closed 編譯期約束）。
+// G2: actionAlive 的 identity gate 由呼叫端提供（{ true } 預設僅供舊測試／legacy
+// 呼叫端）；三個生產呼叫端皆明確傳入
+// `actionAlive = { warningRestartController.isLive(actionId) }`：
+// MainActivity.requestPreClearWarning、MainActivity.requestPreWriteWarning 與
+// PolicyActivity.requestEditorWriteWarning。
 // R2-5 (N10)：非 ROOT Positive「繼續清除」也必須通過 revalidatePreClearContinue 的
 // serial-bound + membership fence；capturedInstalled（警告時凍結的 installed 快照）與
 // reprobe（同一 verified uid／同一 delta 的重探 seam）皆無預設值，缺少任一即編譯失敗。

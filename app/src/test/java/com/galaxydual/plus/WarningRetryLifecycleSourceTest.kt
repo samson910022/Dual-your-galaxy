@@ -167,6 +167,34 @@ class WarningRetryLifecycleSourceTest {
         return out
     }
 
+    // G2: an Unknown Retry settle must validate the accepted action id BEFORE
+    // it releases the freeze, consumes the retry token, or raises guidance.
+    // Membership alone is not enough: the gate must precede EVERY side effect.
+    private fun assertRetrySettleIsIdentityBound(name: String, body: String) {
+        val gateNeedle = "warningRestartController.isLive(actionId)"
+        val gates = indicesOf(body, gateNeedle)
+        // One gate on the settled-Known branch and one on each settled-bad branch.
+        assertTrue(
+            "$name retry settle must gate every branch with isLive(actionId)",
+            gates.size >= 3,
+        )
+        val releaseAt = body.indexOf("setPendingClearConfirm(false)")
+        assertTrue("$name retry settle must expose a flag release", releaseAt >= 0)
+        assertTrue("$name isLive gate must precede setPendingClearConfirm(false)", gates[0] in 0 until releaseAt)
+        val retryAt = body.indexOf("consumeRetry(")
+        assertTrue("$name retry settle must expose a Retry consumption", retryAt >= 0)
+        assertTrue("$name isLive gate must precede consumeRetry(", gates[0] in 0 until retryAt)
+        val guidance = indicesOf(body, "showWarningRetryGuidance(")
+        assertEquals("$name retry settle must expose exactly two guidance sites", 2, guidance.size)
+        assertTrue("$name first isLive gate must precede BOTH guidance sites", gates[0] in 0 until guidance[0])
+        for (at in guidance) {
+            assertTrue(
+                "$name guidance must be preceded by an isLive(actionId) gate",
+                gates.any { it in 0 until at },
+            )
+        }
+    }
+
     // G4: whole-lambda slice for `onCancel = { ... }`. The warning cancel
     // bodies are one-liners that embed a NESTED `{ onCancel() }`, so reading
     // only to the next newline misses side effects appended after that nested
@@ -258,6 +286,18 @@ class WarningRetryLifecycleSourceTest {
             assertTrue("warning install must follow the accept guard", guardAt in 0 until installAt)
             assertTrue(actionSeam.contains("warningRestartController.install("))
             assertTrue(actionSeam.contains("generation = warningRetryOneShot.currentGeneration"))
+            // The correlation-only `currentGeneration` read is REQUIRED above,
+            // so strip it before checking that the fast path touches no other
+            // one-shot member (onWarningInstalled/capture/tryConsume/...).
+            // block() bounds this expression-bodied seam at the next top-level
+            // declaration, so a later guarded body cannot leak into the slice.
+            val fastPathOneShotUses = actionSeam.replace("warningRetryOneShot.currentGeneration", "")
+            assertFalse(
+                "$name fast-path seam must not advance one-shot",
+                fastPathOneShotUses.contains("onWarningInstalled()") ||
+                    fastPathOneShotUses.contains("warningRetryOneShot."),
+            )
+            assertFalse("$name request body must not advance one-shot", requestBody.contains("onWarningInstalled()"))
             // Exactly one scoped assertion: the Known/no-op fast path has
             // NO accept guard and must not advance the retry generation.
             assertFalse(
@@ -350,6 +390,18 @@ class WarningRetryLifecycleSourceTest {
     }
 
     @Test
+    fun retryUnknownWarning_settleIsIdentityGatedBeforeRelease() {
+        assertRetrySettleIsIdentityBound(
+            "MainActivity",
+            block(main, "private fun retryUnknownWarning("),
+        )
+        assertRetrySettleIsIdentityBound(
+            "PolicyActivity",
+            block(editor, "private fun retryUnknownWarning("),
+        )
+    }
+
+    @Test
     fun mainDialogCancelsAndAborts_areIdentityBound() {
         // G2: every Main dialog CANCEL must route through cancelAcceptedWarning,
         // which identity-gates the cancel before touching pendingClearConfirm.
@@ -410,6 +462,23 @@ class WarningRetryLifecycleSourceTest {
         val abortLiveAt = ab.indexOf("warningRestartController.isLive(actionId)")
         assertTrue("abort must gate consent cleanup with isLive", abortLiveAt in 0 until ab.indexOf("pendingWarningConsent = null"))
         assertTrue("abort must gate restart scheduling with isLive", abortLiveAt in 0 until ab.indexOf("scheduleWarningRestart(actionId)"))
+
+        // Mirror the Editor probe-settle gate assertions for BOTH Main request
+        // functions: the accepted-id gate must precede consent/dialog side effects.
+        for ((name, body) in listOf(
+            "Main write" to block(main, "private fun requestPreWriteWarning("),
+            "Main clear" to block(main, "private fun requestPreClearWarning("),
+        )) {
+            assertTrue(body.contains("onRetry = { retryUnknownWarning(actionId) }"))
+            assertTrue(body.contains("actionAlive = { warningRestartController.isLive(actionId) }"))
+            val gateAt = body.indexOf("if (!warningRestartController.isLive(actionId))")
+            assertTrue("$name probe settle gate must exist", gateAt >= 0)
+            assertTrue("$name probe settle gate must precede when(probe)", gateAt in 0 until body.indexOf("when (probe) {"))
+            assertTrue(
+                "$name probe settle gate must precede consent write",
+                gateAt in 0 until body.indexOf("pendingWarningConsent = buildPolicyWriteConsent("),
+            )
+        }
     }
 
     @Test
