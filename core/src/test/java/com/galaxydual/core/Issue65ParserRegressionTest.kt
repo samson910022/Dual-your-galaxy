@@ -690,11 +690,254 @@ class Issue65ParserRegressionTest {
 
     @Test
     fun r6_overflowIdPrefixIsNotParsableAndClaimsNoUser95() {
-        // id= overflows Int: the shared parser returns null, so no row claim
-        // (and certainly no u95 claim) can be manufactured from this line.
+        // id= overflows Int: the shared parser returns null. R10a additionally
+        // claims the `N: id=` shape as REJECTED so the strict gate fails closed
+        // instead of silently ignoring the row; no u95 claim can be made.
         val row = "1: id=99999999999999999999, name=foo, type=profile.CLONE, flags=X (parentId=0)"
         assertNull(VerboseUserRow.parse(row))
         val claims = SamsungProfileAdapter.parseUserListVerbose(row)
         assertTrue("overflow id must not produce a u95 claim: $claims", claims.none { it.userId == 95 })
+    }
+
+    // ---- R8: one classified line owns its own evidence ----
+
+    // Legacy u95 CLONE(serial 15) with NO parent of its own; the only
+    // `parentId=0` lives in a DIFFERENT user's NEW_ROW (display name, real
+    // tail, or a following indented line). None of it may authorize u95.
+    private val r8LegacyNoParent = listOf(
+        "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+        "    userType=android.os.usertype.profile.CLONE",
+    )
+
+    private fun r8NewRow(name: String, tail: String = "flags=X", indent: String = "  ") =
+        indent + "2: id=150, name=$name, type=profile.PRIVATE, $tail"
+
+    private fun r8Claim(vararg lines: String): ProfileIdentity =
+        SamsungProfileAdapter.parseUserListVerbose(lines.joinToString("\n"))
+            .single { it.userId == 95 }
+
+    @Test
+    fun r8_indentedNewRowDisplayNameCannotFillMissingLegacyParent() {
+        val borrowed = r8Claim(*(r8LegacyNoParent + listOf(r8NewRow("parentId=0"))).toTypedArray())
+        assertEquals(ProfileUserType.CLONE, borrowed.userType)
+        assertNull("u95 must not borrow u150's display name as parent evidence", borrowed.parentId)
+        assertEquals(15, borrowed.serial)
+
+        val baseline = r8Claim(*(r8LegacyNoParent + listOf(r8NewRow("Neutral"))).toTypedArray())
+        assertEquals(ProfileUserType.CLONE, baseline.userType)
+        assertNull(baseline.parentId)
+        assertEquals(15, baseline.serial)
+    }
+
+    @Test
+    fun r8_newRowBeforeOrAfterLegacyHeader_isOrderIndependent() {
+        for (lines in listOf(
+            r8LegacyNoParent + listOf(r8NewRow("parentId=0")),
+            listOf(r8NewRow("parentId=0")) + r8LegacyNoParent,
+        )) {
+            val claim = r8Claim(*lines.toTypedArray())
+            assertNull("u95 parent must stay absent in both orders", claim.parentId)
+            assertEquals(15, claim.serial)
+        }
+    }
+
+    @Test
+    fun r8_column0NewRowCannotFillMissingLegacyParent() {
+        val claim = r8Claim(*(r8LegacyNoParent + listOf(r8NewRow("parentId=0", indent = ""))).toTypedArray())
+        assertNull(claim.parentId)
+    }
+
+    @Test
+    fun r8_anotherRowRealTailCannotPolluteLegacyClaim() {
+        val row = r8NewRow("Neutral", tail = "flags=X (parentId=0) serialNo=99")
+        val claims = SamsungProfileAdapter.parseUserListVerbose(
+            (r8LegacyNoParent + listOf(row)).joinToString("\n"),
+        )
+        val u95 = claims.single { it.userId == 95 }
+        assertNull("u150's real parent must not become u95's", u95.parentId)
+        assertEquals("u150's serial must not become u95's", 15, u95.serial)
+        val u150 = claims.single { it.userId == 150 }
+        assertEquals(0, u150.parentId)
+        assertEquals(99, u150.serial)
+    }
+
+    @Test
+    fun r8_followUpParentLineAfterNewRowDoesNotReattach() {
+        val text = (
+            r8LegacyNoParent + listOf(r8NewRow("Neutral"), "    parentId=0")
+            ).joinToString("\n")
+        val claim = SamsungProfileAdapter.parseUserListVerbose(text).single { it.userId == 95 }
+        assertNull("an indented line after a NEW_ROW belongs to nobody", claim.parentId)
+    }
+
+    @Test
+    fun r8_parseDumpsysUserDoesNotAbsorbAnotherRowsNewRow() {
+        val dumpsys = (listOf("Users:") + r8LegacyNoParent + listOf(r8NewRow("parentId=0")))
+            .joinToString("\n")
+        val claims = SamsungProfileAdapter.parseDumpsysUser(dumpsys)
+        val u95 = claims.single { it.userId == 95 }
+        assertNull("dumpsys must not borrow the new row's parent", u95.parentId)
+        assertEquals(15, u95.serial)
+        assertTrue("dumpsys parsing must not emit a claim for the new row's user", claims.none { it.userId == 150 })
+    }
+
+    // ---- R10a: row-like attempts are OWNED and fail closed ----
+
+    private val r10CleanVerbose = listOf(
+        "Users:",
+        "  0: id=0, name=Owner, type=full.SYSTEM, flags=X (parentId=0)",
+        "  1: id=95, name=DUAL_APP, type=profile.CLONE, flags=X (parentId=0)",
+        "  2: id=150, name=Secure Folder, type=profile.PRIVATE, flags=X (parentId=0)",
+    ).joinToString("\n")
+
+    @Test
+    fun r10a_missingNameRowLikeAttempt_isRejectedAndNeverClones() {
+        val duplicate = "1: id=95, type=profile.CLONE, flags=X (parentId=0)"
+        assertEquals(IdentityLineKind.REJECTED, IdentityLineClassifier.classify(duplicate).kind)
+        assertNull(VerboseUserRow.parse(duplicate))
+
+        val alone = SamsungProfileAdapter.parseUserListVerbose(duplicate).single()
+        assertEquals(95, alone.userId)
+        assertEquals(ProfileUserType.UNKNOWN, alone.userType)
+        assertEquals(IdentityConfidence.LOW, alone.confidence)
+        assertNull(alone.parentId)
+
+        val snapshot = r10CleanVerbose + "\n" + duplicate
+        assertEquals(
+            "the malformed duplicate must not add a CLONE claim for u95",
+            1,
+            SamsungProfileAdapter.parseUserListVerbose(snapshot)
+                .count { it.userId == 95 && it.userType == ProfileUserType.CLONE },
+        )
+        assertFalse(PmOutputParser.isIdentityChannelOk(snapshot, 0))
+        assertFalse(PmOutputParser.isListUsersOutputOk(snapshot, 0))
+    }
+
+    @Test
+    fun r10a_overflowAndNonNumericIdRowLikeAttemptsAreRejected() {
+        val duplicates = listOf(
+            "1: id=99999999999999999999, name=foo, type=profile.CLONE, flags=X (parentId=0)",
+            "1: id=abc, name=foo, type=profile.CLONE, flags=X (parentId=0)",
+        )
+        for (duplicate in duplicates) {
+            assertEquals("$duplicate must be REJECTED", IdentityLineKind.REJECTED, IdentityLineClassifier.classify(duplicate).kind)
+            val snapshot = r10CleanVerbose + "\n" + duplicate
+            assertEquals(1, SamsungProfileAdapter.parseUserListVerbose(snapshot).count { it.userId == 95 && it.userType == ProfileUserType.CLONE })
+            assertFalse(PmOutputParser.isIdentityChannelOk(snapshot, 0))
+            assertFalse(PmOutputParser.isListUsersOutputOk(snapshot, 0))
+        }
+    }
+
+    @Test
+    fun r10a_sectionHeadersProseAndCrLfStayCompatible() {
+        for (line in listOf("Users:", "User types (12 types):", "  Device properties:", "just prose", "")) {
+            assertFalse("$line must not look row-like", VerboseUserRow.ROW_LIKE.containsMatchIn(line))
+            assertEquals(IdentityLineKind.OTHER, IdentityLineClassifier.classify(line).kind)
+        }
+        assertTrue(PmOutputParser.isIdentityChannelOk(r10CleanVerbose, 0))
+        assertTrue(PmOutputParser.isIdentityChannelOk(r10CleanVerbose.replace("\n", "\r\n"), 0))
+        assertEquals(1, SamsungProfileAdapter.parseUserListVerbose(r10CleanVerbose).count { it.userId == 95 && it.userType == ProfileUserType.CLONE })
+    }
+
+    @Test
+    fun r10a_rejectedRowIsNotStitchedIntoLegacyBody() {
+        val text = listOf(
+            "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+            "    userType=android.os.usertype.profile.CLONE",
+            "  1: id=95, type=profile.CLONE, flags=X (parentId=0)",
+        ).joinToString("\n")
+        val claims = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(2, claims.size)
+        val legacy = claims.single { it.confidence == IdentityConfidence.MED }
+        assertNull("the REJECTED row's parentId must not authorize u95", legacy.parentId)
+        assertEquals(15, legacy.serial)
+        val rejected = claims.single { it.confidence == IdentityConfidence.LOW }
+        assertEquals(ProfileUserType.UNKNOWN, rejected.userType)
+        assertNull(rejected.parentId)
+        assertFalse(PmOutputParser.isIdentityChannelOk(text, 0))
+    }
+
+    // ---- R10b: one shared parent/serial grammar ----
+
+    @Test
+    fun r10b_serialNumberAliasInEarlierDeclarationFailsClosed() {
+        val row = "1: id=95, name=OK, type=profile.PRIVATE serial number: 99, " +
+            "type=profile.CLONE, flags=X (parentId=0)"
+        assertTrue(VerboseUserRow.parse(row)!!.malformed)
+        assertFalse(PmOutputParser.isIdentityChannelOk(row, 0))
+        assertFalse(PmOutputParser.isListUsersOutputOk(row, 0))
+        val claim = SamsungProfileAdapter.parseUserListVerbose(row).single()
+        assertEquals(ProfileUserType.UNKNOWN, claim.userType)
+        assertNull(claim.parentId)
+        assertNull(claim.serial)
+    }
+
+    @Test
+    fun r10b_allSharedSerialAndParentSpellingsAreStructural() {
+        val tails = listOf(
+            "serial number: 99", "serialnumber=99", "Serial Number : 99",
+            "serialNo=99", "serial: 99", "parentId=10", "parent: 10",
+        )
+        for (tail in tails) {
+            val row = "1: id=95, name=OK, type=profile.PRIVATE $tail, " +
+                "type=profile.CLONE, flags=X (parentId=0)"
+            assertTrue("$tail must be detected as a structural tail", VerboseUserRow.parse(row)!!.malformed)
+            assertFalse("$tail must fail the gate", PmOutputParser.isIdentityChannelOk(row, 0))
+            val claim = SamsungProfileAdapter.parseUserListVerbose(row).single()
+            assertEquals(ProfileUserType.UNKNOWN, claim.userType)
+            assertNull(claim.parentId)
+            assertNull(claim.serial)
+        }
+    }
+
+    @Test
+    fun r10b_structuralAliasOrderSwapsStayMalformed() {
+        val rows = listOf(
+            "1: id=95, name=OK, type=profile.PRIVATE serial number: 99, type=profile.CLONE, flags=X (parentId=0)",
+            "1: id=95, name=OK, type=profile.CLONE serial number: 99, type=profile.PRIVATE, flags=X (parentId=0)",
+            "1: id=95, name=OK, type=profile.PRIVATE parentId=10, type=profile.CLONE, flags=X (parentId=0)",
+            "1: id=95, name=OK, type=profile.CLONE parentId=10, type=profile.PRIVATE, flags=X (parentId=0)",
+        )
+        for (row in rows) {
+            assertTrue("both orders must fail closed: $row", VerboseUserRow.parse(row)!!.malformed)
+            assertFalse("both orders must fail the gate: $row", PmOutputParser.isIdentityChannelOk(row, 0))
+        }
+    }
+
+    @Test
+    fun r10b_legitimateSerialNumberInCanonicalTailParsesAsClone() {
+        val row = "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serial number: 15"
+        assertFalse(VerboseUserRow.parse(row)!!.malformed)
+        val claim = SamsungProfileAdapter.parseUserListVerbose(row).single()
+        assertEquals(ProfileUserType.CLONE, claim.userType)
+        assertEquals(15, claim.serial)
+        assertEquals(0, claim.parentId)
+        assertTrue(PmOutputParser.isIdentityChannelOk(row, 0))
+    }
+
+    @Test
+    fun r10b_sharedFieldGrammarCoversEverySpellingAndBoundary() {
+        for (text in listOf(
+            "serial=99", "serialNo=99", "serialnumber=99", "serial number: 99",
+            "Serial Number : 99", "serial: 99",
+        )) {
+            assertTrue("$text serial head", VerboseIdentityFields.SERIAL_HEAD.containsMatchIn("x $text"))
+            assertTrue("$text serial value", VerboseIdentityFields.serialWithValue().containsMatchIn("x $text"))
+        }
+        for (text in listOf("parent=0", "parentId=0", "parent: 0", "parentId: -10000")) {
+            assertTrue("$text parent head", VerboseIdentityFields.PARENT_HEAD.containsMatchIn("x $text"))
+            assertTrue("$text parent value", VerboseIdentityFields.parentWithValue().containsMatchIn("x $text"))
+        }
+        for (text in listOf(", flags=X", " (flags=X", ",FLAGS = X")) {
+            assertTrue("$text flags head", VerboseIdentityFields.FLAGS_HEAD.containsMatchIn("type=profile.CLONE$text"))
+        }
+        for (text in listOf("personalSerialNo=7", "mySerial=8", "grandparentId=3")) {
+            assertFalse("$text must not match serial head", VerboseIdentityFields.SERIAL_HEAD.containsMatchIn(text))
+            assertFalse("$text must not match serial value", VerboseIdentityFields.serialWithValue().containsMatchIn(text))
+            assertFalse("$text must not match parent head", VerboseIdentityFields.PARENT_HEAD.containsMatchIn(text))
+            assertFalse("$text must not match parent value", VerboseIdentityFields.parentWithValue().containsMatchIn(text))
+        }
+        assertEquals("99", VerboseIdentityFields.serialWithValue().find("serial number: 99")!!.groupValues[1])
+        assertEquals("-10000", VerboseIdentityFields.parentWithValue().find("parentId: -10000")!!.groupValues[1])
     }
 }

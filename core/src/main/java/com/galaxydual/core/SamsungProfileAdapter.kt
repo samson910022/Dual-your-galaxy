@@ -372,15 +372,15 @@ object SamsungProfileAdapter {
     private val EXPLICIT_SEP =
         Regex("(?<![A-Za-z0-9.])${USER_TYPE_PREFIX}\\s*[:=]", RegexOption.IGNORE_CASE)
 
-    // `parentId=0`, `parent: 0`, `parentId: -10000`, ... (case-insensitive).
-    // Left boundary so `transparentId`/`grandparentId` never match.
-    private val PARENT_ID = Regex("(?<![A-Za-z0-9])parent(?:Id)?\\s*[:=]\\s*(-?\\d+)", RegexOption.IGNORE_CASE)
-
-    // `serialNo=15`, `serial: 15`, `Serial number: 15`, ... Case-insensitive.
-    // `serialNo` (no separator) is covered by the optional separator class.
-    // Left boundary so `personalSerialNo` never matches.
-    private val SERIAL =
-        Regex("(?<![A-Za-z0-9])serial(?:No|\\s*number)?\\s*[:=]\\s*(\\d+)", RegexOption.IGNORE_CASE)
+    // `parentId=0`, `parent: 0`, `parentId: -10000`, ... and
+    // `serialNo=15`, `serial: 15`, `Serial number: 15`, `serialnumber=99`,
+    // ... are built from the SAME heads the row parser uses as its structural
+    // ambiguity detector (VerboseIdentityFields, issue #87 R10b). A spelling
+    // extractable here is therefore always detectable there, and vice versa.
+    // Both heads keep the left alnum boundary, so `transparentId`/
+    // `grandparentId`/`personalSerialNo` never contribute evidence.
+    private val PARENT_ID = VerboseIdentityFields.parentWithValue()
+    private val SERIAL = VerboseIdentityFields.serialWithValue()
 
     // Parses `cmd user list -v` verbose output into ONE CLAIM PER PARSED
     // ROW/BLOCK (issue #87 R2: no collapsing, no last-wins overwrite).
@@ -446,13 +446,19 @@ object SamsungProfileAdapter {
         )
     }
 
-    // Shared block splitter/parser for both verbose channels. Cuts the
-    // canonical (LF-normalized, classified) physical lines at each confirmed
-    // LEGACY_HEADER label; the lines following a header up to the next header
-    // form that user's block. Type/parent/serial are searched in the block
-    // BODY only, so the header label can never leak into userType. NEW_ROW and
-    // REJECTED lines are never treated as legacy headers (REJECTED lines are
-    // omitted from bodies entirely and emit a bare UNKNOWN/LOW claim).
+    // Shared block splitter/parser for both verbose channels (also used by
+    // parseDumpsysUser). Cuts the canonical (LF-normalized, classified)
+    // physical lines at each confirmed LEGACY_HEADER label; the lines
+    // following a header up to the next header, the next NEW_ROW/REJECTED line
+    // or a column-0 section form that user's block. Type/parent/serial are
+    // searched in the block BODY only, so the header label can never leak into
+    // userType. NEW_ROW and REJECTED lines are never treated as legacy headers:
+    // each OWNS its own line and TERMINATES any earlier legacy body (R8), so
+    // another user's indented row (or a malformed row-like attempt) can no
+    // longer be stitched into a preceding block as authorization evidence.
+    // Lines after such a break and before the next header belong to nobody --
+    // they are handled only by the new-row parser, never as legacy evidence.
+    // REJECTED lines emit a bare UNKNOWN/LOW claim and are omitted from bodies.
     // Section guard (PR-33 D3, S24 實機 blocking): the LAST header has no
     // next header, so without a cap its body would extend to EOF and swallow
     // the trailing global catalog. On the S24 `dumpsys user` output the Users
@@ -484,25 +490,46 @@ object SamsungProfileAdapter {
                 rejectedClaim(line, source)?.let { out.add(it) }
             }
         }
-        val usable = lines.filter { it.kind != IdentityLineKind.REJECTED }
-        if (usable.isEmpty()) return out
+        if (lines.isEmpty()) return out
 
-        // Rebuild ONE canonical text with uniform LF boundaries from the very
-        // same classified physical lines, then derive all offsets from it.
-        // Offsets are indices into [canonical], never into the original output.
-        val canonical = usable.joinToString("\n") { it.text }
-        val lineStarts = IntArray(usable.size)
+        // Rebuild ONE canonical text with uniform LF boundaries, aligned 1:1
+        // with ALL classified lines (R8). A REJECTED line is represented by an
+        // EMPTY placeholder, never its raw text: offsets stay aligned with the
+        // classifier's line indices while none of its type/parent/serial can
+        // leak into a body. Offsets are indices into [canonical], never into
+        // the original output.
+        val canonicalLines = lines.map { if (it.kind == IdentityLineKind.REJECTED) "" else it.text }
+        val canonical = canonicalLines.joinToString("\n")
+        val lineStarts = IntArray(lines.size)
         var offset = 0
-        for (i in usable.indices) {
+        for (i in lines.indices) {
             lineStarts[i] = offset
-            offset += usable[i].text.length + 1 // +1 for the joining '\n'
+            offset += canonicalLines[i].length + 1 // +1 for the joining '\n'
+        }
+
+        // Evidence ownership fence (R8): a NEW_ROW line -- even an indented
+        // one -- and a REJECTED line both TERMINATE every legacy body that
+        // started earlier. Walk in reverse so breakStart[i] is the first such
+        // line STRICTLY after i (canonical.length when there is none). A legacy
+        // body therefore ends at its own break even when there is no following
+        // header/column-0 section, and lines between a break and the next
+        // header are owned by nobody (fail closed).
+        val breakStart = IntArray(lines.size)
+        var nextBreak = canonical.length
+        for (i in lines.indices.reversed()) {
+            breakStart[i] = nextBreak
+            if (lines[i].kind == IdentityLineKind.NEW_ROW ||
+                lines[i].kind == IdentityLineKind.REJECTED
+            ) {
+                nextBreak = lineStarts[i]
+            }
         }
 
         // Header candidates come ONLY from LEGACY_HEADER-classified lines,
         // matched on that single physical line (no (?m) line-boundary trick).
         // NEW_ROW/OTHER lines are never scanned as headers.
         val headers = mutableListOf<Pair<Int, MatchResult>>()
-        for ((i, line) in usable.withIndex()) {
+        for ((i, line) in lines.withIndex()) {
             if (line.kind != IdentityLineKind.LEGACY_HEADER) continue
             val match = IdentityLineClassifier.LEGACY_HEADER.find(line.text) ?: continue
             headers.add(i to match)
@@ -518,7 +545,7 @@ object SamsungProfileAdapter {
             } else {
                 canonical.length
             }
-            val bodyEnd = minOf(nextHeader, sectionEnd(canonical, bodyStart))
+            val bodyEnd = minOf(nextHeader, sectionEnd(canonical, bodyStart), breakStart[lineIndex])
             val body = canonical.substring(bodyStart, bodyEnd)
             out.add(parseOneBlock(userId = userId, label = label, body = body, source = source))
         }

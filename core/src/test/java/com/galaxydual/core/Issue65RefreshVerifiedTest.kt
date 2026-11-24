@@ -5,6 +5,7 @@ import kotlin.coroutines.Continuation
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.startCoroutine
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -416,8 +417,10 @@ class Issue65RefreshVerifiedTest {
 
     // ---- R2: same-id duplicate evidence at the FULL refreshVerified() level ----
 
-    // Extra claim lines are appended AFTER a clean owner/other snapshot so a
-    // legacy block body can run to EOF without swallowing another user's row.
+    // Extra claim lines are appended AFTER a clean owner/other snapshot. Since
+    // R8 every NEW_ROW owns its line and TERMINATES an earlier legacy body, so
+    // a legacy block is fenced explicitly (not merely by EOF or a column-0
+    // section) and no snapshot row can be borrowed as another user's evidence.
     private fun verboseWithTrailingClaims(claims: List<String>) = (
         listOf(
             "Users:",
@@ -515,11 +518,107 @@ class Issue65RefreshVerifiedTest {
 
     @Test
     fun overflowIdPrefix_failsClosedWithoutPackageRead() {
-        // id= does not fit an Int: VerboseUserRow.parse returns null, so this
-        // row yields NO u95 claim in the verbose channel. With only the dumpsys
-        // CLONE claim the two-channel rule cannot confirm u95 -> Unknown, and
-        // no package read may be issued for the unconfirmed id.
+        // id= does not fit an Int, so parse() returns null. Since R10a the
+        // `N: id=` shape still OWNS the line: it is classified REJECTED and the
+        // strict identity gate fails closed on malformedRow (no ERROR_LINE hit
+        // is needed). The fail-fast gateway therefore never reaches a package
+        // read for the unconfirmed id; the parser likewise emits no CLONE.
         val row = "1: id=99999999999999999999, name=foo, type=profile.CLONE, flags=X (parentId=0)"
         assertFailClosed(FakeGateway(verboseWithRow(row)), "overflow id prefix")
+    }
+
+    // ---- R8: one classified line owns its own evidence (full flow) ----
+
+    // Legacy u95 CLONE(serial 15) with NO parent of its own; the only
+    // `parentId=0` lives in a DIFFERENT user's NEW_ROW. u95 must stay Unknown
+    // (missing parent) with no package read, at either indentation/order.
+    private val r8LegacyNoParent = listOf(
+        "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+        "    userType=android.os.usertype.profile.CLONE",
+    )
+
+    private fun r8NewRow(name: String, tail: String = "flags=X", indent: String = "  ") =
+        indent + "2: id=150, name=$name, type=profile.PRIVATE, $tail"
+
+    private fun r8Verbose(vararg lines: String) = (listOf("Users:") + lines).joinToString("\n")
+
+    @Test
+    fun r8_indentedNewRowNameCannotAuthorizeLegacyClone_failsClosedWithoutPackageRead() {
+        val verbose = r8Verbose(*(r8LegacyNoParent + listOf(r8NewRow("parentId=0"))).toTypedArray())
+        val u95 = SamsungProfileAdapter.parseUserListVerbose(verbose).single { it.userId == 95 }
+        assertNull("u95 must not borrow u150's display name as parent", u95.parentId)
+        assertEquals(15, u95.serial)
+        assertFailClosed(FakeGateway(verbose), "R8: u150 display name borrowed as u95 parent")
+    }
+
+    @Test
+    fun r8_neutralNameBaseline_failsClosedWithoutPackageRead() {
+        val verbose = r8Verbose(*(r8LegacyNoParent + listOf(r8NewRow("Neutral"))).toTypedArray())
+        assertFailClosed(FakeGateway(verbose), "R8: u150 neutral name baseline")
+    }
+
+    @Test
+    fun r8_reverseOrderAndColumn0Row_failsClosedWithoutPackageRead() {
+        for (lines in listOf(
+            listOf(r8NewRow("parentId=0")) + r8LegacyNoParent,
+            r8LegacyNoParent + listOf(r8NewRow("parentId=0", indent = "")),
+        )) {
+            val verbose = r8Verbose(*lines.toTypedArray())
+            val u95 = SamsungProfileAdapter.parseUserListVerbose(verbose).single { it.userId == 95 }
+            assertNull("u95 parent must stay absent in both orders/indents", u95.parentId)
+            assertFailClosed(FakeGateway(verbose), "R8: reversed / column-0 new row")
+        }
+    }
+
+    @Test
+    fun r8_otherRowTailAndFollowUpLineCannotReattach_failsClosedWithoutPackageRead() {
+        for (lines in listOf(
+            r8LegacyNoParent + listOf(r8NewRow("Neutral", "flags=X (parentId=0) serialNo=99")),
+            r8LegacyNoParent + listOf(r8NewRow("Neutral"), "    parentId=0"),
+        )) {
+            val verbose = r8Verbose(*lines.toTypedArray())
+            val u95 = SamsungProfileAdapter.parseUserListVerbose(verbose).single { it.userId == 95 }
+            assertNull("another row's parent must not attach to u95", u95.parentId)
+            assertEquals(15, u95.serial)
+            assertFailClosed(FakeGateway(verbose), "R8: other row's tail / follow-up parent line")
+        }
+    }
+
+    @Test
+    fun r8_consistentMixedEvidenceStillResolvesGroundTruthInBothOrders() {
+        for (claims in listOf(
+            listOf(r2FreshParent0NoSerial) + r2LegacyClone(),
+            r2LegacyClone() + listOf(r2FreshParent0NoSerial),
+        )) {
+            val verbose = verboseWithTrailingClaims(claims)
+            val result = ground(FakeGateway(verbose))
+            assertEquals(95, result.target.userId)
+            assertEquals(15, result.target.serial)
+            assertEquals(0, result.target.parentId)
+            assertEquals(listOf("com.example.chat", "com.example.mail"), result.cloned)
+        }
+    }
+
+    // ---- R10: malformed attempts / shared grammar at the full flow ----
+
+    @Test
+    fun r10a_missingNameDuplicate_failsClosedWithoutPackageRead() {
+        val verbose = verboseWithName("DUAL_APP") + "\n" +
+            "1: id=95, type=profile.CLONE, flags=X (parentId=0)"
+        assertFailClosed(FakeGateway(verbose), "R10a: missing name= duplicate row")
+    }
+
+    @Test
+    fun r10a_overflowIdDuplicate_failsClosedWithoutPackageRead() {
+        val verbose = verboseWithName("DUAL_APP") + "\n" +
+            "1: id=99999999999999999999, name=foo, type=profile.CLONE, flags=X (parentId=0)"
+        assertFailClosed(FakeGateway(verbose), "R10a: overflow id duplicate row")
+    }
+
+    @Test
+    fun r10b_serialNumberAliasEarlierDeclaration_failsClosedWithoutPackageRead() {
+        val row = "1: id=95, name=OK, type=profile.PRIVATE serial number: 99, " +
+            "type=profile.CLONE, flags=X (parentId=0)"
+        assertFailClosed(FakeGateway(verboseWithRow(row)), "R10b: serial number structural alias")
     }
 }

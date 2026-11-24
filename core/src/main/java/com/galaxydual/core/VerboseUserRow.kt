@@ -41,13 +41,15 @@ package com.galaxydual.core
 // Conversely a bare `, type=<token>` with an empty window is display-label
 // text (a rename may legally contain one), so `name=foo, type=profile.CLONE,
 // type=full.SYSTEM, flags=X` still resolves OTHER via the last, structural
-// declaration. The case-insensitive STRUCTURAL_FLAGS / STRUCTURAL_PARENT_SERIAL
-// regexes are a deliberately WIDER ambiguity detector, NOT the authorization
-// grammar: strict canonical FLAGS_SUFFIX at the exact token end still decides
-// which single token is real. Callers must refuse to let ANY token from a
-// malformed row authorize an identity, must not neutralize its error
-// semantics, and must fail the strict identity gate even if ERROR_LINE matched
-// nothing.
+// declaration. The case-insensitive field heads in VerboseIdentityFields
+// (FLAGS_HEAD / PARENT_HEAD / SERIAL_HEAD) are a deliberately WIDER ambiguity
+// detector, NOT the authorization grammar: strict canonical FLAGS_SUFFIX at
+// the exact token end still decides which single token is real. Sharing those
+// heads with the claim parser's parent/serial extractors keeps the detector
+// and the value grammar from drifting apart (issue #87 R10b). Callers must
+// refuse to let ANY token from a malformed row authorize an identity, must
+// not neutralize its error semantics, and must fail the strict identity gate
+// even if ERROR_LINE matched nothing.
 //
 // RESIDUAL AMBIGUITY (honest scope note): this is a FLAT-TEXT format with no
 // field-length prefix or quoting. A row whose label supplies the ONLY
@@ -103,6 +105,16 @@ internal data class VerboseUserRow(
         // deliberately avoided (it would swallow Unicode/VT/FF).
         private val ROW_PREFIX = Regex("""^[ \t]*\d+:[ \t]*id=(\d+),[ \t]*name=""")
 
+        // Row-like ATTEMPT detector (issue #87 R10a): ANY line shaped like a
+        // new-format row prefix (`displayIndex: id=`) is OWNED by the
+        // structured-row path even when parse() cannot produce a row (missing
+        // `name=`, overflow/non-numeric id). Such a line is REJECTED -- never
+        // left as OTHER where it could pass the strict gate with no ERROR_LINE
+        // hit or be stitched into a preceding legacy body. Deliberately does
+        // NOT match section headers (`Users:`, `User types (...)`, `Devices:`)
+        // or prose, so those stay compatible.
+        internal val ROW_LIKE = Regex("""^[ \t]*\d+:[ \t]*id=""")
+
         // Every `, type=` declaration after name=. Group 1 is the raw token:
         // non-whitespace/non-comma, and intentionally allowed to be EMPTY so
         // `type=, flags=...` is detected as a real declaration with no value
@@ -117,14 +129,11 @@ internal data class VerboseUserRow(
         private val FLAGS_SUFFIX = Regex("""(?:[ \t]*,[ \t]*|[ \t]*\([ \t]*)flags=""")
 
         // WIDER ambiguity detector (NOT the authorization grammar above):
-        // case-insensitive, tolerant of space/tab around `flags` and of the
-        // `parent`/`parentId`/`serial`/`serialNo` spellings with `=` or `:`.
+        // case-insensitive field heads are shared with the claim parser's
+        // parent/serial extractors via VerboseIdentityFields, so every
+        // spelling detected here is also one that parser can extract.
         // It only decides whether a declaration OWNS a structural tail; the
         // strict FLAGS_SUFFIX still decides which token, if any, is real.
-        private val STRUCTURAL_FLAGS =
-            Regex("""(?:[ \t]*,[ \t]*|[ \t]*\()[ \t]*flags[ \t]*=""", RegexOption.IGNORE_CASE)
-        private val STRUCTURAL_PARENT_SERIAL =
-            Regex("""(?:parent(?:Id)?|serial(?:No)?)[ \t]*[=:]""", RegexOption.IGNORE_CASE)
 
         // Row splitting shared by BOTH callers (PmOutputParser's strict gate
         // and SamsungProfileAdapter's claim parser) so they can never disagree
@@ -178,8 +187,9 @@ internal data class VerboseUserRow(
             val structural = declarations.mapIndexed { i, decl ->
                 val windowEnd = declarations.getOrNull(i + 1)?.range?.first ?: line.length
                 val window = line.substring(decl.range.last + 1, windowEnd)
-                STRUCTURAL_FLAGS.containsMatchIn(window) ||
-                    STRUCTURAL_PARENT_SERIAL.containsMatchIn(window)
+                VerboseIdentityFields.FLAGS_HEAD.containsMatchIn(window) ||
+                    VerboseIdentityFields.PARENT_HEAD.containsMatchIn(window) ||
+                    VerboseIdentityFields.SERIAL_HEAD.containsMatchIn(window)
             }
             val lastIndex = declarations.lastIndex
             // Rules 1-4: the last declaration has a non-empty token, carries
@@ -210,6 +220,36 @@ internal data class VerboseUserRow(
             )
         }
     }
+}
+
+// Shared field grammar for structured identity evidence (issue #87 R10b).
+// The wide structural-ambiguity detector in VerboseUserRow and the value
+// extractors in SamsungProfileAdapter use THESE heads, so a spelling that one
+// recognizes can never be invisible to the other. All are case-insensitive
+// and carry the same left alnum guard, so `personalSerialNo`, `mySerial` and
+// `grandparentId` never contribute parent/serial evidence.
+internal object VerboseIdentityFields {
+    // `parent`, `parentId`, with `:`/`=` and optional surrounding whitespace.
+    internal val PARENT_HEAD =
+        Regex("""(?<![A-Za-z0-9])parent(?:Id)?\s*[:=]""", RegexOption.IGNORE_CASE)
+
+    // `serial`, `serialNo`, `serial number`, `serialnumber`, with `:`/`=`.
+    // `serialNo` needs no separator class because `No` is part of the name.
+    internal val SERIAL_HEAD =
+        Regex("""(?<![A-Za-z0-9])serial(?:No|\s*number)?\s*[:=]""", RegexOption.IGNORE_CASE)
+
+    // Canonical `, flags=` or spaced/parenthesized ` ( flags=` tail. Used by
+    // the structural detector, never as the strict authorization suffix.
+    internal val FLAGS_HEAD =
+        Regex("""(?:[ \t]*,[ \t]*|[ \t]*\()[ \t]*flags[ \t]*=""", RegexOption.IGNORE_CASE)
+
+    // Value-bearing form of each head. The value is ALWAYS capture group 1
+    // (signed for parent, unsigned for serial, matching the legacy grammar).
+    fun parentWithValue(): Regex =
+        Regex(PARENT_HEAD.pattern + """\s*(-?\d+)""", RegexOption.IGNORE_CASE)
+
+    fun serialWithValue(): Regex =
+        Regex(SERIAL_HEAD.pattern + """\s*(\d+)""", RegexOption.IGNORE_CASE)
 }
 
 // Exactly one classification per RAW physical line, shared by the strict
@@ -253,6 +293,15 @@ internal object IdentityLineClassifier {
         // `name=` label cannot manufacture a competing legacy claim.
         VerboseUserRow.parse(rawText)?.let { row ->
             return ClassifiedIdentityLine(rawText, IdentityLineKind.NEW_ROW, row, null)
+        }
+        // Row-like ATTEMPT that could not be parsed (R10a): OWN the line and
+        // fail closed. Without this, a missing `name=`, an overflow id or a
+        // non-numeric id fell through to OTHER -- the strict gate found no
+        // ERROR_LINE hit and passed, and the tail could be stitched into a
+        // preceding legacy body. parseBlocks represents REJECTED lines with an
+        // empty placeholder and a break fence; the sanitizer sets malformedRow.
+        if (VerboseUserRow.ROW_LIKE.containsMatchIn(rawText)) {
+            return ClassifiedIdentityLine(rawText, IdentityLineKind.REJECTED, null, null)
         }
         LEGACY_HEADER.find(rawText)?.let { header ->
             return ClassifiedIdentityLine(rawText, IdentityLineKind.LEGACY_HEADER, null, header)
