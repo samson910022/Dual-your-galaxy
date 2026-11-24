@@ -108,4 +108,22 @@ class GalaxyAppTest {
         val prefs = GalaxyApp.remotePreferences("test_group")
         org.junit.Assert.assertNull(prefs)
     }
+
+    @Test
+    fun policyTxCoordinator_failsClosedWhenPrefsCannotBeAcquired() {
+        // Pure JVM: android.jar's getSharedPreferences() either throws ("Stub!")
+        // or returns null, so this exercises the REAL GalaxyApp acquisition path.
+        // The seam in RepairHintStore.kt must substitute the fail-closed store —
+        // reverting GalaxyApp to a null store makes this test fail (no warning,
+        // persisted durability reported as verified).
+        val coord = app.policyTxCoordinator
+
+        assertTrue("coordinator must warn when production storage is unavailable", coord.repairHint.value)
+        assertTrue("mirror stays UNKNOWN-active", coord.repairHintPersistedState.active)
+        assertFalse("a non-existent store must never be certified", coord.repairHintDurableForTests)
+
+        coord.markRepairHint(repairedVersion = 1L)
+        assertTrue("warning survives an unconfirmed retry", coord.repairHint.value)
+        assertFalse("and remains uncertified", coord.repairHintDurableForTests)
+    }
 }

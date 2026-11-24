@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -560,32 +561,50 @@ class PolicyRepairHintTest {
     // dispatcher / UI thread).
     // =====================================================================
 
+    // Faithful-enough SharedPreferences fake: Android's commitToMemory() updates
+    // the process-local map BEFORE the disk write and does NOT roll it back when
+    // commit(false) reports a failed disk write. Keeping `memory` and `durable`
+    // SEPARATE is what makes B1 observable: a failed CLEAR leaves memory
+    // inactive but disk still active. A `coldStart()` handle rebuilds memory from
+    // disk (a real process restart), while reusing the same handle models a
+    // same-process coordinator rebuild.
     private open class DurabilityPrefs(
         initial: Map<String, Any?> = emptyMap(),
         var commitOk: Boolean = true,
     ) : SharedPreferences {
-        val durable = LinkedHashMap<String, Any?>(initial)
+        val durable = LinkedHashMap<String, Any?>(initial) // on-disk file
+        val memory = LinkedHashMap<String, Any?>(initial) // process-local mMap
         var commitCount = 0
             private set
         var applyCount = 0
             private set
         var lastCommitted: Map<String, Any?> = emptyMap()
             private set
+        // Thrown commit AFTER commitToMemory(): models a backend that updates the
+        // process-local map and then throws before the disk write completes.
+        var throwFromCommit = false
 
         protected open fun readBooleanValue(key: String?, defValue: Boolean): Boolean =
-            (durable[key] as? Boolean) ?: defValue
+            (memory[key] as? Boolean) ?: defValue
         protected open fun readLongValue(key: String?, defValue: Long): Long =
-            (durable[key] as? Long) ?: defValue
+            (memory[key] as? Long) ?: defValue
 
-        override fun getAll(): MutableMap<String, *> = LinkedHashMap(durable)
-        override fun getString(key: String?, defValue: String?): String? = durable[key] as? String ?: defValue
+        // Cold start: a NEW SharedPreferences handle reconstructs its in-memory
+        // map from the on-disk file. Subclasses preserve their corrupt-read
+        // behavior via copyForColdStart.
+        protected open fun copyForColdStart(disk: Map<String, Any?>): DurabilityPrefs =
+            DurabilityPrefs(disk, commitOk)
+        fun coldStart(): DurabilityPrefs = copyForColdStart(LinkedHashMap(durable))
+
+        override fun getAll(): MutableMap<String, *> = LinkedHashMap(memory)
+        override fun getString(key: String?, defValue: String?): String? = memory[key] as? String ?: defValue
         override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
-            durable[key] as? MutableSet<String> ?: defValues
-        override fun getInt(key: String?, defValue: Int): Int = durable[key] as? Int ?: defValue
+            memory[key] as? MutableSet<String> ?: defValues
+        override fun getInt(key: String?, defValue: Int): Int = memory[key] as? Int ?: defValue
         override fun getLong(key: String?, defValue: Long): Long = readLongValue(key, defValue)
-        override fun getFloat(key: String?, defValue: Float): Float = durable[key] as? Float ?: defValue
+        override fun getFloat(key: String?, defValue: Float): Float = memory[key] as? Float ?: defValue
         override fun getBoolean(key: String?, defValue: Boolean): Boolean = readBooleanValue(key, defValue)
-        override fun contains(key: String?): Boolean = durable.containsKey(key)
+        override fun contains(key: String?): Boolean = memory.containsKey(key)
 
         override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
             private val pending = LinkedHashMap<String, Any?>()
@@ -601,15 +620,18 @@ class PolicyRepairHintTest {
             override fun commit(): Boolean {
                 commitCount++
                 lastCommitted = LinkedHashMap(pending)
-                // commit(false): the pending write is DISCARDED, like a real
-                // SharedPreferences whose disk write failed. This is the signal
-                // the current production save() throws away.
-                if (commitOk) durable.putAll(pending)
+                // commitToMemory() ALWAYS happens first and is never reverted —
+                // this is the exact Android behavior that B1 depends on.
+                memory.putAll(pending)
+                if (throwFromCommit) throw IllegalStateException("simulated commit failure")
+                val ok = commitOk
+                if (ok) durable.putAll(pending)
                 pending.clear()
-                return commitOk
+                return ok
             }
             override fun apply() {
                 applyCount++
+                memory.putAll(pending)
                 durable.putAll(pending)
                 pending.clear()
             }
@@ -623,6 +645,7 @@ class PolicyRepairHintTest {
     // PR4 review (Required 2): the fail-closed `active = true` arm of load() had
     // no test — a mutation to `false` went undetected by all five RED tests.
     private class ThrowingActivePrefs(initial: Map<String, Any?>) : DurabilityPrefs(initial) {
+        override fun copyForColdStart(disk: Map<String, Any?>): DurabilityPrefs = ThrowingActivePrefs(disk)
         override fun readBooleanValue(key: String?, defValue: Boolean): Boolean {
             if (key == REPAIR_HINT_KEY_ACTIVE) {
                 throw IllegalStateException("simulated corrupt active-key read")
@@ -634,11 +657,107 @@ class PolicyRepairHintTest {
     // Models a durable `active=true` marker whose optional `repaired_version`
     // key is corrupt, so getLong(REPAIR_HINT_KEY_REPAIRED_VERSION, ...) throws.
     private class ThrowingRepairedVersionPrefs(initial: Map<String, Any?>) : DurabilityPrefs(initial) {
+        override fun copyForColdStart(disk: Map<String, Any?>): DurabilityPrefs = ThrowingRepairedVersionPrefs(disk)
         override fun readLongValue(key: String?, defValue: Long): Long {
             if (key == REPAIR_HINT_KEY_REPAIRED_VERSION) {
                 throw IllegalStateException("simulated corrupt SharedPreferences read")
             }
             return super.readLongValue(key, defValue)
+        }
+    }
+
+    // B1: `active` reads cleanly as FALSE but `generation` is corrupt. The old
+    // store returned "inactive + recovered" here (fail-open): the coordinator
+    // hid the warning. Fail-closed semantics must report active=true.
+    private class ThrowingGenerationPrefs(initial: Map<String, Any?>) : DurabilityPrefs(initial) {
+        override fun copyForColdStart(disk: Map<String, Any?>): DurabilityPrefs = ThrowingGenerationPrefs(disk)
+        override fun readLongValue(key: String?, defValue: Long): Long {
+            if (key == REPAIR_HINT_KEY_GENERATION) {
+                throw IllegalStateException("simulated corrupt generation read")
+            }
+            return super.readLongValue(key, defValue)
+        }
+    }
+
+    // B2: a non-null store whose load() throws outright. save() succeeds so the
+    // test can also prove a later decision still publishes over the init seed.
+    private class ThrowingLoadStore : RepairHintStore {
+        var saveCount = 0
+            private set
+
+        override fun load(): RepairHintState = throw IllegalStateException("simulated store load failure")
+        override fun save(state: RepairHintState): Boolean {
+            saveCount++
+            return true
+        }
+    }
+
+    // B3: count saves through the production fail-closed stub without changing it.
+    private class CountingStore(private val delegate: RepairHintStore) : RepairHintStore {
+        var saveCount = 0
+            private set
+
+        override fun load(): RepairHintState = delegate.load()
+        override fun save(state: RepairHintState): Boolean {
+            saveCount++
+            return delegate.save(state)
+        }
+        override fun loadWasRecovered(): Boolean = delegate.loadWasRecovered()
+    }
+
+    // B1: thrown edit()/commit() during a CLEAR. The first (durable) save works;
+    // afterwards any edit() throws, modelling a storage backend that becomes
+    // unavailable exactly when the acknowledgement tries to persist its clear.
+    // Unlike commit(false) this exercises production's catch arm, which must set
+    // durabilityUnknown=true for ANY state (including active=false).
+    private class ThrowingEditPrefs : DurabilityPrefs() {
+        var throwOnEdit = false
+
+        override fun edit(): SharedPreferences.Editor {
+            if (throwOnEdit) throw IllegalStateException("simulated edit failure")
+            return super.edit()
+        }
+
+        override fun copyForColdStart(disk: Map<String, Any?>): DurabilityPrefs =
+            ThrowingEditPrefs().also {
+                it.durable.putAll(disk)
+                it.memory.putAll(disk)
+                it.throwOnEdit = throwOnEdit
+            }
+    }
+
+    // B1: every key read throws. There is no separate "all keys" branch in the
+    // production store (each key is caught independently and funnels into the
+    // single verified=false decision), so this is an informational guard that
+    // the fail-closed result is not accidentally weakened by multiple failures.
+    private class ThrowingAllKeysPrefs : DurabilityPrefs() {
+        override fun copyForColdStart(disk: Map<String, Any?>): DurabilityPrefs =
+            ThrowingAllKeysPrefs().also {
+                it.durable.putAll(disk)
+                it.memory.putAll(disk)
+            }
+
+        override fun readBooleanValue(key: String?, defValue: Boolean): Boolean =
+            throw IllegalStateException("simulated corrupt active read")
+
+        override fun readLongValue(key: String?, defValue: Long): Long =
+            throw IllegalStateException("simulated corrupt long read")
+    }
+
+    // B2 hardening: a custom store may report active=false while claiming its
+    // load was recovered (or while throwing from loadWasRecovered()). The
+    // coordinator must force UNKNOWN-active regardless of the reported state.
+    private class InconsistentRecoveryStore(
+        private val verdict: () -> Boolean = { true },
+    ) : RepairHintStore {
+        var loadWasRecoveredCalls = 0
+            private set
+
+        override fun load(): RepairHintState = RepairHintState(false, 3L, 2L)
+        override fun save(state: RepairHintState): Boolean = true
+        override fun loadWasRecovered(): Boolean {
+            loadWasRecoveredCalls++
+            return verdict()
         }
     }
 
@@ -1198,5 +1317,397 @@ class PolicyRepairHintTest {
         assertTrue(coord.repairHintPersistedState.active)
         assertEquals(1L, coord.repairHintPersistedState.generation)
         assertTrue("next mark must land durably after reset", store.load().active)
+    }
+
+    // =====================================================================
+    // PR #89 Phase B (B1/B2/B3): fail-closed durability across failed CLEAR,
+    // corrupt reads, a throwing store and unavailable production storage.
+    // These use the split memory/disk fake above, so no sleep or timing is
+    // involved: the state after each commit is fully deterministic.
+    // =====================================================================
+    @Test
+    fun failedClearAfterDurableActive_warningSurvivesOnColdLoad() {
+        val prefs = DurabilityPrefs()
+        val store = prefs.repairHintStore()
+
+        // A durable active marker lands on disk AND in the process-local map.
+        assertTrue(store.save(RepairHintState(active = true, generation = 1L, repairedVersion = 5L)))
+        assertEquals(true, prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+        assertEquals(true, prefs.memory[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+
+        val coord1 = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord1)
+        assertTrue("durable active seeds the warning", coord1.repairHint.value)
+        assertFalse("a clean durable load is not recovered", store.loadWasRecovered())
+
+        // Failed CLEAR: commit() updates the in-process map to false but leaves
+        // the disk marker active. B1 flagged only failed active=true saves, so
+        // this unconfirmed clear was mistaken for a confirmed inactive marker.
+        prefs.commitOk = false
+        coord1.acknowledgeRepairHint()
+        assertEquals("the clear attempted a commit", 2, prefs.commitCount)
+        assertEquals("memory holds the failed clear's value", false, prefs.memory[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+        assertEquals("disk still holds the durable active marker", true, prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+        assertTrue("the failed CLEAR must keep warning", coord1.repairHint.value)
+        assertTrue("UNKNOWN-active mirror", coord1.repairHintPersistedState.active)
+        assertFalse("durability must stay UNKNOWN", coord1.repairHintDurableForTests)
+
+        val loaded = store.load()
+        assertTrue("store reports unknown-active after a failed clear", loaded.active)
+        assertEquals("generation is unchanged", 1L, loaded.generation)
+        assertTrue("and marks the load recovered", store.loadWasRecovered())
+
+        // Same-process rebuild over the same prefs handle still warns.
+        val sameProcess = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(sameProcess)
+        assertTrue("same-process rebuild still warns", sameProcess.repairHint.value)
+        assertEquals(1L, sameProcess.repairHintPersistedState.generation)
+
+        // True cold start: a fresh handle rebuilds memory from disk (active=true),
+        // so the clean read warns with no recovered flag.
+        val coldStore = prefs.coldStart().repairHintStore()
+        val cold = PolicyTxCoordinator(repairHintStore = coldStore)
+        coords.add(cold)
+        assertTrue("cold start must still warn", cold.repairHint.value)
+        assertTrue("cold mirror active", cold.repairHintPersistedState.active)
+        assertEquals("generation unchanged across cold load", 1L, cold.repairHintPersistedState.generation)
+        assertFalse("cold disk read is verified", coldStore.loadWasRecovered())
+    }
+
+    @Test
+    fun durableActiveLoadedByProductionBinding_seedsWarningAtConstruction() {
+        val prefs = DurabilityPrefs(
+            mapOf(
+                REPAIR_HINT_KEY_ACTIVE to true,
+                REPAIR_HINT_KEY_GENERATION to 7L,
+                REPAIR_HINT_KEY_REPAIRED_VERSION to 3L,
+            ),
+        )
+        val store = prefs.repairHintStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        assertTrue("production binding seeds the flow at construction", coord.repairHint.value)
+        assertTrue("the in-memory mirror is active", coord.repairHintPersistedState.active)
+        assertEquals(7L, coord.repairHintPersistedState.generation)
+        assertEquals(3L, coord.repairHintPersistedState.repairedVersion)
+        assertTrue("a clean durable load is verified", coord.repairHintDurableForTests)
+        assertFalse("and is not recovered", store.loadWasRecovered())
+
+        val vm = makeVm(FakeStore(setOf("com.x.app")).store, coord)
+        assertTrue("fresh VM observes the seeded warning", vm.repairHintFromApp.value)
+        assertFalse("the VM's own hook signal stays untouched", vm.state.value.policyRepairNeedsHookRestart)
+    }
+
+    @Test
+    fun corruptGenerationWithInactiveActive_failClosedToWarning() {
+        val prefs = ThrowingGenerationPrefs(
+            mapOf(
+                REPAIR_HINT_KEY_ACTIVE to false,
+                REPAIR_HINT_KEY_REPAIRED_VERSION to 5L,
+            ),
+        )
+        val store = prefs.repairHintStore()
+        assertFalse("the raw active key really reads false", prefs.getBoolean(REPAIR_HINT_KEY_ACTIVE, true))
+
+        val loaded = store.load()
+        assertTrue("a corrupt generation must fail closed to active=true", loaded.active)
+        assertTrue("and be reported recovered", store.loadWasRecovered())
+
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertTrue("coordinator must warn", coord.repairHint.value)
+        assertTrue("mirror must stay active", coord.repairHintPersistedState.active)
+        assertFalse("durability stays UNKNOWN", coord.repairHintDurableForTests)
+    }
+
+    @Test
+    fun loadThrows_failClosedToWarning() {
+        val store = ThrowingLoadStore()
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        assertTrue("a non-null store that throws on load must fail closed", coord.repairHint.value)
+        assertTrue("mirror stays UNKNOWN-active", coord.repairHintPersistedState.active)
+        assertFalse("durability stays UNKNOWN", coord.repairHintDurableForTests)
+
+        // The init seed uses the monotonic publication mechanism: a later real
+        // decision has a strictly newer ticket and must still publish over it.
+        coord.acknowledgeRepairHint()
+        assertFalse("a later clear can still publish over the init seed", coord.repairHint.value)
+        assertFalse("mirror follows the clear", coord.repairHintPersistedState.active)
+        assertTrue("the successful save certifies durability", coord.repairHintDurableForTests)
+
+        coord.markRepairHint(repairedVersion = 1L)
+        assertTrue("a later mark can also publish", coord.repairHint.value)
+        assertEquals(2, store.saveCount)
+    }
+
+    @Test
+    fun failClosedStubStore_warnsAndRetries() {
+        val store = CountingStore(failClosedRepairHintStore())
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        assertTrue("the stub fails closed at construction", coord.repairHint.value)
+        assertTrue("stub mirror active", coord.repairHintPersistedState.active)
+        assertFalse("nothing was ever certified", coord.repairHintDurableForTests)
+
+        coord.markRepairHint(repairedVersion = 1L)
+        assertEquals("a production-unavailable store still retries the write", 1, store.saveCount)
+        assertTrue("warning survives the unconfirmed retry", coord.repairHint.value)
+        assertTrue("mirror stays active for retry", coord.repairHintPersistedState.active)
+        assertEquals("retry is verbatim: generation unchanged", 0L, coord.repairHintPersistedState.generation)
+        assertFalse("still unconfirmed", coord.repairHintDurableForTests)
+
+        coord.markRepairHint(repairedVersion = 2L)
+        assertEquals("a second notification retries again", 2, store.saveCount)
+        assertTrue("warning is still visible", coord.repairHint.value)
+
+        // A clear through an unavailable store cannot certify either: the stub's
+        // save(false) must re-raise the warning instead of hiding it.
+        coord.acknowledgeRepairHint()
+        assertEquals("the clear attempt is also unconfirmed", 3, store.saveCount)
+        assertTrue("a clear through an unavailable store must re-raise", coord.repairHint.value)
+        assertTrue("mirror stays active for retry", coord.repairHintPersistedState.active)
+        assertFalse("and nothing was ever certified", coord.repairHintDurableForTests)
+    }
+
+    @Test
+    fun splitPrefsFake_distinguishesSameProcessRebuildFromTrueColdStart() {
+        val prefs = DurabilityPrefs(
+            mapOf(
+                REPAIR_HINT_KEY_ACTIVE to true,
+                REPAIR_HINT_KEY_GENERATION to 9L,
+                REPAIR_HINT_KEY_REPAIRED_VERSION to 4L,
+            ),
+        )
+        val store = prefs.repairHintStore()
+
+        // Same-process rebuild shares the prefs handle (and its durabilityUnknown).
+        val sameProcess = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(sameProcess)
+        assertTrue(sameProcess.repairHint.value)
+        assertFalse("the clean shared-handle load is verified", store.loadWasRecovered())
+
+        // A successful CLEAR really lands: memory AND disk become false.
+        sameProcess.acknowledgeRepairHint()
+        assertEquals(false, prefs.memory[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+        assertEquals(false, prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+        assertFalse("same-process rebuild after a real clear stays quiet", store.load().active)
+        assertFalse("the clean load is verified", store.loadWasRecovered())
+
+        // True cold start rebuilds memory from disk: still quiet and verified.
+        val coldStore = prefs.coldStart().repairHintStore()
+        val cold = PolicyTxCoordinator(repairHintStore = coldStore)
+        coords.add(cold)
+        assertFalse("cold start after a real clear stays quiet", cold.repairHint.value)
+        assertFalse("cold clean load is verified", coldStore.loadWasRecovered())
+    }
+
+    // ---- PR #89 Phase B test-review fixes (B3 acquisition seam, thrown writes,
+    //      recovery/divergent metadata, init invariant hardening) ----------------
+
+    @Test
+    fun repairHintStoreOrFailClosed_throwingAcquisition_failsClosed() {
+        val store = repairHintStoreOrFailClosed {
+            throw IllegalStateException("simulated SharedPreferences acquisition failure")
+        }
+        assertTrue("a throwing acquisition must fall back to UNKNOWN-active", store.load().active)
+        assertTrue("and report a recovered/unverified load", store.loadWasRecovered())
+        assertFalse("there is no disk to certify a save", store.save(RepairHintState(true, 1L, 1L)))
+
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertTrue("a coordinator built from the fallback must warn", coord.repairHint.value)
+        assertTrue("mirror stays active", coord.repairHintPersistedState.active)
+        assertFalse("durability stays UNKNOWN", coord.repairHintDurableForTests)
+        coord.markRepairHint(repairedVersion = 1L)
+        assertTrue("the warning survives an unconfirmed retry", coord.repairHint.value)
+    }
+
+    @Test
+    fun repairHintStoreOrFailClosed_nullAcquisition_failsClosed() {
+        val store = repairHintStoreOrFailClosed { null }
+        assertTrue("a null acquisition must fall back to UNKNOWN-active", store.load().active)
+        assertTrue("and report a recovered/unverified load", store.loadWasRecovered())
+        assertFalse("there is no disk to certify a save", store.save(RepairHintState(true, 1L, 1L)))
+
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertTrue("a coordinator built from the fallback must warn", coord.repairHint.value)
+        assertTrue("mirror stays active", coord.repairHintPersistedState.active)
+        assertFalse("durability stays UNKNOWN", coord.repairHintDurableForTests)
+    }
+
+    @Test
+    fun repairHintStoreOrFailClosed_successfulAcquisition_returnsRealStoreUnwrapped() {
+        val real = FakeRepairHintStore()
+        val acquired = repairHintStoreOrFailClosed { real }
+        assertSame("a successful acquisition is returned verbatim (not the stub)", real, acquired)
+        assertTrue("the real store's save is used, not the always-false stub", acquired.save(RepairHintState(true, 4L, 2L)))
+        assertTrue(acquired.load().active)
+        assertEquals(4L, acquired.load().generation)
+    }
+
+    @Test
+    fun thrownEditDuringClear_unknownDurabilityKeepsWarning() {
+        val prefs = ThrowingEditPrefs()
+        val store = prefs.repairHintStore()
+        assertTrue("a durable active marker must land first", store.save(RepairHintState(true, 1L, 5L)))
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertTrue(coord.repairHint.value)
+        assertTrue("the durable seed is verified", coord.repairHintDurableForTests)
+
+        prefs.throwOnEdit = true
+        coord.acknowledgeRepairHint() // edit() throws; save() must mark UNKNOWN
+
+        assertTrue("live warning must stay raised after a thrown clear", coord.repairHint.value)
+        assertTrue("mirror is re-raised", coord.repairHintPersistedState.active)
+        assertFalse("durability must be UNKNOWN", coord.repairHintDurableForTests)
+        assertTrue("store load is recovered after a thrown write", store.loadWasRecovered())
+        assertTrue("store load fails closed to active", store.load().active)
+        assertEquals(
+            "disk still holds the durable active marker",
+            true,
+            prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean,
+        )
+    }
+
+    @Test
+    fun thrownCommitDuringClear_unknownDurabilityKeepsWarning() {
+        val prefs = DurabilityPrefs()
+        val store = prefs.repairHintStore()
+        assertTrue(store.save(RepairHintState(true, 1L, 5L)))
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+
+        prefs.throwFromCommit = true
+        coord.acknowledgeRepairHint()
+
+        assertTrue("live warning must stay raised after a thrown commit", coord.repairHint.value)
+        assertTrue("mirror is re-raised", coord.repairHintPersistedState.active)
+        assertFalse("durability must be UNKNOWN", coord.repairHintDurableForTests)
+        assertTrue("store load is recovered", store.loadWasRecovered())
+        assertTrue("store load fails closed to active", store.load().active)
+        assertEquals("commitToMemory still updated the map", false, prefs.memory[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+        assertEquals("disk was not written", true, prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+    }
+
+    @Test
+    fun failedClearThenSuccessfulClear_recoversDurableInactive() {
+        val prefs = DurabilityPrefs()
+        val store = prefs.repairHintStore()
+        assertTrue(store.save(RepairHintState(true, 1L, 5L)))
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertTrue(coord.repairHint.value)
+
+        prefs.commitOk = false
+        coord.acknowledgeRepairHint() // failed CLEAR: disk still active
+        assertTrue("the failed clear keeps warning", coord.repairHint.value)
+        assertFalse("durability stays UNKNOWN", coord.repairHintDurableForTests)
+
+        prefs.commitOk = true
+        coord.acknowledgeRepairHint() // retry the clear; now it lands
+
+        assertEquals("disk holds the confirmed inactive marker", false, prefs.durable[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+        assertEquals("memory holds the confirmed inactive marker", false, prefs.memory[REPAIR_HINT_KEY_ACTIVE] as? Boolean)
+        assertTrue("a successful clear certifies durability", coord.repairHintDurableForTests)
+        assertFalse("the next load is verified again", store.loadWasRecovered())
+        assertFalse("and reports inactive", store.load().active)
+        assertFalse("live warning is cleared", coord.repairHint.value)
+
+        val fresh = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(fresh)
+        assertFalse("fresh coordinator stays quiet", fresh.repairHint.value)
+    }
+
+    @Test
+    fun divergentGenerationAfterFailedClear_recoverySaveNeverRegressesGeneration() {
+        val prefs = DurabilityPrefs()
+        val store = prefs.repairHintStore()
+        assertTrue(store.save(RepairHintState(active = true, generation = 5L, repairedVersion = 2L)))
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertEquals(5L, coord.repairHintPersistedState.generation)
+
+        prefs.commitOk = false
+        coord.acknowledgeRepairHint() // failed clear: store.lastKnown = (false, 5)
+        assertTrue(coord.repairHint.value)
+        assertFalse(coord.repairHintDurableForTests)
+
+        // Divergent metadata: the in-process map reports an OLDER generation than
+        // both disk and the store's lastKnown (e.g. a stale map restored into
+        // mMap). load() must take maxOf(read, lastKnown), never regress to 2.
+        prefs.memory[REPAIR_HINT_KEY_GENERATION] = 2L
+        assertEquals("disk still holds the newer generation", 5L, prefs.durable[REPAIR_HINT_KEY_GENERATION] as? Long)
+        val loaded = store.load()
+        assertEquals("generation never regresses", 5L, loaded.generation)
+        assertTrue("and the load still fails closed", loaded.active)
+        assertTrue("and stays recovered", store.loadWasRecovered())
+
+        prefs.commitOk = true
+        coord.acknowledgeRepairHint() // later successful save
+
+        assertEquals(
+            "the recovery save writes the non-regressed generation",
+            5L,
+            prefs.durable[REPAIR_HINT_KEY_GENERATION] as? Long,
+        )
+        assertEquals(5L, coord.repairHintPersistedState.generation)
+        assertTrue(coord.repairHintDurableForTests)
+        val fresh = PolicyTxCoordinator(repairHintStore = prefs.coldStart().repairHintStore())
+        coords.add(fresh)
+        assertEquals(5L, fresh.repairHintPersistedState.generation)
+        assertFalse("a durable inactive marker stays quiet", fresh.repairHint.value)
+    }
+
+    @Test
+    fun allKeyReadsThrow_failClosedSingleDecision() {
+        val store = ThrowingAllKeysPrefs().repairHintStore()
+        val loaded = store.load()
+        assertTrue("all throwing reads must still fail closed to active", loaded.active)
+        assertEquals("no readable generation -> 0", 0L, loaded.generation)
+        assertEquals("no readable repaired_version -> -1", -1L, loaded.repairedVersion)
+        assertTrue("multiple read failures stay recovered", store.loadWasRecovered())
+
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertTrue(coord.repairHint.value)
+        assertTrue(coord.repairHintPersistedState.active)
+        assertFalse(coord.repairHintDurableForTests)
+    }
+
+    @Test
+    fun recoveredButInactiveCustomStore_forcedToUnknownActive() {
+        val store = InconsistentRecoveryStore({ true })
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertTrue("an unverified inactive report must still warn", coord.repairHint.value)
+        assertTrue("mirror is forced active", coord.repairHintPersistedState.active)
+        assertEquals(3L, coord.repairHintPersistedState.generation)
+        assertFalse(coord.repairHintDurableForTests)
+
+        // The init seed goes through the monotonic publication mechanism: a
+        // strictly newer decision must still be able to publish over it.
+        coord.acknowledgeRepairHint()
+        assertFalse("a later clear still publishes", coord.repairHint.value)
+        assertTrue("and certifies durability", coord.repairHintDurableForTests)
+    }
+
+    @Test
+    fun throwingRecoveryVerdictOnInactiveStore_forcedToUnknownActive() {
+        val store = InconsistentRecoveryStore({ throw IllegalStateException("verdict failure") })
+        val coord = PolicyTxCoordinator(repairHintStore = store)
+        coords.add(coord)
+        assertTrue("a throwing loadWasRecovered() must be treated as recovered", coord.repairHint.value)
+        assertTrue("mirror is forced active", coord.repairHintPersistedState.active)
+        assertFalse(coord.repairHintDurableForTests)
+
+        coord.acknowledgeRepairHint()
+        assertFalse("a later clear still publishes", coord.repairHint.value)
+        assertTrue(coord.repairHintDurableForTests)
     }
 }

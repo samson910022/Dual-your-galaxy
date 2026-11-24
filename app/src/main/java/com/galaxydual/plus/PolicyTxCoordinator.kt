@@ -180,23 +180,60 @@ class PolicyTxCoordinator internal constructor(
     internal var beforeRepairHintIoLockSeamForTests: (() -> Unit)? = null
 
     init {
-        val loaded = try {
-            repairHintStore?.load()
-        } catch (_: Throwable) {
-            null
-        }
-        if (loaded != null) {
-            persisted = loaded
-            persistedDurable = try {
-                repairHintStore?.loadWasRecovered()?.not() ?: true
-            } catch (_: Throwable) {
-                false
-            }
-            if (loaded.active) _repairHint.value = true
+        val store = repairHintStore
+        if (store == null) {
+            // Explicit no-store mode (JVM tests / in-memory coordinator): nothing
+            // was ever persisted, so there is nothing to verify. Keep the
+            // historical behavior exactly — no warning, durable mirror=true.
+            persistedDurable = true
         } else {
-            // No store = pure in-memory coordinator; nothing to verify. A store
-            // that threw on load leaves durability UNKNOWN (biased to warning).
-            persistedDurable = repairHintStore == null
+            val loaded = try {
+                store.load()
+            } catch (_: Throwable) {
+                null
+            }
+            if (loaded != null) {
+                // PR #89 Phase B (B2 hardening): UNKNOWN load => UNKNOWN-active,
+                // even for a custom store that reports inactive + recovered (or
+                // throws from loadWasRecovered()). Treat a throwing verdict as
+                // recovered: absence of a durability certificate is never proof
+                // of an inactive marker.
+                val recovered = try {
+                    store.loadWasRecovered()
+                } catch (_: Throwable) {
+                    true
+                }
+                if (recovered && !loaded.active) {
+                    val seed = synchronized(this) {
+                        persisted = loaded.copy(active = true)
+                        persistedDurable = false
+                        repairHintWriteSeq += 1L
+                        RepairHintWrite(repairHintWriteSeq, persisted)
+                    }
+                    publishRepairHint(seed)
+                } else {
+                    persisted = loaded
+                    persistedDurable = !recovered
+                    if (loaded.active) _repairHint.value = true
+                }
+            } else {
+                // PR #89 Phase B (B2): a NON-NULL store that threw on load is a
+                // fail-closed condition, NOT the same as no store. The old code
+                // left persisted=inactive and the flow hidden (fail-open) with
+                // only a misleading "biased to warning" comment. Seed an
+                // UNKNOWN-active mirror, mark durability UNKNOWN so later
+                // mark/ack still retry, and publish the seed through the SAME
+                // monotonic ticket mechanism as every other decision: bump the
+                // seq under `this` so a later decision's ticket is strictly
+                // newer and can still publish over this seed.
+                val seed = synchronized(this) {
+                    persisted = persisted.copy(active = true)
+                    persistedDurable = false
+                    repairHintWriteSeq += 1L
+                    RepairHintWrite(repairHintWriteSeq, persisted)
+                }
+                publishRepairHint(seed)
+            }
         }
     }
 
