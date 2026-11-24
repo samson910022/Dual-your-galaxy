@@ -540,8 +540,9 @@ object PmOutputParser {
         return firstErrorLine(output, EXEMPT_LINE) == null
     }
 
-    // Identity-channel gate (Phase 2, issue #21; P2-1 header strip, issue #21).
-    // Strict variant of isSuccess for the verified-identity channels
+    // Identity-channel gate (Phase 2, issue #21; P2-1 display-label handling,
+    // issue #21; R5 single raw-line classification). Strict variant of
+    // isSuccess for the verified-identity channels
     // (`cmd user list -v`, `dumpsys user`, `getprop sys.dualapp.profile_id`).
     // Differences from isSuccess (which stays the install/uninstall/
     // list-packages pm-channel rule; profilesSnapshot and the Elevator
@@ -553,84 +554,100 @@ object PmOutputParser {
     // - No EXEMPT_LINE filtering: package:/path echoes and "installed for
     //   user" success echoes are pm success payloads, never legitimate
     //   identity content; every non-blank line is tested against ERROR_LINE.
-    // - P2-1 header strip: all `UserInfo{...}` header substrings are removed
-    //   before scanning, so a renamed label carrying error keywords
-    //   (`UserInfo{95:Error:400}`, `{95:Failure:400}`, `{10:not found:30}`)
-    //   can never trigger ERROR_LINE. The label is display-only by contract
-    //   (renames do not change authorization); only body lines carry
-    //   error semantics. A genuine body `Failure [...]` line still fails.
-    // - Issue #65 new-format name strip: the same display-only rule is
-    //   applied to `N: id=<id>, name=<label>, type=<token>` lines via
-    //   sanitizeIdentityOutput(), so `name=Error` / `name=not found` (or a
-    //   comma/injected token inside the label) cannot trip ERROR_LINE. Only
-    //   the name span is neutralized; the rest of each valid line is still
-    //   scanned verbatim. A structurally malformed row -- one whose LAST
-    //   `, type=` declaration is empty/non-canonical, where an EARLIER
-    //   declaration also carries the canonical `, flags=` / ` (flags=` suffix,
-    //   or whose display name carries a C0 control -- is left untouched and
-    //   ALSO fails the gate closed, even if ERROR_LINE matched nothing -- no
-    //   token from such a row may authorize.
+    // - Per-line classification (R5): each RAW physical line is classified by
+    //   IdentityLineClassifier using the SAME rule the adapter uses. There is
+    //   NO global unanchored `UserInfo{...}` deletion: a confirmed legacy
+    //   header has ONLY its label group neutralized, a valid new-format row
+    //   has ONLY its `name=` span neutralized, and everything else is scanned
+    //   verbatim. A renamed label carrying error keywords
+    //   (`UserInfo{95:Error:400}`, `name=Failure`, `{10:not found:30}`) can
+    //   therefore never trip ERROR_LINE, while a header-like token in a type/
+    //   flags tail (`flags=UserInfo{1:Failure:0}`) survives and still fails.
+    // - Fail-closed classification: a malformed NEW_ROW (empty/non-canonical
+    //   last declaration, an earlier STRUCTURAL declaration, or a control char
+    //   in the name) and any REJECTED line (lone CR or U+0085/U+2028/U+2029)
+    //   are kept VERBATIM and mark malformedRow. checkStrictLines then fails
+    //   the gate on malformedRow even if ERROR_LINE matched nothing -- no
+    //   token from such a line may authorize.
     // exit != 0 is always failure here (unlike isSuccess, where the
     // ALREADY_EXISTS exemption is checked before exit and can still report
     // success on a non-zero exit).
-    private val IDENTITY_HEADER_STRIP = Regex("UserInfo\\{\\d+:[^}:\\r\\n]*:[^}\\r\\n]*\\}")
 
-    // Issue #65 / P1a (fail-closed): the new-ROM `cmd user list -v` format has
-    // no UserInfo{...} header -- it emits `N: id=<id>, name=<label>,
-    // type=<token>, flags=...`. `name=` is a display-only label (user renames
-    // never change authorization), so ONLY the raw name span is replaced by a
-    // neutral placeholder. The old greedy `(.*)`-to-LAST-`, type=` sanitizer
-    // swallowed a genuine `Failure [...]` / second type declaration sitting
-    // after the label: the entire tail became part of the "display name" and
-    // the strict gate passed on a malformed row. The shared structured parser
-    // (VerboseUserRow) now locates the name span and requires the LAST
-    // `, type=` declaration to be the ONLY one with a canonical `, flags=` /
-    // ` (flags=` suffix AND to carry a non-empty token, with no C0 control in
-    // the display name. A malformed row is NOT neutralized at all and forces
-    // the gate closed, so a label-supplied declaration can never backfill an
-    // empty/non-canonical real field. A valid row keeps its whole remainder
-    // verbatim, so an error token in the type/flags/parent tail still fails
-    // (no whole-line exemption).
+    // Issue #65 / R5 (fail-closed): the two identity formats are handled by
+    // ONE classifier over ONE physical line each. `name=` (new format) and the
+    // `UserInfo{id:label:flags}` label group (legacy) are DISPLAY ONLY, so only
+    // those exact spans are replaced with neutral placeholders. The old
+    // whole-output header strip could delete a tail-embedded
+    // `UserInfo{1:Failure:0}` before the error scan; the old greedy
+    // `(.*)`-to-LAST-`, type=` sanitizer swallowed genuine `Failure [...]` /
+    // second type declarations. Neither shortcut exists now. The shared
+    // structured parser (VerboseUserRow) locates the name span and enforces
+    // the structural invariant (one structural canonical declaration, last,
+    // non-empty, no control chars). No line is deleted or exempted, so an
+    // error token anywhere else stays visible to ERROR_LINE.
     private data class SanitizedIdentity(
-        val text: String,
-        // True when at least one new-format row was structurally malformed.
-        // checkStrictLines fails closed on this signal even if ERROR_LINE
-        // found nothing (never let a token from a bad row authorize).
+        // Same physical lines, same order, LF-normalized only by the shared
+        // LF/CRLF splitter: checkStrictLines scans THESE, never re-splits.
+        val lines: List<String>,
+        // True when a malformed NEW_ROW or a REJECTED line was seen.
+        // checkStrictLines fails closed on this even if ERROR_LINE found
+        // nothing (never let a token from a bad line authorize).
         val malformedRow: Boolean,
     )
 
-    // Legacy display labels are removed by the header strip; new-format
-    // display labels are replaced by a neutral placeholder. Used by every
-    // strict identity gate. Pure string transform: no row is deleted, so
-    // error semantics in the tail remain visible to the ERROR_LINE scan.
     private fun sanitizeIdentityOutput(output: String): SanitizedIdentity {
-        val withoutLegacyHeaders = IDENTITY_HEADER_STRIP.replace(output, "")
-        val sb = StringBuilder()
+        val lines = ArrayList<String>(VerboseUserRow.verboseLines(output).size)
         var malformedRow = false
         // CR-preserving split (shared with SamsungProfileAdapter): a lone \r
-        // stays inside the row so the structured parser can fail it closed,
-        // while normal LF/CRLF output is handled identically to lines().
-        for (raw in VerboseUserRow.verboseLines(withoutLegacyHeaders)) {
-            val row = VerboseUserRow.parse(raw)
-            if (row == null || row.malformed) {
-                if (row?.malformed == true) malformedRow = true
-                // Leave a malformed row as-is: no neutralization, no exemption.
-                sb.append(raw)
-            } else {
-                sb.append(raw, 0, row.nameStart)
-                sb.append("<display-name>")
-                sb.append(raw, row.nameEnd, raw.length)
+        // stays inside the line and is REJECTED by the classifier, while
+        // normal LF/CRLF output is handled identically to lines().
+        for (raw in VerboseUserRow.verboseLines(output)) {
+            val classified = IdentityLineClassifier.classify(raw)
+            when (classified.kind) {
+                IdentityLineKind.NEW_ROW -> {
+                    val row = classified.row!!
+                    if (row.malformed) {
+                        // No neutralization, no exemption: fail closed.
+                        malformedRow = true
+                        lines.add(classified.text)
+                    } else {
+                        lines.add(
+                            classified.text.substring(0, row.nameStart) +
+                                "<display-name>" +
+                                classified.text.substring(row.nameEnd),
+                        )
+                    }
+                }
+                IdentityLineKind.LEGACY_HEADER -> {
+                    // Replace ONLY the label group (group 2), never the whole
+                    // header: the id/flags tail keeps its error semantics.
+                    val label = classified.header!!.groups[2]!!
+                    lines.add(
+                        classified.text.substring(0, label.range.first) +
+                            "<display-label>" +
+                            classified.text.substring(label.range.last + 1),
+                    )
+                }
+                IdentityLineKind.REJECTED -> {
+                    // Unsafe separator: no neutralization and no re-splitting.
+                    malformedRow = true
+                    lines.add(classified.text)
+                }
+                IdentityLineKind.OTHER -> lines.add(classified.text)
             }
-            sb.append('\n')
         }
-        return SanitizedIdentity(sb.toString(), malformedRow)
+        return SanitizedIdentity(lines, malformedRow)
     }
 
     private fun checkStrictLines(output: String, exit: Int): Boolean {
+        // Exit-first: a non-zero exit fails before any parsing/neutralization.
         if (exit != 0) return false
         val sanitized = sanitizeIdentityOutput(output)
         if (sanitized.malformedRow) return false
-        for (raw in sanitized.text.lines()) {
+        // Scan the SAME physical lines the classifier produced; never call
+        // .lines() here (it would split on lone CR / Unicode separators that
+        // the classifier deliberately rejected as one raw line).
+        for (raw in sanitized.lines) {
             val line = raw.trim()
             if (line.isEmpty()) continue
             if (ERROR_LINE.any { it.containsMatchIn(line) }) return false
@@ -643,11 +660,11 @@ object PmOutputParser {
 
     // `pm list users` strict gate (Phase B P1-2, issue #21; owner re-review R3
     // blocking). Independent strict判定, no longer delegating to isSuccess:
-    // exit-first (any non-zero exit fails), header-strip (same
-    // sanitizeIdentityOutput() shape as isIdentityChannelOk (legacy
-    // UserInfo headers AND new-format `name=` labels), so a renamed label
-    // carrying error keywords stays display-only), then every non-blank body
-    // line tested against ERROR_LINE with NO INSTALL_FAILED_ALREADY_EXISTS
+    // exit-first (any non-zero exit fails), then the SAME per-physical-line
+    // classification + display-label neutralization as isIdentityChannelOk
+    // (confirmed legacy header LABEL group OR valid new-format `name=` span,
+    // nothing else; malformed/REJECTED lines fail closed), then every non-blank
+    // sanitized line tested against ERROR_LINE with NO INSTALL_FAILED_ALREADY_EXISTS
     // exemption and NO EXEMPT_LINE filtering. A genuine body `Failure [...]`
     // line (stdout or stderr) fails even at exit 0, and
     // `exit=1 + Failure [INSTALL_FAILED_ALREADY_EXISTS]` can no longer pass
@@ -656,9 +673,9 @@ object PmOutputParser {
     // Loaded). Relation: isSuccess keeps the install-channel
     // idempotent-success semantics (ALREADY_EXISTS + EXEMPT_LINE) unchanged;
     // isIdentityChannelOk shares this same判定 shape (exit-first,
-    // header-strip, no exemptions) for the verified-identity channels
-    // (`cmd user list -v` / `dumpsys user` / `getprop`), while this gate
-    // serves only the `pm list users` channel.
+    // per-line classification + label-only neutralization, no exemptions) for
+    // the verified-identity channels (`cmd user list -v` / `dumpsys user` /
+    // `getprop`), while this gate serves only the `pm list users` channel.
     fun isListUsersOutputOk(output: String, exit: Int): Boolean =
         checkStrictLines(output, exit)
 
