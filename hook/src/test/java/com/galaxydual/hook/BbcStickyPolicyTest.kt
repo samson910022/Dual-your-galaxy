@@ -3,6 +3,7 @@ package com.galaxydual.hook
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
@@ -79,6 +80,37 @@ class BbcStickyPolicyTest {
         val field = EffectivePolicyCache::class.java.getDeclaredField("clockEpoch")
         field.isAccessible = true
         return field.get(cache) as Long
+    }
+
+    // R11: accepted-content comparison evidence (immutable FULL merged set +
+    // the version that owned the high-water when it was accepted). Both live
+    // independently of cached/valid and sticky, and are untouched by invalidate()
+    // /clock distrust/cap expiry. Same reflection seam as clearedMarker/clockEpoch.
+    @Suppress("UNCHECKED_CAST")
+    private fun acceptedCanonical(cache: EffectivePolicyCache): Set<String>? {
+        val field = EffectivePolicyCache::class.java.getDeclaredField("lastAcceptedBbcCanonical")
+        field.isAccessible = true
+        return field.get(cache) as Set<String>?
+    }
+
+    private fun acceptedCanonicalVersion(cache: EffectivePolicyCache): Long {
+        val field = EffectivePolicyCache::class.java.getDeclaredField("lastAcceptedBbcCanonicalVersion")
+        field.isAccessible = true
+        return field.get(cache) as Long
+    }
+
+    // GENUINE no-evidence pin for the H1 fail-closed test ONLY. Production never
+    // clears comparison evidence: invalidate()/clock distrust/cap expiry revoke
+    // freshness only. Here we return the field to its never-accepted state while
+    // cached is empty and sticky has expired, so "no canonical -> reject" can
+    // still be asserted directly instead of relying on a freshness side effect.
+    private fun clearCanonicalForTest(cache: EffectivePolicyCache) {
+        val canonical = EffectivePolicyCache::class.java.getDeclaredField("lastAcceptedBbcCanonical")
+        canonical.isAccessible = true
+        canonical.set(cache, null)
+        val version = EffectivePolicyCache::class.java.getDeclaredField("lastAcceptedBbcCanonicalVersion")
+        version.isAccessible = true
+        version.set(cache, -1L)
     }
 
     // Single-flight owner token, read reflectively (same seam shape as the
@@ -580,6 +612,125 @@ class BbcStickyPolicyTest {
         val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 1L) })
         assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
         assertFalse(cache.isCached())
+        // R11: freshness operations above never erased the comparison evidence.
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(1L, acceptedCanonicalVersion(cache))
+    }
+
+    @Test
+    fun invalidateThenClockDistrustKeepsCanonicalAndSameVersionRecoveryBbc() {
+        // R11 order 1: explicit invalidate FIRST, then clock distrust. Both
+        // revoke freshness only. The accepted-content evidence must survive so a
+        // later trusted, SUCCESSFUL re-read of identical {A},v5 recovers instead
+        // of being permanently Unknown. Pre-fix code fails here: invalidate
+        // emptied cached and distrust discarded sticky, leaving no canonical.
+        val clock = MutableClock(1_000L)
+        val cache = bbcCacheWithClock(clock)
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) })
+            is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+
+        cache.invalidate()
+        assertFalse(cache.isCached())
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+        assertEquals(5L, seenVersion(cache))
+
+        clock.throwing = true
+        var faultReads = 0
+        val fault = cache.getBbc(emptySet(), reader = { faultReads++; Pair(null, null) })
+        assertTrue(fault is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (fault as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertEquals(0, faultReads) // fails at entry, before any reader/IPC
+        assertEquals(1L, cache.bbcStickyExpiredCount.get())
+        assertEquals(1L, cache.bbcStickyFallbackCount.get())
+        assertEquals(1L, cache.bbcUnknownCount.get())
+        assertFalse(cache.isCached())
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+        assertEquals(5L, seenVersion(cache))
+        assertEquals(1L, clockEpoch(cache))
+
+        clock.throwing = false
+        var recoveryReads = 0
+        val recovered = cache.getBbc(emptySet(), reader = {
+            recoveryReads++
+            Pair(setOf("A"), 5L)
+        })
+        assertTrue(recovered is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A"), (recovered as EffectivePolicyCache.BbcPolicy.Good).packages)
+        assertEquals(1, recoveryReads) // a fresh, successful re-read is mandatory
+        assertTrue(cache.isCached())
+        assertEquals(5L, seenVersion(cache))
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+
+        // Negative control: same version, different content is a replay and
+        // must NOT overwrite the accepted canonical.
+        cache.invalidate()
+        val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("B"), 5L) })
+        assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertFalse(cache.isCached())
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+    }
+
+    @Test
+    fun clockDistrustThenInvalidateKeepsCanonicalAndSameVersionRecoveryBbc() {
+        // R11 order 2: clock distrust FIRST, then explicit invalidate. Same
+        // invariant, opposite order. Pre-fix code fails here too: distrust
+        // discarded sticky and invalidate emptied cached.
+        val clock = MutableClock(1_000L)
+        val cache = bbcCacheWithClock(clock)
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) })
+            is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+
+        clock.throwing = true
+        val fault = cache.getBbc(emptySet(), reader = { Pair(null, null) })
+        assertTrue(fault is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (fault as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertEquals(1L, cache.bbcStickyExpiredCount.get())
+        assertFalse(cache.isCached())
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+        assertEquals(5L, seenVersion(cache))
+        assertEquals(1L, clockEpoch(cache))
+
+        // Recover the clock first, then explicitly invalidate: invalidate must
+        // not reset the epoch fence nor the comparison evidence.
+        clock.throwing = false
+        clock.value.set(1_000L)
+        cache.invalidate()
+        assertFalse(cache.isCached())
+        assertEquals(1L, clockEpoch(cache))
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+
+        var recoveryReads = 0
+        val recovered = cache.getBbc(emptySet(), reader = {
+            recoveryReads++
+            Pair(setOf("A"), 5L)
+        })
+        assertTrue(recovered is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("A"), (recovered as EffectivePolicyCache.BbcPolicy.Good).packages)
+        assertEquals(1, recoveryReads)
+        assertTrue(cache.isCached())
+        assertEquals(5L, seenVersion(cache))
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+
+        // Older-version replay still fails closed, even with identical content.
+        cache.invalidate()
+        clock.value.set(1_000L + 5_001L) // clear the 5s failure cooldown
+        val old = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 4L) })
+        assertTrue(old is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertFalse(cache.isCached())
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+        assertEquals(5L, seenVersion(cache))
     }
 
     @Test
@@ -1277,20 +1428,26 @@ class BbcStickyPolicyTest {
         val reaccepted = cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 5L) })
         assertTrue(reaccepted is EffectivePolicyCache.BbcPolicy.Good)
         assertEquals(setOf("A"), (reaccepted as EffectivePolicyCache.BbcPolicy.Good).packages)
+        assertEquals(setOf("A"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
     }
 
     @Test
     fun sameVersionGoodWithoutCanonicalFailsClosedBbc() {
-        // H1: a same-version Good can only be content-checked against a cached
-        // or sticky canonical snapshot. Once BOTH are gone (sticky cap expired
-        // after a failed read, then invalidate empties cached), an arbitrary
-        // same-version Good must FAIL CLOSED as Unknown, not be accepted
-        // unconditionally just because its version matches the high-water.
+        // H1: a same-version Good can only be content-checked against a
+        // canonical snapshot. R11 deliberately KEEPS that canonical across
+        // freshness revocation, so a GENUINE no-evidence state is created here
+        // with clearCanonicalForTest (production never clears comparison
+        // evidence). An arbitrary same-version Good must FAIL CLOSED as Unknown,
+        // not be accepted unconditionally just because its version matches the
+        // high-water.
         val (cache, time) = bbcCacheAt(1_000L)
         assertTrue(
             cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
                 is EffectivePolicyCache.BbcPolicy.Good,
         )
+        assertEquals(setOf("A", "B"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
         // Advance past the sticky cap; the failed read expires the sticky
         // snapshot (stickyIfValidLocked). invalidate() then empties cached and
         // resets the failure cooldown so the next read reaches the version gate.
@@ -1300,9 +1457,21 @@ class BbcStickyPolicyTest {
         assertEquals(emptySet<String>(), (failed as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
         assertEquals(1L, cache.bbcStickyExpiredCount.get())
         cache.invalidate()
+        // The canonical is STILL present after cap expiry + invalidate — this
+        // is the R11 recovery evidence, not a freshness artifact.
+        assertEquals(setOf("A", "B"), acceptedCanonical(cache))
+        assertEquals(5L, acceptedCanonicalVersion(cache))
+        // Pin the genuinely evidence-free state (no cached content, no sticky,
+        // no persistent canonical) to prove H1's fail-closed gate still holds.
+        clearCanonicalForTest(cache)
+        assertNull(acceptedCanonical(cache))
+        assertEquals(-1L, acceptedCanonicalVersion(cache))
         val replay = cache.getBbc(emptySet(), reader = { Pair(setOf("A", "B"), 5L) })
         assertTrue(replay is EffectivePolicyCache.BbcPolicy.Unknown)
         assertEquals(emptySet<String>(), (replay as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertNull(acceptedCanonical(cache)) // rejection never writes evidence
+        assertEquals(-1L, acceptedCanonicalVersion(cache))
+        assertEquals(5L, seenVersion(cache))
     }
 
     @Test

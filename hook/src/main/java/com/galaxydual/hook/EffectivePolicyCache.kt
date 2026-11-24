@@ -30,9 +30,11 @@ class EffectivePolicyCache(
     // the call fails closed (Unknown(emptySet())) — the cap is never widened
     // by an untrusted clock. Clock distrust also invalidates cached freshness
     // (a healthy call must re-read before Good) and bumps a clock epoch that
-    // fences in-flight reads; version evidence (cached / high-water / cleared
-    // marker) is retained so legitimate same-version same-content recovery
-    // still works and no replay window opens.
+    // fences in-flight reads; version evidence (high-water / cleared marker /
+    // lastAcceptedBbcCanonical+Version, which live independently of the
+    // returnable cached/sticky snapshots) is retained so legitimate
+    // same-version same-content recovery still works and no replay window
+    // opens. Explicit invalidate() likewise revokes only freshness.
     // Whitelist path uses false (fail-closed, zero behavior change); BBC path
     // uses a separate instance with true (see DualHook.bbcCache).
     private val stickyLastGood: Boolean = false,
@@ -198,6 +200,26 @@ class EffectivePolicyCache(
     // Long.MAX_VALUE-1/MAX). Updated only on accepted Good/Cleared, never on
     // Unknown/rejected-Cleared, under [lock].
     private var lastBbcSeenVersion: Long = -1L
+
+    // R11: comparison evidence for the last ACCEPTED BBC version, deliberately
+    // separate from the returnable freshness snapshots ([cached]/[valid] and
+    // [lastGoodSticky]). [lastAcceptedBbcCanonical] is the immutable FULL merged
+    // set (post STATIC_SEED / 512-cap sanitize) of that accepted read — the
+    // complete set, NOT a hash, so there is no collision window — paired with
+    // the version that owned the high-water when it was accepted. It is written
+    // ONLY on an accepted Good/Cleared commit inside getBbc(), under [lock], and
+    // is NEVER touched by invalidate(), failClosedUntrustedClockLocked(), sticky
+    // cap expiry, TTL probes, or any rejected/loser path (the loser check runs
+    // before the commit). Those operations revoke FRESHNESS only: a later
+    // trusted, successful re-read of identical same-version content can be
+    // accepted again without reopening replay/downgrade windows.
+    //
+    // SCOPE: this is process-local, in-memory evidence. It is NOT persisted and
+    // is NOT a device-level guarantee: it says nothing about what the remote
+    // prefs actually contain on the device, and it carries NO remote-clear SLA.
+    // A process restart starts with null (genuine no-evidence -> fail closed).
+    private var lastAcceptedBbcCanonical: Set<String>? = null
+    private var lastAcceptedBbcCanonicalVersion: Long = -1L
     val bbcStickyFallbackCount = AtomicLong(0L)
     val bbcStickyExpiredCount = AtomicLong(0L)
     val bbcUnknownCount = AtomicLong(0L)
@@ -321,11 +343,16 @@ class EffectivePolicyCache(
     //   - bump [clockEpoch] so an in-flight read that started before the fault
     //     loses (gen0/epoch0 fence) and cannot publish after recovery;
     //   - release the flight claim and wake followers so a successor can lead.
-    // Canonical / version EVIDENCE is deliberately retained: cached,
-    // lastBbcSeenVersion and lastBbcClearedVersion are UNCHANGED, so a later
-    // legitimate same-version same-content read is still accepted and no old
-    // version/replay window is reopened. [generation] is untouched (only an
-    // explicit invalidate() bumps it).
+    // Canonical / version EVIDENCE is deliberately retained: the high-water
+    // (lastBbcSeenVersion), the cleared marker (lastBbcClearedVersion) and the
+    // accepted-content comparison pair (lastAcceptedBbcCanonical /
+    // lastAcceptedBbcCanonicalVersion) are UNCHANGED — this helper revokes
+    // FRESHNESS only, never comparison evidence. A later trusted and
+    // successful same-version same-content re-read is therefore still accepted
+    // (after either order of clock distrust + invalidate()), while no old
+    // version/replay window is reopened. This evidence is process-local and
+    // in-memory only: it is not a device guarantee and carries no remote-clear
+    // SLA. [generation] is untouched (only an explicit invalidate() bumps it).
     // Exactly-once accounting: one sticky expiry (iff a sticky existed), one
     // sticky fallback, one Unknown, one once-per-process clock-free log. No
     // reader or version gate runs; a single call returns immediately so no arm
@@ -447,6 +474,9 @@ class EffectivePolicyCache(
     // by a time jump. getBbc() now rejects a backwards/dead sample UPSTREAM in
     // sampleTrustedClockLocked() (sticky discarded, Unknown(emptySet())); this
     // age<0 branch is retained as defense in depth for any other call site.
+    // Cap expiry drops the returnable degradation snapshot only; it does NOT
+    // clear lastAcceptedBbcCanonical / lastAcceptedBbcCanonicalVersion (R11),
+    // so a later trusted same-version same-content re-read can still compare.
     private fun stickyIfValidLocked(now: Long): Set<String>? {
         val g = lastGoodSticky ?: return null
         val age = now - lastGoodStickyAtMs
@@ -514,20 +544,28 @@ class EffectivePolicyCache(
     //
     // F2 (same-version content): when v == last and the high-water came from a
     // Good, accept ONLY an identical-content re-acceptance — the candidate set
-    // must equal the last accepted good snapshot (cached, or sticky last-good
-    // after invalidate/TTL), compared as the merged effective set (post
-    // STATIC_SEED / 512-cap sanitize). At an equal version ANY content change —
-    // including a shrink — is a stale replay and is REJECTED as Unknown: the
-    // writer bumps extra_whitelist_version on every successful save/clear, so
-    // a genuine policy change must carry a strictly newer version. Comparing
-    // against BOTH cached and sticky keeps the legacy
-    // successEmptyWithoutVersionKeepsLastGoodBbc (same-version same-content
-    // re-acceptance after a failed read) working, as long as a genuine
-    // snapshot exists. If BOTH are absent (e.g. the sticky cap expired after a
-    // sustained failure storm), content equality cannot be proven and the
-    // same-version Good is REJECTED (fail-closed) instead of being accepted
-    // unconditionally. The wraparound and no-canonical fail-closed branches
-    // are unchanged.
+    // must equal the FULL merged canonical set of the last accepted read,
+    // compared post STATIC_SEED / 512-cap sanitize. At an equal version ANY
+    // content change — including a shrink — is a stale replay and is REJECTED
+    // as Unknown: the writer bumps extra_whitelist_version on every successful
+    // save/clear, so a genuine policy change must carry a strictly newer
+    // version.
+    //
+    // R11: the authoritative canonical is lastAcceptedBbcCanonical, paired with
+    // lastAcceptedBbcCanonicalVersion. It is written only on an accepted commit
+    // and survives freshness revocation (invalidate(), clock distrust, sticky
+    // cap expiry, TTL probe), so a later trusted SUCCESSFUL re-read of identical
+    // same-version content can recover after either order of invalidate +
+    // distrust. cached/sticky are consulted only while no persistent canonical
+    // has ever been written (legacy seed / unversioned-draft path); once a
+    // persistent canonical exists at a DIFFERENT version it is never downgraded
+    // to a possibly stale cached/sticky snapshot. If no canonical can be
+    // established (never accepted, cleared-owned version, or a genuine
+    // no-evidence pin), content equality cannot be proven and the same-version
+    // Good is REJECTED (H1 fail-closed), never accepted unconditionally. The
+    // wraparound, older-version and Cleared-owned fail-closed branches are
+    // unchanged. This evidence is process-local in-memory only — no device
+    // guarantee and no remote-clear SLA.
     private fun isGoodVersionAcceptableLocked(v: Long, candidate: Set<String>): Boolean {
         if (v < 1L) return false
         val last = lastBbcSeenVersion
@@ -535,9 +573,13 @@ class EffectivePolicyCache(
         if (v > last) return true
         if (isBbcVersionWraparound(last, v)) return true
         if (v == last && lastBbcClearedVersion != last) {
-            val canonical = cached.takeIf { it.isNotEmpty() }
-                ?: lastGoodSticky?.takeIf { it.isNotEmpty() }
-                ?: return false // FAIL-CLOSED: no canonical snapshot to compare against.
+            val persistent = lastAcceptedBbcCanonical
+            val canonical = when {
+                persistent != null && lastAcceptedBbcCanonicalVersion == last -> persistent
+                persistent == null -> cached.takeIf { it.isNotEmpty() }
+                    ?: lastGoodSticky?.takeIf { it.isNotEmpty() }
+                else -> null
+            } ?: return false // FAIL-CLOSED: no canonical snapshot to compare against.
             // Byte-for-byte equal merged content (a re-read of the current
             // state) is the ONLY acceptable same-version case. Any content
             // change — including a shrink — needs a strictly newer version;
@@ -1409,6 +1451,12 @@ class EffectivePolicyCache(
                     if (clearedVersion != null) {
                         lastBbcClearedVersion = clearedVersion
                         lastBbcSeenVersion = clearedVersion
+                        // R11: Cleared OWNS the high-water. Pin "no canonical"
+                        // explicitly so a same-version Good replay stays
+                        // rejected by the lastBbcClearedVersion guard (H1), and
+                        // only a strictly newer version can re-establish one.
+                        lastAcceptedBbcCanonical = null
+                        lastAcceptedBbcCanonicalVersion = clearedVersion
                         try {
                             updateStickyLocked(
                                 try {
@@ -1437,6 +1485,13 @@ class EffectivePolicyCache(
                             observeBbcVersionLocked(goodVersion)
                         } catch (_: Throwable) {
                         }
+                        // R11: write comparison evidence ONLY on an accepted
+                        // commit (loser/rejected paths return above). The FULL
+                        // merged set is immutable and collision-free, unlike a
+                        // hash; it is independent of cached/valid and sticky so
+                        // freshness revocation cannot erase it.
+                        lastAcceptedBbcCanonical = unmod
+                        lastAcceptedBbcCanonicalVersion = goodVersion ?: -1L
                         try {
                             updateStickyLocked(
                                 try {
@@ -1472,6 +1527,12 @@ class EffectivePolicyCache(
         // pre-invalidation cached value (fail-closed to seed).
         invalidated = true
         cached = emptySet()
+        // R11: explicit invalidate() revokes FRESHNESS only. It deliberately
+        // leaves lastAcceptedBbcCanonical / lastAcceptedBbcCanonicalVersion (and
+        // the version high-water / cleared marker) intact so a later trusted,
+        // successful same-version same-content re-read can recover after either
+        // order of invalidate + clock distrust. This is process-local in-memory
+        // evidence — no device guarantee, no remote-clear SLA.
         failureLogged = false
         // Stage C: release any in-flight single-flight claim so the next miss
         // elects a fresh leader under the new generation (the stale leader
