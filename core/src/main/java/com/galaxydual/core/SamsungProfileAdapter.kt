@@ -35,24 +35,34 @@ object SamsungProfileAdapter {
     // Header opening one per-user block in both `cmd user list -v` and
     // `dumpsys user` outputs. Same shape as PmOutputParser's UserInfo
     // pattern, kept local so this adapter stays dependency-free.
-    private val HEADER = Regex("UserInfo\\{(\\d+):([^:}]*):([^}]*)\\}")
+    // Issue #65/P2 (line-boundary anchor): an UNANCHORED find used to match
+    // an inline `UserInfo{95:x:400}` inside a new-format `name=` label and
+    // create a spurious legacy claim for that id. Real headers start a line
+    // (optionally indented), so anchor them with (?m)^[ \t]*; a label-embedded
+    // occurrence can no longer produce a competing claim that overwrites the
+    // genuine fresh CLONE type.
+    private val HEADER = Regex("""(?m)^[ \t]*UserInfo\{(\d+):([^:}]*):([^}]*)\}""")
 
     // New-ROM `cmd user list -v` line format (One UI 6.1+/S24, PR-33 D2):
     // no UserInfo header and no serial line, e.g.
     // `1: id=95, name=DUAL_APP, type=profile.CLONE, flags=... (parentId=0) ...`.
-    // Group 1 = user id, group 2 = display name (label only), group 3 =
-    // type token. The display index before `:` is NOT the id and is
-    // ignored; the remainder of the line after the type token carries the
-    // flags/parent tail.
-    // Issue #65 (display-name comma/type injection): group 2 is deliberately
-    // GREEDY `(.*)` so it consumes up to the LAST `, type=`. A user-renamed
-    // label may legally contain commas or even a `type=` substring
-    // (`name=foo, type=profile.CLONE, type=full.SYSTEM`); the authorization
-    // token must be the real trailing `type=full.SYSTEM`, never the
-    // display-only text smuggled into `name=`. A non-greedy `[^,]*` used to
-    // stop at the first comma and hand the injected CLONE token to group 3.
-    private val NEW_VERBOSE_LINE =
-        Regex("""^\s*\d+:\s*id=(\d+),\s*name=(.*),\s*type=([^\s,]+)""")
+    // The display index before `:` is NOT the id and is ignored; the name is
+    // display-only and the type/flags/parent tail carries all authorization
+    // evidence.
+    //
+    // Issue #65 fail-closed rewrite: the old greedy
+    // `^\s*\d+:\s*id=(\d+),\s*name=(.*),\s*type=([^\s,]+)` selected the
+    // LAST `, type=` token. That defended the `name=foo, type=profile.CLONE,
+    // type=full.SYSTEM` injection (real type full.SYSTEM wins) but FAILED
+    // OPEN on `name=foo, type=profile.CLONE, type=, flags=...` (real empty
+    // type skipped -> label's CLONE selected) and on a label smuggling a
+    // FULL canonical `type=profile.CLONE, flags=...` declaration while the
+    // real field is empty/non-canonical. Parsing now goes through the shared
+    // structured row parser (VerboseUserRow): the type can only come from the
+    // LAST `, type=` declaration, it must have a non-empty token, it must be
+    // the ONLY declaration followed by `, flags=`/` (flags=`, and the display
+    // name may carry no C0 control. A malformed row yields userType UNKNOWN
+    // (confidence LOW) and never lets a label token authorize.
 
     // A user-type token meaning Samsung/clone profile. Matches
     // `profile.CLONE` with a tolerant separator (`.`, `_`, `-`, space/Tab) so
@@ -382,19 +392,32 @@ object SamsungProfileAdapter {
     // the label taken from `name=` and the type/parent evidence from the
     // `type=` token plus the flag/parent tail (the label never enters the
     // body). Results merge by userId with UserInfo winning a duplicate
-    // (the two formats never coexist in practice). Tolerant otherwise:
-    // line order, letter case, `:` vs `=` separators and missing lines are
-    // all accepted; a block without any type token yields userType UNKNOWN
-    // (never guessed from the label). The header label is retained
-    // display-only and never affects userType.
+    // (the two formats never coexist in practice). Issue #65/P2: if a fresh
+    // row and a legacy block meet on the SAME userId but disagree on userType,
+    // the merged claim is downgraded to UNKNOWN (confidence LOW) -- fail
+    // closed, never let a blindly overwriting legacy claim cancel a fresh
+    // CLONE (or vice versa). Combined with the line-anchored HEADER, an inline
+    // `UserInfo{...}` inside a `name=` label cannot create such a conflict in
+    // the first place. Tolerant otherwise: line order, letter case, `:` vs
+    // `=` separators and missing lines are all accepted; a block without any
+    // type token yields userType UNKNOWN (never guessed from the label). The
+    // header label is retained display-only and never affects userType.
     fun parseUserListVerbose(text: String): List<ProfileIdentity> {
         val legacy = parseBlocks(text, IdentitySource.USER_LIST_V)
         val fresh = parseNewVerboseLines(text)
         if (fresh.isEmpty()) return legacy
         if (legacy.isEmpty()) return fresh
+        val freshById = fresh.associateBy { it.userId }
         val merged = LinkedHashMap<Int, ProfileIdentity>()
         for (e in fresh) merged[e.userId] = e
-        for (e in legacy) merged[e.userId] = e
+        for (e in legacy) {
+            val conflict = freshById[e.userId]
+            merged[e.userId] = if (conflict != null && conflict.userType != e.userType) {
+                e.copy(userType = ProfileUserType.UNKNOWN, confidence = IdentityConfidence.LOW)
+            } else {
+                e
+            }
+        }
         return merged.values.toList()
     }
 
@@ -461,35 +484,54 @@ object SamsungProfileAdapter {
     }
 
     // New-ROM `cmd user list -v` line parser (PR-33 D2, S24 實機): one claim
-    // per `N: id=<id>, name=<label>, type=<type>, ...` line. The label is
-    // taken from `name=` only (up to the LAST `, type=`, so a comma/`type=`
-    // inside a display name cannot spoof the type); the body searched for
-    // type/parent/serial is the real `type=` token plus the flag/parent
-    // tail, so the label can never leak into the authorization-relevant
-    // userType (same guarantee as the UserInfo body-only rule above).
-    // `type=profile.CLONE` classifies CLONE
-    // via CLONE_MARKER; any other explicit type (profile.PRIVATE,
-    // full.SYSTEM, ...) classifies OTHER via the shared classifier; a line
-    // without a type token is UNKNOWN. `parentId=N` in the tail yields the
-    // parent (absent, e.g. owner, yields null); there is no serial line on
-    // this ROM, so serial stays null (dumpsys serialNo= is authoritative).
+    // per `N: id=<id>, name=<label>, type=<type>, ...` line. All row structure
+    // now comes from the shared VerboseUserRow parser used by
+    // PmOutputParser's strict gate, so the two callers can never disagree on
+    // which `, type=` declaration is real:
+    // - the name span (everything up to the FIRST `, type=`) is DISPLAY ONLY;
+    //   an injected `, type=profile.CLONE` inside `name=` is never authorized;
+    // - the real type is the LAST `, type=` declaration's non-empty token,
+    //   allowed only when it alone is immediately followed by `, flags=` or
+    //   ` (flags=)`; its token is normalized to a `userType=` statement for
+    //   the shared classifier;
+    // - the flags/parent tail goes on its own line: it carries no type keyword
+    //   so a flags tail like `(flags=A|B)` never contributes profile.X tokens
+    //   to the type mention (display-only metadata), while parentId/serial
+    //   extraction still scans the whole body;
+    // - a MALFORMED row (empty/non-canonical last declaration, an earlier
+    //   canonical declaration, a control char in the name, e.g.
+    //   `type=profile.CLONE, type=, flags=...`, or a label smuggling a full
+    //   canonical declaration) emits UNKNOWN with LOW confidence and no
+    //   parent/serial -- never a fallback to a label token.
+    // `type=profile.CLONE` classifies CLONE; any other explicit type
+    // (profile.PRIVATE, full.SYSTEM, ...) classifies OTHER; missing/malformed
+    // type stays UNKNOWN. `parentId=N` in a valid tail yields the parent
+    // (absent, e.g. owner, yields null); there is no serial line on this ROM,
+    // so serial stays null (dumpsys serialNo= is authoritative).
     private fun parseNewVerboseLines(text: String): List<ProfileIdentity> {
         val out = mutableListOf<ProfileIdentity>()
-        for (raw in text.lines()) {
-            val m = NEW_VERBOSE_LINE.find(raw) ?: continue
-            val userId = m.groupValues[1].toIntOrNull() ?: continue
-            val label = m.groupValues[2].trim()
-            val typeToken = m.groupValues[3].trim()
-            // Normalized to a userType= statement so the shared classifier
-            // sees the explicit type; the name=... segment (inside the match
-            // prefix) is excluded by construction. The flags/parent tail goes
-            // on its own line(s): it carries no type keyword so the
-            // classifier ignores it (a flags tail like
-            // "(flags=A|B)" must never contribute profile.X tokens to the
-            // type mention -- display-only metadata), while parentId/serial
-            // extraction still scans the whole body.
-            val body = "userType=$typeToken\n" + raw.substring(m.range.last + 1)
-            out.add(parseOneBlock(userId = userId, label = label, body = body, source = IdentitySource.USER_LIST_V))
+        // CR-preserving split shared with PmOutputParser's strict gate: a lone
+        // \r remains inside the row and makes it malformed instead of splitting
+        // a smuggled declaration into a separate, valid-looking row.
+        for (raw in VerboseUserRow.verboseLines(text)) {
+            val row = VerboseUserRow.parse(raw) ?: continue
+            if (row.malformed) {
+                out.add(
+                    ProfileIdentity(
+                        userId = row.userId,
+                        userType = ProfileUserType.UNKNOWN,
+                        source = IdentitySource.USER_LIST_V,
+                        confidence = IdentityConfidence.LOW,
+                        label = row.displayName,
+                    ),
+                )
+                continue
+            }
+            // A valid row always has a real token; if none, drop the row
+            // entirely (fail closed) rather than emitting a typed claim.
+            val typeToken = row.typeToken ?: continue
+            val body = "userType=$typeToken\n" + row.tail
+            out.add(parseOneBlock(userId = row.userId, label = row.displayName, body = body, source = IdentitySource.USER_LIST_V))
         }
         return out
     }

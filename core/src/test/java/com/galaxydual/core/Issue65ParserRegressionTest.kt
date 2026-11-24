@@ -3,6 +3,7 @@ package com.galaxydual.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -131,5 +132,150 @@ class Issue65ParserRegressionTest {
             95,
             PmOutputParser.resolveDualUserIdVerified(verboseWithErrorName, dumpsys, propertyId = 95),
         )
+    }
+
+    // P1a — the old greedy name segment ran up to the LAST `, type=`, so the
+    // genuine `Failure [bad]` and the second (injected) type declaration were
+    // swallowed into the label and the strict gate returned TRUE. Both type
+    // declarations are followed by `flags=`, i.e. there is no unique real
+    // type: the row is malformed and must fail the gate closed.
+    @Test
+    fun newVerbose_twoTypeDeclarationsWithSwallowedFailure_failsGateClosed() {
+        val row = "1: id=95, name=OK, type=profile.PRIVATE, flags=Failure [bad] (parentId=10), " +
+            "type=profile.CLONE, flags=X (parentId=0)"
+        assertFalse(
+            "a swallowed Failure plus two competing type declarations must fail the gate",
+            PmOutputParser.isIdentityChannelOk("Users:\n$row", 0),
+        )
+        // Same ambiguity with NO error token: the structural malformation
+        // alone must still fail closed (no token may authorize).
+        val noErrorRow = row.replace("Failure [bad]", "OK")
+        assertFalse(
+            "a malformed row must fail the gate even when ERROR_LINE found nothing",
+            PmOutputParser.isIdentityChannelOk("Users:\n$noErrorRow", 0),
+        )
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(noErrorRow)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.UNKNOWN, parsed.first().userType)
+    }
+
+    // P1b — the real `type=` value is EMPTY and the earlier `, type=profile.CLONE`
+    // is only label text. The old "LAST , type=" regex skipped the empty real
+    // field and selected the injected CLONE; the structured parser must refuse.
+    @Test
+    fun newVerbose_emptyRealTypeWithInjectedClone_isUnknown() {
+        val row = "1: id=95, name=foo, type=profile.CLONE, type=, flags=0x190 (parentId=0)"
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(row)
+        val claim = parsed.first { it.userId == 95 }
+        assertEquals(ProfileUserType.UNKNOWN, claim.userType)
+        assertEquals(IdentityConfidence.LOW, claim.confidence)
+        assertNull("no parent/serial may be claimed from a malformed row", claim.parentId)
+        assertNull(claim.serial)
+        assertFalse(
+            "a malformed row must fail the strict identity gate closed",
+            PmOutputParser.isIdentityChannelOk(row, 0),
+        )
+    }
+
+    // Security re-review PoCs A/B/G/H (verified against compiled classes).
+    // All four smuggle a CANONICAL `, type=profile.CLONE, flags=` (or
+    // ` (flags=)`) declaration into the display label while the real field is
+    // empty or non-canonical. The old "ANY canonical-suffix declaration is
+    // real" rule made the smuggled one the SOLE match -> gate passed and the
+    // parser trusted a label-supplied CLONE. Every one must now fail closed.
+    private fun assertSmuggledDeclarationFailsClosed(name: String, row: String) {
+        assertFalse(
+            "$name must fail the strict identity gate",
+            PmOutputParser.isIdentityChannelOk(row, 0),
+        )
+        assertFalse(
+            "$name must fail the pm-list-users gate too",
+            PmOutputParser.isListUsersOutputOk(row, 0),
+        )
+        val claim = SamsungProfileAdapter.parseUserListVerbose(row).first { it.userId == 95 }
+        assertEquals("$name must not claim CLONE", ProfileUserType.UNKNOWN, claim.userType)
+        assertEquals(IdentityConfidence.LOW, claim.confidence)
+        assertNull("$name must not claim a parent", claim.parentId)
+        assertNull(claim.serial)
+    }
+
+    @Test
+    fun newVerbose_pocA_emptyRealTypeWithSmuggledCanonicalFlags_failsClosed() {
+        assertSmuggledDeclarationFailsClosed(
+            "A",
+            "1: id=95, name=foo, type=profile.CLONE, flags=X (parentId=0), " +
+                "type=, flags=0x190 (parentId=0)",
+        )
+    }
+
+    @Test
+    fun newVerbose_pocB_smuggledCanonicalFlagsWithSpaceBeforeComma_failsClosed() {
+        assertSmuggledDeclarationFailsClosed(
+            "B",
+            "1: id=95, name=foo, type=profile.CLONE, flags=X, " +
+                "type=profile.PRIVATE , flags=0x190 (parentId=0)",
+        )
+    }
+
+    @Test
+    fun newVerbose_pocG_parenthesizedSmuggledFlagsWithEmptyRealType_failsClosed() {
+        assertSmuggledDeclarationFailsClosed(
+            "G",
+            "1: id=95, name=foo, type=profile.CLONE (flags=X) (parentId=0), " +
+                "type=, flags=0x190 (parentId=0)",
+        )
+    }
+
+    @Test
+    fun newVerbose_pocH_carriageReturnBeforeSmuggledDeclaration_failsClosed() {
+        // A lone \r is NOT a row separator (VerboseUserRow.verboseLines): it
+        // stays inside the row, where the empty last declaration / earlier
+        // canonical declaration and the C0-control check all fail it closed.
+        assertSmuggledDeclarationFailsClosed(
+            "H",
+            "1: id=95, name=foo, type=profile.CLONE, flags=X (parentId=0)\r" +
+                ", type=, flags=0x190 (parentId=0)",
+        )
+    }
+
+    // P2 — an inline `UserInfo{95:x:400}` inside a `name=` label used to be
+    // found by the unanchored HEADER.findAll, creating a spurious legacy
+    // UNKNOWN claim that overwrote the fresh CLONE at merge time.
+    @Test
+    fun newVerbose_inlineUserInfoHeaderInLabel_doesNotCreateLegacyClaim() {
+        val verbose = "1: id=95, name=UserInfo{95:x:400}, type=profile.CLONE, flags=0x190 (parentId=0)"
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(verbose)
+        assertEquals(1, parsed.size)
+        assertEquals(ProfileUserType.CLONE, parsed.first().userType)
+
+        val dumpsys = """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DUAL_APP:400} serialNo=15:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE
+        """.trimIndent()
+        assertEquals(95, PmOutputParser.resolveDualUserIdVerified(verbose, dumpsys, propertyId = 95))
+        assertEquals(
+            VerifiedDualTarget(95, 15, 0),
+            PmOutputParser.resolveDualTargetVerified(verbose, dumpsys, propertyId = 95),
+        )
+    }
+
+    // A genuine legacy block for the same id with a DIFFERENT type must not
+    // silently overwrite a fresh claim: the merged claim is UNKNOWN.
+    @Test
+    fun legacyAndFreshTypeDisagreement_resolvesUnknown() {
+        val text = """
+            UserInfo{95:DualApp:400} serialNo=15:
+              userType=android.os.usertype.full.SYSTEM
+            1: id=95, name=DUAL_APP, type=profile.CLONE, flags=0x190 (parentId=0)
+        """.trimIndent()
+        val parsed = SamsungProfileAdapter.parseUserListVerbose(text)
+        assertEquals(1, parsed.size)
+        val claim = parsed.first { it.userId == 95 }
+        assertEquals(ProfileUserType.UNKNOWN, claim.userType)
+        assertEquals(IdentityConfidence.LOW, claim.confidence)
     }
 }
