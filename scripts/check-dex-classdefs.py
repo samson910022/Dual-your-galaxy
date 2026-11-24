@@ -259,8 +259,10 @@ def _string_at(data, file_size, endian, data_off, data_end,
 def parse_class_def_descriptors(dex_bytes):
     """Validate a DEX and return one descriptor per class_def_item.
 
-    The result is ordered exactly like class_defs: repeated descriptors are
-    kept, so callers can count class_defs for a given descriptor.
+    The result is ordered exactly like class_defs. Within one DEX, class_idx
+    and descriptor values must be unique: a repeated class_idx or descriptor
+    is rejected (fail closed), so callers can count class_defs for a given
+    descriptor. Cross-DEX duplicates are checked by main() over all entries.
     """
     if not isinstance(dex_bytes, (bytes, bytearray)):
         raise DexError("DEX payload is not bytes")
