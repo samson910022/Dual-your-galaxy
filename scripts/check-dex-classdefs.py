@@ -28,6 +28,13 @@
 #   ::error::MISSING class_def <descriptor> ...
 # per missing descriptor and exits 1.
 #
+# Only strings reached through a class_def's type_ids entry are decoded; other
+# string_ids entries (including non-type strings and type-looking strings with
+# no class_def) are irrelevant and can never create a false positive. Each
+# referenced string_data_item must have a correctly decoded ULEB128 utf16_size
+# (in UTF-16 code units, so it may span multiple bytes) and canonical MUTF-8
+# bytes; surrogate pairs remain two separate code units.
+#
 # Fail closed (::error:: + exit 1) on: unreadable/corrupt APK, missing or
 # duplicated primary DEX, non-canonical or duplicated DEX member names, ZIP
 # member names containing a NUL byte, a gap in secondary DEX numbering,

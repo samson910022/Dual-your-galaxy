@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """Minimal, parser-specific synthetic DEX/ZIP fixture builder.
 
-This is NOT an ART-verifiable DEX. It emits only the header fields and tables
-that scripts/check-dex-classdefs.py reads (magic, file_size, header_size,
+These fixtures are parser-specific MINIMAL DEX payloads, NOT ART-verifiable
+DEX files. The builder emits only the header fields and tables that
+scripts/check-dex-classdefs.py reads (magic, file_size, header_size,
 endian_tag, string_ids, type_ids, class_defs, data_size/data_off, plus
-string_data_item blobs). There are deliberately no checksums, no map/list,
-no code, and no other sections. It exists so the class_def gate can be tested
-offline with pure Python 3 stdlib — no Android SDK, no network, no checked-in
-binary fixtures.
+string_data_item blobs). There are deliberately NO checksums/signatures, NO
+map_list contents (the map_off field is only a pointer for the bounds check),
+NO bytecode/code items, and no other sections. A fixture accepted by the gate
+is therefore not necessarily a DEX the runtime can load. They exist so the
+class_def gate can be tested offline with pure Python 3 stdlib — no Android
+SDK, no network, no checked-in binary fixtures.
+
+map_off defaults to 0 (absent map) in every fixture. The few fixtures that set
+a nonzero map_off exercise ONLY the checker's pointer-bounds validation: they
+do not carry a real map_list and must not be read as ART-emitted DEXes.
 
 Importable API:
   build_dex(strings, types=None, class_idxs=None, **mutations) -> bytes
@@ -443,6 +450,35 @@ def build_all(outdir):
     with open(os.path.join(outdir, "not-a-zip.apk"), "wb") as handle:
         handle.write(b"this is not a zip archive")
     written.append("not-a-zip.apk")
+
+    # --- R3: positive parser-coverage fixtures -------------------------------
+    # Non-identity index mapping: class_idx 0 -> type_ids[0].descriptor_idx 1
+    # -> strings[1] == TARGET. strings[0] (the empty string) and strings[2] (a
+    # type-looking string that has NO class_def) are non-type strings in
+    # string_ids and must never satisfy the gate.
+    nonidentity_dex = build_dex(
+        ["", TARGET, "Lcom/example/metadata/OnlyAString;"],
+        types=[1], class_idxs=[0])
+    apk("nonidentity-type-index.apk", [("classes.dex", nonidentity_dex)])
+
+    # A descriptor longer than 255 UTF-16 code units forces a multi-byte
+    # ULEB128 prefix whose FIRST byte is NOT the full value (a single-byte
+    # decoder would silently mis-decode 128..255 too, so stay above 255).
+    long_descriptor = "Lcom/example/" + "a" * 300 + "/LongTarget;"
+    assert len(uleb128(len(long_descriptor))) > 1
+    apk("long-uleb128.apk", [("classes.dex", build_dex([long_descriptor]))])
+
+    # Canonical MUTF-8 with both 2-byte (Latin-1: Ü, ï, ä) and 3-byte
+    # (BMP: U+20AC) sequences. All characters are BMP, so the declared
+    # utf16_size equals the Python str length.
+    nonascii_descriptor = "Lcom/example/Ünïcode€/Tärget;"
+    apk("nonascii-mutf8.apk", [("classes.dex", build_dex([nonascii_descriptor]))])
+
+    # A surrogate-pair descriptor (U+1F600) is intentionally NOT a CLI fixture:
+    # argv/locale cannot carry lone surrogates. scripts/check-dex-classdefs.test.sh
+    # builds it through the importable API instead, spelling the pair as the two
+    # code points "\ud83d\ude00" so the builder emits two canonical 3-byte
+    # MUTF-8 sequences (never a 4-byte UTF-8 sequence).
 
     # Multi-DEX: target only in the secondary entry.
     multi_primary = dex("multi-primary.dex", [OTHER])

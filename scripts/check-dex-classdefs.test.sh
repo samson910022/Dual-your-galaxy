@@ -97,6 +97,29 @@ assert_case "positive single class_def" "$SUITE_TMP/positive.apk" 0 \
 assert_case "big-endian DEX accepted" "$SUITE_TMP/big-endian.apk" 0 \
   "FOUND class_def $TARGET in classes.dex (count=1)" "$TARGET"
 
+# --- R3: positive parser coverage (index mapping / ULEB128 / MUTF-8) --------
+# Genuinely non-identity mapping: class_idx 0 -> type_ids[0].descriptor_idx 1
+# -> strings[1] == TARGET. strings[0] (empty) and strings[2] (type-looking but
+# with NO class_def) are non-type strings that must not satisfy the gate.
+assert_case "non-identity class_idx -> type_ids -> descriptor_idx mapping" \
+  "$SUITE_TMP/nonidentity-type-index.apk" 0 \
+  "FOUND class_def $TARGET in classes.dex (count=1)" "$TARGET"
+
+# 300 ASCII code units force a two-byte ULEB128 utf16_size prefix whose first
+# byte is not the full value. Build the expected descriptor in shell so no
+# 300-literal-character string is needed.
+long_units="$(printf 'a%.0s' $(seq 1 300))"
+long_descriptor="Lcom/example/${long_units}/LongTarget;"
+assert_case "multi-byte ULEB128 utf16_size (300 UTF-16 code units)" \
+  "$SUITE_TMP/long-uleb128.apk" 0 \
+  "FOUND class_def $long_descriptor in classes.dex (count=1)" "$long_descriptor"
+
+# Canonical MUTF-8 with 2-byte (Latin-1: Ü, ï, ä) and 3-byte (U+20AC) sequences.
+nonascii_descriptor='Lcom/example/Ünïcode€/Tärget;'
+assert_case "canonical non-ASCII MUTF-8 descriptor" \
+  "$SUITE_TMP/nonascii-mutf8.apk" 0 \
+  "FOUND class_def $nonascii_descriptor in classes.dex (count=1)" "$nonascii_descriptor"
+
 # 2. #67 negative: descriptor string + type_ids present, class_defs_size=0.
 assert_case "negative zero class_defs (issue #67)" "$SUITE_TMP/negative.apk" 1 \
   "class_defs_size=0" "$TARGET"
@@ -414,6 +437,65 @@ if [ "$canon_rc" -eq 0 ] && printf '%s\n' "$canon_output" | grep -qF -- "$canon_
   pass_case "canonical MUTF-8 re-encode guard rejects a decoder regression (exit 0)"
 else
   bad_case "canonical MUTF-8 guard must reject regressed decoder with '$canon_needle' (got exit $canon_rc)" "$canon_output"
+fi
+
+# 15. R3 importable-API checks: (a) the long descriptor really has a multi-byte
+#     utf16_size prefix in the emitted DEX (first byte carries the continuation
+#     bit and is not the full 325-code-unit value), and (b) an astral character spelled
+#     as an explicit UTF-16 surrogate pair round-trips as two MUTF-8 code units.
+#     Values come strictly from sys.argv — lone surrogates cannot travel in
+#     argv/locale, so they are passed as hex code-point strings and rebuilt.
+cat > "$SUITE_TMP/unit_r3.py" <<'PYR3'
+import importlib.util
+import struct
+import sys
+import zipfile
+
+checker, builder_dir, apk_path, long_descriptor, hi, lo = sys.argv[1:7]
+sys.path.insert(0, builder_dir)
+import dex_builder as builder
+
+spec = importlib.util.spec_from_file_location("check_dex_classdefs_r3", checker)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+problems = []
+
+# (a) Inspect the actual emitted DEX: the first byte at string_data_off[0]
+# must carry the ULEB128 continuation bit and differ from the full value
+# (325 UTF-16 code units here, so a single-byte decode would be wrong).
+with zipfile.ZipFile(apk_path) as zf:
+    dex = zf.read("classes.dex")
+string_ids_off = struct.unpack_from("<I", dex, 0x3C)[0]
+string_off = struct.unpack_from("<I", dex, string_ids_off)[0]
+prefix = dex[string_off]
+encoded = builder.uleb128(len(long_descriptor))
+if not (prefix & 0x80) or len(encoded) < 2 or prefix == len(long_descriptor):
+    problems.append(f"utf16_size prefix 0x{prefix:02x} is not a non-trivial multi-byte prefix")
+
+# (b) Surrogate pair (U+1F600): two canonical 3-byte MUTF-8 sequences, never a
+# 4-byte UTF-8 sequence. The builder is used via the importable API only.
+pair = chr(int(hi, 16)) + chr(int(lo, 16))
+surrogate_descriptor = "Lcom/example/" + pair + "/EmojiTarget;"
+try:
+    surrogate_dex = builder.build_dex([surrogate_descriptor])
+    descriptors = module.parse_class_def_descriptors(surrogate_dex)
+except module.DexError as exc:
+    problems.append(f"surrogate-pair descriptor rejected: {exc}")
+else:
+    if descriptors != [surrogate_descriptor]:
+        problems.append(f"surrogate-pair resolved to {descriptors!r}")
+
+print("OK" if not problems else "PROBLEMS: " + " | ".join(problems))
+PYR3
+r3_rc=0
+r3_output="$(python3 "$SUITE_TMP/unit_r3.py" \
+  "$CHECKER" "$REPO_ROOT/scripts/fixtures" "$SUITE_TMP/long-uleb128.apk" \
+  "$long_descriptor" d83d de00 2>&1)" || r3_rc=$?
+if [ "$r3_rc" -eq 0 ] && [ "$r3_output" = "OK" ]; then
+  pass_case "R3 importable API: multi-byte ULEB128 prefix + surrogate-pair MUTF-8 (exit 0)"
+else
+  bad_case "R3 importable API checks must pass (got exit $r3_rc)" "$r3_output"
 fi
 
 echo "----"
