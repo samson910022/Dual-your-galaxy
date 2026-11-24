@@ -123,15 +123,25 @@ class RiskDisclosureSourceShapeTest {
         assertTrue("cancel must be a null negative listener",
             gate.contains("setNegativeButton(R.string.dialog_cancel, null)"))
         val positive = block(gate, ".setPositiveButton(R.string.risk_ack_positive)")
-        assertTrue("positive must acknowledge", positive.contains("markAcknowledged()"))
+        // D2a:ack 是非阻塞提交，UI 不得再等待 durability/queue backlog。
+        assertTrue("positive must acknowledge without blocking", positive.contains("markAcknowledgedAsync()"))
+        assertFalse("positive must not call the blocking markAcknowledged()", positive.contains("markAcknowledged()"))
         assertTrue("positive must continue", positive.contains("onContinue()"))
+        // R4:consent 前後都必須確認 host 仍 alive，避免對 dying Activity 繼續流程。
+        assertTrue("positive must re-check a live host before continuing",
+            positive.contains("!activity.isFinishing && !activity.isDestroyed"))
         // R7b-1 共用 helper 同樣：取消不標記、不繼續。
         val sharedGate = block(riskNotice, "internal fun showRiskAckGate(")
         assertTrue("shared cancel must be a null negative listener",
             sharedGate.contains("setNegativeButton(R.string.dialog_cancel, null)"))
         val sharedPositive = block(sharedGate, ".setPositiveButton(R.string.risk_ack_positive)")
-        assertTrue("shared positive must acknowledge", sharedPositive.contains("store.markAcknowledged()"))
+        assertTrue("shared positive must acknowledge without blocking",
+            sharedPositive.contains("store.markAcknowledgedAsync()"))
+        assertFalse("shared positive must not call the blocking markAcknowledged()",
+            sharedPositive.contains("store.markAcknowledged()"))
         assertTrue("shared positive must continue", sharedPositive.contains("onContinue()"))
+        assertTrue("shared positive must re-check a live host before continuing",
+            sharedPositive.contains("!activity.isFinishing && !activity.isDestroyed"))
         // 兩個對話框實作（MainActivity wrapper 與 R7b-1 共用 helper）內容/語意必須一致，
         // 避免日後改了其中一邊造成風險揭露漂移。
         for (b in listOf(gate, sharedGate)) {
@@ -161,8 +171,9 @@ class RiskDisclosureSourceShapeTest {
         val gate = block(riskNotice, "internal fun showRiskAckGate(")
         assertTrue("shared ack gate must return AlertDialog?", gate.contains("AlertDialog?"))
         assertTrue("shared ack gate must return the show() handle", gate.contains("return try {"))
-        // Phase A ack-store contract must survive this change.
-        assertTrue("ack gate must still persist acknowledgement", gate.contains("store.markAcknowledged()"))
+        // Phase A ack-store contract must survive this change (D2a:non-blocking).
+        assertTrue("ack gate must still persist acknowledgement",
+            gate.contains("store.markAcknowledgedAsync()"))
     }
 
     // #78: PolicyActivity has the same handle/lifetime obligation as MainActivity,

@@ -788,8 +788,12 @@ class MainActivity : ComponentActivity() {
                 .setTitle(R.string.risk_details_title)
                 .setMessage(R.string.risk_details_full)
                 .setPositiveButton(R.string.risk_ack_positive) { _, _ ->
-                    store.markAcknowledged()
-                    onContinue()
+                    // D2a:非阻塞提交；durability 未證實時由 ProcessRiskAckState
+                    // 保持 gate 開啟，consent 仍舊進行。R4:繼續前確認 host alive。
+                    store.markAcknowledgedAsync()
+                    if (!activity.isFinishing && !activity.isDestroyed) {
+                        onContinue()
+                    }
                 }
                 .setNegativeButton(R.string.dialog_cancel, null)
                 .setCancelable(true)

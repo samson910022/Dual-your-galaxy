@@ -12,7 +12,9 @@ package com.galaxydual.plus
 
 import android.content.SharedPreferences
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -478,6 +480,178 @@ class RiskAckStoreTest {
             val ioOwnerSettled = CountDownLatch(1)
             RiskAckIoOwner.executor.execute { ioOwnerSettled.countDown() }
             assertTrue("IO owner must settle before the owner is reset", ioOwnerSettled.await(3, TimeUnit.SECONDS))
+            caller.join(2_000L)
+        }
+    }
+
+    // =====================================================================
+    // PR #89 Phase D2a (R4/queue backlog):the UI gate uses the non-blocking
+    // markAcknowledgedAsync(). Every test here uses latches (never sleeps) and
+    // drains the single-thread IO owner before @After resets the process-global
+    // owner, so a late confirm/fail cannot leak into the next test.
+    // =====================================================================
+
+    private fun settleIoOwner() {
+        val settled = CountDownLatch(1)
+        RiskAckIoOwner.executor.execute { settled.countDown() }
+        assertTrue("IO owner must settle before the owner is reset", settled.await(3, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun asyncDefault_delegatesToSyncForFakes() {
+        // The interface default is what keeps every existing fake/caller compiling.
+        val store = MapBackedRiskAckStore()
+        val reported = AtomicBoolean(false)
+        store.markAcknowledgedAsync { ok -> reported.set(ok) }
+        assertTrue("default async must delegate and forward the result", reported.get())
+        assertFalse("default async must still persist the ack", shouldShowRiskGate(store.isAcknowledged()))
+    }
+
+    @Test
+    fun asyncAck_returnsBeforeCommitCompletes() {
+        val commitEntered = CountDownLatch(1)
+        val releaseCommit = CountDownLatch(1)
+        val callback = CountDownLatch(1)
+        val callbackOk = AtomicBoolean(false)
+        val returned = CountDownLatch(1)
+        val prefs = SplitCommitPrefs().apply {
+            beforeDiskWrite = {
+                commitEntered.countDown()
+                releaseCommit.await(5, TimeUnit.SECONDS)
+                true
+            }
+        }
+        // Default dispatch => the real RiskAckIoOwner single-thread executor.
+        val store = prefs.riskAckStore()
+        val caller = Thread {
+            try {
+                store.markAcknowledgedAsync { ok ->
+                    callbackOk.set(ok)
+                    callback.countDown()
+                }
+            } finally {
+                returned.countDown()
+            }
+        }
+        caller.isDaemon = true
+        caller.start()
+        try {
+            assertTrue("commit must be running on the IO owner", commitEntered.await(3, TimeUnit.SECONDS))
+            assertTrue("async ack must return before the blocked commit completes",
+                returned.await(1, TimeUnit.SECONDS))
+            assertFalse("callback must not fire before durability is known",
+                callback.await(100, TimeUnit.MILLISECONDS))
+            assertFalse("gate must stay open while the commit is blocked", store.isAcknowledged())
+        } finally {
+            releaseCommit.countDown()
+        }
+        try {
+            assertTrue("callback must fire after commit", callback.await(3, TimeUnit.SECONDS))
+            assertTrue("durable async ack must report true", callbackOk.get())
+            assertTrue("confirmed ack must close the gate", store.isAcknowledged())
+            assertFalse(shouldShowRiskGate(store.isAcknowledged()))
+        } finally {
+            settleIoOwner()
+            caller.join(2_000L)
+        }
+    }
+
+    @Test
+    fun asyncAckFailure_callbackFalse_gateStaysOpen() {
+        val prefs = SplitCommitPrefs().apply { beforeDiskWrite = { false } }
+        val store = prefs.riskAckStore()
+        val callback = CountDownLatch(1)
+        val callbackOk = AtomicBoolean(true)
+        store.markAcknowledgedAsync { ok ->
+            callbackOk.set(ok)
+            callback.countDown()
+        }
+        try {
+            assertTrue("callback must fire on commit(false)", callback.await(3, TimeUnit.SECONDS))
+            assertFalse("failed commit must report false via callback", callbackOk.get())
+            assertFalse("owner must stay UNKNOWN", store.isAcknowledged())
+            assertTrue("failed async ack must keep the gate open", shouldShowRiskGate(store.isAcknowledged()))
+            assertEquals(1L, ProcessRiskAckState.currentWriteIdForTests())
+        } finally {
+            settleIoOwner()
+        }
+    }
+
+    @Test
+    fun asyncAckSubmitRejection_failsClosed() {
+        val prefs = RecordingPrefs()
+        val callback = CountDownLatch(1)
+        val callbackOk = AtomicBoolean(true)
+        val store = prefs.riskAckStore(
+            dispatch = { throw RejectedExecutionException("simulated executor rejection") },
+        )
+        store.markAcknowledgedAsync { ok ->
+            callbackOk.set(ok)
+            callback.countDown()
+        }
+        assertTrue("callback must fire on submit rejection", callback.await(1, TimeUnit.SECONDS))
+        assertFalse("submit rejection must report false", callbackOk.get())
+        assertFalse("owner must stay UNKNOWN", store.isAcknowledged())
+        assertTrue("submit rejection must keep the gate open", shouldShowRiskGate(store.isAcknowledged()))
+        assertEquals("no commit may be attempted", 0, prefs.commitCount)
+        assertEquals(1L, ProcessRiskAckState.currentWriteIdForTests())
+    }
+
+    @Test
+    fun asyncAckDoesNotWaitOnQueueBacklog() {
+        val firstCommitEntered = CountDownLatch(1)
+        val releaseFirstCommit = CountDownLatch(1)
+        val firstCallback = CountDownLatch(1)
+        val secondCallback = CountDownLatch(1)
+        val firstOk = AtomicBoolean(false)
+        val secondOk = AtomicBoolean(false)
+        val firstWrite = AtomicBoolean(true)
+        val prefs = SplitCommitPrefs().apply {
+            beforeDiskWrite = {
+                if (firstWrite.compareAndSet(true, false)) {
+                    firstCommitEntered.countDown()
+                    releaseFirstCommit.await(5, TimeUnit.SECONDS)
+                }
+                true
+            }
+        }
+        val store = prefs.riskAckStore()
+        store.markAcknowledgedAsync { ok ->
+            firstOk.set(ok)
+            firstCallback.countDown()
+        }
+        assertTrue("first commit must be pinned on the IO owner", firstCommitEntered.await(3, TimeUnit.SECONDS))
+
+        val secondReturned = CountDownLatch(1)
+        val caller = Thread {
+            try {
+                store.markAcknowledgedAsync { ok ->
+                    secondOk.set(ok)
+                    secondCallback.countDown()
+                }
+            } finally {
+                secondReturned.countDown()
+            }
+        }
+        caller.isDaemon = true
+        caller.start()
+        try {
+            assertTrue("second async ack must return despite queue backlog",
+                secondReturned.await(1, TimeUnit.SECONDS))
+            assertFalse("second write is still queued behind the pinned commit",
+                secondCallback.await(100, TimeUnit.MILLISECONDS))
+        } finally {
+            releaseFirstCommit.countDown()
+        }
+        try {
+            assertTrue("first callback must fire", firstCallback.await(3, TimeUnit.SECONDS))
+            assertTrue("second callback must fire", secondCallback.await(3, TimeUnit.SECONDS))
+            assertTrue(firstOk.get())
+            assertTrue(secondOk.get())
+            assertTrue("latest async ack must close the gate", store.isAcknowledged())
+            assertEquals(2L, ProcessRiskAckState.currentWriteIdForTests())
+        } finally {
+            settleIoOwner()
             caller.join(2_000L)
         }
     }

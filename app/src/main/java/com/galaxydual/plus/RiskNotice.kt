@@ -9,8 +9,12 @@
 // - 寫入原子性:單鍵 edit().putBoolean(...).commit() 落盤。#76:改用
 //   commit() 的 Boolean 如實回報 durable 與否，不再吞掉 false/例外。
 // - #76 IO ownership:commit() 在行程級單執行緒 daemon executor 上執行
-//   (serialized IO owner)，不在呼叫執行緒 (UI) 上做磁碟寫入；呼叫端只做一個
-//   有上限的短等待以取得落盤結果，逾時/失敗一律回 false (偏向再顯示風險)。
+//   (serialized IO owner)，不在呼叫執行緒 (UI) 上做磁碟寫入；有上限的短等待
+//   只存在於同步版 markAcknowledged()，逾時/失敗一律回 false (偏向再顯示風險)。
+// - PR #89 Phase D2a:UI gate 改走 markAcknowledgedAsync() —— 提交後立刻回傳，
+//   完全不在 UI 執行緒等待 latch/queue；durability 結果由 onResult 事後通知，
+//   gate 狀態仍由 [ProcessRiskAckState] 單一來源決定。同步版 API 保留給測試/
+//   其他需要如實結果的呼叫端，兩者共用同一個 commit 任務實作。
 // - 讀取失敗 (含任何 Throwable) -> false (fail-safe:偏向「再顯示一次風險」)；
 //   讀取端永不因讀失敗而自動標記已確認。
 // - RiskAckStore 介面與 shouldShowRiskGate 為純 Kotlin seam (無 Android 型別)，
@@ -154,15 +158,15 @@ internal object RiskAckIoOwner {
     }
 }
 
-// 呼叫端等待落盤報告的上限 (ms)。真正磁碟寫作在 IO owner 上；此上限只用來
-// 決定要不要把結果當成「已證實」。逾時即回 false，偏向再次顯示風險。
+// 同步版 markAcknowledged() 等待落盤報告的上限 (ms)。真正磁碟寫作在 IO owner 上；
+// 此上限只用來決定要不要把結果當成「已證實」。逾時即回 false，偏向再次顯示風險。
 //
-// jank trade-off (PR4 review Optional 4):這「不是 zero-blocking」—— 呼叫端 (UI)
+// jank trade-off (PR4 review Optional 4):同步版「不是 zero-blocking」—— 呼叫端
 // 最多同步等待約 400ms (RISK_ACK_IO_WAIT_MS) 以取得真實的 commit 結果。#76 的
 // RED test 要求 truthful result (不能 fire-and-forget 後一律回 true)，故此等待
-// 是「如實結果」下的最小取舍：再短會把正常磁碟寫入誤判為失敗 (偏向重複顯示風險)，
-// 再長只徒增 UI jank。磁碟寫本身在 [RiskAckIoOwner] 的單執行緒上，不阻塞 UI 的
-// 其它工作；超過上限即如實回 false，下次進入仍會再顯示風險。
+// 是「如實結果」下的最小取舍。PR #89 D2a 起 UI gate 不再使用同步版，改走
+// markAcknowledgedAsync()：提交後立刻回傳，逾時/queue backlog 都不佔住 UI 執行緒；
+// 磁碟寫仍在同一條 [RiskAckIoOwner] 單執行緒上序列化。
 internal const val RISK_ACK_IO_WAIT_MS = 400L
 
 // 持久化埠:不含任何 Android 型別,JVM 可以 Map-backed fake 直接實作。
@@ -171,6 +175,15 @@ internal interface RiskAckStore {
 
     /** true = commit() 證實落盤；false = 未證實 (失敗/例外/逾時)，風險仍須再顯示。 */
     fun markAcknowledged(): Boolean
+
+    /**
+     * PR #89 D2a:非阻塞版 —— 提交寫入後立刻回傳，落盤結果由 onResult 事後通知。
+     * 預設設計是刻意保留原始碼相容：既有 fake / caller 不必改寫；生產綁定會
+     * override 成真正不等待 latch 的實作。
+     */
+    fun markAcknowledgedAsync(onResult: (Boolean) -> Unit = {}) {
+        onResult(markAcknowledged())
+    }
 }
 
 // 純函式 seam:單一來源,進入點與測試共用。未確認即顯示 gate。
@@ -181,7 +194,8 @@ internal fun shouldShowRiskGate(acknowledged: Boolean): Boolean = !acknowledged
 // [ProcessRiskAckState] 單一來源決定，絕不直接讀 prefs (其 mMap 會被失敗的
 // commit 污染)。`dispatch` / `ioWaitMs` 為 JVM 測試 seam:
 //   dispatch = { it() } 可讓測試同步執行寫入並如實拿到 commit 結果；
-//   預設使用 RiskAckIoOwner 的單執行緒 executor，呼叫端只做有上限的短等待。
+//   預設使用 RiskAckIoOwner 的單執行緒 executor；同步版呼叫端做有上限的短等待，
+//   非同步版 (UI) 提交後立刻回傳。
 @android.annotation.SuppressLint("ApplySharedPref")
 internal fun android.content.SharedPreferences.riskAckStore(
     dispatch: ((() -> Unit) -> Unit)? = null,
@@ -202,25 +216,23 @@ internal fun android.content.SharedPreferences.riskAckStore(
         // 不回滾；直接 getBoolean() 會讓失敗的 ack 在下次進入時 fail-open。
         override fun isAcknowledged(): Boolean = ProcessRiskAckState.isAcknowledged()
 
-        override fun markAcknowledged(): Boolean {
-            val writeId = ProcessRiskAckState.beginWrite()
-            val done = CountDownLatch(1)
-            val committed = AtomicBoolean(false)
+        // 唯一的 commit 實作，同步/非同步 API 共用。owner 的 confirm/fail 一定在
+        // onSettled (也就是 callback) 之前完成，故 callback 永不觀察到舊的 gate 狀態。
+        private fun submitCommit(writeId: Long, onSettled: (Boolean) -> Unit) {
             val submit = dispatch ?: { task: () -> Unit -> RiskAckIoOwner.executor.execute(task) }
             val submitted = try {
                 submit {
-                    try {
-                        val ok = edit().putBoolean(RISK_ACK_KEY, true).commit()
-                        committed.set(ok)
+                    val ok = try {
+                        val result = edit().putBoolean(RISK_ACK_KEY, true).commit()
                         // 只有證實落盤才能確認；false/例外一律保持 gate 開啟。
-                        // 遲到成功 (呼叫端已逾時) 由 owner 的 current-id 規則處理。
-                        if (ok) ProcessRiskAckState.confirm(writeId) else ProcessRiskAckState.fail(writeId)
+                        // 遲到成功 (同步呼叫端已逾時) 由 owner 的 current-id 規則處理。
+                        if (result) ProcessRiskAckState.confirm(writeId) else ProcessRiskAckState.fail(writeId)
+                        result
                     } catch (_: Throwable) {
-                        committed.set(false)
                         ProcessRiskAckState.fail(writeId)
-                    } finally {
-                        done.countDown()
+                        false
                     }
+                    onSettled(ok)
                 }
                 true
             } catch (_: Throwable) {
@@ -229,7 +241,17 @@ internal fun android.content.SharedPreferences.riskAckStore(
             }
             if (!submitted) {
                 ProcessRiskAckState.fail(writeId)
-                return false
+                onSettled(false)
+            }
+        }
+
+        override fun markAcknowledged(): Boolean {
+            val writeId = ProcessRiskAckState.beginWrite()
+            val done = CountDownLatch(1)
+            val committed = AtomicBoolean(false)
+            submitCommit(writeId) { ok ->
+                committed.set(ok)
+                done.countDown()
             }
             val settled = try {
                 done.await(ioWaitMs, TimeUnit.MILLISECONDS)
@@ -244,6 +266,20 @@ internal fun android.content.SharedPreferences.riskAckStore(
                 return false
             }
             return true
+        }
+
+        // PR #89 D2a:UI 用的非阻塞入口。beginWrite() 在 entry 同步完成 (gate
+        // 立刻進入 PENDING)，之後只提交任务到 IO owner 便回傳 —— 不在呼叫端
+        // await latch，也不管 queue 是否有積壓。結果事後由 onResult 通知。
+        override fun markAcknowledgedAsync(onResult: (Boolean) -> Unit) {
+            val writeId = ProcessRiskAckState.beginWrite()
+            submitCommit(writeId) { ok ->
+                try {
+                    onResult(ok)
+                } catch (_: Throwable) {
+                    // callback 僅是通知；其例外不得回頭影響 IO owner / gate 狀態。
+                }
+            }
         }
     }
 }
@@ -268,9 +304,10 @@ internal fun showRiskDetailsDialog(activity: Activity): AlertDialog? {
 // 首次建立分身／BBC 政策寫入前的風險 gate。
 // positive -> 標記 acknowledgement 並繼續；negative (含返回鍵取消) -> 只關閉,
 // 不標記、不 onContinue。取消語意維持零寫入、零授權。
-// #76:markAcknowledged() 回報的是 durable 與否；回 false 時下次進入仍會顯示
-// (durable 未證實，偏向再顯示風險)。dialog 本身仍舊關閉、onContinue 仍舊執行 ——
-// 使用者已明確 consent，本函式刻意忽略回傳值，不阻塞這次已授權的流程。
+// #76:durability 未證實時下次進入仍會顯示 (偏向再顯示風險)。對話框本身仍舊關閉、
+// onContinue 仍舊執行 —— 使用者已明確 consent，不阻塞這次已授權的流程。
+// PR #89 D2a:提交 ack 用非阻塞版，不再讓 UI 等待 commit/queue；gate 是否關閉
+// 完全由 ProcessRiskAckState 決定。R4:onContinue 前重新確認 host 仍 alive。
 internal fun showRiskAckGate(
     activity: Activity,
     store: RiskAckStore,
@@ -282,8 +319,10 @@ internal fun showRiskAckGate(
             .setTitle(R.string.risk_details_title)
             .setMessage(R.string.risk_details_full)
             .setPositiveButton(R.string.risk_ack_positive) { _, _ ->
-                store.markAcknowledged()
-                onContinue()
+                store.markAcknowledgedAsync()
+                if (!activity.isFinishing && !activity.isDestroyed) {
+                    onContinue()
+                }
             }
             .setNegativeButton(R.string.dialog_cancel, null)
             .setCancelable(true)
