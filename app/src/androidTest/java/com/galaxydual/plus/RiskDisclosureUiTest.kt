@@ -44,6 +44,9 @@ class RiskDisclosureUiTest {
 
     private fun clearAck() {
         riskPrefs().edit().clear().commit()
+        // D1: prefs 只是 durable seed；行程級 owner 的 latch 必須同步重設，
+        // 否則第一個 store 建構時 latch 住的狀態會留整個 process。
+        ProcessRiskAckState.reseedForTests(false)
     }
 
     private fun isAcked(): Boolean = try {

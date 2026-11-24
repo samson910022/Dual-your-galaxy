@@ -5,18 +5,34 @@
 // - 讀取失敗 (任何 Throwable) -> false (fail-safe:重新顯示風險)，不拋出例外。
 // - 生產綁定以 in-memory SharedPreferences 驗證單鍵 commit() (非 apply())，
 //   並如實回報 commit 結果；測試用 dispatch seam 同步化背景寫入。
-//   此為路徑模擬，不證明 Android 磁碟持久化時序。
+// - PR #89 D1 (R2, fail-open):SplitCommitPrefs 忠實模擬 AOSP commitToMemory()
+//   (memory 先更新、disk 只於成功寫入、失敗不回滾)，驗證失敗 ack 之後的 gate
+//   由行程級 ProcessRiskAckState 決定，而不是被 mMap 污染的 getBoolean()。
 package com.galaxydual.plus
 
 import android.content.SharedPreferences
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
 class RiskAckStoreTest {
+
+    // The ack owner is process-scoped (that is the whole point of the R2 fix),
+    // so every test must start and end with a pristine owner.
+    @Before
+    fun resetProcessOwnerBefore() {
+        ProcessRiskAckState.resetForTests()
+    }
+
+    @After
+    fun resetProcessOwnerAfter() {
+        ProcessRiskAckState.resetForTests()
+    }
 
     private class MapBackedRiskAckStore : RiskAckStore {
         private val acks = linkedMapOf<String, Boolean>()
@@ -178,18 +194,33 @@ class RiskAckStoreTest {
     // real result — this is NOT zero-blocking, just capped UI jank.
     // =====================================================================
 
-    // SharedPreferences fake whose commit() result is controlled by the test.
-    // commitOk=false discards the pending write, exactly like a real
-    // SharedPreferences whose disk write failed (commit(false)).
-    private class ControlledCommitPrefs(var commitOk: Boolean = false) : BasePrefs() {
-        val values = linkedMapOf<String, Any?>()
+    // PR #89 D1:FAITHFUL split of AOSP SharedPreferencesImpl, unlike the old
+    // ControlledCommitPrefs (which discarded pending on commit(false) and so
+    // hid the exact fail-open bug under test):
+    //   - commitToMemory() ALWAYS applies pending to the process-local mMap
+    //     (`memory`) FIRST, even when the disk write fails;
+    //   - the disk file (`disk`) is written ONLY on success and is never rolled
+    //     back — so memory=true / disk=false is a legal post-failure state;
+    //   - a cold start rebuilds `memory` from `disk`.
+    // `beforeDiskWrite` models the disk-write step: it may block on a latch and
+    // its Boolean return is the commit() result.
+    private class SplitCommitPrefs(
+        initialDisk: Map<String, Any?> = emptyMap(),
+    ) : BasePrefs() {
+        val disk = linkedMapOf<String, Any?>().apply { putAll(initialDisk) }
+        val memory = linkedMapOf<String, Any?>().apply { putAll(disk) }
+
+        @Volatile
+        var beforeDiskWrite: () -> Boolean = { true }
+
         var commitCount = 0
             private set
         var applyCount = 0
             private set
+        val writes = mutableListOf<Pair<String?, Any?>>()
 
-        override fun getBoolean(key: String?, defValue: Boolean): Boolean = (values[key!!] as? Boolean) ?: defValue
-        override fun contains(key: String?): Boolean = values.containsKey(key!!)
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = (memory[key!!] as? Boolean) ?: defValue
+        override fun contains(key: String?): Boolean = memory.containsKey(key!!)
 
         override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
             private val pending = linkedMapOf<String, Any?>()
@@ -204,51 +235,185 @@ class RiskAckStoreTest {
             override fun clear(): SharedPreferences.Editor { pending.clear(); return this }
             override fun commit(): Boolean {
                 commitCount++
-                if (commitOk) values.putAll(pending)
+                writes.addAll(pending.map { it.key to it.value })
+                memory.putAll(pending) // AOSP commitToMemory: ALWAYS first, never rolled back.
+                val ok = beforeDiskWrite()
+                if (ok) disk.putAll(pending) // disk only on success
                 pending.clear()
-                return commitOk
+                return ok
             }
             override fun apply() {
                 applyCount++
-                values.putAll(pending)
+                memory.putAll(pending)
                 pending.clear()
             }
         }
     }
 
+    // =====================================================================
+    // PR #89 Phase D1 (R2, fail-open):AOSP commitToMemory() updates the
+    // process-local mMap BEFORE the disk write and never reverts on failure.
+    // The old ControlledCommitPrefs discarded pending on commit(false), which
+    // hid the bug: a failed ack left mMap=true, and the next entry read
+    // getBoolean()==true and skipped the risk gate. These tests use the
+    // faithful SplitCommitPrefs and a process-scoped owner instead.
+    // =====================================================================
+
     @Test
-    fun ackCommitFailure_doesNotTreatAsDurable() {
-        // #76 RED: the production binding calls edit().putBoolean(...).commit()
-        // and IGNORES the Boolean. markAcknowledged() is `Unit`, so the caller
-        // (showRiskAckGate positive button) cannot tell that commit(false) meant
-        // "not durable" and cannot retry. FIX: return/report the commit outcome
-        // (Boolean or Result<Unit>) and let the caller decide; verified durability.
-        //
-        // Reflection keeps this compiling against the CURRENT (Unit) API while
-        // still failing TODAY, because the method currently returns void. After
-        // production changes the signature, replace the reflection block with a
-        // direct `val durable: Boolean = store.markAcknowledged()` assertion.
-        val prefs = ControlledCommitPrefs(commitOk = false)
-        val store = prefs.riskAckStore()
+    fun failedCommit_memoryTrueOwnerUnknown_gateStaysOpen() {
+        val prefs = SplitCommitPrefs().apply { beforeDiskWrite = { false } }
+        val store = prefs.riskAckStore(dispatch = { it() })
 
-        val method = RiskAckStore::class.java.getMethod("markAcknowledged")
-        assertTrue(
-            "#76 RED: markAcknowledged must report the commit outcome (Boolean/Result), not void/Unit",
-            method.returnType != java.lang.Void.TYPE,
-        )
+        assertFalse("failed commit must be reported NOT durable", store.markAcknowledged())
+        assertEquals("AOSP commitToMemory updates memory even on commit(false)", true, prefs.memory[RISK_ACK_KEY])
+        assertFalse("disk must NOT contain the ack", prefs.disk.containsKey(RISK_ACK_KEY))
+        assertFalse("process owner must stay unacknowledged", store.isAcknowledged())
+        assertTrue("failed commit must keep the gate open", shouldShowRiskGate(store.isAcknowledged()))
+    }
 
-        val outcome = method.invoke(store)
-        if (method.returnType == java.lang.Boolean.TYPE || method.returnType == java.lang.Boolean::class.java) {
-            assertFalse(
-                "#76 RED: commit(false) must be reported as NOT durable",
-                outcome as Boolean,
-            )
+    @Test
+    fun secondWrapperAfterFailedCommit_gateStaysOpen() {
+        val prefs = SplitCommitPrefs().apply { beforeDiskWrite = { false } }
+        val first = prefs.riskAckStore(dispatch = { it() })
+        assertFalse(first.markAcknowledged())
+        assertEquals(true, prefs.memory[RISK_ACK_KEY])
+
+        // A new wrapper re-reads the polluted mMap at construction, but the
+        // durable seed was latched at the FIRST construction (before any commit)
+        // and isAcknowledged() never reads prefs. The gate must stay open.
+        val second = prefs.riskAckStore(dispatch = { it() })
+        assertFalse("owner is process-scoped, not per-prefs-wrapper", second.isAcknowledged())
+        assertTrue("a second wrapper must not re-open a failed ack", shouldShowRiskGate(second.isAcknowledged()))
+    }
+
+    @Test
+    fun timeoutWhileCommitBlocked_gateStaysOpen() {
+        val commitEntered = CountDownLatch(1)
+        val releaseCommit = CountDownLatch(1)
+        val diskDone = CountDownLatch(1)
+        val prefs = SplitCommitPrefs().apply {
+            beforeDiskWrite = {
+                commitEntered.countDown()
+                releaseCommit.await(3, TimeUnit.SECONDS)
+                diskDone.countDown()
+                true
+            }
         }
-        assertEquals("a commit was attempted", 1, prefs.commitCount)
-        assertFalse(
-            "commit(false) left nothing durable",
-            prefs.values[RISK_ACK_KEY] as? Boolean ?: false,
+        // Fresh thread per test so a stuck commit cannot leak into other tests.
+        // Keep a handle so the finally block can JOIN it: diskDone counts down
+        // before commit() returns, and confirm()/fail() runs after that. Joining
+        // prevents a late confirm() from landing after @After resets the owner.
+        var commitThread: Thread? = null
+        val store = prefs.riskAckStore(
+            dispatch = { task ->
+                Thread(task).apply {
+                    isDaemon = true
+                    commitThread = this
+                }.start()
+            },
+            ioWaitMs = 25L,
         )
+        try {
+            assertFalse("blocked commit must time out to NOT durable", store.markAcknowledged())
+            assertTrue("commit must have entered", commitEntered.await(2, TimeUnit.SECONDS))
+            assertEquals("memory is already true after commitToMemory", true, prefs.memory[RISK_ACK_KEY])
+            assertFalse("disk write is still blocked", prefs.disk.containsKey(RISK_ACK_KEY))
+            assertFalse(store.isAcknowledged())
+            assertTrue("gate must stay open while the commit is blocked", shouldShowRiskGate(store.isAcknowledged()))
+        } finally {
+            releaseCommit.countDown()
+            assertTrue("blocked commit must finish", diskDone.await(3, TimeUnit.SECONDS))
+            commitThread?.join(3_000L)
+            assertFalse("commit task must return before @After resets the owner", commitThread?.isAlive == true)
+        }
+    }
+
+    @Test
+    fun lateSuccessAfterTimeout_confirmsOnlyIfLatest() {
+        val prefs = SplitCommitPrefs()
+        val tasks = mutableListOf<() -> Unit>()
+        // Capture (do not run) the commit task; ioWaitMs=0 forces an immediate
+        // timeout so the commit can be replayed later, deterministically.
+        val store = prefs.riskAckStore(dispatch = { tasks += it }, ioWaitMs = 0L)
+
+        // Write 1: timed out -> fail(1) -> UNKNOWN, gate open.
+        assertFalse(store.markAcknowledged())
+        assertTrue(shouldShowRiskGate(store.isAcknowledged()))
+        assertEquals(1L, ProcessRiskAckState.currentWriteIdForTests())
+
+        // Late success #1 with NO newer write: disk is truly true now -> CONFIRMED.
+        tasks[0].invoke()
+        assertEquals(true, prefs.disk[RISK_ACK_KEY])
+        assertFalse("late success with no newer write must confirm", shouldShowRiskGate(store.isAcknowledged()))
+
+        // Write 2 starts, then the newer write 3 starts (and later fails).
+        assertFalse(store.markAcknowledged()) // id=2, timed out -> fail(2)
+        assertTrue(shouldShowRiskGate(store.isAcknowledged()))
+        assertFalse(store.markAcknowledged()) // id=3, timed out -> fail(3)
+        assertEquals(3L, ProcessRiskAckState.currentWriteIdForTests())
+
+        // Write 3's commit really fails; then write 2's success arrives late.
+        // currentWriteId is 3, so confirm(2) MUST be ignored.
+        prefs.beforeDiskWrite = { false }
+        tasks[2].invoke() // write 3 -> fail(3) again (no-op)
+        assertTrue(shouldShowRiskGate(store.isAcknowledged()))
+        prefs.beforeDiskWrite = { true }
+        tasks[1].invoke() // write 2's late success -> confirm(2) ignored
+        assertTrue("late success must not confirm over a newer write", shouldShowRiskGate(store.isAcknowledged()))
+        assertFalse("no stale success may flip the owner", store.isAcknowledged())
+    }
+
+    @Test
+    fun coldStartSeedFromDurableDisk_whenDiskAcked_gateClosed() {
+        // @Before already reset the owner; reset again to pin "cold start".
+        ProcessRiskAckState.resetForTests()
+        val prefs = SplitCommitPrefs(initialDisk = mapOf(RISK_ACK_KEY to true))
+        assertEquals("cold start must rebuild memory from disk", true, prefs.memory[RISK_ACK_KEY])
+        val store = prefs.riskAckStore(dispatch = { it() })
+        assertTrue("durable ack must seed CONFIRMED at cold start", store.isAcknowledged())
+        assertFalse(shouldShowRiskGate(store.isAcknowledged()))
+        assertEquals("a durable seed needs no commit", 0, prefs.commitCount)
+    }
+
+    @Test
+    fun reseedForTests_reopensThenReclosesGateWithoutNewCommit() {
+        val prefs = RecordingPrefs()
+        val store = prefs.riskAckStore(dispatch = { it() })
+        assertTrue("confirmed ack must close the gate", store.markAcknowledged())
+        assertTrue(store.isAcknowledged())
+        assertEquals("ack committed exactly once", 1, prefs.commitCount)
+
+        // androidTest helpers mutate prefs directly and never construct another
+        // store, so only an explicit reseed can move the process-global owner.
+        // If the seam failed to reset the latch, the assertion below fails.
+        ProcessRiskAckState.reseedForTests(false)
+        assertFalse("reseed(false) must reopen the gate", store.isAcknowledged())
+        assertTrue(shouldShowRiskGate(store.isAcknowledged()))
+        assertEquals(0L, ProcessRiskAckState.currentWriteIdForTests())
+        assertEquals("reseed must not commit", 1, prefs.commitCount)
+
+        ProcessRiskAckState.reseedForTests(true)
+        assertTrue("reseed(true) must close the gate with no new commit", store.isAcknowledged())
+        assertFalse(shouldShowRiskGate(store.isAcknowledged()))
+        assertEquals(0L, ProcessRiskAckState.currentWriteIdForTests())
+        assertEquals("reseed must not commit", 1, prefs.commitCount)
+    }
+
+    @Test
+    fun cancelZeroAckZeroProceed() {
+        val prefs = SplitCommitPrefs()
+        val store = prefs.riskAckStore(dispatch = { it() })
+        // The negative button is a null listener: cancel closes the dialog and
+        // runs NEITHER markAcknowledged() NOR onContinue (see
+        // RiskDisclosureSourceShapeTest.cancelPath_doesNotAcknowledgeOrContinue
+        // for the source-shape half of this contract).
+        assertFalse("cancel must not acknowledge", store.isAcknowledged())
+        assertEquals("cancel must not commit", 0, prefs.commitCount)
+        assertEquals("cancel must not allocate a write id", 0L, ProcessRiskAckState.currentWriteIdForTests())
+        // Even a stale success token cannot flip an owner that never wrote.
+        ProcessRiskAckState.confirm(1L)
+        assertFalse("cancel must leave the owner untouched", store.isAcknowledged())
+        assertEquals("stale token must not allocate a write id", 0L, ProcessRiskAckState.currentWriteIdForTests())
     }
 
     @Test
@@ -306,6 +471,13 @@ class RiskAckStoreTest {
             )
         } finally {
             releaseCommit.countDown()
+            // The commit task calls confirm() AFTER commit() returns. Queue a
+            // barrier on the same single-thread IO owner so the whole task (including
+            // confirm) has settled before @After resets the process-global owner;
+            // otherwise a late confirm can leak into the next test.
+            val ioOwnerSettled = CountDownLatch(1)
+            RiskAckIoOwner.executor.execute { ioOwnerSettled.countDown() }
+            assertTrue("IO owner must settle before the owner is reset", ioOwnerSettled.await(3, TimeUnit.SECONDS))
             caller.join(2_000L)
         }
     }
