@@ -4,10 +4,13 @@ package com.galaxydual.core
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.startCoroutine
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 // Issue #66 Phase B regression tests: the write/verify entry points pin the
@@ -43,6 +46,14 @@ class PostListIdentityFenceTest {
         var listFlipsIdentity: Boolean = true,
         var listFailureCount: Int = 0,
         var listContainsPackage: Boolean = true,
+        // Flip on the first identity fetch AFTER the write (the `after` pin
+        // fetch), with no listing involved. Isolates the after-write drift
+        // check from the post-list fence.
+        var flipOnAfterFetch: Boolean = false,
+        // Throw on the identity re-fetch performed by the post-list fence
+        // (the first identity fetch after the listing). The fence must let the
+        // CancellationException through instead of swallowing it as Unknown.
+        var cancelOnPostListIdentityFetch: Boolean = false,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         val commands = mutableListOf<String>()
@@ -82,6 +93,12 @@ class PostListIdentityFenceTest {
                     err = "",
                 )
                 cmd == DualRepository.CMD_USER_LIST_VERBOSE -> {
+                    // writeCount > 0 means this is the post-write `after` pin
+                    // fetch; !flipped keeps the flip to exactly one fetch.
+                    if (flipOnAfterFetch && writeCount > 0 && !flipped) flipped = true
+                    if (cancelOnPostListIdentityFetch && listPackagesCount > 0) {
+                        throw CancellationException("cancelled during post-list identity re-fetch")
+                    }
                     identityFetchCount++
                     currentSerial = when {
                         firstFetchSerialHidden && identityFetchCount == 1 -> null
@@ -190,6 +207,22 @@ class PostListIdentityFenceTest {
     }
 
     @Test
+    fun cloneVerifiedExpected_unknownAfterSend_serialFlipsDuringListing_returnsVerifyUnknown() {
+        // Timeout arm (DualRepository.kt:1325): the write reply is abandoned,
+        // so the read-only probe decides; the post-list fence still applies.
+        val gateway = DriftGateway(writeTimedOut = true)
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected VerifyUnknown, never Success, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val unknown = outcome as CloneOutcome.VerifyUnknown
+        assertEquals(95, unknown.dualId)
+        assertPostListDrift(unknown.detail, "cloneVerifiedExpected/unknown-after-send")
+        assertNoWriteResend("cloneVerifiedExpected/unknown-after-send", gateway)
+        assertEquals(1, gateway.listPackagesCount)
+    }
+
+    @Test
     fun removeVerified_serialFlipsDuringListing_returnsVerifyUnknown() {
         val gateway = DriftGateway()
         val outcome = runSuspend { DualRepository(gateway).removeVerified("com.example.chat") }
@@ -198,6 +231,20 @@ class PostListIdentityFenceTest {
         assertEquals(95, unknown.dualId)
         assertPostListDrift(unknown.detail, "removeVerified")
         assertNoWriteResend("removeVerified", gateway)
+        assertEquals(1, gateway.listPackagesCount)
+    }
+
+    @Test
+    fun removeVerified_unknownAfterSend_serialFlipsDuringListing_returnsVerifyUnknown() {
+        // Timeout arm (DualRepository.kt:1451): a clean absent listing would
+        // otherwise be Success; the fence must turn it into VerifyUnknown.
+        val gateway = DriftGateway(writeTimedOut = true, listContainsPackage = false)
+        val outcome = runSuspend { DualRepository(gateway).removeVerified("com.example.chat") }
+        assertTrue("expected VerifyUnknown, never Success, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val unknown = outcome as RemoveOutcome.VerifyUnknown
+        assertEquals(95, unknown.dualId)
+        assertPostListDrift(unknown.detail, "removeVerified/unknown-after-send")
+        assertNoWriteResend("removeVerified/unknown-after-send", gateway)
         assertEquals(1, gateway.listPackagesCount)
     }
 
@@ -212,6 +259,57 @@ class PostListIdentityFenceTest {
         assertEquals(95, unknown.dualId)
         assertPostListDrift(unknown.detail, "removeVerifiedExpected")
         assertNoWriteResend("removeVerifiedExpected", gateway)
+        assertEquals(1, gateway.listPackagesCount)
+    }
+
+    @Test
+    fun removeVerifiedExpected_unknownAfterSend_serialFlipsDuringListing_returnsVerifyUnknown() {
+        // Timeout arm (DualRepository.kt:1648): same contract as clone's
+        // timeout arm; the absent listing alone must not become Success.
+        val gateway = DriftGateway(writeTimedOut = true, listContainsPackage = false)
+        val outcome = runSuspend {
+            DualRepository(gateway).removeVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("expected VerifyUnknown, never Success, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val unknown = outcome as RemoveOutcome.VerifyUnknown
+        assertEquals(95, unknown.dualId)
+        assertPostListDrift(unknown.detail, "removeVerifiedExpected/unknown-after-send")
+        assertNoWriteResend("removeVerifiedExpected/unknown-after-send", gateway)
+        assertEquals(1, gateway.listPackagesCount)
+    }
+
+    // ---- Cancellation propagation through the post-list fence -------------
+
+    @Test
+    fun cloneVerified_postListIdentityFetchCancellation_propagatesWithoutWriteResend() {
+        // The fence's identity re-fetch throws; it must propagate instead of
+        // being folded into VerifyUnknown by the probe's thrown-defense.
+        val gateway = DriftGateway(cancelOnPostListIdentityFetch = true)
+        try {
+            runSuspend { DualRepository(gateway).cloneVerified("com.example.chat") }
+            fail("CancellationException from the post-list re-fetch must propagate")
+        } catch (e: CancellationException) {
+            assertEquals("cancelled during post-list identity re-fetch", e.message)
+        }
+        assertNoWriteResend("cloneVerified/post-list cancellation", gateway)
+        assertEquals(1, gateway.listPackagesCount)
+    }
+
+    @Test
+    fun removeVerifiedExpected_postListIdentityFetchCancellation_propagatesWithoutWriteResend() {
+        val gateway = DriftGateway(
+            cancelOnPostListIdentityFetch = true,
+            listContainsPackage = false,
+        )
+        try {
+            runSuspend {
+                DualRepository(gateway).removeVerifiedExpected("com.example.chat", 95, 15)
+            }
+            fail("CancellationException from the post-list re-fetch must propagate")
+        } catch (e: CancellationException) {
+            assertEquals("cancelled during post-list identity re-fetch", e.message)
+        }
+        assertNoWriteResend("removeVerifiedExpected/post-list cancellation", gateway)
         assertEquals(1, gateway.listPackagesCount)
     }
 
@@ -324,6 +422,49 @@ class PostListIdentityFenceTest {
         assertNoWriteResend("removeVerified/unknown/null->15->15->null", gateway)
     }
 
+    // ---- Defense in depth: drift on the post-write `after` fetch ----------
+    // The after-write drift check must pin `fresh` (serial 15), not `before`
+    // (serial null here). Reverting it to `before` would tolerate null->16 and
+    // let the listing report a false Success, so these tests go RED on that
+    // mutation even though the post-list fence is still present.
+
+    @Test
+    fun cloneVerified_serialFlipsOnAfterFetch_afterWriteDriftCheckFailsClosed() {
+        val gateway = DriftGateway(
+            firstFetchSerialHidden = true,
+            flipOnAfterFetch = true,
+            listFlipsIdentity = false,
+            serialAfterList = 16,
+        )
+        val outcome = runSuspend { DualRepository(gateway).cloneVerified("com.example.chat") }
+        assertTrue("after-fetch drift must fail closed, got: $outcome", outcome is CloneOutcome.VerifyUnknown)
+        val detail = (outcome as CloneOutcome.VerifyUnknown).detail
+        assertTrue("after-write drift check must name identity change, got: '$detail'", detail.contains("identity-changed"))
+        assertTrue("detail must name serial reuse, got: '$detail'", detail.contains("serial reuse"))
+        assertFalse("must be caught BEFORE the listing, got: '$detail'", detail.contains("post-list"))
+        assertNoWriteResend("cloneVerified/after-fetch drift", gateway)
+        assertEquals("drift check runs before the probe, got: ${gateway.commands}", 0, gateway.listPackagesCount)
+    }
+
+    @Test
+    fun removeVerified_serialFlipsOnAfterFetch_afterWriteDriftCheckFailsClosed() {
+        val gateway = DriftGateway(
+            firstFetchSerialHidden = true,
+            flipOnAfterFetch = true,
+            listFlipsIdentity = false,
+            serialAfterList = 16,
+            listContainsPackage = false,
+        )
+        val outcome = runSuspend { DualRepository(gateway).removeVerified("com.example.chat") }
+        assertTrue("after-fetch drift must fail closed, got: $outcome", outcome is RemoveOutcome.VerifyUnknown)
+        val detail = (outcome as RemoveOutcome.VerifyUnknown).detail
+        assertTrue("after-write drift check must name identity change, got: '$detail'", detail.contains("identity-changed"))
+        assertTrue("detail must name serial reuse, got: '$detail'", detail.contains("serial reuse"))
+        assertFalse("must be caught BEFORE the listing, got: '$detail'", detail.contains("post-list"))
+        assertNoWriteResend("removeVerified/after-fetch drift", gateway)
+        assertEquals("drift check runs before the probe, got: ${gateway.commands}", 0, gateway.listPackagesCount)
+    }
+
     @Test
     fun cloneVerified_beforeNull_absentListingStillFailsClosed() {
         val gateway = DriftGateway(
@@ -377,6 +518,36 @@ class PostListIdentityFenceTest {
         assertNoWriteResend("removeVerified/stable serial", gateway)
     }
 
+    // ---- Pinned (Expected) Success carries the verified serial (Phase 1) --
+
+    @Test
+    fun cloneVerifiedExpected_serialStaysKnown_returnsSuccessWithVerifiedSerial() {
+        val gateway = DriftGateway(listFlipsIdentity = false)
+        val outcome = runSuspend {
+            DualRepository(gateway).cloneVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("stable serial must not be fenced as drift, got: $outcome", outcome is CloneOutcome.Success)
+        val success = outcome as CloneOutcome.Success
+        assertEquals(95, success.dualId)
+        assertEquals("Expected Success must carry the pinned serial", 15, success.verifiedSerial)
+        assertNoWriteResend("cloneVerifiedExpected/stable serial", gateway)
+        assertEquals(1, gateway.listPackagesCount)
+    }
+
+    @Test
+    fun removeVerifiedExpected_serialStaysKnown_returnsSuccessWithVerifiedSerial() {
+        val gateway = DriftGateway(listFlipsIdentity = false, listContainsPackage = false)
+        val outcome = runSuspend {
+            DualRepository(gateway).removeVerifiedExpected("com.example.chat", 95, 15)
+        }
+        assertTrue("stable serial must not be fenced as drift, got: $outcome", outcome is RemoveOutcome.Success)
+        val success = outcome as RemoveOutcome.Success
+        assertEquals(95, success.dualId)
+        assertEquals("Expected Success must carry the pinned serial", 15, success.verifiedSerial)
+        assertNoWriteResend("removeVerifiedExpected/stable serial", gateway)
+        assertEquals(1, gateway.listPackagesCount)
+    }
+
     @Test
     fun cloneVerified_serialNeverObservable_staysSuccessWithNullSerial() {
         val gateway = DriftGateway(
@@ -388,6 +559,23 @@ class PostListIdentityFenceTest {
         assertTrue("documented serial==null limit must be preserved, got: $outcome", outcome is CloneOutcome.Success)
         assertEquals(null, (outcome as CloneOutcome.Success).verifiedSerial)
         assertNoWriteResend("cloneVerified/serial never observable", gateway)
+    }
+
+    @Test
+    fun removeVerified_serialNeverObservable_staysSuccessWithNullSerial() {
+        // Mirror of the clone all-null case: remove confirms absence (empty
+        // listing), and the documented serial==null capability limit holds on
+        // both sides (all-null serials are tolerated by continuityBreach).
+        val gateway = DriftGateway(
+            firstFetchSerialHidden = true,
+            serialBeforeList = null,
+            listFlipsIdentity = false,
+            listContainsPackage = false,
+        )
+        val outcome = runSuspend { DualRepository(gateway).removeVerified("com.example.chat") }
+        assertTrue("documented serial==null limit must be preserved, got: $outcome", outcome is RemoveOutcome.Success)
+        assertEquals(null, (outcome as RemoveOutcome.Success).verifiedSerial)
+        assertNoWriteResend("removeVerified/serial never observable", gateway)
     }
 
     // The drift can land inside the listing's retry settle wait, not only at
