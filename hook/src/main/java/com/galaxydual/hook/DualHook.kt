@@ -891,9 +891,11 @@ class DualHook : XposedModule() {
     // 是快取 prefs 的布林查表（見 bbcInjectionEnabledNow），但 D06 起此讀取
     // 另走專屬零佇列 executor + 真實牆鐘上限（BBC_GATE_MAX_MS），避免 IPC
     // 停頓直接釘住呼叫執行緒（原 50ms deadline 只管到後面的政策 reader）。
-    // Phase A P0 sticky last-good：null/拋/contention/deadline/clock 失敗回
-    // 上次成功非空快照；僅成功讀到空（帶版本證明 Cleared）方可收縮；TTL 過期
-    // /invalidate 不丟 BBC last-good（僅 sticky cap 到期才過期，計數+節流日誌）。
+    // Phase A P0 sticky last-good：null/拋/contention/deadline 失敗回上次成功
+    // 非空快照；clock 失效／倒退取樣則 fail-closed 丟棄 sticky 並回
+    // Unknown(emptySet())（新鮮度無法證明，上限不放寬）；僅成功讀到空（帶版本
+    // 證明 Cleared）方可收縮；TTL 過期/invalidate 不丟 BBC last-good（僅 sticky
+    // cap 到期才過期，計數+節流日誌）。
     // TTL 60s／failureCooldown 5s／single-flight／50ms budget 語義與白名單
     // 一致，grace/deadline 取樣方式比照 effectivePolicy，不漂移。
     //
@@ -1552,8 +1554,10 @@ class DualHook : XposedModule() {
         }
         // Phase A P0 explicit-empty token: Good(non-empty) merges; Cleared
         // (empty+version) is an intentional clear (no merge, no Unknown log);
-        // Unknown (null/version-absent/contention/deadline/clock) keeps
-        // last-good with a once-per-process keep-last-good log.
+        // Unknown (null/version-absent/contention/deadline) keeps last-good
+        // with a once-per-process keep-last-good log. An untrusted/dead clock
+        // is the exception: its Unknown carries an EMPTY last-good (sticky
+        // discarded fail-closed), so no policy is merged.
         val extra: Set<String> = when (bbcResult) {
             is EffectivePolicyCache.BbcPolicy.Cleared -> {
                 // Read-only entry: intentional-clear path (empty policy).

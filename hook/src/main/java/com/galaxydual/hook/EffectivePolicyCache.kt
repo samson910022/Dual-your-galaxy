@@ -25,7 +25,10 @@ class EffectivePolicyCache(
     private val onLog: (String) -> Unit = {},
     // Phase A P0 (BBC sticky last-good): when true, failed reads keep the
     // last successful snapshot across TTL expiry / invalidate / cooldown /
-    // contention / clock / deadline instead of falling back to seed.
+    // contention / deadline instead of falling back to seed. A DEAD or
+    // BACKWARDS clock sample is the exception: freshness cannot be proven, so
+    // the sticky is discarded and the call fails closed (Unknown(emptySet()))
+    // — the cap is never widened by an untrusted clock.
     // Whitelist path uses false (fail-closed, zero behavior change); BBC path
     // uses a separate instance with true (see DualHook.bbcCache).
     private val stickyLastGood: Boolean = false,
@@ -291,12 +294,11 @@ class EffectivePolicyCache(
     // getBbc(): the entry catch, a mid-read skew, or a dead completion sample.
     // Drops ONLY the sticky snapshot (option (a): cached freshness is kept, so
     // a later healthy call may still serve a genuinely valid cached value
-    // within TTL — the comment on the old entry catch claiming a later call
-    // "cannot resurrect it" was misleading). Counts one sticky expiry (iff a
-    // sticky existed), one sticky fallback and one Unknown; emits the
-    // clock-free diagnostic. No reader, version gate, valid/cached/
-    // lastRefreshMs or failure-cooldown state is touched, and a single call
-    // returns immediately so no arm can double-count.
+    // within TTL — one untrusted sample does not poison future healthy calls).
+    // Counts one sticky expiry (iff a sticky existed), one sticky fallback and
+    // one Unknown; emits the clock-free diagnostic. No reader, version gate,
+    // valid/cached/lastRefreshMs or failure-cooldown state is touched, and a
+    // single call returns immediately so no arm can double-count.
     private fun failClosedUntrustedClockLocked(): BbcPolicy {
         val hadSticky = lastGoodSticky != null
         if (hadSticky) {
@@ -364,8 +366,11 @@ class EffectivePolicyCache(
     // (fail-closed to null) past BBC_STICKY_MAX_AGE_MS with a counted +
     // throttled log so a clear can never hide indefinitely. A backwards clock
     // (now < lastGoodStickyAtMs) yields a negative age and would otherwise
-    // never expire — mirror the whitelist TTL rule (:420) and treat skew as
-    // expired. The 30-min cap is therefore never widened by a time jump.
+    // never expire — mirror the whitelist TTL rule (`now - lastRefreshMs < 0L`
+    // in get()) and treat skew as expired, so the 30-min cap is never widened
+    // by a time jump. getBbc() now rejects a backwards/dead sample UPSTREAM in
+    // sampleTrustedClockLocked() (sticky discarded, Unknown(emptySet())); this
+    // age<0 branch is retained as defense in depth for any other call site.
     private fun stickyIfValidLocked(now: Long): Set<String>? {
         val g = lastGoodSticky ?: return null
         val age = now - lastGoodStickyAtMs
@@ -507,9 +512,16 @@ class EffectivePolicyCache(
         } catch (_: Throwable) {
             // H9: seed-only fallback, routed like the sibling broken-clock
             // degrades (a no-op log when the clock is dead).
-            // Phase A P0: sticky instances keep last-good on clock failure
-            // (no TTL/expiry check possible without a clock — serve sticky
-            // as-is, never unbounded seed-only churn).
+            // LEGACY / UNREACHABLE IN PRODUCTION (see the note above get()):
+            // the whitelist instance constructs with stickyLastGood=false and
+            // the BBC instance only calls getBbc(), so this arm is kept purely
+            // for defensive parity with a hypothetical future sticky caller
+            // of get(). It retains the OLD fail-sticky semantics (without a
+            // clock no TTL/expiry can be checked, so the sticky is served
+            // as-is). It is NOT the shipped BBC behavior: getBbc() routes a
+            // dead/skewed clock through failClosedUntrustedClockLocked(),
+            // which discards sticky and returns Unknown(emptySet()).
+            // Behavior here is intentionally unchanged.
             if (stickyLastGood) {
                 val sticky: Set<String>? = synchronized(lock) { lastGoodSticky }
                 if (sticky != null) {
@@ -1015,9 +1027,10 @@ class EffectivePolicyCache(
         if (now0 == null) {
             // Preserve the gate-closed invariant even when the clock sample is
             // untrusted: re-evaluate the opt-out provider (wrapped, never
-            // throws) and still short-circuit to Cleared(-1) with ZERO reader
-            // calls and ZERO state/counter changes. A broken provider cannot
-            // mask the existing clock fallback.
+            // throws) and still short-circuit to Cleared(-1) with zero reader
+            // calls and no cache/counter changes (the trusted-clock high-water
+            // may advance when the sample itself is healthy). A broken
+            // provider cannot mask the existing clock fallback.
             val gateClosed = try {
                 !bbcGateOpen()
             } catch (_: Throwable) {

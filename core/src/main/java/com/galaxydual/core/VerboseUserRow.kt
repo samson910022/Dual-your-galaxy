@@ -13,9 +13,11 @@ package com.galaxydual.core
 // (`type=profile.CLONE (flags=...) (parentId=0)`), so BOTH canonical forms
 // are accepted as the real-type suffix. The `name=` value is DISPLAY ONLY:
 // a user rename may legally contain commas, `Error`, or even a smuggled
-// `, type=profile.CLONE` token. Those earlier `type=` declarations are
-// treated as part of the label; the authorization-relevant type can only be
-// the LAST declaration, and only when it alone carries the canonical suffix.
+// `, type=profile.CLONE` token. Such injected declarations lie AT or AFTER
+// [nameEnd] (NOT inside the replaced label span — nameEnd stops at the FIRST
+// `, type=`); they are simply NOT AUTHORIZED. The authorization-relevant type
+// can only be the LAST declaration, and only when it alone carries the
+// canonical suffix.
 //
 // FAIL CLOSED -- a row is VALID only when ALL of the following hold:
 //   1. the LAST `, type=` declaration has a NON-EMPTY token;
@@ -101,8 +103,9 @@ internal data class VerboseUserRow(
             val nameStart = prefix.range.last + 1
 
             val declarations = TYPE_DECLARATION.findAll(line, nameStart).toList()
-            // The display label ends at the FIRST `, type=`; every earlier
-            // token (including an injected CLONE) stays in the label span.
+            // The display label ends at the FIRST `, type=`. An injected
+            // declaration lies AT/AFTER that offset (not inside the label
+            // span) and is simply not eligible to authorize anything.
             val nameEnd = declarations.firstOrNull()?.range?.first ?: line.length
 
             // Per declaration: does the canonical flags suffix start EXACTLY

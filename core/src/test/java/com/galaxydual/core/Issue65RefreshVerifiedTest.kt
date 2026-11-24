@@ -10,22 +10,29 @@ import org.junit.Test
 
 // Issue #65 acceptance AC2/AC4: verify the FULL repository resolver with a
 // fake CmdGateway (not just a regex unit). Only the display-only `name=`
-// label changes between the two gateways; target identity (id/serial/parent),
-// package listing and freshness must be identical, and a label containing an
-// error keyword must not turn a legal target into Unknown/ChannelError.
+// label changes between the two gateways; target identity (id/serial/parent)
+// and package listing must be identical, and a label containing an error
+// keyword must not turn a legal target into Unknown/ChannelError. A separate
+// case re-grounds after the gateway's package output changes, pinning listing
+// FRESHNESS (no stale package list carried across refreshes).
 // Issue #65 review hardening: malformed rows / dirty identity channels must
 // fail closed with NO `pm list packages` probe for the unconfirmed target,
 // and the fake gateway fails fast (instead of silently answering "ok") for
 // any command the production resolver is not expected to issue.
 class Issue65RefreshVerifiedTest {
 
-    private class FakeGateway(
+    // internal so the parameterized #65 acceptance table can reuse the SAME
+    // fail-fast recording gateway (no permissive fallback introduced).
+    internal class FakeGateway(
         verbose: String,
         // Override the whole verbose-channel result (exit code / truncation).
         private val verboseResult: CmdResult? = null,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         var verboseOutput: String = verbose
+        // Mutable so a second ground() can prove the package listing is
+        // re-read instead of a stale list surviving across refreshes.
+        var packagesOutput: String = "package:com.example.chat\npackage:com.example.mail\n"
 
         // Real issued commands, so "no package read on the unconfirmed
         // target" is an assertion, not an assumption.
@@ -56,7 +63,7 @@ class Issue65RefreshVerifiedTest {
                 DualRepository.CMD_GETPROP_DUAL -> CmdResult(exit = 0, out = "95\n", err = "")
                 PmOutputParser.buildListPackages(95) -> CmdResult(
                     exit = 0,
-                    out = "package:com.example.chat\npackage:com.example.mail\n",
+                    out = packagesOutput,
                     err = "",
                 )
                 else -> error("unexpected cmd: $cmd")
@@ -64,17 +71,21 @@ class Issue65RefreshVerifiedTest {
         }
     }
 
-    private fun <T> runSuspend(block: suspend () -> T): T {
-        var result: Result<T>? = null
-        block.startCoroutine(
-            object : Continuation<T> {
-                override val context = EmptyCoroutineContext
-                override fun resumeWith(r: Result<T>) {
-                    result = r
-                }
-            },
-        )
-        return (result ?: error("suspend block never resumed")).getOrThrow()
+    companion object {
+        // Companion so the parameterized #65 acceptance table can reuse the
+        // same blocking bridge (and the same fail-fast FakeGateway above).
+        internal fun <T> runSuspend(block: suspend () -> T): T {
+            var result: Result<T>? = null
+            block.startCoroutine(
+                object : Continuation<T> {
+                    override val context = EmptyCoroutineContext
+                    override fun resumeWith(r: Result<T>) {
+                        result = r
+                    }
+                },
+            )
+            return (result ?: error("suspend block never resumed")).getOrThrow()
+        }
     }
 
     private fun verboseWithName(name: String) = """
@@ -125,8 +136,32 @@ class Issue65RefreshVerifiedTest {
         val clean = ground("DUAL_APP")
         val notFound = ground("not found")
 
+        // Pin absolute values too: a cross-comparison alone would pass even if
+        // BOTH gateways resolved the wrong id/serial/parent or a stale listing.
         assertEquals(clean.target, notFound.target)
+        assertEquals(95, notFound.target.userId)
+        assertEquals(15, notFound.target.serial)
+        assertEquals(0, notFound.target.parentId)
         assertEquals(clean.cloned, notFound.cloned)
+        assertEquals(listOf("com.example.chat", "com.example.mail"), notFound.cloned)
+    }
+
+    // Listing freshness: ground with [chat, mail], change the gateway's
+    // package output, re-ground, and require the NEW list. This would fail if
+    // refreshVerified() reused a stale package listing across refreshes.
+    @Test
+    fun packageListingRefresh_reGroundTracksChangedPackages() {
+        val gateway = FakeGateway(verboseWithName("DUAL_APP"))
+        val first = ground(gateway)
+        assertEquals(95, first.target.userId)
+        assertEquals(listOf("com.example.chat", "com.example.mail"), first.cloned)
+
+        gateway.packagesOutput = "package:com.example.chat\npackage:com.example.new\n"
+        val second = ground(gateway)
+        assertEquals(95, second.target.userId)
+        assertEquals(15, second.target.serial)
+        assertEquals(0, second.target.parentId)
+        assertEquals(listOf("com.example.chat", "com.example.new"), second.cloned)
     }
 
     // P2 — an inline `UserInfo{95:x:400}` label used to create a legacy
