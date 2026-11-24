@@ -641,4 +641,60 @@ class Issue65ParserRegressionTest {
             resolution,
         )
     }
+
+    // ---- R6: composite label / displayName scope ----
+
+    @Test
+    fun r6_compositeLabelWithEarlierNonCanonicalErrorDeclaration_gatesFailClosed() {
+        // The row parser selects the LAST canonical declaration and considers
+        // the row structurally valid, but `, type=Error` lies OUTSIDE the
+        // neutralized name span (nameEnd = first `, type=`). Both strict gates
+        // scan that un-neutralized remainder and reject on the Error keyword.
+        // This is an intentional conservative trade-off, NOT a display-only
+        // label (see VerboseUserRow KDoc).
+        val row = "1: id=95, name=foo, type=Error, type=profile.CLONE, flags=X (parentId=0)"
+        val parsed = VerboseUserRow.parse(row)!!
+        assertEquals("foo", parsed.displayName)
+        assertEquals("profile.CLONE", parsed.typeToken)
+        assertFalse(parsed.malformed)
+        assertFalse(
+            "earlier type=Error survives outside the name span and must fail the strict identity gate",
+            PmOutputParser.isIdentityChannelOk(row, 0),
+        )
+        assertFalse(
+            "the pm-list-users strict gate must reject identically",
+            PmOutputParser.isListUsersOutputOk(row, 0),
+        )
+    }
+
+    @Test
+    fun r6_flagsLikeTextBeforeRealTypeIsPartOfDisplayNameAndGatesPass() {
+        // nameEnd stops at the FIRST `, type=`, so `, flags=X` before the real
+        // declaration stays inside the neutralized name span. displayName is
+        // ONLY that prefix (NOT the full raw name), the real CLONE token wins,
+        // and no error token remains -> both strict gates pass.
+        val row = "1: id=95, name=foo, flags=X, type=profile.CLONE, flags=0x190 (parentId=0)"
+        val parsed = VerboseUserRow.parse(row)!!
+        assertEquals("foo, flags=X", parsed.displayName)
+        assertEquals("profile.CLONE", parsed.typeToken)
+        assertFalse(parsed.malformed)
+        assertTrue(
+            "flags-like text inside the name span is display-only; identity gate must pass",
+            PmOutputParser.isIdentityChannelOk(row, 0),
+        )
+        assertTrue(
+            "flags-like text inside the name span is display-only; pm-list-users gate must pass",
+            PmOutputParser.isListUsersOutputOk(row, 0),
+        )
+    }
+
+    @Test
+    fun r6_overflowIdPrefixIsNotParsableAndClaimsNoUser95() {
+        // id= overflows Int: the shared parser returns null, so no row claim
+        // (and certainly no u95 claim) can be manufactured from this line.
+        val row = "1: id=99999999999999999999, name=foo, type=profile.CLONE, flags=X (parentId=0)"
+        assertNull(VerboseUserRow.parse(row))
+        val claims = SamsungProfileAdapter.parseUserListVerbose(row)
+        assertTrue("overflow id must not produce a u95 claim: $claims", claims.none { it.userId == 95 })
+    }
 }

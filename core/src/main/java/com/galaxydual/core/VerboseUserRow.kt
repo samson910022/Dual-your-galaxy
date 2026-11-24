@@ -60,10 +60,30 @@ package com.galaxydual.core
 // control chars in the name); they do not, and cannot, detect that lone
 // label-supplied declaration. It is outside the threat model addressed here
 // and must be corroborated by the other identity channels.
+//
+// COMPOSITE-LABEL / DISPLAY-NAME SCOPE (honest contract): the display-only
+// guarantee covers ONLY the neutralized `name=` span (the prefix before the
+// FIRST `, type=` declaration). A composite label whose EARLIER NON-CANONICAL
+// declaration carries error semantics is NOT covered by that guarantee. For
+// example `name=foo, type=Error, type=profile.CLONE, flags=X`: nameEnd stops at
+// the first `, type=`, so this parser selects the LAST (canonical, structural)
+// declaration and reports typeToken=CLONE with `malformed == false`; BUT the
+// strict identity gate neutralizes ONLY `foo` and then scans the un-neutralized
+// remainder (`, type=Error, ...`), where the ERROR_LINE keyword makes the gate
+// REJECT. This is an INTENTIONAL conservative trade-off: the parser refuses to
+// swallow potential malformed/error evidence just to make an arbitrary label
+// display-only. Do NOT claim that arbitrary composite labels are display-only.
+// `displayName` is ONLY `line.substring(nameStart, nameEnd).trim()` (the prefix
+// before the first `, type=` declaration), NOT the full raw name; log/UI
+// consumers must NOT treat it as complete or authoritative identity evidence.
+// The lone-label-declaration ambiguity note above still applies unchanged.
 internal data class VerboseUserRow(
     val userId: Int,
-    // Display label (trimmed), retained for logs/UI only -- never read for
-    // authorization by either caller.
+    // Display label only: EXACTLY line.substring(nameStart, nameEnd).trim(),
+    // i.e. the prefix before the FIRST `, type=` declaration -- NOT the full
+    // raw name. Retained for logs/UI only, never read for authorization and
+    // never complete/authoritative identity evidence (see composite-label
+    // scope note above).
     val displayName: String,
     // Offsets of the raw name= value in the ORIGINAL line, so the sanitizer
     // can replace ONLY that span and leave the whole remainder (type, flags,

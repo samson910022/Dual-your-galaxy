@@ -9,8 +9,13 @@ import org.junit.runners.Parameterized
 
 // Issue #65 parameterized acceptance table: neither the renamed user's id nor
 // the display-only `name=` label may affect authorization. 3 renamed users
-// (owner 0 / dual 95 / other 150) x 6 labels (error keywords, a comma, an
-// injected `type=` declaration, an inline UserInfo header) = 18 cases.
+// (owner 0 / dual 95 / other 150) x 8 labels (error keywords, a comma, an
+// injected `type=` declaration, an inline UserInfo header, multiple commas,
+// flags-like text BEFORE the real `, type=`) = 24 cases. Only UNAMBIGUOUS
+// compat labels are listed here; a composite label with an earlier
+// error-semantic declaration (e.g. `, type=Error, ...`) is intentionally NOT
+// display-only and must fail the strict gate -- see VerboseUserRow KDoc and
+// Issue65RefreshVerifiedTest.compositeLabelWithEarlierErrorDeclaration_*.
 // Every case is checked at three layers: the strict identity AND pm-list-users
 // gates, the structured parser's userType against a clean-label baseline, and
 // the FULL refreshVerified() result against that same baseline (with absolute
@@ -32,6 +37,13 @@ class Issue65AcceptanceTableTest(
                 "Dual, App",
                 "foo, type=profile.CLONE",
                 "UserInfo{95:Error:400}",
+                // Multiple commas: a rename may legally contain them; they are
+                // display-only and must not perturb the type/tail parse.
+                "Dual, App, Jr.",
+                // flags-like text BEFORE the real `, type=`: it stays inside
+                // the neutralized name span (nameEnd = first `, type=`), so it
+                // is display-only and the real CLONE declaration still wins.
+                "foo, flags=X",
             )
             return users.flatMap { uid ->
                 labels.map { displayName -> arrayOf<Any>(uid, displayName) }

@@ -147,21 +147,38 @@ class Issue65RefreshVerifiedTest {
     }
 
     // Listing freshness: ground with [chat, mail], change the gateway's
-    // package output, re-ground, and require the NEW list. This would fail if
-    // refreshVerified() reused a stale package listing across refreshes.
+    // package output, re-ground, and require the NEW list. R7: BOTH refreshes
+    // go through ONE DualRepository instance (the ground() helper creates a
+    // fresh one per call and so cannot catch a future stale per-instance
+    // cache). The exact `pm list packages --user 95` command count == 2 proves
+    // the listing read was actually RE-ISSUED on the second ground, not just
+    // that the gateway was capable of serving new data. The ground() helpers
+    // above are kept unchanged for the other tests.
     @Test
-    fun packageListingRefresh_reGroundTracksChangedPackages() {
+    fun packageListingRefresh_sameRepositoryReGroundTracksChangedPackages() {
         val gateway = FakeGateway(verboseWithName("DUAL_APP"))
-        val first = ground(gateway)
-        assertEquals(95, first.target.userId)
-        assertEquals(listOf("com.example.chat", "com.example.mail"), first.cloned)
+        val repository = DualRepository(gateway)
+
+        val first = runSuspend { repository.refreshVerified() }
+        assertTrue("expected GroundTruth, got: $first", first is RefreshOutcome.GroundTruth)
+        val firstTruth = first as RefreshOutcome.GroundTruth
+        assertEquals(95, firstTruth.target.userId)
+        assertEquals(listOf("com.example.chat", "com.example.mail"), firstTruth.cloned)
 
         gateway.packagesOutput = "package:com.example.chat\npackage:com.example.new\n"
-        val second = ground(gateway)
-        assertEquals(95, second.target.userId)
-        assertEquals(15, second.target.serial)
-        assertEquals(0, second.target.parentId)
-        assertEquals(listOf("com.example.chat", "com.example.new"), second.cloned)
+        val second = runSuspend { repository.refreshVerified() }
+        assertTrue("expected GroundTruth, got: $second", second is RefreshOutcome.GroundTruth)
+        val secondTruth = second as RefreshOutcome.GroundTruth
+        assertEquals(95, secondTruth.target.userId)
+        assertEquals(15, secondTruth.target.serial)
+        assertEquals(0, secondTruth.target.parentId)
+        assertEquals(listOf("com.example.chat", "com.example.new"), secondTruth.cloned)
+
+        assertEquals(
+            "the second ground must re-issue the package listing read on the SAME repository: ${gateway.commands}",
+            2,
+            gateway.commands.count { it == "pm list packages --user 95" },
+        )
     }
 
     // P2 — an inline `UserInfo{95:x:400}` label used to create a legacy
@@ -480,5 +497,29 @@ class Issue65RefreshVerifiedTest {
         assertEquals(15, result.target.serial)
         assertEquals(0, result.target.parentId)
         assertEquals(listOf("com.example.chat", "com.example.mail"), result.cloned)
+    }
+
+    // ---- R6: composite label / display-name scope at the FULL refresh level ----
+
+    @Test
+    fun compositeLabelWithEarlierErrorDeclaration_failsClosedWithoutPackageRead() {
+        // The shared row parser selects the LAST canonical declaration (CLONE)
+        // and reports malformed=false, but `, type=Error` sits OUTSIDE the
+        // neutralized name span (nameEnd = first `, type=`). The strict gate
+        // scans that un-neutralized remainder, ERROR_LINE matches "Error", and
+        // the whole channel fails closed. This is an INTENTIONAL conservative
+        // trade-off, NOT a display-only label (see VerboseUserRow KDoc).
+        val row = "1: id=95, name=foo, type=Error, type=profile.CLONE, flags=X (parentId=0)"
+        assertFailClosed(FakeGateway(verboseWithRow(row)), "composite label with earlier type=Error")
+    }
+
+    @Test
+    fun overflowIdPrefix_failsClosedWithoutPackageRead() {
+        // id= does not fit an Int: VerboseUserRow.parse returns null, so this
+        // row yields NO u95 claim in the verbose channel. With only the dumpsys
+        // CLONE claim the two-channel rule cannot confirm u95 -> Unknown, and
+        // no package read may be issued for the unconfirmed id.
+        val row = "1: id=99999999999999999999, name=foo, type=profile.CLONE, flags=X (parentId=0)"
+        assertFailClosed(FakeGateway(verboseWithRow(row)), "overflow id prefix")
     }
 }
