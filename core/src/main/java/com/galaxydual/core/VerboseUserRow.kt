@@ -105,15 +105,22 @@ internal data class VerboseUserRow(
         // deliberately avoided (it would swallow Unicode/VT/FF).
         private val ROW_PREFIX = Regex("""^[ \t]*\d+:[ \t]*id=(\d+),[ \t]*name=""")
 
-        // Row-like ATTEMPT detector (issue #87 R10a): ANY line shaped like a
-        // new-format row prefix (`displayIndex: id=`) is OWNED by the
+        // Row-like ATTEMPT detector (issue #87 R10a/R12): ANY line shaped like
+        // a new-format row prefix (`displayIndex: id` + `=`) is OWNED by the
         // structured-row path even when parse() cannot produce a row (missing
-        // `name=`, overflow/non-numeric id). Such a line is REJECTED -- never
-        // left as OTHER where it could pass the strict gate with no ERROR_LINE
-        // hit or be stitched into a preceding legacy body. Deliberately does
-        // NOT match section headers (`Users:`, `User types (...)`, `Devices:`)
-        // or prose, so those stay compatible.
-        internal val ROW_LIKE = Regex("""^[ \t]*\d+:[ \t]*id=""")
+        // `name=`, overflow/non-numeric id, whitespace around `=`). Such a line
+        // is REJECTED -- never left as OTHER where it could pass the strict gate
+        // with no ERROR_LINE hit or be stitched into a preceding legacy body.
+        // This is an ATTEMPT detector only, NOT an authorization grammar: the
+        // strict ROW_PREFIX above alone decides what can authorize an identity.
+        // Deliberately does NOT match section headers (`Users:`,
+        // `User types (...)`, `Devices:`) or prose, so those stay compatible.
+        internal val ROW_LIKE = Regex("""^[ \t]*\d+:[ \t]*id[ \t]*=""")
+
+        // Diagnostic id recovery for a REJECTED row-like attempt. NEVER used
+        // to authorize: it only lets the claim parser emit a bare UNKNOWN/LOW
+        // claim instead of silently forgetting the attempted id.
+        internal val ROW_LIKE_ID = Regex("""^[ \t]*\d+:[ \t]*id[ \t]*=(\d+)""")
 
         // Every `, type=` declaration after name=. Group 1 is the raw token:
         // non-whitespace/non-comma, and intentionally allowed to be EMPTY so
@@ -252,6 +259,136 @@ internal object VerboseIdentityFields {
         Regex(SERIAL_HEAD.pattern + """\s*(\d+)""", RegexOption.IGNORE_CASE)
 }
 
+// Shared legacy `UserInfo{id:label:flags}` header fields, parsed by ONE
+// grammar for every caller (strict gate, claim parser, pm-list diagnostics;
+// issue #87 R12/R13). Offsets are indices into the ORIGINAL raw line passed to
+// LegacyHeaderParser.parse, so the sanitizer can neutralize EXACTLY the
+// display-label span and leave the flags/tail visible to ERROR_LINE.
+//
+// AOSP's UserInfo.toString() concatenates id, name and hex flags WITHOUT
+// quoting the name, so a legal rename may contain colons (`Work:Error`) and
+// spaces (`a:not found`). The label therefore ends at the separator
+// IMMEDIATELY BEFORE A VALID FLAGS TOKEN (last such colon, else last such
+// space/tab), NOT at the first colon. `flags` is diagnostic-only; no caller
+// may read it for authorization.
+internal data class LegacyHeaderFields(
+    val id: Int,
+    val label: String,
+    val labelStart: Int,
+    val labelEnd: Int,
+    val flags: String,
+    val flagsStart: Int,
+    val flagsEnd: Int,
+    val headerStart: Int,
+    val headerEnd: Int,
+)
+
+internal sealed interface LegacyParseResult {
+    data class Ok(val fields: LegacyHeaderFields) : LegacyParseResult
+
+    data class Rejected(val reason: String) : LegacyParseResult
+
+    data object NotAnAttempt : LegacyParseResult
+}
+
+internal object LegacyHeaderParser {
+    // ATTEMPT claims a line as a LEGACY-HEADER attempt (even when malformed);
+    // HEAD is the valid numeric-id prefix. Both are anchored to ONE physical
+    // line: Java's `^` also matches after lone CR / U+0085/U+2028/U+2029,
+    // which would let a smuggled header become a second claim. Callers always
+    // pass one element of VerboseUserRow.verboseLines().
+    internal val ATTEMPT = Regex("""^[ \t]*UserInfo\{""")
+    internal val HEAD = Regex("""^[ \t]*UserInfo\{(\d+):""")
+
+    // AOSP hex flags OR the decimal/hex-looking spellings already present in
+    // ROM fixtures (`13`, `400`, `c13`, `4c13`, `20001010`, `61010`, ...).
+    // Full match only: `400oops` is malformed, not a prefix of `400`.
+    private val FLAGS_TOKEN = Regex("""(?:0[xX][0-9a-fA-F]+|[0-9a-fA-F]+)""")
+
+    // Tab is part of the legacy separator grammar, so it is NOT an illegal
+    // control here (unlike VerboseUserRow's strict display name). C0 controls
+    // plus DEL / Unicode separators can re-segment flat text -> reject.
+    private fun hasIllegalControl(s: String): Boolean = s.any {
+        (it.code <= 0x1F && it != '\t') || it == '\u007F' ||
+            it == '\u0085' || it == '\u2028' || it == '\u2029'
+    }
+
+    // Diagnostic-only id recovery for a REJECTED legacy attempt. Never an
+    // authorization path: it only lets the claim parser emit a bare
+    // UNKNOWN/LOW claim instead of silently forgetting the attempted id.
+    fun recoverId(line: String): Int? = HEAD.find(line)?.groupValues?.get(1)?.toIntOrNull()
+
+    // `requireLineStart = false` is for PmOutputParser's diagnostic pm-list
+    // scan, which hands us a loose `UserInfo\{\d+:[^}]*\}` fragment beginning
+    // at `UserInfo{`. The classifier/classification-based callers always use
+    // the default (strict line start).
+    fun parse(line: String, requireLineStart: Boolean = true): LegacyParseResult {
+        if (requireLineStart && !ATTEMPT.containsMatchIn(line)) return LegacyParseResult.NotAnAttempt
+        val head = HEAD.find(line) ?: return LegacyParseResult.Rejected("bad-id-head")
+        val id = head.groupValues[1].toIntOrNull()
+            ?: return LegacyParseResult.Rejected("overflow-id")
+        val headEnd = head.range.last + 1
+
+        // FIRST closing brace after the head only. An inner `{` (or a second
+        // brace after the close) is a competing/nested header: reject instead
+        // of greedily swallowing another user's body (issue #87 R13).
+        val close = line.indexOf('}', headEnd)
+        if (close < 0) return LegacyParseResult.Rejected("unclosed")
+        val inner = line.substring(headEnd, close)
+        if (inner.contains('{')) return LegacyParseResult.Rejected("extra-brace")
+        val afterClose = line.substring(close + 1)
+        if (afterClose.contains('{') || afterClose.contains('}')) {
+            return LegacyParseResult.Rejected("extra-brace")
+        }
+        if (hasIllegalControl(line)) return LegacyParseResult.Rejected("control-char")
+
+        // Locate the separator immediately preceding a VALID flags token:
+        // the LAST such colon wins, else the LAST such space/tab.
+        val suffix = findFlagsSuffix(inner) ?: return LegacyParseResult.Rejected("missing-or-malformed-flags")
+        val (sepIndex, flagsStartInInner, flagsEndInInner) = suffix
+        val flags = inner.substring(flagsStartInInner, flagsEndInInner)
+
+        val labelRaw = inner.substring(0, sepIndex)
+        val label = labelRaw.trim(' ', '\t')
+        val labelOffset = labelRaw.indexOf(label)
+        val labelStart = headEnd + if (labelOffset < 0) 0 else labelOffset
+        val labelEnd = labelStart + label.length
+
+        return LegacyParseResult.Ok(
+            LegacyHeaderFields(
+                id = id,
+                label = label,
+                labelStart = labelStart,
+                labelEnd = labelEnd,
+                flags = flags,
+                flagsStart = headEnd + flagsStartInInner,
+                flagsEnd = headEnd + flagsEndInInner,
+                headerStart = head.range.first,
+                headerEnd = close + 1,
+            ),
+        )
+    }
+
+    // Returns (separator index, flags start, flags end), all relative to
+    // [inner]. Colons take priority over space/tab separators; within each
+    // class the LAST valid separator wins.
+    private fun findFlagsSuffix(inner: String): IntArray? {
+        fun collect(wanted: (Char) -> Boolean): IntArray? {
+            var best: IntArray? = null
+            for (i in inner.indices) {
+                if (!wanted(inner[i])) continue
+                val rest = inner.substring(i + 1)
+                val token = rest.trim(' ', '\t')
+                if (!FLAGS_TOKEN.matches(token)) continue
+                val start = i + 1 + rest.takeWhile { it == ' ' || it == '\t' }.length
+                best = intArrayOf(i, start, start + token.length)
+            }
+            return best
+        }
+        return collect { it == ':' } ?: collect { it == ' ' || it == '\t' }
+    }
+}
+
 // Exactly one classification per RAW physical line, shared by the strict
 // identity gate (PmOutputParser.sanitizeIdentityOutput) and the adapter's
 // legacy/new claim parsers. Classifying the SAME raw text in both callers is
@@ -269,43 +406,53 @@ internal data class ClassifiedIdentityLine(
     val kind: IdentityLineKind,
     // Non-null iff kind == NEW_ROW (already parsed by the shared row parser).
     val row: VerboseUserRow?,
-    // Non-null iff kind == LEGACY_HEADER; groups are id / label / flags.
-    val header: MatchResult?,
+    // Non-null iff kind == LEGACY_HEADER. Shared LegacyHeaderParser fields;
+    // never a raw regex match, so label/flags splitting is identical in every
+    // caller (gate, claim parser, pm-list diagnostics).
+    val fields: LegacyHeaderFields?,
+    // Non-null iff kind == REJECTED (diagnostic only: the line fails closed
+    // regardless of the reason).
+    val rejectReason: String?,
 )
 
 internal object IdentityLineClassifier {
-    // Anchored to ONE physical line: no `(?m)`. Java's multiline `^` also
-    // matches after U+0085/U+2028/U+2029 and a lone CR, which could turn a
-    // header smuggled after such a char into a second legacy claim. Callers
-    // always pass one element of VerboseUserRow.verboseLines(), so LF/CRLF is
-    // the only record boundary; an embedded unsafe separator is REJECTED
-    // before this regex is ever tried.
-    val LEGACY_HEADER = Regex("""^[ \t]*UserInfo\{(\d+):([^:}]*):([^}]*)\}""")
-
+    // Classification order is ownership order: an attempt that cannot be
+    // parsed fully is OWNED and REJECTED before any other rule can look at its
+    // text. This is what stops a malformed record from being stitched into a
+    // preceding legacy body (issue #87 R12).
     fun classify(rawText: String): ClassifiedIdentityLine {
+        fun rejected(reason: String) =
+            ClassifiedIdentityLine(rawText, IdentityLineKind.REJECTED, null, null, reason)
+
         // Unsafe separators first: they are never display-only text and the
         // whole line must fail closed, regardless of what else it contains.
         if (rawText.any { it == '\r' || it == '\u0085' || it == '\u2028' || it == '\u2029' }) {
-            return ClassifiedIdentityLine(rawText, IdentityLineKind.REJECTED, null, null)
+            return rejected("unsafe-separator")
         }
         // New format wins over legacy: a NEW_ROW line is NEVER also scanned as
         // a legacy header, so an inline `UserInfo{...}` in a valid/malformed
         // `name=` label cannot manufacture a competing legacy claim.
         VerboseUserRow.parse(rawText)?.let { row ->
-            return ClassifiedIdentityLine(rawText, IdentityLineKind.NEW_ROW, row, null)
+            return ClassifiedIdentityLine(rawText, IdentityLineKind.NEW_ROW, row, null, null)
         }
-        // Row-like ATTEMPT that could not be parsed (R10a): OWN the line and
-        // fail closed. Without this, a missing `name=`, an overflow id or a
-        // non-numeric id fell through to OTHER -- the strict gate found no
-        // ERROR_LINE hit and passed, and the tail could be stitched into a
-        // preceding legacy body. parseBlocks represents REJECTED lines with an
-        // empty placeholder and a break fence; the sanitizer sets malformedRow.
+        // Row-like ATTEMPT that could not be parsed (R10a/R12): OWN the line
+        // and fail closed. The `id[ \t]*=` head also catches spaced `id =`
+        // attempts that previously fell through to OTHER. This is an ATTEMPT
+        // detector, never an authorization grammar.
         if (VerboseUserRow.ROW_LIKE.containsMatchIn(rawText)) {
-            return ClassifiedIdentityLine(rawText, IdentityLineKind.REJECTED, null, null)
+            return rejected("malformed-new-attempt")
         }
-        LEGACY_HEADER.find(rawText)?.let { header ->
-            return ClassifiedIdentityLine(rawText, IdentityLineKind.LEGACY_HEADER, null, header)
+        return when (val result = LegacyHeaderParser.parse(rawText)) {
+            is LegacyParseResult.Ok -> ClassifiedIdentityLine(
+                rawText,
+                IdentityLineKind.LEGACY_HEADER,
+                null,
+                result.fields,
+                null,
+            )
+            is LegacyParseResult.Rejected -> rejected(result.reason)
+            LegacyParseResult.NotAnAttempt ->
+                ClassifiedIdentityLine(rawText, IdentityLineKind.OTHER, null, null, null)
         }
-        return ClassifiedIdentityLine(rawText, IdentityLineKind.OTHER, null, null)
     }
 }

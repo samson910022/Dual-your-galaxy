@@ -880,8 +880,11 @@ class ProfileIdentityTest {
 
     @Test
     fun identityGate_malformedHeaderIsNotStripped() {
-        // Only well-formed `UserInfo{id:label:flags}` headers are stripped.
-        // A malformed header carrying an error keyword must still fail.
+        // Only well-formed `UserInfo{id:label:flags}` headers get a neutralized
+        // label. Since R12/R13 the shared LegacyHeaderParser OWNS every
+        // `UserInfo{` attempt: an unparseable one is classified REJECTED (not
+        // OTHER), so a malformed header carrying an error keyword still fails
+        // and can no longer be stitched into a preceding legacy body.
         val malformed = "Users:\n  UserInfo{foo Failure}\n    User type: android.os.usertype.profile.CLONE\n"
         assertTrue(!PmOutputParser.isIdentityChannelOk(malformed, 0))
         val missingFlags = "Users:\n  UserInfo{95:Error}\n    User type: android.os.usertype.profile.CLONE\n"
@@ -890,8 +893,9 @@ class ProfileIdentityTest {
 
     @Test
     fun identityGate_unclosedHeaderDoesNotSwallowFailure() {
-        // The strip pattern never spans lines: an unclosed header must not
-        // swallow a genuine Failure line below it (fail-open guard).
+        // An unclosed header is now REJECTED by the shared parser (no greedy
+        // cross-body brace scan), so it can never swallow a genuine Failure
+        // line below it (fail-open guard).
         val truncated = "Users:\n  UserInfo{95:Broken:400 running:\nFailure [INSTALL_FAILED_INVALID_APK: bad]\n"
         assertTrue(!PmOutputParser.isIdentityChannelOk(truncated, 0))
     }
