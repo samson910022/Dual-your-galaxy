@@ -9400,9 +9400,15 @@ class DualViewModel(
     // PR #89 Round-3 R3-2: reports whether the write was dispatched (ACCEPTED),
     // refused but retryable with the pending retained (RETRYABLE_RETAINED), or
     // terminal (TERMINAL). All guards/messages/state updates/launches unchanged.
+    // PR #89 Round-4 R4-1: [onAttemptComplete] reports the ACTUAL async outcome
+    // of a dispatched write. It is emitted EXACTLY ONCE when the launched
+    // coroutine ends (including early `return@launch`/`return@withLock` and
+    // cancellation), NEVER for a synchronous pre-launch refusal. The verdict is
+    // derived from OBSERVED end state, not from this dispatch return value.
     fun confirmPolicyWrite(
         expected: PendingPolicyWrite,
         acknowledgedGeneration: Long?,
+        onAttemptComplete: ((attemptGeneration: Long, outcome: PolicyWriteConfirmAttemptOutcome) -> Unit)? = null,
     ): PolicyWriteConfirmAdmission {
         // N1: pending==null 必須優先報 NO_PENDING（INVALID），不得被 acknowledgement
         // 訊息掩蓋（acknowledgement 檢查置於其後）。
@@ -9480,6 +9486,13 @@ class DualViewModel(
         }
         viewModelScope.launch {
             val pendingAtCall = expected
+            // R4-1: identity anchor for a REAL Tx claim. Never cleared — a
+            // stale rollback must not turn a proven handover into retryable QUEUED.
+            var attemptTx: PolicyTx? = null
+            // R4-1: outermost wrapper also covers the `return@launch` exits above
+            // and every `return@withLock` below, so the settlement callback fires
+            // exactly once even when the coroutine bails before the inner try.
+            try {
             if (_state.value.pendingPolicyWrite != pendingAtCall) return@launch
             val key = policyWriteKey(pendingAtCall)
             if (!inFlightWrites.add(key)) {
@@ -9872,6 +9885,7 @@ class DualViewModel(
                         }
                         h1Deferred = lazy
                         preClaimTx = tx
+                        attemptTx = tx
                         var preIoAbort = false
                         policyRevisionMutex.withLock {
                             try {
@@ -10186,6 +10200,7 @@ class DualViewModel(
                                 }
                             }
                             handoverTx = htx
+                            attemptTx = htx
                             preClaimTx = null
                             return@withLock
                         }
@@ -10201,6 +10216,7 @@ class DualViewModel(
                                 val pc = preClaimTx
                                 if (pc != null) {
                                     handoverTx = pc
+                                    attemptTx = pc
                                     preClaimTx = null
                                     if (writeLocked) {
                                         try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
@@ -10249,6 +10265,7 @@ class DualViewModel(
                                     }
                                 }
                                 handoverTx = htx
+                                attemptTx = htx
                                 preClaimTx = null
                                 return@withLock
                             }
@@ -10501,8 +10518,54 @@ class DualViewModel(
                     }
                 } catch (_: Exception) { }
             }
+            } finally {
+                // R4-1: exactly-once settlement for the launched attempt. The
+                // verdict is read from OBSERVED end state AFTER the F3 repair
+                // above, and the callback runs OUTSIDE policySettleLock.
+                if (onAttemptComplete != null) {
+                    // Fail CLOSED: any failure to read end state keeps the
+                    // action live (RETRYABLE_RETAINED) instead of suppressing
+                    // the settlement callback that releases the caller's guard.
+                    val outcome = try {
+                        resolveConfirmAttemptOutcome(pendingAtCall, attemptTx)
+                    } catch (_: Exception) {
+                        PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED
+                    }
+                    try { onAttemptComplete(pendingAtCall.generation, outcome) }
+                    catch (_: Exception) { } // foreign callback never changes VM outcome
+                }
+            }
         }
         return PolicyWriteConfirmAdmission.ACCEPTED
+    }
+
+    // R4-1: derive the ACTUAL async outcome from observed state, not from the
+    // dispatch return. Same-generation + QUEUED WINS over any Tx evidence: the
+    // local-set loser and foreign BUSY arms can leave coordinator residue while
+    // the pending is still retryable QUEUED. A proven handover is the only case
+    // where a pending may be retained yet cannot return to retryable QUEUED.
+    private fun resolveConfirmAttemptOutcome(
+        expected: PendingPolicyWrite,
+        attemptTx: PolicyTx?,
+    ): PolicyWriteConfirmAttemptOutcome = synchronized(policySettleLock) {
+        val s = _state.value
+        val key = policyWriteKey(expected)
+        val same = s.pendingPolicyWrite?.generation == expected.generation
+        val txHeld = attemptTx != null && (
+            activePolicyTx.get() === attemptTx ||
+            policyTxCoordinator?.activeTx?.get() === attemptTx
+        )
+        val joinable = attemptTx != null && canJoinTx(attemptTx)
+        val reconOurs = s.policyWritePhase == PolicyWritePhase.RECONCILING &&
+            policyReconciling.contains(key)
+        when {
+            s.pendingPolicyWrite == null -> PolicyWriteConfirmAttemptOutcome.CONSUMED
+            !same -> PolicyWriteConfirmAttemptOutcome.SUPERSEDED
+            s.policyWritePhase == PolicyWritePhase.QUEUED ->
+                PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED
+            txHeld || joinable || reconOurs -> PolicyWriteConfirmAttemptOutcome.HANDED_OFF
+            else -> PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED
+        }
     }
 
     // 清除草稿：只刪 HookPolicyStore 條目，不清記憶體勾選，不碰裝置寫入路徑

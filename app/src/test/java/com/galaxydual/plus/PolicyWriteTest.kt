@@ -6918,6 +6918,215 @@ class PolicyWriteTest {
         }
     }
 
+    // PR #89 Round-4 R4-1 (counterexample A): a BUSY/in-progress async refusal
+    // must report RETRYABLE_RETAINED exactly once and keep the accepted action
+    // live. The verdict is observed from real VM end state, not a prechosen enum.
+    @Test
+    fun confirmHeldMutexRetention_reportsRetryableRetainedExactlyOnce() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            assertTrue(coord.writeMutex.tryLock())
+            try {
+                val controller = WarningRestartController()
+                val action = controller.install(
+                    action = WarningRestartAction.WRITE,
+                    candidateKey = "com.example.a",
+                    generation = 1,
+                    callback = { },
+                    resetBudget = true,
+                )
+                val actionId = action.identity.id
+                val settlements = java.util.Collections.synchronizedList(
+                    mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+                )
+                val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+                setPendingPolicyWrite(vm, pending)
+                assertFalse(revisionStaleOf(vm))
+                val savesBefore = fake.saveCalls.get()
+
+                val admission = vm.confirmPolicyWrite(pending, pending.generation) { gen, outcome ->
+                    settlements.add(gen to outcome)
+                }
+                assertEquals(PolicyWriteConfirmAdmission.ACCEPTED, admission)
+                await { settlements.isNotEmpty() }
+                await { vm.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText() }
+
+                assertEquals(1, settlements.size)
+                assertEquals(pending.generation, settlements[0].first)
+                assertEquals(PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED, settlements[0].second)
+                assertEquals(pending, vm.state.value.pendingPolicyWrite)
+                assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+                assertEquals(savesBefore, fake.saveCalls.get())
+                assertNull(activeTxOf(vm))
+                assertNull(coordinatorTxOf(coord))
+
+                // Compose the observed outcome with the PRODUCTION ownership seam.
+                val tracker = PolicyWriteAttemptTracker()
+                val token = checkNotNull(tracker.tryEnter(pending.generation))
+                val retired = confirmAttemptRetiresAction(
+                    outcome = settlements[0].second,
+                    callbackGeneration = settlements[0].first,
+                    expectedGeneration = pending.generation,
+                    attemptActive = tracker.exit(pending.generation, token),
+                    actionLive = controller.isLive(actionId),
+                    hostAlive = true,
+                )
+                assertFalse("BUSY retention must NOT retire the accepted action", retired)
+                assertTrue("action must stay live for a fresh retry", controller.isLive(actionId))
+                assertEquals(actionId, controller.currentRequestId())
+            } finally {
+                try {
+                    coord.writeMutex.unlock()
+                } catch (_: Exception) {
+                }
+            }
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // R4-1: the `inFlightWrites.add` failure path is BEFORE the inner try at
+    // opMutex. It must still emit exactly one settlement from the outer finally.
+    @Test
+    fun confirmDuplicateInFlight_secondAttemptReportsRetainedOnce() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            assertTrue(coord.writeMutex.tryLock())
+            try {
+                val settlements = java.util.Collections.synchronizedList(
+                    mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+                )
+                val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+                setPendingPolicyWrite(vm, pending)
+                val savesBefore = fake.saveCalls.get()
+
+                val sink: (Long, PolicyWriteConfirmAttemptOutcome) -> Unit = { gen, outcome ->
+                    settlements.add(gen to outcome)
+                }
+                assertEquals(
+                    PolicyWriteConfirmAdmission.ACCEPTED,
+                    vm.confirmPolicyWrite(pending, pending.generation, sink),
+                )
+                assertEquals(
+                    PolicyWriteConfirmAdmission.ACCEPTED,
+                    vm.confirmPolicyWrite(pending, pending.generation, sink),
+                )
+                await { settlements.size == 2 }
+                assertTrue(
+                    "both attempts must report retained, not dispatched-success",
+                    settlements.all {
+                        it.first == pending.generation &&
+                            it.second == PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED
+                    },
+                )
+                assertEquals(pending, vm.state.value.pendingPolicyWrite)
+                assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+                assertEquals(savesBefore, fake.saveCalls.get())
+            } finally {
+                try {
+                    coord.writeMutex.unlock()
+                } catch (_: Exception) {
+                }
+            }
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // R4-1: the `pending != pendingAtCall` return@launch sits BEFORE the inner
+    // try. Pause Main so the coroutine runs only after the pending is swapped,
+    // then assert the settlement still fires exactly once (SUPERSEDED).
+    @Test
+    fun confirmPreLaunchBail_invokesCallbackOnce() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            val paused = kotlinx.coroutines.test.StandardTestDispatcher()
+            val settlements = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+            )
+            try {
+                Dispatchers.setMain(paused)
+                val a = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+                setPendingPolicyWrite(vm, a)
+                vm.confirmPolicyWrite(a, a.generation) { gen, outcome -> settlements.add(gen to outcome) }
+                val b = PendingPolicyWrite(setOf("com.example.b"), System.currentTimeMillis() + 1L)
+                setPendingPolicyWrite(vm, b)
+                assertNotEquals(a.generation, b.generation)
+                paused.scheduler.runCurrent()
+
+                assertEquals(1, settlements.size)
+                assertEquals(a.generation, settlements[0].first)
+                assertEquals(PolicyWriteConfirmAttemptOutcome.SUPERSEDED, settlements[0].second)
+                assertEquals(0, fake.saveCalls.get())
+                assertEquals(b, vm.state.value.pendingPolicyWrite)
+            } finally {
+                // Drain and cancel every queued VM job while the paused
+                // dispatcher is STILL installed. Otherwise tearDown's
+                // drainBeforeResetMain cannot converge after resetMain().
+                vm.viewModelScope.cancel()
+                val scopeJob = vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]
+                val drainDeadline = System.currentTimeMillis() + 2_000L
+                while (scopeJob != null && !scopeJob.isCompleted &&
+                    System.currentTimeMillis() < drainDeadline
+                ) {
+                    paused.scheduler.advanceUntilIdle()
+                    Thread.sleep(20L)
+                }
+                Dispatchers.resetMain()
+            }
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // R4-1: an abort that CLEARS the pending must report CONSUMED exactly once,
+    // so the caller retires the action. Uses the existing no-store fail-closed
+    // path (zero IO) to make the end state deterministic.
+    @Test
+    fun confirmNoStoreAbort_reportsConsumedOnce() {
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(null, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            val settlements = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+            )
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pending)
+
+            val admission = vm.confirmPolicyWrite(pending, pending.generation) { gen, outcome ->
+                settlements.add(gen to outcome)
+            }
+            assertEquals(PolicyWriteConfirmAdmission.ACCEPTED, admission)
+            await { settlements.isNotEmpty() }
+            assertEquals(1, settlements.size)
+            assertEquals(pending.generation, settlements[0].first)
+            assertEquals(PolicyWriteConfirmAttemptOutcome.CONSUMED, settlements[0].second)
+            assertNull(vm.state.value.pendingPolicyWrite)
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     // Stage I2-4：coordinator 佔位（CAS 失配同理）回 IDLE（無本地 Tx）。
     // 以慢速無關 op 先佔 opMutex，使 clear 外層先 QUEUED 排隊，再設 holder，
     // 放行後內層見 reconciling 即條件回 IDLE＋epoch＋BUSY（不耗 clear）。

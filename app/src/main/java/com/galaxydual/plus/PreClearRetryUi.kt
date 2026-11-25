@@ -468,7 +468,7 @@ internal fun confirmRevocationAccepted(admission: PolicyWriteConfirmAdmission): 
 // ACCEPTED (dispatch) alone never retires an accepted warning action; only a
 // proven CONSUMED/HANDED_OFF outcome may do so, and only for the generation and
 // attempt that produced it. Framework-free and JVM-testable.
-internal enum class PolicyWriteConfirmAttemptOutcome {
+public enum class PolicyWriteConfirmAttemptOutcome {
     CONSUMED,           // pending settled/cleared; no retryable pending remains
     HANDED_OFF,         // proven Tx ownership transition; cannot return to retryable QUEUED
     RETRYABLE_RETAINED, // same expected pending still QUEUED with zero save; keep action
