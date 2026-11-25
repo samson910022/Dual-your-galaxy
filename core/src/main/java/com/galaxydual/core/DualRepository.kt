@@ -120,10 +120,14 @@ sealed interface CloneOutcome {
     // actually authorized this Success (the listing-adjacent `after` pin, or
     // the expected/synthetic pin on the Expected variants). It travels to the
     // ViewModel so a same-id rebuild can be detected there instead of being
-    // silently merged into an older FRESH (id, serial) inventory. Null keeps
-    // the documented "serial never observable" capability limit: callers must
-    // not manufacture drift from absent evidence, but must fail closed when
-    // later evidence is lost. Defaults to null so old call sites keep building.
+    // silently merged into an older FRESH (id, serial) inventory. Null means the
+    // authorizing pin had no serial available / no incarnation binding was
+    // established for this result -- NOT that a serial is unobservable forever:
+    // the post-list fence tolerates null -> known, so a serial may first appear
+    // in a later read-only triple, and that later value must never be backfilled
+    // as evidence verified by this operation. Callers must not manufacture drift
+    // from absent evidence, but must fail closed when already-present evidence
+    // is later lost. Defaults to null so old call sites keep building.
     data class Success(val dualId: Int, val verifiedSerial: Int? = null) : CloneOutcome
     data object NoDual : CloneOutcome
     data class ChannelError(val detail: String) : CloneOutcome
@@ -159,10 +163,13 @@ sealed interface CloneOutcome {
 // same id. Only Success (post-check confirms absent) counts as removed.
 sealed interface RemoveOutcome {
     // Same contract as CloneOutcome.Success: the already-verified serial of
-    // the target that authorized this Success (null when no serial was ever
-    // observable). Read-only consumers may ignore it; the ViewModel must use
-    // it to keep a stale FRESH (id, serial) inventory from absorbing the
-    // result of a write on a different incarnation of the same id.
+    // the target that authorized this Success. Null means the authorizing pin
+    // had no serial available / no incarnation binding was established for this
+    // result -- NOT that a serial is unobservable forever; a later read-only
+    // triple may reveal one, but that value must never be backfilled as evidence
+    // verified by this operation. Read-only consumers may ignore it; the
+    // ViewModel must use it to keep a stale FRESH (id, serial) inventory from
+    // absorbing the result of a write on a different incarnation of the same id.
     data class Success(val dualId: Int, val verifiedSerial: Int? = null) : RemoveOutcome
     data object NoDual : RemoveOutcome
     data class ChannelError(val detail: String) : RemoveOutcome
