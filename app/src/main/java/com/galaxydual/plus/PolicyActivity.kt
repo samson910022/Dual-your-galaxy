@@ -1093,8 +1093,13 @@ class PolicyActivity : ComponentActivity() {
                         if (!warningRestartController.isLive(actionId)) {
                             preClearLog("policy-write confirm dropped: request no longer live")
                         } else {
-                            vm.confirmPolicyWrite(pending, pending.generation)
-                            warningRestartController.revoke(actionId)
+                            // PR #89 R3-2: same admission gate as MainActivity.
+                            // Other retained-pending refusals (e.g. RECONCILING)
+                            // must not revoke the accepted action either.
+                            val admission = vm.confirmPolicyWrite(pending, pending.generation)
+                            if (confirmRevocationAccepted(admission)) {
+                                warningRestartController.revoke(actionId)
+                            }
                         }
                     },
                     revoke = { try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { } },

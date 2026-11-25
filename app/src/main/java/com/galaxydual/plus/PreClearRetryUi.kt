@@ -455,6 +455,13 @@ internal class WarningRestartController {
 internal fun cancelOwnershipAccepted(vmCancelled: Boolean, actionLive: Boolean): Boolean =
     vmCancelled && actionLive
 
+// PR #89 Round-3 R3-2: the final dialog's Positive arm revokes the accepted
+// warning action only when the VM actually dispatched the write. A
+// RETRYABLE_RETAINED verdict keeps the pending for a retry, so the action must
+// stay live and its Retry token consumable. Framework-free and JVM-testable.
+internal fun confirmRevocationAccepted(admission: PolicyWriteConfirmAdmission): Boolean =
+    admission != PolicyWriteConfirmAdmission.RETRYABLE_RETAINED
+
 // PR #89 Round-3 R3-3: after rotation, an orphan QUEUED pending that was rebuilt
 // from saved state and has no live consent action must be invalidated. SAVING /
 // RECONCILING / IDLE and any live action are never invalidated here.

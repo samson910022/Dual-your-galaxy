@@ -459,6 +459,72 @@ class WarningActionOwnershipTest {
         assertFalse(controller.isLive(actionId))
     }
 
+    // PR #89 Round-3 R3-2: the final-dialog Positive arm gates revocation on
+    // the admission verdict. Model both paths against the REAL controller: a
+    // RETRYABLE_RETAINED refusal (ack withdrawn mid-revalidation) keeps the
+    // accepted WRITE live and its Retry token consumable; only ACCEPTED (the
+    // write actually dispatched) revokes the identity and makes the old retry
+    // token stale. Fails if the controller's revoke/consumption semantics stop
+    // being identity-bound.
+    @Test
+    fun retryableConfirmRefusal_keepsActionLive_untilAcceptedDispatch() {
+        val controller = WarningRestartController()
+        val hits = mutableListOf<String>()
+
+        // Accepted warning -> live WRITE action with a consumable Retry token.
+        val first = controller.install(
+            action = WarningRestartAction.WRITE,
+            candidateKey = "pkg.final.confirm.retry",
+            generation = 1,
+            callback = { hits.add("write:pkg.final.confirm.retry") },
+            resetBudget = true,
+        )
+        val firstId = first.identity.id
+        assertTrue("installed WRITE must be live", controller.isLive(firstId))
+        assertEquals(firstId, controller.retryRequestId())
+
+        // Attempt 1: VM refuses with RETRYABLE_RETAINED (pending is kept). The
+        // shared gate `confirmRevocationAccepted(retained)` evaluates FALSE, so
+        // NO revoke is issued and the same action survives for the retry.
+        val retained = PolicyWriteConfirmAdmission.RETRYABLE_RETAINED
+        assertFalse("retained refusal must not satisfy the revoke gate", confirmRevocationAccepted(retained))
+        if (confirmRevocationAccepted(retained)) {
+            controller.revoke(firstId)
+        }
+        assertTrue("WRITE must stay live after a retained refusal", controller.isLive(firstId))
+        assertEquals(firstId, controller.currentRequestId())
+        assertEquals(firstId, controller.retryRequestId())
+        assertTrue("Retry token must remain consumable after a retained refusal", controller.consumeRetry(firstId, true))
+        assertEquals(listOf("write:pkg.final.confirm.retry"), hits)
+        assertFalse("Retry is one-shot per request", controller.consumeRetry(firstId, true))
+
+        // Attempt 2: the retried Positive is admitted; the VM dispatches the
+        // write, so the gate is TRUE and the accepted action is revoked.
+        val second = controller.install(
+            action = WarningRestartAction.WRITE,
+            candidateKey = "pkg.final.confirm.retry",
+            generation = 1,
+            callback = { hits.add("write:pkg.final.confirm.retry:second") },
+            resetBudget = false, // Retry re-entry carries the restart budget.
+        )
+        val secondId = second.identity.id
+        assertNotEquals(firstId, secondId)
+        assertTrue("retried WRITE must be live before dispatch", controller.isLive(secondId))
+        val admitted = PolicyWriteConfirmAdmission.ACCEPTED
+        assertTrue("accepted dispatch must satisfy the revoke gate", confirmRevocationAccepted(admitted))
+        if (confirmRevocationAccepted(admitted)) {
+            assertTrue("gate must revoke the live action", controller.revoke(secondId))
+        }
+        assertFalse("WRITE must be dead after the accepted dispatch", controller.isLive(secondId))
+        assertNull(controller.currentIdentity)
+        assertNull(controller.currentRequestId())
+
+        // Stale tokens from BOTH attempts are rejected by the real controller.
+        assertFalse("stale first-attempt retry must be rejected", controller.consumeRetry(firstId, true))
+        assertFalse("revoked second-attempt retry must be rejected", controller.consumeRetry(secondId, true))
+        assertEquals("no write callback after revocation", listOf("write:pkg.final.confirm.retry"), hits)
+    }
+
     private fun installClear(
         controller: WarningRestartController,
         generation: Int,

@@ -6753,8 +6753,13 @@ class MainActivity : ComponentActivity() {
                         if (!warningRestartController.isLive(actionId)) {
                             preClearLog("policy-write confirm dropped: request no longer live")
                         } else {
-                            vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null)
-                            warningRestartController.revoke(actionId)
+                            // PR #89 R3-2: a RETRYABLE_RETAINED refusal keeps the
+                            // QUEUED pending (e.g. consent withdrawn mid-revalidation),
+                            // so the accepted action must stay live for the retry.
+                            val admission = vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null)
+                            if (confirmRevocationAccepted(admission)) {
+                                warningRestartController.revoke(actionId)
+                            }
                         }
                     },
                     revoke = { try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { } },

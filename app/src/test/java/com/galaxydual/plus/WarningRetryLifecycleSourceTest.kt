@@ -620,4 +620,91 @@ class WarningRetryLifecycleSourceTest {
             assertTrue("${seam.name} ownership gate must precede revocation", gateAt in 0 until revokeAt)
         }
     }
+
+    // PR #89 Round-3 R3-2: the final-dialog Positive arm must capture the VM's
+    // admission verdict and revoke the accepted warning action ONLY when the
+    // write actually left the QUEUED state. A RETRYABLE_RETAINED refusal (e.g.
+    // the ack was unchecked during the fresh-validation await) keeps the same
+    // pending; revoking there leaves the retry with no live action, so the next
+    // Positive trips `!isLive(actionId)` and the dialog silently disappears.
+    @Test
+    fun finalConfirmRevocation_isAdmissionGated() {
+        data class ConfirmSeam(val name: String, val src: String, val ackExpr: String)
+        for (seam in listOf(
+            ConfirmSeam("MainActivity", main, "if (policyAcknowledged) pending.generation else null"),
+            // Editor has no live checkbox, but the VM has OTHER retained-pending
+            // refusal paths (pending!=expected / RECONCILING): same gate required.
+            ConfirmSeam("PolicyActivity", editor, "pending.generation"),
+        )) {
+            val body = block(seam.src, "private fun confirmWriteWithConsent(")
+            val callLine = body.lines().firstOrNull { it.contains("vm.confirmPolicyWrite(") }
+                ?: throw AssertionError("${seam.name} final confirm must call vm.confirmPolicyWrite")
+            assertTrue(
+                "${seam.name} final confirm must capture the admission verdict",
+                callLine.trimStart().startsWith("val admission = vm.confirmPolicyWrite("),
+            )
+            assertTrue(
+                "${seam.name} final confirm must keep the ack LIVE at callback time",
+                callLine.contains("vm.confirmPolicyWrite(pending, ${seam.ackExpr})"),
+            )
+
+            // Strip comment-only lines: a documented guard cannot satisfy the
+            // ordering check, only executable code can.
+            val code = body.lines().filterNot { it.trimStart().startsWith("//") }.joinToString("\n")
+            val guard = "if (confirmRevocationAccepted(admission)) {"
+            val guardAt = code.indexOf(guard)
+            val revokeAt = code.indexOf("warningRestartController.revoke(actionId)")
+            assertTrue("${seam.name} final confirm must expose the confirmRevocationAccepted gate", guardAt >= 0)
+            assertTrue("${seam.name} final confirm must expose the ownership revoke", revokeAt >= 0)
+            assertTrue(
+                "${seam.name} admission gate must precede revocation",
+                guardAt in 0 until revokeAt,
+            )
+
+            // Exactly one confirm call and one revoke in this function: no
+            // parallel unguarded arm can hide behind the gated one.
+            assertEquals(
+                "${seam.name} final confirm must have one VM confirm call",
+                1,
+                indicesOf(code, "vm.confirmPolicyWrite(").size,
+            )
+            assertEquals(
+                "${seam.name} final confirm must have one ownership revoke",
+                1,
+                indicesOf(code, "warningRestartController.revoke(actionId)").size,
+            )
+            // Whole-lambda style: the revoke must be INSIDE the guard block,
+            // not merely after it on an unguarded line. Match the guard's own
+            // `{` to its closing `}` — counting braces between guard and revoke
+            // is unsound: an empty guard plus a separate `run { revoke(...) }`
+            // arm leaves more `{` than `}` before the revoke yet revokes
+            // unconditionally.
+            val guardOpen = code.indexOf('{', guardAt)
+            assertTrue("${seam.name} admission guard must open a block", guardOpen >= 0)
+            var depth = 0
+            var guardClose = -1
+            for (i in guardOpen until code.length) {
+                when (code[i]) {
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) {
+                            guardClose = i
+                            break
+                        }
+                    }
+                }
+            }
+            assertTrue("${seam.name} admission guard block must close", guardClose >= 0)
+            assertTrue(
+                "${seam.name} revoke must be nested inside the admission guard",
+                revokeAt in guardOpen until guardClose,
+            )
+            assertFalse(
+                "${seam.name} must not have a bare confirm immediately followed by revoke",
+                Regex("""vm\.confirmPolicyWrite\([^\n]*\)\s*\n\s*warningRestartController\.revoke\(""")
+                    .containsMatchIn(code),
+            )
+        }
+    }
 }

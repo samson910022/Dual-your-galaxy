@@ -21,6 +21,16 @@ class PolicyWriteAdmissionPredicatesTest {
     }
 
     @Test
+    fun confirmRevocationAccepted_truthTable() {
+        // Only a RETRYABLE_RETAINED refusal keeps the accepted action live;
+        // a dispatched write or a terminal no-write path both revoke it.
+        assertTrue(confirmRevocationAccepted(PolicyWriteConfirmAdmission.ACCEPTED))
+        assertFalse(confirmRevocationAccepted(PolicyWriteConfirmAdmission.RETRYABLE_RETAINED))
+        assertTrue(confirmRevocationAccepted(PolicyWriteConfirmAdmission.TERMINAL))
+        assertEquals(3, PolicyWriteConfirmAdmission.values().size)
+    }
+
+    @Test
     fun shouldInvalidateOrphanPendingOnRebuild_truthTable() {
         var accepted = 0
         for (rebuilt in listOf(false, true)) {
