@@ -709,6 +709,9 @@ class MainActivity : ComponentActivity() {
         // posted restart Runnable specifically; keep the blanket removal below
         // for the other Handler callbacks.
         warningRestartController.clear()
+        // R4-1: release every in-flight write attempt so a late settlement on
+        // a destroyed Activity is a harmless no-op.
+        policyWriteAttempts.clear()
         pendingWarningRestartRunnable?.let { mainHandler.removeCallbacks(it) }
         pendingWarningRestartRunnable = null
         // G2: drop the session-scoped consent and the owned Runnable's request id.
@@ -4906,6 +4909,11 @@ class MainActivity : ComponentActivity() {
             }
             // D03b：最終 confirm 經 consent fence（警告↔confirm 期間的 clone TOCTOU）；
             // ProceedOk 且 host 存活才真正寫入，其餘一律 revoke pending＋強制新警告。
+            // R4-1: a second Positive while this pending's attempt is in flight
+            // is ignored — never converted into a cancel of the first write.
+            if (policyWriteAttempts.isAnyActive(pending.generation)) {
+                return@setOnClickListener
+            }
             if (policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, curPolicySaving)) {
                 confirmWriteWithConsent(pending)
             }
@@ -6482,6 +6490,9 @@ class MainActivity : ComponentActivity() {
 
     // D03b fixer M5：confirm 重入防護（double-tap）——第一段 enter 成功才 launch。
     private val consentConfirmInFlight = InFlightGuard()
+    // R4-1: per-pending, tokenized attempt guard spanning the VM's async
+    // pre-read/claim window. Distinct from the short global revalidation guard.
+    private val policyWriteAttempts = PolicyWriteAttemptTracker()
 
     // G2: every dialog CANCEL is identity-bound. A stale cancel (e.g. a late
     // onCancel from a superseded CLEAR) must NOT touch pendingClearConfirm or
@@ -6749,16 +6760,30 @@ class MainActivity : ComponentActivity() {
     private fun confirmWriteWithConsent(pending: PendingPolicyWrite) {
         // G2: the consent carries the id of the request that accepted this write.
         val actionId = pending.consent?.actionId
+        val generation = pending.generation
+        // R4-1: per-pending tokenized guard spans BOTH the Activity revalidation
+        // window and the VM's async pre-read/claim window; the global guard
+        // below stays short so unrelated operations are never blocked.
+        val attemptId = policyWriteAttempts.tryEnter(generation)
+        if (attemptId == null) {
+            preClearLog("policy-write confirm dropped: attempt already in flight for this pending")
+            return
+        }
         if (!warningRestartController.isLive(actionId)) {
+            policyWriteAttempts.exit(generation, attemptId)
             preClearLog("policy-write consent aborted: no live request id")
             try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
             return
         }
         if (!consentConfirmInFlight.tryEnter()) {
+            policyWriteAttempts.exit(generation, attemptId)
             preClearLog("consent confirm dropped: write already in flight")
             return
         }
         lifecycleScope.launch {
+            // R4-1: only the VM's real settlement releases the guard after a
+            // dispatched attempt; all abort paths release it in the finally.
+            var handedOff = false
             try {
                 val livePending = try {
                     vm.state.value.pendingPolicyWrite
@@ -6810,12 +6835,23 @@ class MainActivity : ComponentActivity() {
                         if (!warningRestartController.isLive(actionId)) {
                             preClearLog("policy-write confirm dropped: request no longer live")
                         } else {
-                            // PR #89 R3-2: a RETRYABLE_RETAINED refusal keeps the
-                            // QUEUED pending (e.g. consent withdrawn mid-revalidation),
-                            // so the accepted action must stay live for the retry.
-                            val admission = vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null)
-                            if (confirmRevocationAccepted(admission)) {
-                                warningRestartController.revoke(actionId)
+                            // PR #89 R3-2: the ack is read LIVE at callback time.
+                            // R4-1: ACCEPTED only DISPATCHES the VM attempt — the
+                            // action stays live until the real settlement reports
+                            // CONSUMED/HANDED_OFF (or a synchronous TERMINAL).
+                            val admission = vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null) { cbGen, outcome ->
+                                onPolicyWriteAttemptComplete(actionId, generation, attemptId, cbGen, outcome)
+                            }
+                            if (admission == PolicyWriteConfirmAdmission.ACCEPTED) {
+                                // Async callback now owns the per-pending guard.
+                                handedOff = true
+                            } else {
+                                // Synchronous refusal launched no coroutine, so
+                                // no settlement callback will release the guard.
+                                policyWriteAttempts.exit(generation, attemptId)
+                                if (confirmRevocationAccepted(admission)) {
+                                    warningRestartController.revoke(actionId)
+                                }
                             }
                         }
                     },
@@ -6825,7 +6861,39 @@ class MainActivity : ComponentActivity() {
                 )
             } finally {
                 consentConfirmInFlight.exit()
+                // R4-1: a dispatched attempt is released by the callback only;
+                // every abort path releases here.
+                if (!handedOff) {
+                    policyWriteAttempts.exit(generation, attemptId)
+                }
             }
+        }
+    }
+
+    // R4-1: consume the VM's async settlement. The per-pending token is
+    // consumed ATOMICALLY by exit(), so a late settle for an older attempt on
+    // the same retained generation can never retire a newer action.
+    private fun onPolicyWriteAttemptComplete(
+        actionId: Long?,
+        generation: Long,
+        attemptId: Long,
+        callbackGeneration: Long,
+        outcome: PolicyWriteConfirmAttemptOutcome,
+    ) {
+        val attemptActive = policyWriteAttempts.exit(generation, attemptId)
+        if (!attemptActive || callbackGeneration != generation) return
+        val hostAlive = !isFinishing && !isDestroyed
+        val actionLive = warningRestartController.isLive(actionId)
+        if (confirmAttemptRetiresAction(
+                outcome = outcome,
+                callbackGeneration = callbackGeneration,
+                expectedGeneration = generation,
+                attemptActive = attemptActive,
+                actionLive = actionLive,
+                hostAlive = hostAlive,
+            )
+        ) {
+            warningRestartController.revoke(actionId)
         }
     }
 

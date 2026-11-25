@@ -213,6 +213,9 @@ class PolicyActivity : ComponentActivity() {
 
     // D03b fixer M5：confirm 重入防護. Restart scheduling is request-scoped now.
     private val consentConfirmInFlight = InFlightGuard()
+    // R4-1: per-pending, tokenized attempt guard spanning the VM's async
+    // pre-read/claim window. Distinct from the short global revalidation guard.
+    private val policyWriteAttempts = PolicyWriteAttemptTracker()
 
     // R03：旗標翻轉時立即重建列，讓勾選控制項在 probe 啟動前就禁用；
     // 取消／完成／例外路徑同樣立刻恢復。
@@ -735,6 +738,9 @@ class PolicyActivity : ComponentActivity() {
         // posted restart Runnable specifically; keep the blanket Handler
         // cleanup below for the other callbacks (e.g. search debounce).
         warningRestartController.clear()
+        // R4-1: release every in-flight write attempt so a late settlement on
+        // a destroyed Editor is a harmless no-op.
+        policyWriteAttempts.clear()
         pendingWarningRestartRunnable?.let { handler.removeCallbacks(it) }
         pendingWarningRestartRunnable = null
         // G2: drop the session-scoped consent and the owned Runnable's request id.
@@ -1043,16 +1049,30 @@ class PolicyActivity : ComponentActivity() {
     private fun confirmWriteWithConsent(pending: PendingPolicyWrite) {
         // G2: the consent carries the id of the request that accepted this write.
         val actionId = pending.consent?.actionId
+        val generation = pending.generation
+        // R4-1: per-pending tokenized guard spans BOTH the Activity revalidation
+        // window and the VM's async pre-read/claim window; the global guard
+        // below stays short so unrelated operations are never blocked.
+        val attemptId = policyWriteAttempts.tryEnter(generation)
+        if (attemptId == null) {
+            preClearLog("policy-write confirm dropped: attempt already in flight for this pending")
+            return
+        }
         if (!warningRestartController.isLive(actionId)) {
+            policyWriteAttempts.exit(generation, attemptId)
             preClearLog("policy-write consent aborted: no live request id")
             try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
             return
         }
         if (!consentConfirmInFlight.tryEnter()) {
+            policyWriteAttempts.exit(generation, attemptId)
             preClearLog("consent confirm dropped: write already in flight")
             return
         }
         lifecycleScope.launch {
+            // R4-1: only the VM's real settlement releases the guard after a
+            // dispatched attempt; all abort paths release it in the finally.
+            var handedOff = false
             try {
                 val livePending = try {
                     vm.state.value.pendingPolicyWrite
@@ -1114,9 +1134,17 @@ class PolicyActivity : ComponentActivity() {
                             val ackGen = if (policyConfirmState.acknowledged &&
                                 policyConfirmState.ackGeneration == pending.generation
                             ) pending.generation else null
-                            val admission = vm.confirmPolicyWrite(pending, ackGen)
-                            if (confirmRevocationAccepted(admission)) {
-                                warningRestartController.revoke(actionId)
+                            // R4-1: ACCEPTED only DISPATCHES the VM attempt.
+                            val admission = vm.confirmPolicyWrite(pending, ackGen) { cbGen, outcome ->
+                                onPolicyWriteAttemptComplete(actionId, generation, attemptId, cbGen, outcome)
+                            }
+                            if (admission == PolicyWriteConfirmAdmission.ACCEPTED) {
+                                handedOff = true
+                            } else {
+                                policyWriteAttempts.exit(generation, attemptId)
+                                if (confirmRevocationAccepted(admission)) {
+                                    warningRestartController.revoke(actionId)
+                                }
                             }
                         }
                     },
@@ -1126,7 +1154,39 @@ class PolicyActivity : ComponentActivity() {
                 )
             } finally {
                 consentConfirmInFlight.exit()
+                // R4-1: a dispatched attempt is released by the callback only;
+                // every abort path releases here.
+                if (!handedOff) {
+                    policyWriteAttempts.exit(generation, attemptId)
+                }
             }
+        }
+    }
+
+    // R4-1: consume the VM's async settlement. The per-pending token is
+    // consumed ATOMICALLY by exit(), so a late settle for an older attempt on
+    // the same retained generation can never retire a newer action.
+    private fun onPolicyWriteAttemptComplete(
+        actionId: Long?,
+        generation: Long,
+        attemptId: Long,
+        callbackGeneration: Long,
+        outcome: PolicyWriteConfirmAttemptOutcome,
+    ) {
+        val attemptActive = policyWriteAttempts.exit(generation, attemptId)
+        if (!attemptActive || callbackGeneration != generation) return
+        val hostAlive = !isFinishing && !isDestroyed
+        val actionLive = warningRestartController.isLive(actionId)
+        if (confirmAttemptRetiresAction(
+                outcome = outcome,
+                callbackGeneration = callbackGeneration,
+                expectedGeneration = generation,
+                attemptActive = attemptActive,
+                actionLive = actionLive,
+                hostAlive = hostAlive,
+            )
+        ) {
+            warningRestartController.revoke(actionId)
         }
     }
 
@@ -1336,6 +1396,11 @@ class PolicyActivity : ComponentActivity() {
                 } catch (_: RuntimeException) {
                     null
                 } ?: run { try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }; return@setOnClickListener }
+                // R4-1: a second Positive while this pending's attempt is in
+                // flight is ignored — never a cancel of the first write.
+                if (policyWriteAttempts.isAnyActive(live.generation)) {
+                    return@setOnClickListener
+                }
                 // D03b：最終 confirm 經 consent fence（警告↔confirm 期間的 clone TOCTOU）。
                 confirmWriteWithConsent(live)
             }

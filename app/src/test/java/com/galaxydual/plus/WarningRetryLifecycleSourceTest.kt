@@ -895,6 +895,87 @@ class WarningRetryLifecycleSourceTest {
         }
     }
 
+    // PR #89 Round-4 R4-1: ACCEPTED only DISPATCHES the VM attempt. Both hosts
+    // must hold a per-pending token across the async window, pass the settlement
+    // callback to confirmPolicyWrite, and retire the action ONLY from the
+    // dedicated settlement handler (never inline on the dispatch verdict).
+    // Source shape only — actual async outcomes are proven by PolicyWriteTest
+    // and the real WarningRestartController tests (DEVICE-UNVERIFIED for dialogs).
+    @Test
+    fun finalConfirmAsyncOwnership_isPerPendingAndStaleSafe() {
+        for ((name, src) in listOf("MainActivity" to main, "PolicyActivity" to editor)) {
+            val body = block(src, "private fun confirmWriteWithConsent(")
+            val code = body.lines().filterNot { it.trimStart().startsWith("//") }.joinToString("\n")
+            val codeFlat = flat(code)
+
+            // Exactly one tokenized attempt guard, BEFORE every cancel path and
+            // before the short global revalidation guard.
+            val enterNeedle = "policyWriteAttempts.tryEnter(generation)"
+            assertEquals("$name must enter one per-pending attempt", 1, indicesOf(codeFlat, enterNeedle).size)
+            val enterAt = codeFlat.indexOf(enterNeedle)
+            assertTrue(
+                "$name attempt guard must precede the no-live-action cancel",
+                codeFlat.indexOf("if (!warningRestartController.isLive(actionId))") in enterAt until codeFlat.length,
+            )
+            assertTrue(
+                "$name attempt guard must precede the global revalidation guard",
+                codeFlat.indexOf("consentConfirmInFlight.tryEnter()") in enterAt until codeFlat.length,
+            )
+
+            // The confirm call carries the settlement callback.
+            val confirmAt = codeFlat.indexOf("vm.confirmPolicyWrite(")
+            assertTrue("$name must call vm.confirmPolicyWrite", confirmAt >= 0)
+            val confirmCall = codeFlat.substring(confirmAt, minOf(codeFlat.length, confirmAt + 400))
+            assertTrue(
+                "$name confirm must pass the async settlement callback",
+                confirmCall.contains("onPolicyWriteAttemptComplete(actionId, generation, attemptId, cbGen, outcome)"),
+            )
+
+            // ACCEPTED only hands ownership to the callback; no inline retire.
+            val acceptedNeedle = "if (admission == PolicyWriteConfirmAdmission.ACCEPTED) {"
+            assertTrue("$name must gate handoff on ACCEPTED", codeFlat.contains(acceptedNeedle))
+            val acceptedAt = codeFlat.indexOf(acceptedNeedle)
+            val handedAt = codeFlat.indexOf("handedOff = true")
+            val elseAt = codeFlat.indexOf("} else {", acceptedAt)
+            assertTrue(
+                "$name handedOff must be set inside the ACCEPTED arm",
+                acceptedAt in 0 until handedAt && handedAt < elseAt,
+            )
+            assertEquals("$name must have exactly one inline (synchronous) revoke",
+                1, indicesOf(codeFlat, "warningRestartController.revoke(actionId)").size)
+
+            // Every non-handed-off attempt is released by the finally.
+            assertTrue(
+                "$name finally must release a non-handed-off attempt",
+                codeFlat.contains("if (!handedOff) { policyWriteAttempts.exit(generation, attemptId) }"),
+            )
+
+            // The dedicated settlement handler consumes the token ATOMICALLY
+            // and fences stale generations before retiring.
+            val handler = block(src, "private fun onPolicyWriteAttemptComplete(")
+            val handlerFlat = flat(handler)
+            assertTrue(
+                "$name settlement must consume the token via exit()",
+                handlerFlat.contains("val attemptActive = policyWriteAttempts.exit(generation, attemptId)"),
+            )
+            assertTrue("$name settlement must reject a stale generation",
+                handlerFlat.contains("callbackGeneration != generation"))
+            assertTrue("$name settlement must use the framework-free retirement gate",
+                handlerFlat.contains("confirmAttemptRetiresAction("))
+            assertEquals("$name settlement must own exactly one revoke",
+                1, indicesOf(handlerFlat, "warningRestartController.revoke(actionId)").size)
+            assertFalse("$name settlement must not use isActive as a check-then-act token",
+                handlerFlat.contains("policyWriteAttempts.isActive("))
+
+            // Lifecycle + click peek.
+            val destroy = block(src, "override fun onDestroy()")
+            assertTrue("$name onDestroy must clear attempt tokens",
+                flat(destroy).contains("policyWriteAttempts.clear()"))
+            assertTrue("$name Positive click must peek the per-pending guard",
+                flat(src).contains("policyWriteAttempts.isAnyActive("))
+        }
+    }
+
     // PR #89 Round-3 R3-3: rotation leaves a QUEUED pending in the retained VM
     // but destroys the Activity's WarningRestartController, so the rebuilt final
     // dialog has no live consent action and its Positive arm silently cancels the
