@@ -7127,6 +7127,207 @@ class PolicyWriteTest {
         }
     }
 
+    // PR #89 Round-4 R4-1 counterexample A (full lifecycle): a BUSY retention
+    // keeps the action live; releasing the mutex and retrying with FRESH
+    // validation must commit exactly once and then retire the action.
+    @Test
+    fun retryAfterBusyRetention_commitsOnceThenRetiresAction() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val controller = WarningRestartController()
+            val hits = mutableListOf<String>()
+            val action = controller.install(
+                action = WarningRestartAction.WRITE,
+                candidateKey = "com.example.a",
+                generation = 1,
+                callback = { hits.add("write") },
+                resetBudget = true,
+            )
+            val actionId = action.identity.id
+            val tracker = PolicyWriteAttemptTracker()
+            val settlements = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+            )
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            val savesBefore = fake.saveCalls.get()
+
+            assertTrue(coord.writeMutex.tryLock())
+            try {
+                setPendingPolicyWrite(vm, pending)
+                val token1 = checkNotNull(tracker.tryEnter(pending.generation))
+                assertEquals(
+                    PolicyWriteConfirmAdmission.ACCEPTED,
+                    vm.confirmPolicyWrite(pending, pending.generation) { g, o -> settlements.add(g to o) },
+                )
+                await { settlements.isNotEmpty() }
+                assertEquals(1, settlements.size)
+                assertEquals(PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED, settlements[0].second)
+                val retire1 = confirmAttemptRetiresAction(
+                    outcome = settlements[0].second,
+                    callbackGeneration = settlements[0].first,
+                    expectedGeneration = pending.generation,
+                    attemptActive = tracker.exit(pending.generation, token1),
+                    actionLive = controller.isLive(actionId),
+                    hostAlive = true,
+                )
+                assertFalse("BUSY retryable retention must NOT retire", retire1)
+                assertTrue("action must survive a BUSY retention", controller.isLive(actionId))
+            } finally {
+                try {
+                    coord.writeMutex.unlock()
+                } catch (_: Exception) {
+                }
+            }
+
+            // Fresh retry: the VM re-runs all pre-read / consent / revision gates.
+            assertTrue("retry requires a live action", controller.isLive(actionId))
+            val token2 = checkNotNull(tracker.tryEnter(pending.generation))
+            assertEquals(
+                PolicyWriteConfirmAdmission.ACCEPTED,
+                vm.confirmPolicyWrite(pending, pending.generation) { g, o -> settlements.add(g to o) },
+            )
+            await { vm.state.value.pendingPolicyWrite == null && fake.saveCalls.get() == savesBefore + 1 }
+            assertEquals(2, settlements.size)
+            assertEquals(PolicyWriteConfirmAttemptOutcome.CONSUMED, settlements[1].second)
+            val retire2 = confirmAttemptRetiresAction(
+                outcome = settlements[1].second,
+                callbackGeneration = settlements[1].first,
+                expectedGeneration = pending.generation,
+                attemptActive = tracker.exit(pending.generation, token2),
+                actionLive = controller.isLive(actionId),
+                hostAlive = true,
+            )
+            assertTrue("CONSUMED must retire", retire2)
+            if (retire2) assertTrue(controller.revoke(actionId))
+            assertFalse("action dead after commit", controller.isLive(actionId))
+            assertEquals(setOf("com.example.a"), fake.saved)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertFalse(vm.state.value.loading)
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue(inFlightKeysOf(vm).isEmpty())
+            assertTrue(savingKeysOf(vm).isEmpty())
+            assertTrue(reconcilingKeysOf(vm).isEmpty())
+            assertTrue("revoke alone must not fire the restart callback", hits.isEmpty())
+
+            // A stale replay of the FIRST (retained) settlement cannot retire
+            // a NEWER action installed for a subsequent pending.
+            val newer = controller.install(
+                action = WarningRestartAction.WRITE,
+                candidateKey = "com.example.b",
+                generation = 2,
+                callback = { hits.add("write:newer") },
+                resetBudget = true,
+            )
+            val staleRetires = confirmAttemptRetiresAction(
+                outcome = settlements[0].second,
+                callbackGeneration = settlements[0].first,
+                expectedGeneration = pending.generation + 9L,
+                attemptActive = true,
+                actionLive = controller.isLive(newer.identity.id),
+                hostAlive = true,
+            )
+            assertFalse("stale settlement must not retire a newer action", staleRetires)
+            assertTrue(controller.isLive(newer.identity.id))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // PR #89 Round-4 R4-1 counterexample B: a second Positive while the first
+    // attempt is queued behind a slow unrelated op must be IGNORED, not mapped
+    // to cancelPolicyWrite, and must not start a second write.
+    @Test
+    fun duplicatePositiveInQueuedWindow_doesNotCancelOrDoubleWrite() {
+        val fake = FakePolicyStore()
+        val blockerEntered = java.util.concurrent.CountDownLatch(1)
+        val blockerRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val blockingSelectionStore = SelectionStore(
+            loadRaw = { null },
+            saveRaw = { _ ->
+                blockerEntered.countDown()
+                while (!blockerRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                true
+            },
+        )
+        try {
+            val vm = makeVm(fake.store, userId = 0, selectionStore = blockingSelectionStore)
+            seedSelection(vm)
+            vm.requestPolicyWrite()
+            val pending = checkNotNull(vm.state.value.pendingPolicyWrite)
+            val controller = WarningRestartController()
+            val action = controller.install(
+                action = WarningRestartAction.WRITE,
+                candidateKey = "com.example.a",
+                generation = 1,
+                callback = { },
+                resetBudget = true,
+            )
+            val actionId = action.identity.id
+            val tracker = PolicyWriteAttemptTracker()
+            val settlements = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+            )
+            val savesBefore = fake.saveCalls.get()
+            vm.cancelSavedSelection()
+            assertTrue(blockerEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            try {
+                val loadsBefore = fake.loadCalls.get()
+
+                // First Positive: guard entered, VM attempt dispatched/queued.
+                val token = checkNotNull(tracker.tryEnter(pending.generation))
+                assertEquals(
+                    PolicyWriteConfirmAdmission.ACCEPTED,
+                    vm.confirmPolicyWrite(pending, pending.generation) { g, o -> settlements.add(g to o) },
+                )
+                await { vm.policyOperationInProgress }
+                assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+                assertTrue("dispatch alone must not retire", controller.isLive(actionId))
+                assertTrue("no settlement before claim", settlements.isEmpty())
+
+                // Second Positive: production click peek sees the live attempt
+                // and returns without calling confirm OR cancel.
+                assertTrue("second Positive must be ignored", tracker.isAnyActive(pending.generation))
+                assertEquals(pending, vm.state.value.pendingPolicyWrite)
+                assertEquals(savesBefore, fake.saveCalls.get())
+                assertEquals(loadsBefore, fake.loadCalls.get())
+                assertTrue(controller.isLive(actionId))
+
+                // Explicit Negative in the SAME window must still cancel.
+                val cancelled = vm.cancelPolicyWrite(pending)
+                assertTrue(cancelled)
+                val owned = cancelOwnershipAccepted(cancelled, controller.isLive(actionId))
+                assertTrue(owned)
+                if (owned) assertTrue(controller.revoke(actionId))
+                assertNull(vm.state.value.pendingPolicyWrite)
+                assertFalse(controller.isLive(actionId))
+                assertEquals(savesBefore, fake.saveCalls.get())
+
+                // A stale token cannot release the newer action's guard.
+                assertFalse(tracker.exit(pending.generation, token + 7L))
+            } finally {
+                blockerRelease.set(true)
+            }
+            await { !vm.policyOperationInProgress }
+            assertEquals(savesBefore, fake.saveCalls.get())
+            assertEquals(setOf("com.seed"), fake.saved)
+            assertNull(vm.state.value.pendingPolicyWrite)
+        } finally {
+            blockerRelease.set(true)
+        }
+    }
+
     // Stage I2-4：coordinator 佔位（CAS 失配同理）回 IDLE（無本地 Tx）。
     // 以慢速無關 op 先佔 opMutex，使 clear 外層先 QUEUED 排隊，再設 holder，
     // 放行後內層見 reconciling 即條件回 IDLE＋epoch＋BUSY（不耗 clear）。
