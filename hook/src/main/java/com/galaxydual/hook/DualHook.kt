@@ -194,6 +194,19 @@ internal fun bbcCoherentEffectGateBounded(
     return bbcCoherentEffectDecision(true, snapshot, hybridOpen)
 }
 
+// Entry-clock-distrust decision for the BBC effect gate. When the entry clock
+// sample is untrusted the coherent snapshot cannot be read (its remaining
+// budget is zero), so the raw gate decision would be CLOSED. getBbc() would then
+// short-circuit with Cleared(-1) BEFORE its clock-distrust branch and leave
+// cached/sticky state intact. Reporting the compile-time switch instead keeps
+// main's invariant: switch ON => getBbc() discards sticky / bumps clock epoch;
+// switch OFF => still a zero-read/zero-state gate-closed short-circuit.
+internal fun bbcGateOpenWithEntryClockDistrust(
+    clockOk: Boolean,
+    compileTimeGate: Boolean,
+    coherentGate: () -> Boolean,
+): Boolean = if (!clockOk) compileTimeGate else coherentGate()
+
 // N06(a): process-local confirmed-OFF timestamp (millis on the injected clock;
 // null = no confirmed OFF in this process). compareAndSet in the gate makes the
 // get -> decide -> write transition atomic/visibility-safe under concurrent BBC
@@ -1118,16 +1131,32 @@ class DualHook : XposedModule() {
             // The compile-time constant is NOT ANDed twice (hybrid gets true).
             // A Binder stall, wrong type or torn generation degrades to CLOSED;
             // ZERO writes on every path (libxposed API 102 read-only prefs).
+            // ENTRY CLOCK DISTRUST: remainingBudget() is 0 when our clock sample
+            // is untrusted, so the coherent read would return null without a
+            // submission and this provider would report CLOSED. getBbc() would
+            // then short-circuit to Cleared(-1) BEFORE its
+            // failClosedUntrustedClockLocked() branch, leaving cached/sticky
+            // state intact and allowing a later recovery to serve an unverified
+            // snapshot. Report the compile-time switch directly instead: with
+            // the switch ON getBbc() enters its clock-distrust path (sticky
+            // discarded + Unknown(emptySet()) + clock epoch bumped, zero reader
+            // calls); with the switch OFF it still short-circuits with zero
+            // IPC/state changes. Only the healthy-clock path touches prefs.
             bbcGateOpen = {
-                bbcCoherentEffectGateBounded(
+                bbcGateOpenWithEntryClockDistrust(
+                    clockOk = clockOk,
                     compileTimeGate = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
-                    readBoundedSnapshot = {
-                        readBbcPreactivationBounded(
-                            bbcPreactivationExecutor,
-                            minOf(BBC_GATE_MAX_MS, remainingBudget()),
-                        ) { bbcCoherentPrefsNow() }
-                    },
-                )
+                ) {
+                    bbcCoherentEffectGateBounded(
+                        compileTimeGate = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+                        readBoundedSnapshot = {
+                            readBbcPreactivationBounded(
+                                bbcPreactivationExecutor,
+                                minOf(BBC_GATE_MAX_MS, remainingBudget()),
+                            ) { bbcCoherentPrefsNow() }
+                        },
+                    )
+                }
             },
             followerGraceMs = graceAtEntry,
             deadlineMs = deadlineMs,

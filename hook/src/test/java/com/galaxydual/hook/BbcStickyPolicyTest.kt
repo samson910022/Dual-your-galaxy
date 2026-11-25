@@ -347,6 +347,66 @@ class BbcStickyPolicyTest {
     }
 
     @Test
+    fun bbcEntryClockDistrustReachesStickyDiscardWithoutPrefRead() {
+        // Production bbcPolicy() uses bbcGateOpenWithEntryClockDistrust: when
+        // its entry clock sample is untrusted, the coherent read has a 0ms
+        // budget and the raw gate would report CLOSED. getBbc() would then
+        // short-circuit with Cleared(-1) BEFORE failClosedUntrustedClockLocked(),
+        // leaving stale sticky intact. Reporting the compile-time switch keeps
+        // main's invariant: switch ON reaches the discard/epoch path with ZERO
+        // reader calls; switch OFF stays a zero-state short-circuit.
+        val clock = MutableClock(1_000L)
+        val cache = bbcCacheWithClock(clock)
+        assertTrue(cache.getBbc(emptySet(), reader = { Pair(setOf("A"), 1L) }) is EffectivePolicyCache.BbcPolicy.Good)
+        val epoch0 = clockEpoch(cache)
+        clock.throwing = true
+        var reads = 0
+        var coherentGateCalls = 0
+        val result = cache.getBbc(
+            emptySet(),
+            bbcGateOpen = {
+                bbcGateOpenWithEntryClockDistrust(clockOk = false, compileTimeGate = true) {
+                    coherentGateCalls++
+                    true
+                }
+            },
+            reader = { reads++; Pair(null, null) },
+        )
+        assertTrue(result is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals(emptySet<String>(), (result as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+        assertEquals("no pref/reader call under entry distrust", 0, reads)
+        assertEquals("coherent gate must not run with a 0ms budget", 0, coherentGateCalls)
+        assertTrue("clock epoch must fence in-flight reads", clockEpoch(cache) > epoch0)
+        assertFalse(cache.isCached())
+        clock.throwing = false
+        val after = cache.getBbc(emptySet(), reader = { reads++; Pair(null, null) })
+        assertTrue(after is EffectivePolicyCache.BbcPolicy.Unknown)
+        assertEquals("sticky was discarded, not reused after recovery", emptySet<String>(), (after as EffectivePolicyCache.BbcPolicy.Unknown).lastGood)
+
+        // Compile-time emergency switch OFF: still zero reads and zero cache
+        // state changes (gate-closed short-circuit preserved).
+        val clock2 = MutableClock(1_000L)
+        val cache2 = bbcCacheWithClock(clock2)
+        assertTrue(cache2.getBbc(emptySet(), reader = { Pair(setOf("B"), 1L) }) is EffectivePolicyCache.BbcPolicy.Good)
+        val epoch2 = clockEpoch(cache2)
+        clock2.throwing = true
+        var reads2 = 0
+        val off = cache2.getBbc(
+            emptySet(),
+            bbcGateOpen = { bbcGateOpenWithEntryClockDistrust(false, false) { error("coherent gate must not run") } },
+            reader = { reads2++; Pair(null, null) },
+        )
+        assertTrue(off is EffectivePolicyCache.BbcPolicy.Cleared)
+        assertEquals(0, reads2)
+        assertEquals(epoch2, clockEpoch(cache2))
+        clock2.throwing = false
+        val stillThere = cache2.getBbc(emptySet(), reader = { reads2++; Pair(null, null) })
+        assertTrue(stillThere is EffectivePolicyCache.BbcPolicy.Good)
+        assertEquals(setOf("B"), (stillThere as EffectivePolicyCache.BbcPolicy.Good).packages)
+        assertEquals("zero state changes means the cached Good is untouched", 0, reads2)
+    }
+
+    @Test
     fun stickyCapBoundaryExactlyAtCapExpiresBbc() {
         // cap-1 keeps the sticky; exactly cap expires it (cap+1 is pinned by
         // stickyCapExpiresToEmptyBbc above). Separate caches keep the failure

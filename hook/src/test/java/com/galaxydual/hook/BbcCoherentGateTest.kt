@@ -131,7 +131,7 @@ class BbcCoherentGateTest {
             ),
         )
         try {
-            assertFalse(finalGate(prefs, executor))
+            assertFalse(finalGate(prefs, executor, timeoutMs = GENEROUS_READ_TIMEOUT_MS))
             assertEquals("exactly ONE bounded submission", 1, executor.submissions.get())
             assertEquals("exactly ONE getAll() copy", 1, prefs.getAllCalls)
             assertEquals("zero write attempts", 0, prefs.editCalls)
@@ -153,7 +153,7 @@ class BbcCoherentGateTest {
             ),
         )
         try {
-            assertTrue(finalGate(prefs, executor))
+            assertTrue(finalGate(prefs, executor, timeoutMs = GENEROUS_READ_TIMEOUT_MS))
             assertEquals(1, executor.submissions.get())
             assertEquals(1, prefs.getAllCalls)
             assertEquals(0, prefs.editCalls)
@@ -182,7 +182,7 @@ class BbcCoherentGateTest {
             val executor = CountingExecutor(newExecutor())
             val prefs = CountingPrefs(first, alternateValues = second)
             try {
-                assertFalse(finalGate(prefs, executor))
+                assertFalse(finalGate(prefs, executor, timeoutMs = GENEROUS_READ_TIMEOUT_MS))
                 assertEquals(1, executor.submissions.get())
                 assertEquals("only one generation may be read", 1, prefs.getAllCalls)
                 assertEquals(0, prefs.editCalls)
@@ -317,7 +317,7 @@ class BbcCoherentGateTest {
             ),
         )
         try {
-            assertFalse(finalGate(prefs, executor))
+            assertFalse(finalGate(prefs, executor, timeoutMs = GENEROUS_READ_TIMEOUT_MS))
             assertEquals(1, executor.submissions.get())
             assertEquals(1, prefs.getAllCalls)
             assertEquals(0, prefs.editCalls)

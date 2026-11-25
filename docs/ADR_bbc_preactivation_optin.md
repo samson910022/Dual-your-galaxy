@@ -130,7 +130,7 @@ fail-closed，並把 legacy 判定從「目前的草稿 bytes」改為 App 持�
   （都在其可寫入的 `XposedService` remote-prefs 通道），Hook 端唯讀；不聲稱 Hook
   端曾完成任何寫入。
 - 既有 hybrid 測試中「首次讀取失敗 fail-open」的預期已如實改為 fail-closed；
-  沒有丟棄任何 hybrid fail-open 預期。API 102 marker-writer 測試
+  未刪除或跳過任何測試。API 102 marker-writer 測試
   (`BbcMigrationMarkerTest.kt`) 已隨其 production writer 一併移除（Hook 唯讀），
   並由 read-only／owner-write 測試取代。
 - **已知限制（App opt-in commit Unknown 與冷行程）**：`commit(false)`／拋錯時如實
