@@ -702,6 +702,15 @@ class HookPolicyStore(
     // contains() so absent is a definite false and a read failure is null.
     // Direct-injected test backends default to absent / unreadable.
     private val readBbcLegacyMigratedAuthoritativeRaw: () -> Boolean? = { null },
+    // PR #90 review: ONE coherent snapshot of ALL consent-authoritative keys,
+    // mirroring the Hook-side BbcCoherentPrefsSnapshot. Unlike the per-key seams
+    // above (kept for their existing callers), this reads ONE prefs instance and
+    // maps any failure / wrong type / mismatch to a single fail-closed result so
+    // App and Hook cannot disagree about the same durable bytes. Cancellation
+    // still propagates. Direct-injected test backends default to fail-closed.
+    private val readBbcConsentDurableRaw: () -> BbcConsentDurableSnapshot = {
+        BbcConsentDurableSnapshot.failClosed()
+    },
 ) {
 
     // E07 (PR #74 R4): app-process-local, one-shot signal that a SUCCESSFUL
@@ -848,6 +857,21 @@ class HookPolicyStore(
         throw ce
     } catch (_: Throwable) {
         null
+    }
+
+    /**
+     * PR #90 review: the AUTHORITATIVE durable read used for app consent
+     * resolution. All keys come from ONE coherent [BbcConsentDurableSnapshot];
+     * a failed/invalid/torn read masks the WHOLE snapshot (never a hybrid of
+     * two generations, never an inferred default-true runtime value). The
+     * generation is supplied by the caller (the app-scoped holder owns it).
+     */
+    internal fun readBbcConsentAuthoritative(): BbcConsentDurableSnapshot = try {
+        readBbcConsentDurableRaw()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcConsentDurableSnapshot.failClosed()
     }
 
     // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
@@ -1722,6 +1746,121 @@ fun remoteHookPolicyStore(
                     throw ce
                 } catch (_: Throwable) {
                     null
+                }
+            }
+        },
+        // PR #90 review P2: ONE immutable copy of the CURRENT service
+        // instance's prefs (mirrors the Hook's BbcCoherentPrefsSnapshot:
+        // getAll() exactly once + copy). Every key is read from that SAME copy,
+        // so no live/torn binder view can mix generations and no ~16 paired
+        // contains()/typed-get trips are needed. The Hook's failure detectors
+        // are mirrored exactly: a corrupt version key (wrong type / CCE /
+        // value < 1) and a wrong-typed package set mask the WHOLE snapshot.
+        // An ABSENT key stays a definite ABSENT/null, never default-true.
+        readBbcConsentDurableRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                BbcConsentDurableSnapshot.failClosed()
+            } else {
+                val copy: Map<String, Any?>? = try {
+                    LinkedHashMap<String, Any?>(prefs.all)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+                if (copy == null) {
+                    BbcConsentDurableSnapshot.failClosed()
+                } else {
+                    var failed = false
+
+                    fun booleanKey(key: String): Boolean? {
+                        if (!copy.containsKey(key)) return null // definite ABSENT
+                        val value = copy[key]
+                        if (value !is Boolean) {
+                            failed = true // present but wrong type => fail closed
+                            return null
+                        }
+                        return value
+                    }
+
+                    fun stringKey(key: String): String? {
+                        if (!copy.containsKey(key)) return null
+                        val value = copy[key]
+                        if (value !is String) {
+                            failed = true
+                            return null
+                        }
+                        return value
+                    }
+
+                    // Version seqlock over the SAME copy, via the shared hook
+                    // probe contract. A corrupt / unreadable version fails the
+                    // whole snapshot, exactly like hook/BbcPreactivationPrefs.
+                    fun probeVersionFromCopy(): VersionProbeResult = try {
+                        probeVersion(object : VersionPrefsView {
+                            override fun containsVersion(): Boolean =
+                                copy.containsKey(PolicySource.POLICY_KEY_EXTRA_VERSION)
+
+                            override fun readVersion(defValue: Long): Long {
+                                val value = copy[PolicySource.POLICY_KEY_EXTRA_VERSION]
+                                    ?: return defValue
+                                if (value !is Long) {
+                                    throw ClassCastException("$value is not a Long")
+                                }
+                                return value
+                            }
+                        })
+                    } catch (_: Throwable) {
+                        VersionProbeResult.Unavailable
+                    }
+                    val versionBefore = probeVersionFromCopy()
+
+                    val optIn = booleanKey(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN)
+                    val migrated = booleanKey(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED)
+                    val classification = stringKey(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION)
+                        .also {
+                            if (it != null && it !in PolicySource.INSTALL_CLASSIFICATION_VALUES) {
+                                failed = true
+                            }
+                        }
+                    // Authoritative runtime seed for Legacy. ABSENT => null; a
+                    // default-true fallback here would fabricate a checked state.
+                    val runtime = booleanKey(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED)
+
+                    // Failure detector ONLY (never legacy evidence): a hostile
+                    // package-set value must mask the whole snapshot, matching
+                    // the Hook reader's packagesReadable check.
+                    val packagesKey = PolicySource.POLICY_KEY_EXTRA_PACKAGES
+                    if (copy.containsKey(packagesKey) && copy[packagesKey] !is Set<*>) {
+                        failed = true
+                    }
+
+                    val versionAfter = probeVersionFromCopy()
+                    if (versionBefore is VersionProbeResult.Invalid ||
+                        versionBefore is VersionProbeResult.Unavailable ||
+                        versionAfter is VersionProbeResult.Invalid ||
+                        versionAfter is VersionProbeResult.Unavailable ||
+                        versionBefore != versionAfter
+                    ) {
+                        failed = true
+                    }
+
+                    if (failed) {
+                        BbcConsentDurableSnapshot.failClosed()
+                    } else {
+                        BbcConsentDurableSnapshot(
+                            optIn = when (optIn) {
+                                null -> BbcOptInValue.ABSENT
+                                true -> BbcOptInValue.TRUE
+                                false -> BbcOptInValue.FALSE
+                            },
+                            classification = classification,
+                            migrated = migrated,
+                            legacyRuntimeEnabled = runtime,
+                            coherent = true,
+                        )
+                    }
                 }
             }
         },

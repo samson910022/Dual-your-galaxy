@@ -25,6 +25,7 @@ import org.junit.Test
 private val optinKey = PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN
 private val classKey = PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION
 private val markerKey = PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED
+private val runtimeKey = PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class BbcConsentDurabilityFenceTest {
@@ -69,16 +70,24 @@ class BbcConsentDurabilityFenceTest {
 
         fun authoritativeRead(generation: Long) = BbcConsentAuthoritativeRead(
             serviceGeneration = generation,
-            optInGranted = if (contains(optinKey)) getBoolean(optinKey, false) else false,
+            optIn = if (!contains(optinKey)) {
+                BbcOptInValue.ABSENT
+            } else if (getBoolean(optinKey, false)) {
+                BbcOptInValue.TRUE
+            } else {
+                BbcOptInValue.FALSE
+            },
             classification = if (contains(classKey)) getString(classKey, null) else null,
             migrated = if (contains(markerKey)) getBoolean(markerKey, false) else false,
-            legacyRuntimeEnabled = true,
+            // Authoritative contains()-based seed: no default-true fabrication.
+            legacyRuntimeEnabled = if (contains(runtimeKey)) getBoolean(runtimeKey, false) else null,
         )
     }
 
     private fun newService(): FakePrefs {
         val durable = mutableMapOf<String, Any>(
             classKey to PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
+            runtimeKey to true,
         )
         return FakePrefs(durable)
     }
@@ -146,7 +155,7 @@ class BbcConsentDurabilityFenceTest {
         // Upgrade install: the owner App's bind-time durable classification
         // commit fails. The local mMap is polluted with PRE_UPGRADE + marker;
         // the daemon persisted NEITHER key.
-        val durable = mutableMapOf<String, Any>()
+        val durable = mutableMapOf<String, Any>(runtimeKey to true)
         val service = FakePrefs(durable)
         service.commitOk = false
         assertFalse(service.commitClassification(
@@ -180,7 +189,13 @@ class BbcConsentDurabilityFenceTest {
             PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING, marker = true,
         ))
         holder.onServiceGenerationChanged(2L)
+        holder.markInstallClassificationConfirmed(2L)
         val b = harness(holder, coordinator(holder, service))
+        // The legacy runtime seed is only used when a View is first built.
+        // Supply the confirmed effect the projection needs to settle the box:
+        // the durable legacy authorization alone must not fabricate a value.
+        b.coordinator.state.mark(BbcWriteOutcome.Confirmed(true), 1L)
+        testScheduler.runCurrent()
         b.coordinator.submitConsentRead()
         testScheduler.advanceUntilIdle()
         assertEquals(BbcActivationConsentState.Legacy(true), holder.currentState())
@@ -190,6 +205,59 @@ class BbcConsentDurabilityFenceTest {
         b.userToggle(false)
         assertEquals("a durable legacy migration must not demand consent", 0, b.dialogsShown.size)
         assertEquals(listOf(true, false), b.toggleCalls)
+        b.dispose()
+    }
+
+    @Test
+    fun queuedReadAfterFailedClassification_fences_thenConfirmedReadAuthorizesLegacy() = runTest {
+        val durable = mutableMapOf<String, Any>(runtimeKey to true)
+        val service = FakePrefs(durable)
+        service.commitOk = false
+        assertFalse(service.commitClassification(
+            PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING, marker = true,
+        ))
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.markInstallClassificationFailed(1L)
+
+        // P2 review: feed the OPTIMISTIC local mMap (not a fresh durable
+        // instance) so the test actually exercises the pollution its comment
+        // describes. The holder's same-generation fence must reject it.
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val localReadCoordinator = BbcToggleCoordinator(
+            scope = appScope,
+            state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { BbcWriteOutcome.Confirmed(it) },
+            io = dispatcher,
+            consentCommit = { BbcWriteOutcome.Unknown },
+            consentRead = { generation -> service.authoritativeRead(generation) },
+            consentHolder = holder,
+        )
+        val a = BbcConsentTestHarness(holder, localReadCoordinator, dispatcher)
+        a.coordinator.submitConsentRead()
+        testScheduler.advanceUntilIdle()
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+        assertTrue(holder.currentState().requiresConsentFor(true))
+        assertNull(holder.currentState().toggleUi().checked)
+        a.dispose()
+
+        // Retry on a NEW generation with a confirmed durable classification and
+        // a persisted runtime opt-out of FALSE: no default-true fabrication.
+        service.durable[runtimeKey] = false
+        service.commitOk = true
+        assertTrue(service.commitClassification(
+            PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING, marker = true,
+        ))
+        holder.onServiceGenerationChanged(2L)
+        holder.markInstallClassificationConfirmed(2L)
+        val b = harness(holder, coordinator(holder, service))
+        b.coordinator.submitConsentRead()
+        testScheduler.advanceUntilIdle()
+        assertEquals(BbcActivationConsentState.Legacy(false), holder.currentState())
+        assertEquals(false, b.lastSettledChecked)
+        assertFalse(holder.currentState().requiresConsentFor(true))
         b.dispose()
     }
 
@@ -325,7 +393,7 @@ class BbcConsentDurabilityFenceTest {
         b.accept()
         testScheduler.advanceUntilIdle()
         assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
-        holder.resolve(BbcConsentAuthoritativeRead(2L, true, null, null, true))
+        holder.resolve(bbcConsentAuthoritativeReadLegacyBoolean(2L, true, null, null, true))
         assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
         b.dispose()
 
@@ -357,7 +425,7 @@ class BbcConsentDurabilityFenceTest {
         assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
 
         // Same-gen raw local read=true (the polluted mMap) is rejected.
-        holder.resolve(BbcConsentAuthoritativeRead(1L, true, null, null, true))
+        holder.resolve(bbcConsentAuthoritativeReadLegacyBoolean(1L, true, null, null, true))
         assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
 
         // Confirmed write on the current generation DOES grant.

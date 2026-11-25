@@ -503,4 +503,96 @@ class BbcPreactivationClassificationTest {
         assertEquals(dataAfterFirst, LinkedHashMap(prefs.data))
         assertTrue(hookOpen(prefs))
     }
+
+    @Test
+    fun unknownInstallClassificationValue_isNeverOverwritten() {
+        // A value this client does not understand is never replaced by a
+        // guess (neither the bind-time durable confirmation nor the legacy
+        // idempotent writer may touch it).
+        val prefs = PersistedPrefs().apply {
+            data[classificationKey] = "FUTURE_SCHEMA_UNKNOWN"
+        }
+        val before = LinkedHashMap(prefs.data)
+
+        assertFalse(confirmBbcInstallClassificationDurable { prefs })
+        assertFalse(ensureBbcInstallClassification { prefs })
+
+        assertEquals("an unknown classification value must be preserved verbatim",
+            before, LinkedHashMap(prefs.data))
+        assertEquals("no durable commit may be attempted for an unknown value",
+            0, prefs.commitCalls)
+        assertTrue("no key may be rewritten for an unknown value", prefs.writtenKeys.isEmpty())
+    }
+
+    /**
+     * PR #90 P1-2: the optimistic-local-mMap confirmation trap, exact sequence.
+     * gen1 commit(PRE_UPGRADE, marker) fails -> daemon has neither key;
+     * markInstallClassificationFailed(1) fences Unknown. Service death clears
+     * the pending intent, and a duplicate/rebind returns the SAME prefs
+     * instance (PendingBbcClassification.matches uses ===). A NoWrite inferred
+     * from the polluted local mMap must NEVER confirm classification: the Hook
+     * would stay OFF while the App skipped consent. Only a real successful
+     * durable commit may authorize Legacy.
+     */
+    @Test
+    fun failedCommitThenDeathClearedPending_sameInstanceRebind_neverConfirmsFromPollutedLocalMap() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val prefs = OptimisticPrefs(mapOf(packagesKey to setOf("com.example.old"), versionKey to 7L))
+
+        prefs.commitSucceeds = false
+        assertFalse("gen1 bind-time commit fails", confirmBbcInstallClassificationDurable { prefs })
+        assertNull("daemon persisted no classification", prefs.durable[classificationKey])
+        assertNull("daemon persisted no marker", prefs.durable[markerKey])
+        assertEquals(preUpgrade, prefs.local[classificationKey])
+        assertEquals(true, prefs.local[markerKey])
+        holder.markInstallClassificationFailed(1L)
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+
+        // Service death clears the pending intent; a duplicate rebind returns
+        // the SAME prefs instance (local map still polluted).
+        clearPendingBbcClassification()
+        holder.onServiceGenerationChanged(2L)
+        assertFalse("retry commit still fails", confirmBbcInstallClassificationDurable { prefs })
+        assertNull(prefs.durable[classificationKey])
+        assertNull(prefs.durable[markerKey])
+        holder.markInstallClassificationFailed(2L)
+
+        // Feed the polluted local read: the current-generation Unknown fence
+        // must hold, with no Legacy and no consent skip.
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 2L,
+                optIn = BbcOptInValue.ABSENT,
+                classification = prefs.local[classificationKey] as? String,
+                migrated = prefs.local[markerKey] as? Boolean,
+                legacyRuntimeEnabled = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+        assertTrue(holder.currentState().requiresConsentFor(true))
+        assertFalse("Hook gate must be OFF — nothing durable was persisted", hookOpenDurable(prefs))
+
+        // A subsequent SUCCESSFUL durable commit DOES authorize Legacy and
+        // opens the Hook gate (on a newer service generation, so the old
+        // Unknown fence no longer applies).
+        prefs.commitSucceeds = true
+        assertTrue("a real commit confirms", confirmBbcInstallClassificationDurable { prefs })
+        assertEquals(preUpgrade, prefs.durable[classificationKey])
+        assertEquals(true, prefs.durable[markerKey])
+        holder.onServiceGenerationChanged(3L)
+        holder.markInstallClassificationConfirmed(3L)
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 3L,
+                optIn = BbcOptInValue.ABSENT,
+                classification = prefs.durable[classificationKey] as? String,
+                migrated = prefs.durable[markerKey] as? Boolean,
+                legacyRuntimeEnabled = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Legacy(true), holder.currentState())
+        assertFalse(holder.currentState().requiresConsentFor(true))
+        assertTrue(hookOpenDurable(prefs))
+    }
 }

@@ -9,6 +9,7 @@ import com.galaxydual.hook.PolicySource
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -32,13 +33,25 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class BbcActivationConsentStateMachineTest {
 
+    /** Boolean-ish helper: true/false/null map to TRUE/ABSENT/UNAVAILABLE. */
     private fun read(
         generation: Long,
         optIn: Boolean?,
         classification: String? = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
-        runtime: Boolean = false,
+        runtime: Boolean? = false,
         migrated: Boolean? = null,
-    ) = BbcConsentAuthoritativeRead(generation, optIn, classification, migrated, runtime)
+        coherent: Boolean = true,
+    ) = bbcConsentAuthoritativeReadLegacyBoolean(generation, optIn, classification, migrated, runtime, coherent)
+
+    /** Explicit enum helper for the ABSENT-vs-FALSE-vs-UNAVAILABLE parity cases. */
+    private fun read(
+        generation: Long,
+        optIn: BbcOptInValue,
+        classification: String? = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
+        runtime: Boolean? = false,
+        migrated: Boolean? = null,
+        coherent: Boolean = true,
+    ) = BbcConsentAuthoritativeRead(generation, optIn, classification, migrated, runtime, coherent)
 
     /** Shared app-scoped coordinator on one TestScheduler, as in BbcToggleConcurrencyTest. */
     private fun TestScope.newCoordinator(
@@ -168,6 +181,7 @@ class BbcActivationConsentStateMachineTest {
     fun legacyInit_usesRuntimeValueAndNeverAsks() = runTest {
         val holder = BbcActivationConsentHolder()
         holder.onServiceGenerationChanged(1L)
+        holder.markInstallClassificationConfirmed(1L)
         holder.resolve(
             read(
                 1L, optIn = false,
@@ -213,7 +227,9 @@ class BbcActivationConsentStateMachineTest {
         )
         assertEquals(BbcActivationConsentState.Initializing, holder.currentState())
 
-        // MIGRATED opens without a marker; it is the durable classification.
+        // MIGRATED opens without a marker, but only once the App has confirmed
+        // the durable classification for this generation.
+        holder.markInstallClassificationConfirmed(1L)
         holder.resolve(
             read(
                 1L, optIn = false,
@@ -269,6 +285,7 @@ class BbcActivationConsentStateMachineTest {
 
         val legacy = BbcActivationConsentHolder()
         legacy.onServiceGenerationChanged(2L)
+        legacy.markInstallClassificationConfirmed(2L)
         legacy.resolve(
             read(
                 2L, optIn = false,
@@ -660,5 +677,372 @@ class BbcActivationConsentStateMachineTest {
             appScope.cancel()
             io.close()
         }
+    }
+
+    // ---- PR #90 review: ONE UI projection / authorization parity -------------
+
+    private fun TestScope.coordinatorWithEffect(
+        holder: BbcActivationConsentHolder,
+        confirmedEffect: Boolean,
+    ): BbcToggleCoordinator {
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false)
+        assertTrue(runtime.mark(BbcWriteOutcome.Confirmed(confirmedEffect), 1L))
+        val appScope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        return BbcToggleCoordinator(
+            scope = appScope,
+            state = runtime,
+            commit = { BbcWriteOutcome.Confirmed(it) },
+            io = StandardTestDispatcher(testScheduler),
+            consentCommit = { BbcWriteOutcome.Unknown },
+            consentHolder = holder,
+        )
+    }
+
+    @Test
+    fun coldStartOptInTrueWithRuntimeFalse_rendersUnchecked() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = BbcOptInValue.TRUE, runtime = false))
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+        assertNull("authorization must never fabricate a checkbox value",
+            holder.currentState().toggleUi().checked)
+
+        val h = harness(holder, coordinatorWithEffect(holder, confirmedEffect = false))
+        testScheduler.advanceUntilIdle()
+        assertEquals("consent=true + runtime=false must render UNCHECKED", false, h.lastSettledChecked)
+        assertEquals(0, h.toggleCalls.size)
+        h.dispose()
+
+        // Even with no effect mark at all (Provisional), a grant alone must not
+        // fabricate ON: the neutral seed leaves the box unchecked.
+        val h2 = harness(holder, newCoordinator(holder, { BbcWriteOutcome.Unknown }))
+        testScheduler.advanceUntilIdle()
+        assertEquals(false, h2.lastSettledChecked)
+        h2.dispose()
+    }
+
+    @Test
+    fun grantedEmissionAfterConfirmedFalse_doesNotRecheckTheBox() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false)) // NotGranted, effect OFF
+        val h = harness(holder, coordinatorWithEffect(holder, confirmedEffect = false))
+        testScheduler.advanceUntilIdle()
+        assertEquals(false, h.lastSettledChecked)
+
+        // A rebind/resync finds durable opt-in=true. The newer authorization is
+        // Granted, but the confirmed effect is still OFF: OFF wins.
+        holder.resolve(read(1L, optIn = BbcOptInValue.TRUE, runtime = false))
+        testScheduler.advanceUntilIdle()
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+        assertEquals(false, h.lastSettledChecked)
+        assertEquals("Granted authorization must not dispatch an effect by itself", 0, h.toggleCalls.size)
+        h.dispose()
+    }
+
+    /**
+     * PR #90 P1-3: a rebuilt View must NOT flip a user's in-flight OFF back ON.
+     * The effect axis replays Confirmed(true) to the new per-View locals while
+     * the OFF commit has not landed. Only the APP-SCOPED latest intent (recorded
+     * at coordinator submit) can keep the box OFF — including after an Unknown
+     * outcome, which is not an acknowledgement.
+     */
+    @Test
+    fun rebuildDuringInFlightOff_keepsUserOffAfterReplayAndUnknown() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false)) // NotGranted; OFF needs no consent
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false)
+        val inheritedSeq = runtime.nextSequence() // reserve the inherited mark's sequence
+        assertTrue("seed the inherited effect ON", runtime.mark(BbcWriteOutcome.Confirmed(true), inheritedSeq))
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val outcome = CompletableDeferred<BbcWriteOutcome>()
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope,
+            state = runtime,
+            commit = { outcome.await() }, // in flight until released below
+            io = dispatcher,
+            consentCommit = { BbcWriteOutcome.Unknown },
+            consentHolder = holder,
+        )
+
+        val a = BbcConsentTestHarness(holder, coordinator, dispatcher)
+        testScheduler.advanceUntilIdle()
+        assertEquals(true, a.lastSettledChecked) // Confirmed(true) replay
+
+        // Tap OFF: intent is recorded app-scoped; the commit blocks.
+        a.userToggle(false)
+        testScheduler.advanceUntilIdle()
+        assertEquals(false, a.lastSettledChecked)
+
+        // Rebuild the View BEFORE the OFF result lands. Its per-View locals are
+        // fresh (pendingIntentChecked = null) but the app-scoped intent survives.
+        val b = BbcConsentTestHarness(holder, coordinator, dispatcher)
+        b.seedFromHolder()
+        testScheduler.advanceUntilIdle()
+        assertEquals("a rebuilt View must keep the in-flight OFF", false, b.lastSettledChecked)
+        assertEquals("the old View must also stay OFF", false, a.lastSettledChecked)
+
+        // A stale/inherited Confirmed(true) replay cannot supersede the newer
+        // OFF intent (its sequence is older, so the fence drops it).
+        assertFalse(runtime.mark(BbcWriteOutcome.Confirmed(true), inheritedSeq))
+        testScheduler.advanceUntilIdle()
+        assertEquals(false, b.lastSettledChecked)
+
+        // The OFF commit reports Unknown: the user's last intent still wins.
+        outcome.complete(BbcWriteOutcome.Unknown)
+        testScheduler.advanceUntilIdle()
+        assertEquals("Unknown must not revert to the stale Confirmed ON", false, b.lastSettledChecked)
+        assertEquals(false, a.lastSettledChecked)
+        a.dispose()
+        b.dispose()
+    }
+
+    /**
+     * P1-A counterexample 1: the newest OFF tap must be what the checkbox
+     * renders, even while an older ON intent is still projected app-scoped
+     * because its commit is blocked in the single writer.
+     */
+    @Test
+    fun newestOffTapWinsOverStillProjectedOlderOnIntent() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = true)) // Granted: no consent dialog on ON
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false)
+        val confirmedSeq = runtime.nextSequence()
+        assertTrue(runtime.mark(BbcWriteOutcome.Confirmed(false), confirmedSeq))
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val blocked = CompletableDeferred<BbcWriteOutcome>()
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope,
+            state = runtime,
+            commit = { blocked.await() }, // ON enters the writer and parks here
+            io = dispatcher,
+            consentCommit = { BbcWriteOutcome.Unknown },
+            consentHolder = holder,
+        )
+        val h = BbcConsentTestHarness(holder, coordinator, dispatcher)
+        testScheduler.advanceUntilIdle()
+        assertEquals(false, h.lastSettledChecked)
+
+        h.userToggle(true) // ON@seq2: submitted, but the commit is blocked
+        testScheduler.advanceUntilIdle()
+        assertEquals(true, h.lastSettledChecked)
+        assertEquals(0, h.dialogsShown.size)
+
+        h.userToggle(false) // OFF@seq3 must be authoritative at render time
+        testScheduler.advanceUntilIdle()
+        assertEquals("the newest tap must not be rendered with the previous intent",
+            false, h.lastSettledChecked)
+        assertEquals(listOf(true, false), h.toggleCalls)
+
+        blocked.complete(BbcWriteOutcome.Unknown)
+        testScheduler.advanceUntilIdle()
+        assertEquals(false, h.lastSettledChecked)
+        h.dispose()
+    }
+
+    /**
+     * P1-A counterexample 2: after the user accepts the dialog, the checkbox
+     * must immediately show the chosen ON, not the older app-scoped OFF intent
+     * left behind by the blocked preceding tap.
+     */
+    @Test
+    fun acceptRendersChosenOnOverStaleProjectedOff() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false)) // NotGranted: ON demands consent
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false)
+        val inherited = runtime.nextSequence()
+        assertTrue(runtime.mark(BbcWriteOutcome.Confirmed(true), inherited))
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val blocked = CompletableDeferred<BbcWriteOutcome>()
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope,
+            state = runtime,
+            commit = { blocked.await() }, // OFF's commit is still in flight
+            io = dispatcher,
+            consentCommit = { BbcWriteOutcome.Confirmed(true) },
+            consentHolder = holder,
+        )
+        val h = BbcConsentTestHarness(holder, coordinator, dispatcher)
+        testScheduler.advanceUntilIdle()
+        assertEquals(true, h.lastSettledChecked) // inherited Confirmed(true)
+
+        h.userToggle(false) // OFF@seq2 blocked in the writer
+        testScheduler.advanceUntilIdle()
+        assertEquals(false, h.lastSettledChecked)
+
+        h.userToggle(true)
+        assertEquals(1, h.dialogsShown.size)
+        h.accept() // user just chose ON; the stale OFF must not repaint the box
+        assertEquals("accept must render the user's ON immediately",
+            true, h.lastSettledChecked)
+        // Release the blocked OFF commit so the queued consent write can land;
+        // neither it nor its Unknown outcome may undo the chosen ON.
+        blocked.complete(BbcWriteOutcome.Unknown)
+        testScheduler.advanceUntilIdle()
+        assertEquals(true, h.lastSettledChecked)
+        assertEquals(listOf(false, true), h.toggleCalls)
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+        h.dispose()
+    }
+
+    /**
+     * P1-A cancel case: cancel restores the pre-dialog value with ZERO effect
+     * writes, and a later render (triggered by an async effect emission) must
+     * not be hijacked by a stale app-scoped intent from a dead UI.
+     */
+    @Test
+    fun cancelRestoreIsNotOverwrittenByStaleAppIntent() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false)) // NotGranted
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false)
+        val inherited = runtime.nextSequence()
+        assertTrue(runtime.mark(BbcWriteOutcome.Confirmed(true), inherited))
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { BbcWriteOutcome.Confirmed(it) }, io = dispatcher,
+            consentCommit = { BbcWriteOutcome.Unknown }, consentHolder = holder,
+        )
+        val h = BbcConsentTestHarness(holder, coordinator, dispatcher)
+        testScheduler.advanceUntilIdle()
+        assertEquals(true, h.lastSettledChecked)
+
+        // A dead UI's older OFF intent is still app-scoped/projected.
+        runtime.noteToggleIntent(inherited + 1L, false)
+        h.userToggle(true) // opens the dialog; the box still shows the pre-dialog ON
+        assertEquals(true, h.lastSettledChecked)
+
+        h.cancel()
+        assertEquals("cancel must restore the pre-dialog ON", true, h.lastSettledChecked)
+        assertEquals(0, h.toggleCalls.size)
+
+        // An async effect emission re-renders: the stale OFF intent must not
+        // settle the restored value, and no effect write may be issued.
+        assertTrue(runtime.mark(BbcWriteOutcome.Unknown))
+        testScheduler.advanceUntilIdle()
+        assertEquals("stale app intent must not overwrite the cancel restore",
+            true, h.lastSettledChecked)
+        assertEquals(0, h.toggleCalls.size)
+        h.dispose()
+    }
+
+    @Test
+    fun projection_pendingIntentWins_thenConfirmedEffect_thenNeutral() {
+        assertEquals(
+            "an unacknowledged user intent wins over a stale confirmed OFF",
+            true,
+            bbcToggleUiProjection(BbcActivationConsentState.Granted, BbcEffectStatus.Confirmed(false), true).checked,
+        )
+        // P1-3 explicit directions: a pending OFF must beat a Confirmed ON,
+        // and a pending intent must beat both Provisional and Unknown effects.
+        assertEquals(
+            "a pending OFF wins over a replayed Confirmed ON",
+            false,
+            bbcToggleUiProjection(BbcActivationConsentState.Granted, BbcEffectStatus.Confirmed(true), false).checked,
+        )
+        assertEquals(true, bbcToggleUiProjection(
+            BbcActivationConsentState.Granted, BbcEffectStatus.Provisional, true,
+        ).checked)
+        assertEquals(false, bbcToggleUiProjection(
+            BbcActivationConsentState.Granted, BbcEffectStatus.Provisional, false,
+        ).checked)
+        assertEquals(true, bbcToggleUiProjection(
+            BbcActivationConsentState.Granted, BbcEffectStatus.Unknown, true,
+        ).checked)
+        assertEquals(false, bbcToggleUiProjection(
+            BbcActivationConsentState.Granted, BbcEffectStatus.Unknown, false,
+        ).checked)
+        assertEquals(
+            false,
+            bbcToggleUiProjection(BbcActivationConsentState.Granted, BbcEffectStatus.Confirmed(false), null).checked,
+        )
+        val initializing = bbcToggleUiProjection(
+            BbcActivationConsentState.Initializing, BbcEffectStatus.Provisional, null,
+        )
+        assertNull(initializing.checked)
+        assertTrue(initializing.neutral)
+        val unknown = bbcToggleUiProjection(
+            BbcActivationConsentState.Granted, BbcEffectStatus.Unknown, null,
+        )
+        assertNull("an unknown effect supplies no checkbox value", unknown.checked)
+        assertTrue(unknown.neutral)
+    }
+
+    @Test
+    fun explicitFalseOptIn_deniesEvenWithConfirmedLegacyMarker() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.markInstallClassificationConfirmed(1L)
+        holder.resolve(
+            read(
+                1L, optIn = BbcOptInValue.FALSE,
+                classification = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                migrated = true, runtime = true,
+            ),
+        )
+        assertEquals("explicit opt-out wins exactly like the Hook gate",
+            BbcActivationConsentState.NotGranted, holder.currentState())
+        assertTrue(holder.currentState().requiresConsentFor(true))
+    }
+
+    @Test
+    fun unreadableAuthoritativeSnapshot_neverAuthorizesLegacy() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.markInstallClassificationConfirmed(1L)
+        holder.resolve(
+            read(
+                1L, optIn = BbcOptInValue.UNAVAILABLE,
+                classification = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                migrated = true, runtime = true, coherent = false,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Initializing, holder.currentState())
+        assertTrue(holder.currentState().requiresConsentFor(true))
+
+        // A same-generation read cannot lift the durable Unknown fence either.
+        holder.markConsentWriteOutcome(BbcWriteOutcome.Unknown, 1L, 1L)
+        holder.resolve(
+            read(
+                1L, optIn = BbcOptInValue.UNAVAILABLE,
+                classification = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+                migrated = true, runtime = true, coherent = false,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+    }
+
+    @Test
+    fun legacyRequiresClassificationConfirmedForTheGeneration() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val legacyRead = read(
+            1L, optIn = BbcOptInValue.ABSENT,
+            classification = PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+            migrated = true, runtime = false,
+        )
+        holder.resolve(legacyRead)
+        assertEquals("an unconfirmed read must stay retryable/neutral",
+            BbcActivationConsentState.Initializing, holder.currentState())
+        assertTrue(holder.currentState().requiresConsentFor(true))
+
+        holder.markInstallClassificationConfirmed(1L)
+        holder.resolve(legacyRead)
+        assertEquals(BbcActivationConsentState.Legacy(false), holder.currentState())
+        assertEquals(false, holder.currentState().toggleUi().checked)
+        assertFalse(holder.currentState().requiresConsentFor(true))
     }
 }

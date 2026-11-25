@@ -15,7 +15,6 @@ import com.galaxydual.hook.PolicySource
 import io.github.libxposed.service.XposedService
 import io.github.libxposed.service.XposedServiceHelper
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
@@ -100,17 +99,12 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
                 val store = remoteHookPolicyStore {
                     remotePreferences(PolicySource.POLICY_PREFS_NAME)
                 }
-                BbcConsentAuthoritativeRead(
-                    serviceGeneration = generation,
-                    optInGranted = store.readBbcPreactivationOptInAuthoritative(),
-                    classification = store.readBbcInstallClassification(),
-                    // Final fixer: PRE_UPGRADE_EXISTING needs the SAME durable
-                    // marker the Hook gate requires. Both keys are contains()-read
-                    // from the current service instance; the holder still fences
-                    // them by generation.
-                    migrated = store.readBbcLegacyMigratedAuthoritative(),
-                    legacyRuntimeEnabled = store.isBbcInjectionEnabled(),
-                )
+                // ONE coherent snapshot of every consent-authoritative key,
+                // mirroring the Hook reader: distinct explicit-FALSE / ABSENT /
+                // UNAVAILABLE opt-in states, a contains()-based runtime seed
+                // (never the default-true legacy read), and a single all-or-
+                // nothing failure flag. The holder still fences by generation.
+                store.readBbcConsentAuthoritative().forGeneration(generation)
             },
             consentHolder = bbcActivationConsentHolder,
         )
@@ -121,10 +115,60 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     // Granted/Legacy must be re-resolved; the durable Unknown fence survives.
     private val bbcConsentServiceGeneration = AtomicLong(0L)
 
-    private fun bumpBbcConsentServiceGeneration() {
+    private fun bumpBbcConsentServiceGeneration(): Long {
         val generation = bbcConsentServiceGeneration.incrementAndGet()
         bbcActivationConsentHolder.onServiceGenerationChanged(generation)
+        return generation
     }
+
+    /**
+     * P1-B: ONE atomic bind snapshot. Generation, bound service identity and
+     * the prefs provider are captured TOGETHER on Main at bind entry (no binder
+     * call here). The IO coroutine uses this snapshot and NEVER re-samples the
+     * generation after resolving prefs: a stale attempt that outlives a rebind
+     * must skip ALL state effects (confirm AND Unknown fence), leaving them to
+     * the newer bind's own attempt.
+     *
+     * [resolvedPrefs] is filled in on the IO lane and participates in the
+     * pre-apply check, so a failed commit made against a prefs instance that
+     * is no longer the bound one cannot fence the new generation.
+     */
+    private class BbcClassificationAttempt(
+        val generation: Long,
+        val service: XposedService?,
+        val provider: () -> SharedPreferences?,
+    ) {
+        @Volatile
+        var resolvedPrefs: SharedPreferences? = null
+    }
+
+    /** Guards snapshot publication so a stale attempt cannot clobber it. */
+    private val bbcClassificationSnapshotLock = Any()
+
+    /** The current bind's snapshot; replaced atomically by every new bind. */
+    private val bbcClassificationAttempt = AtomicReference<BbcClassificationAttempt?>(null)
+
+    /** The prefs instance the CURRENT attempt resolved on the IO lane. */
+    private val bbcClassificationBoundPrefs = AtomicReference<SharedPreferences?>(null)
+
+    /**
+     * True only while the captured generation, service/provider identity AND
+     * the resolved prefs instance are all still the ones bound for this
+     * attempt. Called twice in the IO coroutine: before committing and before
+     * applying ANY outcome.
+     */
+    private fun isBindSnapshotCurrent(attempt: BbcClassificationAttempt): Boolean {
+        val current = bbcClassificationAttempt.get() ?: return false
+        return current === attempt &&
+            bbcConsentServiceGeneration.get() == attempt.generation &&
+            serviceRef.get() === attempt.service &&
+            bbcClassificationPrefsProvider === attempt.provider
+    }
+
+    /** Full check, including the prefs identity resolved by this attempt. */
+    private fun isBbcClassificationAttemptCurrent(attempt: BbcClassificationAttempt): Boolean =
+        isBindSnapshotCurrent(attempt) &&
+            bbcClassificationBoundPrefs.get() === attempt.resolvedPrefs
 
     /** Resolve the consent state from durable keys on the app IO lane. */
     private fun refreshBbcActivationConsent() {
@@ -167,68 +211,93 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         CoroutineScope(SupervisorJob() + Dispatchers.IO)
     }
 
+    /**
+     * PR #90 P1-1 test seam: the writable remote-prefs provider used by the
+     * bind-time durable-classification confirmation. Production always uses
+     * the app's XposedService channel; JVM tests inject an in-memory prefs
+     * because `Process.myUid()` is an Android stub there (so [remotePreferences]
+     * always fails closed). Defaults to the production channel.
+     */
+    internal var bbcClassificationPrefsProvider: () -> SharedPreferences? = {
+        remotePreferences(PolicySource.POLICY_PREFS_NAME)
+    }
+
     override fun onServiceBind(service: XposedService) {
         serviceRef.set(service)
         // PR #90 Phase C: a newly bound service is a NEW prefs instance. Drop
         // cached Granted/Legacy trust (but keep the durable Unknown fence) and
         // resolve again from durable keys once classification is in place.
-        bumpBbcConsentServiceGeneration()
-        // P0 (PR #90): best-effort durable install classification on the App's
-        // writable channel. A failed attempt must NOT latch the one-shot flag —
-        // a later bind retries. saveRaw independently guarantees that no draft
-        // is ever written without a durable classification.
-        if (!installClassificationOnce.get()) {
-            bbcClassificationScope.launch {
-                // Final fixer: resolve the prefs instance AND sample the service
-                // generation INSIDE this IO coroutine, never on Main. Sampling
-                // on Main could pair a DEAD generation with a NEW prefs instance
-                // after binder death/rebind: the failure would then be recorded
-                // against the old generation (generation guard no-ops) while
-                // the new instance's optimistic mMap was polluted with
-                // PRE_UPGRADE + marker, letting a later read falsely resolve
-                // Legacy. CancellationException always propagates; every other
-                // throwable fails closed as binder-absent.
-                val prefs = try {
-                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Throwable) {
-                    null
-                }
-                val generation = bbcConsentServiceGeneration.get()
-                val ok = if (prefs == null) false else try {
-                    ensureBbcInstallClassification { prefs }
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Throwable) {
-                    false
-                }
-                if (generation != bbcConsentServiceGeneration.get()) {
-                    // A rebind landed while the attempt was in flight: this
-                    // attempt may have touched a now-dead prefs instance. Let
-                    // the newer bind's own attempt own the state; do not latch
-                    // the one-shot, refresh, or fence from its outcome.
-                } else if (ok) {
-                    // NoWrite (key already present) and a confirmed commit both
-                    // satisfy the bind-time responsibility.
-                    installClassificationOnce.compareAndSet(false, true)
-                    // Phase C: resolve authorization from durable keys only after
-                    // the classification is confirmed durable, on the app IO lane
-                    // (never on Main, never from a cached local mMap).
-                    refreshBbcActivationConsent()
-                } else {
-                    // Final fixer: a FAILED bind-time classification may have
-                    // left PRE_UPGRADE_EXISTING + marker in THIS instance's local
-                    // mMap while the daemon persisted NOTHING. Do NOT resync from
-                    // that read: fence this generation as Unknown so no legacy
-                    // checkbox or consent skip can be authorized by optimistic
-                    // pollution. A newer instance retry may clear the fence via
-                    // an authoritative read.
-                    bbcActivationConsentHolder.markInstallClassificationFailed(generation)
-                }
+        val generation = bumpBbcConsentServiceGeneration()
+        // P1-B: capture generation + bound service + provider identity in ONE
+        // atomic snapshot at bind entry. These are in-memory reads on Main —
+        // no binder call. The IO coroutine uses ONLY this snapshot; its prefs
+        // resolution can no longer be paired with a newer generation.
+        val attempt = BbcClassificationAttempt(
+            generation = generation,
+            service = serviceRef.get(),
+            provider = bbcClassificationPrefsProvider,
+        )
+        bbcClassificationAttempt.set(attempt)
+        // PR #90 P1-1: confirm classification on EVERY bind, including a rebind
+        // that arrives without a death callback (or whose stale death callback
+        // lost the CAS). A rebind bumps the consent generation, which resets
+        // classificationConfirmedGeneration; short-circuiting on a one-shot flag
+        // left legacy installs stuck at Initializing (App demanding consent
+        // while the Hook gate was open). Confirmation therefore always runs for
+        // the current bind's generation; a failed attempt is retried on a later
+        // bind.
+        bbcClassificationScope.launch {
+            // Resolve prefs on IO with the CAPTURED provider. The generation is
+            // deliberately NOT re-sampled here: the earlier code paired prefs1
+            // with gen2 after a rebind and let that stale failure fence gen2.
+            // CancellationException always propagates; every other throwable
+            // fails closed as binder-absent.
+            val prefs = try {
+                attempt.provider()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                null
             }
-        } else {
-            bbcClassificationScope.launch { refreshBbcActivationConsent() }
+            attempt.resolvedPrefs = prefs
+            // P1-B: a newer bind already owns this state — skip EVERYTHING.
+            // Publishing the prefs identity is atomic with the snapshot check
+            // so a stale attempt can never clobber the new bind's identity.
+            synchronized(bbcClassificationSnapshotLock) {
+                if (!isBindSnapshotCurrent(attempt)) return@launch
+                bbcClassificationBoundPrefs.set(prefs)
+            }
+            // P1-2: only a SUCCESSFUL durable commit may confirm classification.
+            // A NoWrite inferred from a polluted local mMap is never enough.
+            val ok = if (prefs == null) false else try {
+                confirmBbcInstallClassificationDurable { prefs }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                false
+            }
+            // P1-B: verify the snapshot AGAIN before applying ANY outcome. A
+            // rebind during the blocking commit must leave both confirmation
+            // and the Unknown fence to the newer bind's own attempt.
+            if (!isBbcClassificationAttemptCurrent(attempt)) return@launch
+            if (ok) {
+                // Review A6: record the CONFIRMED fact BEFORE enqueuing the
+                // resync. A queued read can otherwise observe an optimistic
+                // local mMap polluted by a failed classification commit and
+                // resolve Legacy before the failure fence is installed.
+                bbcActivationConsentHolder.markInstallClassificationConfirmed(attempt.generation)
+                // Phase C: resolve authorization from durable keys only after
+                // the classification is confirmed durable, on the app IO lane
+                // (never on Main, never from a cached local mMap).
+                refreshBbcActivationConsent()
+            } else {
+                // A FAILED bind-time classification may have left
+                // PRE_UPGRADE_EXISTING + marker in THIS instance's local mMap
+                // while the daemon persisted NOTHING. Do NOT resync from that
+                // read: fence this generation as Unknown so no legacy checkbox
+                // or consent skip can be authorized by optimistic pollution.
+                bbcActivationConsentHolder.markInstallClassificationFailed(attempt.generation)
+            }
         }
         // 5.1.5:通知所有綁定監聽者 (例如刷新政策草稿)。
         // Never blocked by the binder commit above.
@@ -243,12 +312,17 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
             // so the new service cannot inherit stale process state.
             synchronized(versionCommitLock) {
                 clearPendingBbcClassification()
-                installClassificationOnce.set(false)
             }
             // PR #90 Phase C: bump the consent trust generation. Granted/Legacy
             // degrade to Initializing (must resync on next bind); a durable
             // Unknown fence is intentionally preserved across binder death.
             bumpBbcConsentServiceGeneration()
+            // P1-B: invalidate the dead bind's snapshot; its in-flight attempt
+            // must not apply a confirm/fence to the new instance.
+            synchronized(bbcClassificationSnapshotLock) {
+                bbcClassificationAttempt.set(null)
+                bbcClassificationBoundPrefs.set(null)
+            }
             // 通知監聽者服務已斷線,讓呼叫端重新評估 (fail-closed)。
             notifyServiceListeners()
         }
@@ -271,11 +345,6 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
     companion object {
         private val serviceRef = AtomicReference<XposedService?>(null)
-
-        // P0 (PR #90): latched only after a bind-time classification SUCCEEDS
-        // (or is already present). Reset on active service death so a new
-        // service/rebind retries; saveRaw owns the retry-before-write path.
-        private val installClassificationOnce = AtomicBoolean(false)
 
         // 5.1.5:service 綁定監聽者 (CopyOnWriteArrayList 供併發安全)。
         // Phase 4:改 private + add/remove 封裝,避免外部直接 mutable 存取。

@@ -43,8 +43,16 @@ import kotlinx.coroutines.flow.asStateFlow
 internal class BbcToggleRuntimeState(
     initialConfirmed: Boolean? = null,
 ) {
-    /** Immutable snapshot so the sequence fence and value can move in one CAS. */
-    private data class MarkedState(val sequence: Long, val value: Boolean?)
+    /**
+     * Immutable snapshot so the sequence fence and value can move in one CAS.
+     * [confirmed] distinguishes a real Confirmed effect mark from an Unknown
+     * outcome: only a Confirmed mark may acknowledge the user's latest intent.
+     */
+    private data class MarkedState(
+        val sequence: Long,
+        val value: Boolean?,
+        val confirmed: Boolean,
+    )
 
     /** User intents issued in this process (never reset by a UI rebuild). */
     private val sequence = AtomicLong(0L)
@@ -54,7 +62,18 @@ internal class BbcToggleRuntimeState(
      * Keeping both in one [AtomicReference] lets [mark] advance them atomically:
      * a concurrent older mark can never overwrite a newer sequence's value.
      */
-    private val state = AtomicReference(MarkedState(0L, initialConfirmed))
+    private val state = AtomicReference(MarkedState(0L, initialConfirmed, false))
+
+    /**
+     * PR #90 P1-3: the LATEST user effect-toggle intent, recorded app-scoped
+     * when the coordinator accepts submit(sequence, value, ...). A rebuilt View
+     * must not lose it: a per-View local starts at null while the effect axis
+     * replays an older Confirmed value, which used to flip a user's OFF back ON
+     * before the OFF commit had landed.
+     */
+    private data class LatestToggleIntent(val sequence: Long, val value: Boolean)
+
+    private val latestToggleIntent = AtomicReference<LatestToggleIntent?>(null)
 
     /**
      * E04: read-only, app-scoped projection of the last APPLIED mark for the UI.
@@ -86,6 +105,73 @@ internal class BbcToggleRuntimeState(
      * it waited in the CONFLATED channel; [mark] separately fences the result.
      */
     fun latestSequence(): Long = sequence.get()
+
+    /**
+     * P1-3: record a user toggle intent at submit-accept time. Sequence-aware:
+     * a stale/duplicate submit can never replace a newer intent (the CONFLATED
+     * coordinator slot may hold only the newest one, but the record must also
+     * survive a racing multi-threaded caller).
+     */
+    @Synchronized
+    fun noteToggleIntent(sequence: Long, value: Boolean) {
+        val current = latestToggleIntent.get()
+        if (current == null || sequence >= current.sequence) {
+            latestToggleIntent.set(LatestToggleIntent(sequence, value))
+        }
+    }
+
+    /**
+     * P1-A: record the NEWEST user value at the START of a UI handler, BEFORE
+     * that handler's first render, so the projection can never show an older
+     * app-scoped intent over the tap the user just made. Reserving a sequence
+     * here is harmless bookkeeping: the controller's later submit() assigns a
+     * newer sequence for the same value and supersedes this record.
+     *
+     * Used by the effect-toggle taps and by consent-dialog accept (whose ON
+     * reaches the effect writer only after the consent commit is confirmed).
+     */
+    fun noteLatestUserIntent(value: Boolean): Long {
+        val sequence = nextSequence()
+        noteToggleIntent(sequence, value)
+        return sequence
+    }
+
+    /**
+     * P1-A: cancel/back/show-failure restores the pre-dialog value with ZERO
+     * effect writes. Drop any app-scoped intent left by an older UI or an
+     * in-flight tap so a later render cannot repaint the restored value with
+     * that stale intent; the restored local value stays authoritative until a
+     * real Confirmed effect acknowledges it.
+     */
+    @Synchronized
+    fun abandonLatestUserIntent() {
+        latestToggleIntent.set(null)
+    }
+
+    /**
+     * P1-3 projection seam: the user's latest intent while it is still the
+     * authority for the checkbox, or null once a Confirmed effect mark has
+     * acknowledged it.
+     *
+     * Rule (sequence-aware):
+     *  - an intent whose sequence is NEWER than the applied mark wins (its
+     *    commit has not landed yet — a rebuilt View must keep showing it);
+     *  - an intent at the SAME sequence as an Unknown mark also wins — an
+     *    Unknown outcome is NOT confirmation, so the user's last intent is
+     *    preserved rather than reverting to a stale Confirmed effect;
+     *  - a Confirmed mark at the same sequence, or ANY mark from a NEWER
+     *    sequence, acknowledges/supersedes the intent => null (the confirmed
+     *    effect value then drives the projection).
+     */
+    fun latestIntentProjectedValue(): Boolean? {
+        val intent = latestToggleIntent.get() ?: return null
+        val marked = state.get()
+        return when {
+            marked.sequence < intent.sequence -> intent.value
+            marked.sequence == intent.sequence && !marked.confirmed -> intent.value
+            else -> null
+        }
+    }
 
     /**
      * Fold a write outcome into the app-scoped state; Unknown clears confirmation.
@@ -133,11 +219,12 @@ internal class BbcToggleRuntimeState(
         }
         while (true) {
             val cur = state.get()
+            val confirmed = outcome is BbcWriteOutcome.Confirmed
             val next = if (targetSequence == null) {
-                MarkedState(cur.sequence, value)
+                MarkedState(cur.sequence, value, confirmed)
             } else {
                 if (targetSequence <= cur.sequence) return false
-                MarkedState(targetSequence, value)
+                MarkedState(targetSequence, value, confirmed)
             }
             if (state.compareAndSet(cur, next)) {
                 _effectStatus.value = status

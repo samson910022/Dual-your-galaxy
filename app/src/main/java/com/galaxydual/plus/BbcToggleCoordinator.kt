@@ -88,7 +88,7 @@ internal class BbcToggleCoordinator(
      * time so a stale service instance cannot certify consent.
      */
     private val consentRead: suspend (Long) -> BbcConsentAuthoritativeRead = { generation ->
-        BbcConsentAuthoritativeRead(generation, null, null, null, true)
+        BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
     },
     /** The one app-scoped authorization holder; shared across all UI rebuilds. */
     internal val consentHolder: BbcActivationConsentHolder = BbcActivationConsentHolder(),
@@ -211,7 +211,7 @@ internal class BbcToggleCoordinator(
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (_: Throwable) {
-                        BbcConsentAuthoritativeRead(generation, null, null, null, true)
+                        BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
                     }
                     // Resolve on the IO consumer thread: no Main-thread binder
                     // read, and a local mMap value can never clear the fence
@@ -236,11 +236,17 @@ internal class BbcToggleCoordinator(
      * Never blocks on the consumer; superseded
      * CONFLATED intents simply never get a callback. This is the ONLY submit
      * overload production code may call.
+     *
+     * P1-3: the accepted intent is recorded app-scoped BEFORE enqueueing (inside
+     * the same lock) so a rebuilt View can project it while the commit is still
+     * in flight (or after an Unknown outcome) instead of replaying a stale
+     * Confirmed effect.
      */
     fun submit(value: Boolean, onResult: (BbcWriteOutcome) -> Unit): Long =
         synchronized(enqueueLock) {
             val seq = state.nextSequence()
             afterBbcSequenceAllocatedForTests?.invoke(seq)
+            state.noteToggleIntent(seq, value)
             writes.trySend(Work.Toggle(seq, value, onResult))
             seq
         }

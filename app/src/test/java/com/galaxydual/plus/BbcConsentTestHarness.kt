@@ -18,9 +18,12 @@ import kotlinx.coroutines.launch
  * Test-only model of MainActivity's BBC toggle + consent dialog wiring. It uses
  * the PRODUCTION state machine, holder, coordinator and controller; only the
  * Android View/dialog plumbing is replaced by counters. `userToggle`, `accept`
- * and `cancel` reproduce the exact branch order from MainActivity, and a
- * holder-state collector reproduces `renderConsentState` (including the P2
- * exactly-once replay of an enable intent after a UI rebuild).
+ * and `cancel` reproduce the exact branch order from MainActivity.
+ *
+ * Both app collectors (holder state and effect status) feed ONE shared state
+ * and call ONE projection -> ONE checkbox writer, exactly like MainActivity's
+ * `renderToggle`/`setToggleChecked`. This is what makes the dual-collector bug
+ * ("last emitter wins" / rebind restoring a user's OFF) observable here.
  *
  * [alive] models Activity/controller teardown: once false, late consent-write
  * callbacks and state emissions are DROPPED and cannot mutate UI state.
@@ -62,14 +65,51 @@ internal class BbcConsentTestHarness(
     var lastSettledChecked: Boolean = holder.currentState().toggleUi().checked ?: false
         private set
 
+    // Shared axes fed by BOTH collectors; neither writes the checkbox directly.
+    @Volatile
+    private var currentAuthorization: BbcActivationConsentState = holder.currentState()
+
+    @Volatile
+    private var currentEffect: BbcEffectStatus = coordinator.state.effectStatus.value
+
+    @Volatile
+    private var pendingIntentChecked: Boolean? = null
+
+    /** The ONE checkbox write path, mirroring MainActivity's setToggleChecked. */
+    private fun setToggleChecked(value: Boolean) {
+        lastSettledChecked = value
+    }
+
+    /** The ONE projection, mirroring MainActivity's renderToggle. */
+    private fun renderToggle() {
+        if (!alive) return
+        // P1-3: consume the APP-SCOPED latest user intent, not this View's
+        // per-View local. A rebuild must keep an in-flight OFF even while the
+        // effect axis replays an older Confirmed(true).
+        val pendingIntent = coordinator.state.latestIntentProjectedValue() ?: pendingIntentChecked
+        val projection = bbcToggleUiProjection(currentAuthorization, currentEffect, pendingIntent)
+        if (!dialogPending) projection.checked?.let(::setToggleChecked)
+    }
+
     val controller = BbcInjectionToggleController(
         coordinator = coordinator,
         initialValue = lastSettledChecked,
         main = main,
-        onRestored = { restored.add(it) },
+        // F03: onRestored is NOT a no-op any more — it feeds the SAME projection
+        // as the effect collector. The checkbox still has only one writer.
+        onRestored = { confirmed ->
+            restored.add(confirmed)
+            renderToggle()
+        },
         onFailed = {},
         onUnknown = {},
-        onEffectStatus = {},
+        onEffectStatus = { status ->
+            currentEffect = status
+            if (status is BbcEffectStatus.Confirmed && pendingIntentChecked == status.value) {
+                pendingIntentChecked = null
+            }
+            renderToggle()
+        },
     )
 
     private val uiScope = CoroutineScope(SupervisorJob() + main)
@@ -86,14 +126,14 @@ internal class BbcConsentTestHarness(
 
     private fun renderConsentState(state: BbcActivationConsentState) {
         if (!alive) return
-        val ui = state.toggleUi()
-        if (!dialogPending) ui.checked?.let { lastSettledChecked = it }
+        currentAuthorization = state
         // P2: Granted is AUTHORIZATION only. If this UI (or its destroyed
         // predecessor) never handed the enable to the effect controller, replay
         // it exactly once. The holder's consume is atomic, so a racing live
         // callback can never produce a second toggle.
-        val effectStatus = coordinator.state.effectStatus.value
-        val alreadyEnabled = effectStatus is BbcEffectStatus.Confirmed && effectStatus.value
+        // MainActivity reads its cached `currentEffect` axis (fed by the
+        // controller's effect collector), not a fresh StateFlow read here.
+        val alreadyEnabled = (currentEffect as? BbcEffectStatus.Confirmed)?.value == true
         if (state is BbcActivationConsentState.Granted &&
             !dialogPending &&
             !alreadyEnabled &&
@@ -102,11 +142,18 @@ internal class BbcConsentTestHarness(
             toggleCalls.add(true)
             controller.onToggle(true)
         }
+        renderToggle()
     }
 
     /** Rebuild a UI from a fresh View/Activity while keeping the app-scoped holder. */
     fun seedFromHolder() {
-        lastSettledChecked = holder.currentState().toggleUi().checked ?: false
+        currentAuthorization = holder.currentState()
+        currentEffect = coordinator.state.effectStatus.value
+        pendingIntentChecked = null
+        setToggleChecked(currentAuthorization.toggleUi().checked ?: false)
+        // P1-3: the rebuilt View must immediately project the app-scoped intent
+        // (if any) before any Confirmed replay can repaint the box.
+        renderToggle()
     }
 
     fun userToggle(checked: Boolean) {
@@ -120,7 +167,11 @@ internal class BbcConsentTestHarness(
             }
             dialogPending = false
             controller.setConsentPending(false)
-            lastSettledChecked = false
+            pendingIntentChecked = false
+            // P1-A: same ordering as MainActivity's OFF branch — the newest
+            // value is recorded app-scoped BEFORE the first render.
+            coordinator.state.noteLatestUserIntent(false)
+            renderToggle()
             controller.onToggle(false)
             toggleCalls.add(false)
             return
@@ -134,7 +185,9 @@ internal class BbcConsentTestHarness(
             controller.setConsentPending(true)
             dialogsShown.add(seq)
         } else {
-            lastSettledChecked = true
+            pendingIntentChecked = true
+            coordinator.state.noteLatestUserIntent(true)
+            renderToggle()
             controller.onToggle(true)
             toggleCalls.add(true)
         }
@@ -148,6 +201,9 @@ internal class BbcConsentTestHarness(
         holder.notePendingEnable(seq, generation)
         dialogPending = false
         controller.setConsentPending(false)
+        pendingIntentChecked = true
+        coordinator.state.noteLatestUserIntent(true)
+        renderToggle()
         coordinator.submitConsentWrite(seq, generation) { outcome ->
             // Mirrors the Main-thread result hop: still sequence/disposal guarded.
             if (!alive || seq != activeSeq) return@submitConsentWrite
@@ -171,6 +227,12 @@ internal class BbcConsentTestHarness(
         holder.abandonIntent(seq)
         dialogPending = false
         controller.setConsentPending(false)
+        pendingIntentChecked = lastSettledChecked
+        // MainActivity writes the restored value through the ONE writer
+        // directly (ZERO effect writes, NO projection render) and drops any
+        // stale app-scoped intent that could repaint it on a later render.
+        coordinator.state.abandonLatestUserIntent()
+        setToggleChecked(lastSettledChecked)
         controller.restoreConsentUi(lastSettledChecked)
     }
 

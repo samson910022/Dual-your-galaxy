@@ -9,12 +9,8 @@
 // proof of consent; a durable classification must be established at/before the
 // first new-generation draft write.
 //
-// Two entry points, ONE decision:
-//  1. [ensureBbcInstallClassification] (GalaxyApp.onServiceBind): if the key is
-//     absent, commits the classification (+ marker for a genuine upgrade) in
-//     its own edit/commit. No packages/version key is touched, so an old draft
-//     stays byte-identical.
-//  2. [planBbcInstallClassificationForWrite] (start of HookPolicyStore.saveRaw,
+// Entry points (ONE decision, shared with the Hook's saveRaw path):
+//  1. [planBbcInstallClassificationForWrite] (start of HookPolicyStore.saveRaw,
 //     inside versionCommitLock): decides BEFORE any draft write; the caller
 //     adds the same key/value (+ marker) to the SAME editor/commit as
 //     packages/version. Single transaction = no window where a draft exists
@@ -23,6 +19,19 @@
 //     the app-scoped [pendingBbcClassification] then forces the retry to re-add
 //     the SAME key/value (+ marker) even when classificationValue() reads that
 //     polluted local value as "known". Cleared only on a CONFIRMED commit.
+//  2. [confirmBbcInstallClassificationDurable] (GalaxyApp.onServiceBind): the
+//     ONLY bind-time trust path. It forces a real commit even when the key
+//     appears present, because a NoWrite inferred from the local mMap is not
+//     durable proof. Only a successful commit authorizes confirmation.
+//
+// [ensureBbcInstallClassification] is retained as a TEST-ONLY idempotent-writer
+// helper: it commits the classification (+ marker for a genuine upgrade) in
+// its own edit when the key is absent (no packages/version key is touched, so
+// an old draft stays byte-identical) and returns true on NoWrite. It MUST NOT
+// be used for bind-time confirmation — NoWrite is not durable proof, since a
+// failed commit can pollute the optimistic local mMap while the daemon persists
+// nothing. Production bind-time confirmation always goes through
+// [confirmBbcInstallClassificationDurable].
 //
 // Framework-free core: [planBbcInstallClassification] only sees the small
 // [BbcClassificationReads] seam; JVM tests can fake every failure mode.
@@ -230,9 +239,15 @@ internal fun planBbcInstallClassificationForPrefs(prefs: SharedPreferences): Bbc
     return planBbcInstallClassification(classificationReads(prefs))
 }
 
-// Bind-time binding. Uses the same process-wide commit lock as the policy
-// writer and the other BBC single-key writers. CE from provider or any read
-// propagates; every other Throwable maps to binder-absent / fail-closed.
+// TEST-ONLY idempotent-writer helper (NOT the bind-time trust path). Kept for
+// JVM tests that need to seed a classification via its own edit/commit; it MUST
+// NOT be used for bind-time confirmation, because NoWrite is not durable proof.
+// Production bind-time confirmation always goes through
+// [confirmBbcInstallClassificationDurable]. Uses the same process-wide commit
+// lock as the policy writer and the other BBC single-key writers. CE from
+// provider or any read propagates; every other Throwable maps to binder-absent
+// / fail-closed. A NoWrite (key already present with a trusted value) is a
+// legitimate answer for this WRITER, but it is NOT durable confirmation.
 internal fun ensureBbcInstallClassification(provider: () -> SharedPreferences?): Boolean {
     val prefs: SharedPreferences = try {
         provider()
@@ -259,5 +274,96 @@ internal fun ensureBbcInstallClassification(provider: () -> SharedPreferences?):
                 false
             }
         }
+    }
+}
+
+/**
+ * PR #90 P1-2: bind-time DURABLE CONFIRMATION. This is the ONLY evidence that
+ * may authorize `markInstallClassificationConfirmed()`: a successful
+ * `commit()`. A `NoWrite` inferred from `contains()`/`getString()` can be a
+ * LIE — a failed commit flushes its keys into this process's optimistic local
+ * mMap while the daemon persists nothing. Treating that as confirmation opens
+ * the App's gate while the Hook (which reads the durable map) stays OFF.
+ *
+ * Therefore, unlike [ensureBbcInstallClassification], this ALWAYS performs a
+ * real commit when a trusted classification value is known:
+ *  - [BbcClassificationPlan.Write]: commit the planned value + marker exactly
+ *    as the draft-write path does (a pending intent for this instance wins).
+ *  - [BbcClassificationPlan.NoWrite]: re-put the ALREADY-KNOWN value and
+ *    marker in a fresh editor and commit. A successful commit restores parity
+ *    (durable map now matches local) and authorizes confirmation; a failed
+ *    one returns false so the caller installs the Unknown fence instead.
+ *  - [BbcClassificationPlan.FailClosed] / unknown / unreadable value: no
+ *    commit, no confirmation — an unknown value is NEVER overwritten.
+ *
+ * The pending intent is set for the forced re-put too, so a failed bind-time
+ * commit still forces later draft writes to re-add the same keys.
+ */
+internal fun confirmBbcInstallClassificationDurable(provider: () -> SharedPreferences?): Boolean {
+    val prefs: SharedPreferences = try {
+        provider()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
+    } ?: return false
+
+    return synchronized(versionCommitLock) {
+        try {
+            when (val plan = planBbcInstallClassificationForWrite(prefs)) {
+                BbcClassificationPlan.FailClosed -> false
+                is BbcClassificationPlan.Write -> commitClassificationDurable(prefs, plan)
+                BbcClassificationPlan.NoWrite -> {
+                    // Trust only a KNOWN value; a present-but-unreadable /
+                    // unknown value is fail-closed and is never overwritten.
+                    val reads = classificationReads(prefs)
+                    val value = reads.classificationValue()
+                    if (value == null || value !in BbcInstallClassificationValues) {
+                        false
+                    } else {
+                        val marker = try {
+                            if (prefs.contains(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED)) {
+                                prefs.getBoolean(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED, false)
+                            } else false
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (_: Throwable) {
+                            // Present but unreadable marker: never invent a
+                            // durable migration proof.
+                            null
+                        }
+                        if (marker == null) false else commitClassificationDurable(
+                            prefs,
+                            BbcClassificationPlan.Write(value, marker),
+                        )
+                    }
+                }
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            false
+        }
+    }
+}
+
+/** The single forced commit shared by both plan outcomes above. */
+private fun commitClassificationDurable(
+    prefs: SharedPreferences,
+    plan: BbcClassificationPlan.Write,
+): Boolean {
+    // Keep the pending intent until the daemon CONFIRMS persistence: a failed
+    // commit must still be re-added by every later draft write.
+    pendingBbcClassification.set(PendingBbcClassification.of(prefs, plan))
+    return try {
+        val editor = prefs.edit()
+        applyBbcClassificationPlan(editor, plan)
+        val committed = editor.commit()
+        if (committed) clearPendingBbcClassification()
+        committed
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        false
     }
 }

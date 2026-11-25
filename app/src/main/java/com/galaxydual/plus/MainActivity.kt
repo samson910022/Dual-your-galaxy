@@ -2657,20 +2657,45 @@ class MainActivity : ComponentActivity() {
         val app = application as GalaxyApp
         val consentHolder = app.bbcActivationConsentHolder
         val initialConsentState = consentHolder.currentState()
+        // Authorization-only SEED: NotGranted => unchecked, Legacy => the
+        // captured durable runtime value, everything else => leave the box
+        // as-is. A Granted permission is NOT proof of a live effect and must
+        // never fabricate a checked ON (cold start: consent=true/runtime=false).
         val initialUi = initialConsentState.toggleUi()
         // D04: after commit(false)/throw the local mMap may be optimistically
         // polluted, so isBbcInjectionEnabled() is NOT authority. The app-scoped
         // holder's null means UNKNOWN from a prior failed write; render the
         // honest "effect unknown" row regardless of any preference read.
         val effectUnknownOnOpen = app.bbcToggleRuntimeState.confirmedOrUnknown == null
-        val toggle = CheckBox(this).apply {
+        lateinit var toggle: CheckBox
+        // Last UI value we can honestly stand behind. Updated ONLY by the one
+        // checkbox writer below; captured as the restore target when a dialog opens.
+        var lastSettledChecked = initialUi.checked ?: false
+        // Both collectors feed these shared axes; neither writes the checkbox.
+        var currentAuthorization = initialConsentState
+        var currentEffect = app.bbcToggleRuntimeState.effectStatus.value
+        // The user's latest intent that the effect axis has not acknowledged
+        // yet. It wins over a stale Confirmed(false) from a prior OFF so a tap
+        // is not immediately undone by a replayed mark.
+        var pendingIntentChecked: Boolean? = null
+        var consentDialogPending = false
+        var restoring = false
+        // onUnknown (D04) and the legacy onFailed toast path can both fire for
+        // the same failed commit; dedupe the toast per user intent.
+        var unknownToastShown = false
+
+        // The ONE programmatic checkbox write. All other callers (both
+        // collectors, onRestored, user branches) feed the shared projection and
+        // land here, so the last emitter can no longer fight a second writer.
+        fun setChecked(value: Boolean) {
+            restoring = true
+            toggle.isChecked = value
+            restoring = false
+            lastSettledChecked = value
+        }
+
+        toggle = CheckBox(this).apply {
             text = getString(R.string.settings_bbc_injection_label)
-            // PR #90 Phase C: seed ONLY from the app-scoped authorization state.
-            // NotGranted => unchecked (fresh installs are OFF, no legacy
-            // default-true); Legacy => the captured runtime opt-out value;
-            // Granted => checked; Initializing/Unknown => neutral (checked==null,
-            // leave as-is) with retryable styling — never a fabricated OFF/ON.
-            initialUi.checked?.let { isChecked = it }
             minimumHeight = dp(48)
             setCompoundDrawablePadding(dp(8))
             if (effectUnknownOnOpen || initialUi.neutral) {
@@ -2678,16 +2703,8 @@ class MainActivity : ComponentActivity() {
                 setTypeface(null, Typeface.ITALIC)
             }
         }
+        initialUi.checked?.let(::setChecked)
         val initialChecked = toggle.isChecked
-        // Last UI value we can honestly stand behind. Updated only when the box
-        // is programmatically settled or on a non-consent toggle; captured as
-        // the restore target when a consent dialog opens.
-        var lastSettledChecked = initialChecked
-        var consentDialogPending = false
-        var restoring = false
-        // onUnknown (D04) and the legacy onFailed toast path can both fire for
-        // the same failed commit; dedupe the toast per user intent.
-        var unknownToastShown = false
 
         val summary = TextView(this).apply {
             text = if (effectUnknownOnOpen || initialUi.neutral) {
@@ -2695,13 +2712,6 @@ class MainActivity : ComponentActivity() {
             } else {
                 getString(R.string.settings_bbc_injection_summary)
             }
-        }
-
-        fun setChecked(value: Boolean) {
-            restoring = true
-            toggle.isChecked = value
-            restoring = false
-            lastSettledChecked = value
         }
 
         // E04: the app-scoped StateFlow replays its last applied mark to this
@@ -2725,15 +2735,33 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        fun renderConsentState(state: BbcActivationConsentState) {
-            val ui = state.toggleUi()
-            consentNeutral = ui.neutral
+        // The ONLY render function for the checkbox. Both the authorization
+        // collector and the effect collector (including controller onRestored)
+        // call it; it alone decides whether to write, via the shared projection.
+        fun renderToggle() {
+            // P1-3: the LATEST user toggle intent is app-scoped (recorded when
+            // the coordinator accepted submit). A rebuilt View must project it
+            // instead of its own per-View local: an older Confirmed replay must
+            // not flip the user's in-flight OFF back ON. The local remains only
+            // as the consent-dialog accept / cancel-restore fallback.
+            val pendingIntent = app.bbcToggleRuntimeState.latestIntentProjectedValue()
+                ?: pendingIntentChecked
+            val projection = bbcToggleUiProjection(
+                authorization = currentAuthorization,
+                effect = currentEffect,
+                pendingIntent = pendingIntent,
+            )
+            consentNeutral = projection.neutral
             // Never overwrite the box while a consent dialog is pending: an
             // inherited Confirmed (or an async resync) must not settle a state
-            // the user has not answered yet.
-            if (!consentDialogPending) ui.checked?.let(::setChecked)
-            val effectStatus = app.bbcToggleRuntimeState.effectStatus.value
-            renderEffect(effectStatus)
+            // the user has not answered yet. `checked == null` also leaves the
+            // box untouched (no fabricated ON/OFF from authorization alone).
+            if (!consentDialogPending) projection.checked?.let(::setChecked)
+            renderEffect(currentEffect)
+        }
+
+        fun renderConsentState(state: BbcActivationConsentState) {
+            currentAuthorization = state
             // P2 convergence: a Confirmed consent commit grants AUTHORIZATION
             // only — it does NOT write the runtime opt-out preference. If the
             // Activity that accepted was rotated away before its UI callback
@@ -2742,7 +2770,7 @@ class MainActivity : ComponentActivity() {
             // effect mark yet, leaving the box ON would contradict effect OFF.
             // "Matching" mark means Confirmed(true): a stale Confirmed(false)
             // from a prior OFF is exactly the contradiction being repaired.
-            val alreadyEnabled = effectStatus is BbcEffectStatus.Confirmed && effectStatus.value
+            val alreadyEnabled = (currentEffect as? BbcEffectStatus.Confirmed)?.value == true
             if (state is BbcActivationConsentState.Granted &&
                 !consentDialogPending &&
                 !alreadyEnabled &&
@@ -2750,14 +2778,20 @@ class MainActivity : ComponentActivity() {
             ) {
                 bbcToggleController?.onToggle(true)
             }
+            // A newer Granted emission can no longer flip a confirmed OFF back
+            // ON: the ONE projection reads the effect axis, not a hardcoded
+            // authorization-derived value.
+            renderToggle()
         }
 
         fun markEffectUnknown() {
             // Keep the CheckBox at the user's last intent — never silently flip
             // it. Only the row presentation is downgraded to "unverified"; the
             // app-level status flow renders the identical presentation, so this
-            // per-intent path is idempotent.
-            renderEffect(BbcEffectStatus.Unknown)
+            // per-intent path is idempotent. The projection supplies NO checked
+            // value for Unknown, so no write happens here either.
+            currentEffect = BbcEffectStatus.Unknown
+            renderToggle()
             if (!unknownToastShown && !isFinishing && !isDestroyed) {
                 unknownToastShown = true
                 Toast.makeText(
@@ -2773,7 +2807,8 @@ class MainActivity : ComponentActivity() {
         // Unknown fence on the app IO lane; here we only render neutral and
         // show a deduped, honest toast. NO onToggle and NO effect claim.
         fun markPreactivationOptInFailed(seq: Long) {
-            renderEffect(BbcEffectStatus.Unknown)
+            currentEffect = BbcEffectStatus.Unknown
+            renderToggle()
             if (consentFailureToastSequence != seq && !isFinishing && !isDestroyed) {
                 consentFailureToastSequence = seq
                 Toast.makeText(
@@ -2799,6 +2834,16 @@ class MainActivity : ComponentActivity() {
             consentDialogPending = false
             bbcToggleController?.setConsentPending(false)
             dismissBbcConsentDialogSilently()
+            // The consent write is not an effect confirmation, but the user has
+            // just chosen ON: hold that pending intent in the shared projection
+            // so a replayed Confirmed(false) cannot immediately undo the tap.
+            // P1-A: record it BEFORE the first render of this handler. The
+            // effect writer runs only after the consent commit is confirmed,
+            // so without this the older OFF intent (from the tap that opened
+            // the dialog) would still be projected and the box would show OFF.
+            pendingIntentChecked = checked
+            app.bbcToggleRuntimeState.noteLatestUserIntent(checked)
+            renderToggle()
             app.bbcToggleCoordinator.submitConsentWrite(
                 sequence = seq,
                 generation = generation,
@@ -2829,6 +2874,14 @@ class MainActivity : ComponentActivity() {
             consentDialogPending = false
             bbcToggleController?.setConsentPending(false)
             dismissBbcConsentDialogSilently()
+            pendingIntentChecked = lastSettledChecked
+            // P1-A: abandon any app-scoped intent left by an older UI/in-flight
+            // tap. A stale intent has the same sequence-aware authority as this
+            // restore and would otherwise repaint the box on the next render.
+            app.bbcToggleRuntimeState.abandonLatestUserIntent()
+            // Cancel is a UI-only restore with ZERO writes: it uses the ONE
+            // writer directly (no projection needed — the value is the exact
+            // pre-dialog state we captured).
             setChecked(lastSettledChecked)
             bbcToggleController?.restoreConsentUi(lastSettledChecked)
         }
@@ -2836,20 +2889,23 @@ class MainActivity : ComponentActivity() {
         bbcToggleController = BbcInjectionToggleController(
             coordinator = app.bbcToggleCoordinator,
             initialValue = initialChecked,
-            // F03: onRestored is intentionally used ONLY for inherited-confirmed
-            // sync — a rebuilt dialog with no tap of its own corrects a stale
-            // CheckBox when an app-scoped Confirmed(value) lands. It is NOT a
-            // failure rollback: D04 leaves the box at the user's intent on Unknown.
-            // The restoring guard keeps this programmatic set from re-firing onToggle.
-            onRestored = { lastGood ->
-                restoring = true
-                toggle.isChecked = lastGood
-                restoring = false
-                lastSettledChecked = lastGood
-            },
+            // F03: onRestored reports an inherited Confirmed value for a rebuilt
+            // dialog with no tap of its own. It must NOT write the CheckBox:
+            // the app-level effect collector already fed `currentEffect`, so
+            // routing back through the ONE projection is sufficient (and lets
+            // a later Confirmed(false) still win — OFF is never overwritten).
+            onRestored = { renderToggle() },
             onUnknown = { markEffectUnknown() },
             onFailed = { markEffectUnknown() }, // legacy failure Toast path, now the Unknown message
-            onEffectStatus = { renderEffect(it) },
+            onEffectStatus = { status ->
+                currentEffect = status
+                // The effect has acknowledged the user's intent; from now on
+                // the confirmed value, not the pending intent, is authoritative.
+                if (status is BbcEffectStatus.Confirmed && pendingIntentChecked == status.value) {
+                    pendingIntentChecked = null
+                }
+                renderToggle()
+            },
         )
         toggle.setOnCheckedChangeListener { _, checked ->
             if (restoring) return@setOnCheckedChangeListener
@@ -2866,7 +2922,12 @@ class MainActivity : ComponentActivity() {
                 consentDialogPending = false
                 bbcToggleController?.setConsentPending(false)
                 dismissBbcConsentDialogSilently()
-                setChecked(false)
+                pendingIntentChecked = false
+                // P1-A: the newest tap must be recorded BEFORE this handler's
+                // first render; otherwise renderToggle() projects the previous
+                // app-scoped intent and the OFF tap is visually ignored.
+                app.bbcToggleRuntimeState.noteLatestUserIntent(false)
+                renderToggle()
                 bbcToggleController?.onToggle(false)
                 return@setOnCheckedChangeListener
             }
@@ -2886,7 +2947,11 @@ class MainActivity : ComponentActivity() {
                 )
             } else {
                 // Already Granted or Legacy-authorized: no consent demand.
-                setChecked(true)
+                // P1-A: record the tap before rendering so the new value wins
+                // over an older projected intent while this commit is in flight.
+                pendingIntentChecked = true
+                app.bbcToggleRuntimeState.noteLatestUserIntent(true)
+                renderToggle()
                 bbcToggleController?.onToggle(checked)
             }
         }

@@ -54,46 +54,172 @@ import kotlinx.coroutines.flow.asStateFlow
 internal sealed interface BbcActivationConsentState {
     data object Initializing : BbcActivationConsentState
     data object NotGranted : BbcActivationConsentState
-    data class Legacy(val runtimeEnabled: Boolean) : BbcActivationConsentState
+    /**
+     * [runtimeEnabled] is the persisted opt-out value captured with the
+     * durable classification. It is a SEED for the checkbox, never proof of a
+     * live effect: a confirmed [BbcEffectStatus] always wins over it. `null`
+     * means the key was authoritatively absent (no default-true fabrication).
+     */
+    data class Legacy(val runtimeEnabled: Boolean?) : BbcActivationConsentState
     data object Granted : BbcActivationConsentState
     data object Unknown : BbcActivationConsentState
 }
 
 /**
- * The three durable reads needed to resolve authorization, taken from the
- * CURRENT service generation's prefs instance on the app's IO lane.
+ * Authoritative opt-in key, read the same way the Hook gate reads it:
+ * `contains()` first, then a guarded typed get. ABSENT and FALSE are both
+ * definite answers (but only FALSE explicitly denies), while UNAVAILABLE is a
+ * read failure / wrong type / torn snapshot and must never authorize.
+ */
+enum class BbcOptInValue { ABSENT, FALSE, TRUE, UNAVAILABLE }
+
+/**
+ * ALL authoritative durable inputs of a consent resolution, taken from ONE
+ * coherent snapshot of the CURRENT service generation's prefs instance on the
+ * app's IO lane. Mirrors the Hook's all-or-nothing `BbcCoherentPrefsSnapshot`:
+ * [coherent] == false means at least one read failed / saw a wrong type, so
+ * NO authorization may be produced (Granted or Legacy).
+ */
+data class BbcConsentDurableSnapshot(
+    val optIn: BbcOptInValue,
+    val classification: String?,
+    val migrated: Boolean?,
+    /** Authoritative `contains()`-based read; `null` = absent (not default true). */
+    val legacyRuntimeEnabled: Boolean?,
+    val coherent: Boolean = true,
+) {
+    companion object {
+        fun failClosed(): BbcConsentDurableSnapshot = BbcConsentDurableSnapshot(
+            optIn = BbcOptInValue.UNAVAILABLE,
+            classification = null,
+            migrated = null,
+            legacyRuntimeEnabled = null,
+            coherent = false,
+        )
+    }
+
+    internal fun forGeneration(generation: Long): BbcConsentAuthoritativeRead =
+        BbcConsentAuthoritativeRead(
+            serviceGeneration = generation,
+            optIn = optIn,
+            classification = classification,
+            migrated = migrated,
+            legacyRuntimeEnabled = legacyRuntimeEnabled,
+            coherent = coherent,
+        )
+}
+
+/**
+ * LEGACY Boolean-ish compatibility factory. It deliberately maps `false` to
+ * [BbcOptInValue.ABSENT] (the opt-out key was not written), which is the old
+ * "no explicit opt-out" meaning — it does NOT mean an explicit opt-out. Any
+ * caller that can observe a definite `false` value (an authoritative read, a
+ * parity case) MUST use [BbcConsentDurableSnapshot.forGeneration] or construct
+ * [BbcConsentAuthoritativeRead] directly with [BbcOptInValue.FALSE], otherwise
+ * an explicit opt-out would silently be treated as "no key" and could be
+ * overridden by a legacy fallback. The name is intentionally explicit so a
+ * plain Boolean can never be mistaken for a three-way opt-in signal.
+ */
+internal fun bbcConsentAuthoritativeReadLegacyBoolean(
+    generation: Long,
+    optIn: Boolean?,
+    classification: String?,
+    migrated: Boolean?,
+    legacyRuntimeEnabled: Boolean?,
+    coherent: Boolean = true,
+): BbcConsentAuthoritativeRead = BbcConsentAuthoritativeRead(
+    serviceGeneration = generation,
+    optIn = when (optIn) {
+        true -> BbcOptInValue.TRUE
+        false -> BbcOptInValue.ABSENT
+        null -> BbcOptInValue.UNAVAILABLE
+    },
+    classification = classification,
+    migrated = migrated,
+    legacyRuntimeEnabled = legacyRuntimeEnabled,
+    coherent = coherent,
+)
+
+/**
+ * The durable reads needed to resolve authorization, taken from the CURRENT
+ * service generation's prefs instance on the app's IO lane.
  *
- * [optInGranted] `null` means the read could not be performed authoritatively
- * (binder absent / throw). It must never be coerced to "granted".
- * [classification] `null` means the key is absent or unreadable.
+ * [optIn] distinguishes a definite FALSE/UNAVAILABLE from a normal ABSENT key
+ * (the old `optInGranted: Boolean?` collapsed all three and could not mirror
+ * the Hook's "explicit opt-out wins" rule).
+ * [classification] `null` means the key is genuinely absent; an unreadable /
+ * unknown value makes [coherent] false.
  * [migrated] is the authoritative, `contains()`-based read of the one-time
  * migration marker. `PRE_UPGRADE_EXISTING` authorizes ONLY when this is `true`
  * (the same rule the Hook gate applies); `null`/`false` fails closed.
+ * [legacyRuntimeEnabled] is nullable: `null` is a definite absence, never a
+ * fabricated default-true seed.
  */
 internal data class BbcConsentAuthoritativeRead(
     val serviceGeneration: Long,
-    val optInGranted: Boolean?,
+    val optIn: BbcOptInValue,
     val classification: String?,
     val migrated: Boolean?,
-    val legacyRuntimeEnabled: Boolean,
+    val legacyRuntimeEnabled: Boolean?,
+    val coherent: Boolean = true,
 )
 
-/** Pure UI projection. `checked == null` means "leave the CheckBox as-is". */
+/** Authorization-only seed for a freshly built UI. Never a final value. */
 internal data class BbcActivationToggleUi(
     val checked: Boolean?,
     val neutral: Boolean,
 )
+
+/**
+ * The ONE checkbox projection, fed by BOTH app collectors (authorization and
+ * effect status). [checked] == null means "leave the CheckBox as-is" — neither
+ * authorization nor a provisional read may fabricate a value.
+ *
+ * Rule, in priority order:
+ *  1. a pending user intent wins (the user's latest, still-unverified choice);
+ *  2. [BbcEffectStatus.Confirmed] supplies the acknowledged effect value;
+ *  3. Provisional/Unknown supplies NO value and renders neutral/unverified.
+ *
+ * Authorization does not decide the checkbox value: [Granted] is permission
+ * to skip the consent dialog, NOT proof that the effect is on. It only affects
+ * the "unresolved" neutral styling and, via [requiresConsentFor], whether an
+ * ON tap asks for consent.
+ */
+internal data class BbcToggleUiProjection(
+    val checked: Boolean?,
+    val neutral: Boolean,
+)
+
+internal fun bbcToggleUiProjection(
+    authorization: BbcActivationConsentState,
+    effect: BbcEffectStatus,
+    pendingIntent: Boolean?,
+): BbcToggleUiProjection {
+    val checked = when {
+        pendingIntent != null -> pendingIntent
+        effect is BbcEffectStatus.Confirmed -> effect.value
+        else -> null
+    }
+    val neutral = checked == null ||
+        authorization is BbcActivationConsentState.Initializing ||
+        authorization is BbcActivationConsentState.Unknown
+    return BbcToggleUiProjection(checked, neutral)
+}
 
 /** Fail-closed gate: an unresolved/unknown state still demands consent on ON. */
 internal fun BbcActivationConsentState.requiresConsentFor(checked: Boolean): Boolean =
     checked && this !is BbcActivationConsentState.Granted &&
         this !is BbcActivationConsentState.Legacy
 
-/** Never fabricates an OFF/ON for [Initializing]/[Unknown]: checked == null. */
+/**
+ * Authorization-only SEED for a freshly built UI. A [Granted] permission must
+ * not fabricate a checked ON: the Hook gate may be closed because the runtime
+ * preference is false. The final value always comes from [bbcToggleUiProjection].
+ */
 internal fun BbcActivationConsentState.toggleUi(): BbcActivationToggleUi = when (this) {
     BbcActivationConsentState.NotGranted -> BbcActivationToggleUi(false, false)
     is BbcActivationConsentState.Legacy -> BbcActivationToggleUi(runtimeEnabled, false)
-    BbcActivationConsentState.Granted -> BbcActivationToggleUi(true, false)
+    BbcActivationConsentState.Granted -> BbcActivationToggleUi(null, false)
     BbcActivationConsentState.Initializing,
     BbcActivationConsentState.Unknown,
     -> BbcActivationToggleUi(null, true)
@@ -103,10 +229,14 @@ internal fun BbcActivationConsentState.toggleUi(): BbcActivationToggleUi = when 
 // RESERVED (Phase A): we only ever READ it; the grant path writes the opt-in
 // key and never fabricates that classification value.
 // PRE_UPGRADE_EXISTING is deliberately NOT here: like BbcPreactivationGate it
-// needs the migration marker as a second durable proof. Only MIGRATED (and
-// EXPLICITLY_GRANTED below) opens without a marker read.
+// needs the migration marker as a second durable proof. MIGRATED and
+// EXPLICITLY_GRANTED open without a marker, but EVERY classification-based
+// authorization (including PRE_UPGRADE) still requires a classification
+// confirmed for the current service generation — see resolve() and
+// markInstallClassificationConfirmed().
 private val LEGACY_CLASSIFICATIONS = setOf(
     PolicySource.INSTALL_CLASSIFICATION_MIGRATED,
+    PolicySource.INSTALL_CLASSIFICATION_EXPLICITLY_GRANTED,
 )
 
 /**
@@ -118,7 +248,7 @@ private val LEGACY_CLASSIFICATIONS = setOf(
  *
  * Trust rules (explicit and conservative):
  *  - Only [markConsentWriteOutcome] with Confirmed (and matching generation)
- *    or [resolve] with `optInGranted == true` from the *current* service
+ *    or [resolve] with `BbcOptInValue.TRUE` from the *current* service
  *    generation may produce [Granted].
  *  - A same-generation read can NEVER upgrade [Unknown] — the local mMap may
  *    have been optimistically polluted by a failed commit. Only a read from a
@@ -152,10 +282,20 @@ internal class BbcActivationConsentHolder {
          * resync from a different prefs instance and may.
          */
         val fenceGeneration: Long,
+        /**
+         * Service generation whose bind-time classification the owner App
+         * CONFIRMED durable. Only a FORCED, SUCCESSFUL commit confirms it — a
+         * NoWrite inferred from a polluted local mMap is never enough. A
+         * classification read is only allowed to authorize Legacy for this
+         * exact generation: a queued read can otherwise observe an optimistic
+         * local mMap polluted by a FAILED commit before
+         * [markInstallClassificationFailed] fences it.
+         */
+        val classificationConfirmedGeneration: Long,
     )
 
     private val fenced = AtomicReference(
-        Fenced(BbcActivationConsentState.Initializing, 0L, 0L, -1L),
+        Fenced(BbcActivationConsentState.Initializing, 0L, 0L, -1L, -1L),
     )
     private val sequence = AtomicLong(0L)
 
@@ -179,6 +319,23 @@ internal class BbcActivationConsentHolder {
     fun currentState(): BbcActivationConsentState = fenced.get().state
 
     fun currentGeneration(): Long = fenced.get().generation
+
+    /** True only when the owner App confirmed classification for THIS generation. */
+    internal fun isInstallClassificationConfirmed(generation: Long): Boolean =
+        fenced.get().classificationConfirmedGeneration == generation
+
+    /**
+     * Bind-time classification was confirmed by a FORCED, SUCCESSFUL durable
+     * commit (never by a NoWrite/local-mMap inference). Only then may a legacy
+     * classification read authorize Legacy; see [resolve]. A dead generation
+     * cannot certify a new instance.
+     */
+    @Synchronized
+    internal fun markInstallClassificationConfirmed(generation: Long) {
+        val cur = fenced.get()
+        if (generation != cur.generation) return
+        fenced.set(cur.copy(classificationConfirmedGeneration = generation))
+    }
 
     /** Monotonic, app-wide user-intent sequence (never reset by UI rebuilds). */
     fun nextIntentSequence(): Long = sequence.incrementAndGet()
@@ -239,7 +396,9 @@ internal class BbcActivationConsentHolder {
             -> BbcActivationConsentState.Initializing
             else -> cur.state
         }
-        fenced.set(Fenced(next, generation, cur.appliedIntentSequence, cur.fenceGeneration))
+        // The confirmation belongs to a prefs instance, not to the app process:
+        // a rebind must re-confirm classification for the new generation.
+        fenced.set(Fenced(next, generation, cur.appliedIntentSequence, cur.fenceGeneration, -1L))
         _state.value = next
     }
 
@@ -249,6 +408,11 @@ internal class BbcActivationConsentHolder {
      * same-generation read cannot clear [Unknown]: that is exactly the polluted
      * local-mMap case the durable fence exists for. Only a read from a NEWER
      * generation (a genuinely different prefs instance) may clear the fence.
+     *
+     * Decision order mirrors the read-only Hook gate: explicit opt-out wins
+     * over every legacy fallback, an unreadable snapshot authorizes nothing,
+     * and legacy classification needs BOTH a confirmed generation and (for
+     * PRE_UPGRADE_EXISTING) the durable migration marker.
      */
     @Synchronized
     fun resolve(read: BbcConsentAuthoritativeRead) {
@@ -257,15 +421,21 @@ internal class BbcActivationConsentHolder {
         val fenceIsCurrent =
             cur.state is BbcActivationConsentState.Unknown &&
                 read.serviceGeneration <= cur.fenceGeneration
+        val classificationConfirmed =
+            isInstallClassificationConfirmed(read.serviceGeneration)
+        val legacy = when {
+            read.classification == PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING ->
+                read.migrated == true
+            else -> read.classification in LEGACY_CLASSIFICATIONS
+        }
         val next = when {
             fenceIsCurrent -> cur.state
-            read.optInGranted == true -> BbcActivationConsentState.Granted
-            read.classification == PolicySource.INSTALL_CLASSIFICATION_EXPLICITLY_GRANTED ->
-                BbcActivationConsentState.Granted
-            read.classification == PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING &&
-                read.migrated == true ->
-                BbcActivationConsentState.Legacy(read.legacyRuntimeEnabled)
-            read.classification in LEGACY_CLASSIFICATIONS ->
+            // ALL-OR-NOTHING: any failed authoritative read masks the snapshot.
+            !read.coherent || read.optIn == BbcOptInValue.UNAVAILABLE -> cur.state
+            // Highest priority, exactly like bbcPreactivationGate's optIn == false.
+            read.optIn == BbcOptInValue.FALSE -> BbcActivationConsentState.NotGranted
+            read.optIn == BbcOptInValue.TRUE -> BbcActivationConsentState.Granted
+            legacy && classificationConfirmed ->
                 BbcActivationConsentState.Legacy(read.legacyRuntimeEnabled)
             read.classification == PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED ->
                 BbcActivationConsentState.NotGranted
@@ -273,7 +443,12 @@ internal class BbcActivationConsentHolder {
         }
         if (next === cur.state) return
         val fenceGeneration = if (next is BbcActivationConsentState.Unknown) read.serviceGeneration else -1L
-        fenced.set(Fenced(next, cur.generation, cur.appliedIntentSequence, fenceGeneration))
+        fenced.set(
+            Fenced(
+                next, cur.generation, cur.appliedIntentSequence,
+                fenceGeneration, cur.classificationConfirmedGeneration,
+            ),
+        )
         _state.value = next
     }
 
@@ -308,7 +483,10 @@ internal class BbcActivationConsentHolder {
             cur.fenceGeneration >= generation
         ) return
         fenced.set(
-            Fenced(BbcActivationConsentState.Unknown, cur.generation, cur.appliedIntentSequence, generation),
+            Fenced(
+                BbcActivationConsentState.Unknown, cur.generation, cur.appliedIntentSequence,
+                generation, cur.classificationConfirmedGeneration,
+            ),
         )
         _state.value = BbcActivationConsentState.Unknown
     }
@@ -358,7 +536,12 @@ internal class BbcActivationConsentHolder {
                 minOf(cur.generation, generation)
             }
         } else -1L
-        fenced.set(Fenced(next, cur.generation, intentSequence, fenceGeneration))
+        fenced.set(
+            Fenced(
+                next, cur.generation, intentSequence, fenceGeneration,
+                cur.classificationConfirmedGeneration,
+            ),
+        )
         _state.value = next
         return true
     }
@@ -376,6 +559,11 @@ internal class BbcActivationConsentHolder {
         val pending = pendingEnable
         if (pending != null && pending.sequence <= intentSequence) pendingEnable = null
         if (intentSequence <= cur.appliedIntentSequence) return
-        fenced.set(Fenced(cur.state, cur.generation, intentSequence, cur.fenceGeneration))
+        fenced.set(
+            Fenced(
+                cur.state, cur.generation, intentSequence, cur.fenceGeneration,
+                cur.classificationConfirmedGeneration,
+            ),
+        )
     }
 }
