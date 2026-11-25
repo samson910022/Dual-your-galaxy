@@ -525,6 +525,82 @@ class WarningActionOwnershipTest {
         assertEquals("no write callback after revocation", listOf("write:pkg.final.confirm.retry"), hits)
     }
 
+    // PR #89 Round-4 R4-1: a late CONSUMED settlement for action A must never
+    // retire B, the newer action that now owns the pending. The generation
+    // mismatch is the ONLY veto here — every other conjunct is held true so a
+    // gate that drops it flips to retire and this test fails.
+    @Test
+    fun confirmAttemptSettlement_staleCannotRetireNewerAction() {
+        val controller = WarningRestartController()
+        val hits = mutableListOf<String>()
+        val tracker = PolicyWriteAttemptTracker()
+        val generationA = 1L
+        val generationB = 2L
+
+        // A is installed; its confirm attempt enters the per-pending guard.
+        val a = controller.install(
+            action = WarningRestartAction.WRITE,
+            candidateKey = "pkg.stale.confirm.a",
+            generation = 1,
+            callback = { hits.add("write:stale.confirm.a") },
+            resetBudget = true,
+        )
+        val aId = a.identity.id
+        assertTrue("A must be live", controller.isLive(aId))
+        val attemptA = checkNotNull(tracker.tryEnter(generationA))
+
+        // Real gate for a RETRYABLE_RETAINED async outcome: no retire, A stays live.
+        val retainedRetires = confirmAttemptRetiresAction(
+            PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED,
+            generationA,
+            generationA,
+            tracker.isActive(generationA, attemptA),
+            controller.isLive(aId),
+            true,
+        )
+        assertFalse("retained async outcome must not retire", retainedRetires)
+        assertTrue("A stays live after a retained outcome", controller.isLive(aId))
+        assertEquals(aId, controller.currentRequestId())
+        assertEquals(aId, controller.retryRequestId())
+
+        // B supersedes A with a fresh identity and its own generation/attempt.
+        val b = controller.install(
+            action = WarningRestartAction.WRITE,
+            candidateKey = "pkg.stale.confirm.b",
+            generation = 2,
+            callback = { hits.add("write:stale.confirm.b") },
+            resetBudget = true,
+        )
+        val bId = b.identity.id
+        assertNotEquals(aId, bId)
+        val attemptB = checkNotNull(tracker.tryEnter(generationB))
+        assertNotEquals("fresh attempt id for B", attemptA, attemptB)
+        assertTrue("B must be live", controller.isLive(bId))
+        assertEquals(bId, controller.currentRequestId())
+
+        // Stale CONSUMED settlement carrying A's generation/attempt/id arrives.
+        // A's attempt is still marked active and its captured action/host were
+        // alive: ONLY the callback-vs-expected generation mismatch may veto.
+        val staleRetires = confirmAttemptRetiresAction(
+            PolicyWriteConfirmAttemptOutcome.CONSUMED,
+            callbackGeneration = generationA,
+            expectedGeneration = generationB,
+            attemptActive = tracker.isActive(generationA, attemptA),
+            actionLive = true,
+            hostAlive = true,
+        )
+        assertFalse("stale generation must not retire", staleRetires)
+        if (staleRetires) {
+            assertFalse("a stale id cannot revoke a newer action", controller.revoke(aId))
+        }
+        assertFalse("A's callback must never fire", hits.any { it == "write:stale.confirm.a" })
+        assertTrue("B still live", controller.isLive(bId))
+        assertEquals(bId, controller.currentRequestId())
+        assertTrue("B's retry still consumable", controller.consumeRetry(bId, true))
+        assertEquals(listOf("write:stale.confirm.b"), hits)
+        assertFalse("stale A retry never consumable", controller.consumeRetry(aId, true))
+    }
+
     private fun installClear(
         controller: WarningRestartController,
         generation: Int,

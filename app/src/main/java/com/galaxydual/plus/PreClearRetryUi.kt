@@ -455,12 +455,77 @@ internal class WarningRestartController {
 internal fun cancelOwnershipAccepted(vmCancelled: Boolean, actionLive: Boolean): Boolean =
     vmCancelled && actionLive
 
-// PR #89 Round-3 R3-2: the final dialog's Positive arm revokes the accepted
-// warning action only when the VM actually dispatched the write. A
-// RETRYABLE_RETAINED verdict keeps the pending for a retry, so the action must
-// stay live and its Retry token consumable. Framework-free and JVM-testable.
+// PR #89 Round-3 R3-2 / Phase 1: this is the SYNCHRONOUS verdict gate only —
+// a RETRYABLE_RETAINED refusal keeps the accepted action live; a dispatched
+// write or a terminal no-write path both retire it. The ASYNC outcome gate
+// (`confirmAttemptRetiresAction`) is wired into the Activities/VM in a LATER
+// phase; flipping this to TERMINAL-only before that wiring lands atomically
+// would strand normal ACCEPTED writes with a live action and no async producer.
 internal fun confirmRevocationAccepted(admission: PolicyWriteConfirmAdmission): Boolean =
     admission != PolicyWriteConfirmAdmission.RETRYABLE_RETAINED
+
+// PR #89 Round-4 R4-1: the ACTUAL async outcome of a dispatched confirm write.
+// ACCEPTED (dispatch) alone never retires an accepted warning action; only a
+// proven CONSUMED/HANDED_OFF outcome may do so, and only for the generation and
+// attempt that produced it. Framework-free and JVM-testable.
+internal enum class PolicyWriteConfirmAttemptOutcome {
+    CONSUMED,           // pending settled/cleared; no retryable pending remains
+    HANDED_OFF,         // proven Tx ownership transition; cannot return to retryable QUEUED
+    RETRYABLE_RETAINED, // same expected pending still QUEUED with zero save; keep action
+    SUPERSEDED,         // a different generation now owns the pending; never retire a newer action
+}
+
+internal fun confirmAttemptMayRetire(o: PolicyWriteConfirmAttemptOutcome): Boolean =
+    o == PolicyWriteConfirmAttemptOutcome.CONSUMED ||
+    o == PolicyWriteConfirmAttemptOutcome.HANDED_OFF
+
+/**
+ * Settlement-time gate for retiring the accepted warning action after an async
+ * confirm attempt. Signature and truth semantics are unchanged from Phase 1.
+ *
+ * IMPORTANT (TOCTOU): [attemptActive] MUST be the result of the ATOMIC
+ * [PolicyWriteAttemptTracker.exit] call performed AT settlement time with the
+ * captured (generation, attemptId). A pre-check via
+ * [PolicyWriteAttemptTracker.isActive] and a later exit is a race: another
+ * settle can consume the attempt in between. Likewise [actionLive] and
+ * [hostAlive] MUST be RE-READ at settlement time, and the caller MUST hold a
+ * live action id so that a true result is applied to the very action that was
+ * checked here (not to whatever the controller happens to hold later).
+ */
+internal fun confirmAttemptRetiresAction(
+    outcome: PolicyWriteConfirmAttemptOutcome,
+    callbackGeneration: Long,
+    expectedGeneration: Long,
+    attemptActive: Boolean,
+    actionLive: Boolean,
+    hostAlive: Boolean,
+): Boolean =
+    hostAlive && actionLive && attemptActive &&
+        callbackGeneration == expectedGeneration &&
+        confirmAttemptMayRetire(outcome)
+
+// PR #89 Round-4 R4-1: tokenized per-pending attempt guard. No global
+// AtomicBoolean: a stale settle for an old attempt on the SAME retained pending
+// cannot release a newer attempt, and unrelated generations never block each
+// other. The tracker GENERATES its own monotonic attempt ids — callers cannot
+// choose or forge a token, so a stale settle cannot replay an old id.
+// Framework-free and JVM-testable.
+internal class PolicyWriteAttemptTracker {
+    private val active = java.util.concurrent.ConcurrentHashMap<Long, Long>()
+    private val nextAttemptId = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** null => duplicate attempt for this generation; caller must ignore the tap. */
+    fun tryEnter(generation: Long): Long? {
+        val id = nextAttemptId.incrementAndGet()
+        return if (active.putIfAbsent(generation, id) == null) id else null
+    }
+    /** Atomic consume: returns true ONLY if [attemptId] still owned this generation. */
+    fun exit(generation: Long, attemptId: Long): Boolean = active.remove(generation, attemptId)
+    fun isActive(generation: Long, attemptId: Long): Boolean = active[generation] == attemptId
+    fun isAnyActive(generation: Long): Boolean = active.containsKey(generation)
+    /** Lifecycle-only escape hatch (Activity onDestroy); late callbacks then no-op. */
+    fun clear() { active.clear() }
+}
 
 // PR #89 Round-3 R3-3: after rotation, an orphan QUEUED pending that was rebuilt
 // from saved state and has no live consent action must be invalidated. SAVING /
