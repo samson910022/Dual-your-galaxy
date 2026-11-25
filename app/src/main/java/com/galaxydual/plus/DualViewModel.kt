@@ -4212,6 +4212,15 @@ class DualViewModel(
     //   id differs: true. A same-id rebuild can happen after core's own
     //   verified serial was captured, so omitting fresh.serial here would
     //   fail open (issue #68 stale splice).
+    // - pinned serial unknown (null) but any other evidence now carries a
+    //   serial: true. This is an EVIDENCE UPGRADE (an old FRESH id-only pin
+    //   whose serial simply was not observable at listing time, while the
+    //   operation/consent/live triple can read it now), NOT proof that the
+    //   target was rebuilt. It is deliberately not a "target 已重建" note
+    //   nor a VERIFY_MISMATCH diagnostic: rebuiltNote stays gated on an id
+    //   change (false here) and recordOp keeps diagnose = null. The single
+    //   read-only refreshLocked() is enough to build a complete snapshot
+    //   without re-issuing the write.
     // - serial null everywhere (never observable): no fabricated drift.
     // The caller degrades the inventory out of FRESH and runs a read-only
     // refreshLocked(); this helper never mutates state nor persists anything.
@@ -4238,9 +4247,15 @@ class DualViewModel(
         // write time and can still be the OLD serial when a same-id rebuild
         // happens before this extra query. Comparing only the three older
         // serials would fail open ([15,15,null] or [15,null,null] look agreed).
-        // All-null stays tolerated: filterNotNull() leaves an empty list.
-        val knownSerials = listOf(pinned.targetSerial, verifiedSerial, consentSerial, fresh.serial)
-        return knownSerials.filterNotNull().distinct().size > 1
+        // All-null stays tolerated: listOfNotNull() leaves an empty list.
+        // fresh.serial MUST stay in the list: it is the newly observable
+        // evidence that upgrades an id-only pin (see KDoc above).
+        val knownSerials = listOfNotNull(pinned.targetSerial, verifiedSerial, consentSerial, fresh.serial)
+        // Evidence upgrade, not a proven rebuild: the old pin had no serial
+        // while a later operation/consent/live read does. Do not emit any
+        // "target 已重建" / VERIFY_MISMATCH diagnostic for this branch.
+        if (pinned.targetSerial == null && knownSerials.isNotEmpty()) return true
+        return knownSerials.distinct().size > 1
     }
 
     // Phase N2 Shizuku binding teardown (issue #34 re-review), hardened by

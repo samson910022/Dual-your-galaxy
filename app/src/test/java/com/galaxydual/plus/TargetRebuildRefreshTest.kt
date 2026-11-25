@@ -22,6 +22,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -639,5 +640,266 @@ class TargetRebuildRefreshTest {
         )
         assertEquals("count must match the retained list", s.cloned.size, s.inventory.count)
         assertEquals("no uninstall resend may occur", 1, gw.writeCount)
+    }
+
+    // PR #88 Round 2 P2-R2-1 (clone). The all-null serial case is an accepted
+    // capability limit, but only when the serial NEVER becomes readable. Here
+    // the initial listing cannot see a serial, so the inventory is honestly
+    // FRESH(95,null) with {chat,old}; before the clone the serial becomes
+    // observable (41) and the profile content is replaced. Old pin has no
+    // serial to disagree with the operation's 41, so the helper must treat
+    // this as an EVIDENCE UPGRADE (not a proven rebuild): degrade to non-FRESH
+    // and do ONE read-only refresh, without resending the install. The target
+    // barrier waits for the complete FRESH(95,41) snapshot, not the first
+    // non-FRESH frame.
+    @Test
+    fun cloneAfterSerialBecameObservable_refreshesIntoFresh95_41WithoutResend() {
+        val gw = RebuildFake(nullSerialBeforeExtraFetch = true)
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertNull("serial not observable at initial listing", vm.state.value.inventory.targetSerial)
+        assertEquals(setOf("com.example.chat", "com.example.old"), vm.state.value.cloned.toSet())
+
+        // The serial becomes readable and the profile content is swapped.
+        gw.nullSerialBeforeExtraFetch = false
+        gw.serial = 41
+        gw.pkgsByUser[95] = mutableSetOf("com.example.chat", "com.example.rebuilt")
+
+        vm.clone("com.example.new")
+        val expected = setOf("com.example.chat", "com.example.rebuilt", "com.example.new")
+        await {
+            val s = vm.state.value
+            !s.loading &&
+                s.lastOperation?.phase == OpPhase.SUCCESS &&
+                s.inventory.freshness == InventoryFreshness.FRESH &&
+                s.inventory.targetId == 95 &&
+                s.inventory.targetSerial == 41 &&
+                s.inventory.count == s.cloned.size &&
+                s.cloned.toSet() == expected
+        }
+
+        val s = vm.state.value
+        assertEquals(95, s.lastOperation?.pinnedTarget)
+        assertEquals(
+            "refresh must publish the whole post-upgrade package set, got: ${s.cloned}",
+            expected,
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the rebuilt list", s.cloned.size, s.inventory.count)
+        assertNull("success after refresh must clear diagnose", s.diagnose)
+        assertNull("clone must not leave a pending remove", s.pendingRemove)
+        assertFalse(
+            "evidence upgrade is not a proven target rebuild",
+            s.lastOperation?.detail?.contains("target 已重建") == true,
+        )
+        assertEquals("no install resend may occur", 1, gw.writeCount)
+    }
+
+    // P2-R2-1 (remove). Same evidence-upgrade shape, but the consent pin
+    // (pendingRemove.dualSerial) also carries 41. The old id-only FRESH(95,null)
+    // inventory must not keep {chat,old} after the read-only refresh; the
+    // complete FRESH(95,41) snapshot must contain only {rebuilt}.
+    @Test
+    fun removeAfterSerialBecameObservable_refreshesIntoFresh95_41WithoutResend() {
+        val gw = RebuildFake(nullSerialBeforeExtraFetch = true)
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertNull("serial not observable at initial listing", vm.state.value.inventory.targetSerial)
+        assertEquals(setOf("com.example.chat", "com.example.old"), vm.state.value.cloned.toSet())
+
+        gw.nullSerialBeforeExtraFetch = false
+        gw.serial = 41
+        gw.pkgsByUser[95] = mutableSetOf("com.example.chat", "com.example.rebuilt")
+
+        vm.requestRemove("com.example.chat")
+        await {
+            vm.state.value.pendingRemove?.dualId == 95 &&
+                vm.state.value.pendingRemove?.dualSerial == 41
+        }
+        vm.confirmRemove()
+        val expected = setOf("com.example.rebuilt")
+        await {
+            val s = vm.state.value
+            !s.loading &&
+                s.lastOperation?.phase == OpPhase.SUCCESS &&
+                s.inventory.freshness == InventoryFreshness.FRESH &&
+                s.inventory.targetId == 95 &&
+                s.inventory.targetSerial == 41 &&
+                s.inventory.count == s.cloned.size &&
+                s.cloned.toSet() == expected
+        }
+
+        val s = vm.state.value
+        assertEquals(95, s.lastOperation?.pinnedTarget)
+        assertEquals(
+            "refresh must publish the whole post-upgrade package set, got: ${s.cloned}",
+            expected,
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the rebuilt list", s.cloned.size, s.inventory.count)
+        assertNull("success after refresh must clear diagnose", s.diagnose)
+        assertNull("confirm must drop pending", s.pendingRemove)
+        assertFalse(
+            "evidence upgrade is not a proven target rebuild",
+            s.lastOperation?.detail?.contains("target 已重建") == true,
+        )
+        assertEquals("no uninstall resend may occur", 1, gw.writeCount)
+    }
+
+    // P2-R2-1 failure path (clone): the read-only refresh triggered by the
+    // evidence upgrade cannot confirm the target. The inventory must stay
+    // non-FRESH with CHANNEL_ERROR/CHANNEL, no new package may be spliced, and
+    // the install must not be re-issued.
+    @Test
+    fun cloneAfterSerialBecameObservable_whenRefreshFails_staysNonFreshWithoutResend() {
+        val gw = RebuildFake(
+            nullSerialBeforeExtraFetch = true,
+            postWriteIdentityMode = RebuildFake.IdentityMode.NULL_TARGET,
+        )
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertNull(vm.state.value.inventory.targetSerial)
+
+        gw.nullSerialBeforeExtraFetch = false
+        gw.serial = 41
+        gw.pkgsByUser[95] = mutableSetOf("com.example.chat", "com.example.rebuilt")
+
+        vm.clone("com.example.new")
+        await {
+            val s = vm.state.value
+            !s.loading &&
+                s.lastOperation?.phase == OpPhase.SUCCESS &&
+                s.diagnose?.code == DiagnoseCode.CHANNEL_ERROR &&
+                s.msgKind == MsgKind.CHANNEL &&
+                s.inventory.freshness != InventoryFreshness.FRESH
+        }
+
+        val s = vm.state.value
+        assertEquals(
+            "failed refresh must not leave a mixed FRESH splice, got: ${s.cloned}",
+            setOf("com.example.chat", "com.example.old"),
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the retained list", s.cloned.size, s.inventory.count)
+        assertFalse(
+            "evidence upgrade is not a proven target rebuild",
+            s.lastOperation?.detail?.contains("target 已重建") == true,
+        )
+        assertEquals("no install resend may occur", 1, gw.writeCount)
+    }
+
+    // P2-R2-1 failure path (remove): same as above through confirmRemove().
+    // The removed package is still dropped from the retained list, but no
+    // post-upgrade content may be spliced and the inventory stays non-FRESH.
+    @Test
+    fun removeAfterSerialBecameObservable_whenRefreshFails_staysNonFreshWithoutResend() {
+        val gw = RebuildFake(
+            nullSerialBeforeExtraFetch = true,
+            postWriteIdentityMode = RebuildFake.IdentityMode.NULL_TARGET,
+        )
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertNull(vm.state.value.inventory.targetSerial)
+
+        gw.nullSerialBeforeExtraFetch = false
+        gw.serial = 41
+        gw.pkgsByUser[95] = mutableSetOf("com.example.chat", "com.example.rebuilt")
+
+        vm.requestRemove("com.example.chat")
+        await {
+            vm.state.value.pendingRemove?.dualId == 95 &&
+                vm.state.value.pendingRemove?.dualSerial == 41
+        }
+        vm.confirmRemove()
+        await {
+            val s = vm.state.value
+            !s.loading &&
+                s.lastOperation?.phase == OpPhase.SUCCESS &&
+                s.diagnose?.code == DiagnoseCode.CHANNEL_ERROR &&
+                s.msgKind == MsgKind.CHANNEL &&
+                s.inventory.freshness != InventoryFreshness.FRESH
+        }
+
+        val s = vm.state.value
+        assertEquals(
+            "failed refresh must not leave a mixed FRESH splice, got: ${s.cloned}",
+            setOf("com.example.old"),
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the retained list", s.cloned.size, s.inventory.count)
+        assertNull("confirm must drop pending", s.pendingRemove)
+        assertFalse(
+            "evidence upgrade is not a proven target rebuild",
+            s.lastOperation?.detail?.contains("target 已重建") == true,
+        )
+        assertEquals("no uninstall resend may occur", 1, gw.writeCount)
+    }
+
+    // Accepted capability limit: serial is NEVER observable (suppression is
+    // kept on, and NULL_SERIAL drops it at the VM's extra query too). Every
+    // serial is null, so the helper must not invent drift: no refresh, no
+    // degrade, FRESH(95,null) survives with the new package simply spliced.
+    @Test
+    fun cloneAllNullSerials_keepsAllowedFreshIdOnlyLimit() {
+        val gw = RebuildFake(
+            nullSerialBeforeExtraFetch = true,
+            postWriteIdentityMode = RebuildFake.IdentityMode.NULL_SERIAL,
+        )
+        val clock = JumpClock()
+        val vm = makeVm(gw, clock)
+        await { vm.state.value.channelReady }
+
+        vm.refresh()
+        await { vm.state.value.inventory.freshness == InventoryFreshness.FRESH }
+        assertEquals(95, vm.state.value.inventory.targetId)
+        assertNull(vm.state.value.inventory.targetSerial)
+
+        // No world flip: suppression stays on through the clone.
+        vm.clone("com.example.new")
+        val expected = setOf("com.example.chat", "com.example.old", "com.example.new")
+        await {
+            val s = vm.state.value
+            !s.loading &&
+                s.lastOperation?.phase == OpPhase.SUCCESS &&
+                s.inventory.freshness == InventoryFreshness.FRESH &&
+                s.inventory.targetId == 95 &&
+                s.inventory.targetSerial == null &&
+                s.inventory.count == s.cloned.size &&
+                s.cloned.toSet() == expected
+        }
+
+        val s = vm.state.value
+        assertEquals(95, s.lastOperation?.pinnedTarget)
+        assertEquals(
+            "all-null serials keep the id-only FRESH splice, got: ${s.cloned}",
+            expected,
+            s.cloned.toSet(),
+        )
+        assertEquals("count must match the list", s.cloned.size, s.inventory.count)
+        assertNull("all-null serials must not fabricate a drift diagnostic", s.diagnose)
+        assertEquals(MsgKind.INFO, s.msgKind)
+        assertFalse(
+            "all-null serials must not claim a target rebuild",
+            s.lastOperation?.detail?.contains("target 已重建") == true,
+        )
+        assertEquals("no install resend may occur", 1, gw.writeCount)
     }
 }
