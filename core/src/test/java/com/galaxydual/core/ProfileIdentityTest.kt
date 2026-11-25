@@ -220,6 +220,7 @@ class ProfileIdentityTest {
         serial: Int? = null,
         parentId: Int? = if (userId == 0) null else 0,
         label: String = "",
+        evidenceInvalid: Boolean = false,
     ) = ProfileIdentity(
         userId = userId,
         serial = serial,
@@ -228,6 +229,7 @@ class ProfileIdentityTest {
         source = source,
         confidence = IdentityConfidence.MED,
         label = label,
+        evidenceInvalid = evidenceInvalid,
     )
 
     @Test
@@ -758,6 +760,170 @@ class ProfileIdentityTest {
         )
     }
 
+    // ---- Issue #87 R9: invalid evidence vetoes independently of values ----
+
+    // A flagged UNKNOWN on the SAME channel as a CLONE is the decisive case:
+    // verbose has CLONE(0,15) + flagged UNKNOWN(0,15), dumpsys has CLONE(0,15)
+    // and the property agrees. Every old gate would pass; only the flag can
+    // veto. The retained 0/15 values are diagnosis, not authorization.
+    @Test
+    fun r9_flaggedVerboseUnknownClaimRefusesDualTarget() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = 15, evidenceInvalid = true),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+        )
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("flagged verbose evidence must refuse: $res", res is DualResolution.Refused)
+        assertTrue((res as DualResolution.Refused).reason.contains("contradictory evidence"))
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
+    @Test
+    fun r9_flaggedDumpsysUnknownClaimRefusesDualTarget() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.DUMPSYS, serial = 15, evidenceInvalid = true),
+        )
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("flagged dumpsys evidence must refuse: $res", res is DualResolution.Refused)
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
+    @Test
+    fun r9_bareUnknownStaysUnknownNotRefused() {
+        // Two-tier contract: a bare UNKNOWN (no contradictory/invalid value)
+        // means insufficient evidence -> Unknown, never Refused.
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = null, parentId = null),
+        )
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
+    @Test
+    fun r9_flagOnOtherIdDoesNotVetoTarget95() {
+        // id scoping: an invalid claim for a DIFFERENT id must not disturb
+        // an otherwise clean Confirmed(95,15,0).
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+            claim(96, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = 99, evidenceInvalid = true),
+        )
+        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+        assertEquals(
+            VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
+            SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
+        )
+    }
+
+    @Test
+    fun r9_flagPlusConflictingSerialIsNonConfirmed() {
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 99),
+            claim(95, ProfileUserType.UNKNOWN, IdentitySource.USER_LIST_V, serial = 42, evidenceInvalid = true),
+        )
+        val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+        assertTrue("flag must veto even alongside a serial conflict: $res", res !is DualResolution.Confirmed)
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
+    @Test
+    fun r9_cleanCloneConsensusStillConfirmsWithAbsolutePins() {
+        // Positive control with absolute pins: no UNKNOWN/invalid claim means
+        // the R9 vetoes are inert and the legitimate target still confirms.
+        val candidates = listOf(
+            claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15),
+            claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15),
+        )
+        assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+        assertEquals(
+            VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
+            SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
+        )
+    }
+
+    // ---- R14: strict numeric value grammar reaches the resolver ----
+
+    private val r14CleanVerbose = claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15)
+    private val r14CleanDumpsys = claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15)
+
+    @Test
+    fun r14_malformedNumericClaimOnTargetRefusesBothChannelsAndOrders() {
+        // Real parsed claims (not hand-built flags): a malformed parent in the
+        // verbose channel and a malformed serial in the dumpsys channel must
+        // both survive to the R9 veto, in either claim order.
+        val malformedVerbose = SamsungProfileAdapter.parseUserListVerbose(
+            "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0x10) serialNo=15",
+        ).single()
+        val malformedDumpsys = SamsungProfileAdapter.parseDumpsysUser(
+            """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DUAL_APP:400} serialNo=15oops:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE
+            """.trimIndent(),
+        ).single { it.userId == 95 }
+
+        for (invalid in listOf(malformedVerbose, malformedDumpsys)) {
+            assertEquals("${invalid.source}: must be UNKNOWN", ProfileUserType.UNKNOWN, invalid.userType)
+            assertTrue("${invalid.source}: must be flagged invalid", invalid.evidenceInvalid)
+            for (candidates in listOf(
+                listOf(invalid, r14CleanVerbose, r14CleanDumpsys),
+                listOf(r14CleanVerbose, r14CleanDumpsys, invalid),
+            )) {
+                val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+                assertTrue("${invalid.source}: invalid target evidence must refuse: $res", res is DualResolution.Refused)
+                assertNull(
+                    "${invalid.source}: no target may survive",
+                    SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun r14_malformedNumericClaimOnOtherIdDoesNotVetoTarget() {
+        val invalidOther = SamsungProfileAdapter.parseUserListVerbose(
+            "1: id=96, name=OK, type=profile.CLONE, flags=X (parentId=2147483648)",
+        ).single()
+        assertEquals(96, invalidOther.userId)
+        assertEquals(ProfileUserType.UNKNOWN, invalidOther.userType)
+        assertTrue(invalidOther.evidenceInvalid)
+        for (candidates in listOf(
+            listOf(invalidOther, r14CleanVerbose, r14CleanDumpsys),
+            listOf(r14CleanVerbose, r14CleanDumpsys, invalidOther),
+        )) {
+            assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+            assertEquals(
+                VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
+                SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
+            )
+        }
+    }
+
+    @Test
+    fun r14_bareUnknownWithoutNumericEvidenceStaysUnknownNotRefused() {
+        // A malformed ROW (empty type) emits bare UNKNOWN/LOW with no values
+        // and no malformed field: two-tier contract -> Unknown, not Refused.
+        val bare = SamsungProfileAdapter.parseUserListVerbose(
+            "1: id=95, name=OK, type=, flags=X",
+        ).single()
+        assertEquals(ProfileUserType.UNKNOWN, bare.userType)
+        assertNull(bare.parentId)
+        assertNull(bare.serial)
+        assertTrue(!bare.evidenceInvalid)
+        val candidates = listOf(r14CleanVerbose, r14CleanDumpsys, bare)
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
     @Test
     fun identityGate_headerErrorLabelsDoNotFail() {
         val verbose = """
@@ -791,8 +957,11 @@ class ProfileIdentityTest {
 
     @Test
     fun identityGate_malformedHeaderIsNotStripped() {
-        // Only well-formed `UserInfo{id:label:flags}` headers are stripped.
-        // A malformed header carrying an error keyword must still fail.
+        // Only well-formed `UserInfo{id:label:flags}` headers get a neutralized
+        // label. Since R12/R13 the shared LegacyHeaderParser OWNS every
+        // `UserInfo{` attempt: an unparseable one is classified REJECTED (not
+        // OTHER), so a malformed header carrying an error keyword still fails
+        // and can no longer be stitched into a preceding legacy body.
         val malformed = "Users:\n  UserInfo{foo Failure}\n    User type: android.os.usertype.profile.CLONE\n"
         assertTrue(!PmOutputParser.isIdentityChannelOk(malformed, 0))
         val missingFlags = "Users:\n  UserInfo{95:Error}\n    User type: android.os.usertype.profile.CLONE\n"
@@ -801,8 +970,9 @@ class ProfileIdentityTest {
 
     @Test
     fun identityGate_unclosedHeaderDoesNotSwallowFailure() {
-        // The strip pattern never spans lines: an unclosed header must not
-        // swallow a genuine Failure line below it (fail-open guard).
+        // An unclosed header is now REJECTED by the shared parser (no greedy
+        // cross-body brace scan), so it can never swallow a genuine Failure
+        // line below it (fail-open guard).
         val truncated = "Users:\n  UserInfo{95:Broken:400 running:\nFailure [INSTALL_FAILED_INVALID_APK: bad]\n"
         assertTrue(!PmOutputParser.isIdentityChannelOk(truncated, 0))
     }

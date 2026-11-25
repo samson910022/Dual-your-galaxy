@@ -118,6 +118,16 @@ case "$mode" in
   ok)
     echo 'BUILD SUCCESSFUL in 1s'
     exit 0 ;;
+  env-passthrough)
+    # Pins the `-- env VAR=value <cmd>` form used by android.yml's release
+    # manifest-merge step. The fake REQUIRES the exported variable AND that it
+    # equal exactly 1: without it the ${VAR:?} expansion exits non-zero, and a
+    # wrong value (e.g. `=0`) fails the explicit check below. Either way a
+    # guard (or fixture) that drops the `env` prefix or passes the wrong value
+    # makes the fake exit non-zero, so the passthrough fixture goes RED.
+    printf 'ALLOW_RELEASE_MANIFEST_MERGE=%s\n' "${ALLOW_RELEASE_MANIFEST_MERGE:?ALLOW_RELEASE_MANIFEST_MERGE not exported}"
+    [ "$ALLOW_RELEASE_MANIFEST_MERGE" = 1 ] || exit 1
+    exit 0 ;;
   split-signature)
     # Signature printed across two lines: the line-based pass cannot match;
     # the newline-collapsed fallback can and fails fast.
@@ -220,8 +230,12 @@ run_guard() {
   local case_dir case_rc case_invocations expected_desc
   case_dir="$(mktemp -d "${TMPDIR:-/tmp}/ci-retry-guard-test.XXXXXX")"
   : > "$case_dir/invocations"
+  # Strip any ambient ALLOW_RELEASE_MANIFEST_MERGE so the env fixtures below
+  # can ONLY pass via the explicit `-- env ALLOW_RELEASE_MANIFEST_MERGE=1` in
+  # the guard arguments — an ambient export cannot mask a dropped `env`
+  # prefix. Harmless for every other fixture.
   INVOCATIONS_FILE="$case_dir/invocations" FAKE_MODE="$fake_mode" \
-    bash "$GUARD" "$@" >"$case_dir/output.log" 2>&1
+    env -u ALLOW_RELEASE_MANIFEST_MERGE bash "$GUARD" "$@" >"$case_dir/output.log" 2>&1
   case_rc=$?
   case_invocations="$(wc -l < "$case_dir/invocations" | tr -d ' ')"
   if [ "$case_rc" = "$expected_rc" ] && [ "$case_invocations" = "$expected_invocations" ]; then
@@ -287,6 +301,27 @@ run_guard 'transient 504 then success on 2nd attempt (exits 0, invocations 2)' \
 run_guard 'passing command is not retried (exits 0, invocations 1)' \
   0 1 ok \
   3 0 "test ok" -- "$FAKE_GRADLE"
+
+# --- (h) `env VAR=value` wrapper passthrough (android.yml:501 call form) ------
+# The release manifest-merge step invokes the guard as:
+#   bash scripts/ci-retry-guard.sh 5 30 <label> -- env ALLOW_RELEASE_MANIFEST_MERGE=1 ./gradlew ...
+# The `env-passthrough` fake mode requires the exported variable, so dropping
+# the `-- env` prefix makes the success fixture go RED (it would retry to
+# the cap with a non-zero exit). The other three fixtures pin that wrapping
+# the command in `env` does not alter fail-fast, retry, or eventual-success
+# semantics.
+run_guard 'env passthrough via -- env VAR=... (pass, 1 invocation)' \
+  0 1 env-passthrough \
+  3 0 "test env passthrough" -- env ALLOW_RELEASE_MANIFEST_MERGE=1 "$FAKE_GRADLE"
+run_guard 'env wrapper preserves verification fail-fast (exit 1, 1 invocation)' \
+  1 1 verify-junit-bom \
+  3 0 "test env fail-fast" -- env ALLOW_RELEASE_MANIFEST_MERGE=1 "$FAKE_GRADLE"
+run_guard 'env wrapper preserves transient retry (exit 1, 3 invocations)' \
+  1 3 http-504 \
+  3 0 "test env transient" -- env ALLOW_RELEASE_MANIFEST_MERGE=1 "$FAKE_GRADLE"
+run_guard 'env wrapper preserves flaky-then-ok (exit 0, 2 invocations)' \
+  0 2 flaky-then-ok \
+  5 0 "test env flaky-then-ok" -- env ALLOW_RELEASE_MANIFEST_MERGE=1 "$FAKE_GRADLE"
 
 # --- (e) multiline fallback: signature split across lines fails fast ---------
 # The guard collapses newlines to spaces and re-matches with the SAME

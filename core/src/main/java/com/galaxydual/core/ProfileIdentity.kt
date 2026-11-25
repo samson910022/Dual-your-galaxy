@@ -76,6 +76,14 @@ data class ProfileIdentity(
     // Human-readable label from the UserInfo{...} header. DISPLAY ONLY:
     // never read for authorization (see rule above).
     val label: String = "",
+    // Issue #87 R9: true when this claim's evidence is contradictory/invalid
+    // (e.g. one block carried two distinct parentId or serial values, or the
+    // type classification was ambiguous) while a FIRST value was retained for
+    // diagnosis. That retained value is NEVER authorization evidence:
+    // resolveDual() vetoes any flagged claim on the target id regardless of
+    // parent/serial values, channel or claim order. Defaulted at the end so
+    // every existing construction site keeps compiling unchanged.
+    val evidenceInvalid: Boolean = false,
 )
 
 /**

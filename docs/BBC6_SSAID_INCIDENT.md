@@ -52,7 +52,7 @@
 | `settings --user 95 get secure android_id` | `<u95 android_id（已遮蔽）>` |
 | User-0 SSAID 表 ChatGPT entry | `10431` → `<8ca73ab6…（系統 SSAID hash，已遮蔽）>`（mtime 2026-11-17 04:18:00） |
 | User-95 SSAID 表 ChatGPT entry | `10431` → `<fc8baf3f…（系統 SSAID hash，已遮蔽）>`（mtime 2026-11-18 17:22:21.354） |
-| User-95 SSAID 表 條目數 | 約 324 筆：322 筆 full-uid 鍵（值為 u95 android_id）＋ 1 筆 appId 鍵 `10431`＋1 筆 preserve 列（依本機 `INVESTIGATION_SSAID_BBC6.md`／`abx_notes.md`）；**不是**「全部 appId keyed」
+| User-95 SSAID 表 條目數 | 約 324 筆：322 筆 full-uid 鍵（值為 u95 android_id）＋ 1 筆 appId 鍵 `10431`＋1 筆 preserve 列（依本機私有 `INVESTIGATION_SSAID_BBC6.md`／`abx_notes.md`；私有、不入 repo、**本 PR 未獨立稽核**；`BBC_COLDSTART_DELETE_INCIDENT.md` 僅涵蓋冷啟動刪除軸、不含此 SSAID 表分解）；**不是**「全部 appId keyed」 |
 
 ## 時間線（2026-11-18，UTC+08:00）
 

@@ -32,20 +32,35 @@ sealed interface DualResolution {
 // parsing (see PmOutputParser.resolveDualUserIdVerified); the label-only
 // resolveDualUserId() is Deprecated and must not authorize new writes.
 object SamsungProfileAdapter {
-    // Header opening one per-user block in both `cmd user list -v` and
-    // `dumpsys user` outputs. Same shape as PmOutputParser's UserInfo
-    // pattern, kept local so this adapter stays dependency-free.
-    private val HEADER = Regex("UserInfo\\{(\\d+):([^:}]*):([^}]*)\\}")
+    // Legacy headers are parsed by the shared LegacyHeaderParser (called from
+    // IdentityLineClassifier) on ONE classified physical line at a time (no
+    // `(?m)`): the old `(?m)^` anchor treated U+0085/U+2028/U+2029 and lone CR
+    // as line starts, so a header-like token after such a char could
+    // manufacture a second legacy claim. Classification also keeps NEW_ROW /
+    // REJECTED lines out of the legacy header scan entirely, so an inline
+    // `UserInfo{95:x:400}` inside a `name=` label can never produce a
+    // competing claim.
 
     // New-ROM `cmd user list -v` line format (One UI 6.1+/S24, PR-33 D2):
     // no UserInfo header and no serial line, e.g.
     // `1: id=95, name=DUAL_APP, type=profile.CLONE, flags=... (parentId=0) ...`.
-    // Group 1 = user id, group 2 = display name (label only), group 3 =
-    // type token. The display index before `:` is NOT the id and is
-    // ignored; the remainder of the line after the type token carries the
-    // flags/parent tail.
-    private val NEW_VERBOSE_LINE =
-        Regex("""^\s*\d+:\s*id=(\d+),\s*name=([^,]*),\s*type=([^\s,]+)""")
+    // The display index before `:` is NOT the id and is ignored; the name is
+    // display-only and the type/flags/parent tail carries all authorization
+    // evidence.
+    //
+    // Issue #65 fail-closed rewrite: the old greedy
+    // `^\s*\d+:\s*id=(\d+),\s*name=(.*),\s*type=([^\s,]+)` selected the
+    // LAST `, type=` token. That defended the `name=foo, type=profile.CLONE,
+    // type=full.SYSTEM` injection (real type full.SYSTEM wins) but FAILED
+    // OPEN on `name=foo, type=profile.CLONE, type=, flags=...` (real empty
+    // type skipped -> label's CLONE selected) and on a label smuggling a
+    // FULL canonical `type=profile.CLONE, flags=...` declaration while the
+    // real field is empty/non-canonical. Parsing now goes through the shared
+    // structured row parser (VerboseUserRow): the type can only come from the
+    // LAST `, type=` declaration, it must have a non-empty token, it must be
+    // the ONLY declaration followed by `, flags=`/` (flags=`, and the display
+    // name may carry no C0 control. A malformed row yields userType UNKNOWN
+    // (confidence LOW) and never lets a label token authorize.
 
     // A user-type token meaning Samsung/clone profile. Matches
     // `profile.CLONE` with a tolerant separator (`.`, `_`, `-`, space/Tab) so
@@ -182,9 +197,17 @@ object SamsungProfileAdapter {
         }
         sb.append(mention, cursor, mention.length)
         var residual = sb.toString()
-        // 2. Strip co-located structured fields (authorized separately).
-        residual = PARENT_ID.replace(residual, "")
-        residual = SERIAL.replace(residual, "")
+        // 2. Strip co-located structured fields (authorized separately) ONLY
+        //    when their WHOLE value passes the strict decimal grammar. A
+        //    malformed/overflow value must REMAIN in the residual so a
+        //    would-be CLONE mention fails closed to OTHER instead of being
+        //    laundered by a broad value-capture match (issue #87 R14).
+        residual = PARENT_ID.replace(residual) { m ->
+            if (VerboseIdentityFields.parseParentValue(m.groupValues[1]) == null) m.value else ""
+        }
+        residual = SERIAL.replace(residual) { m ->
+            if (VerboseIdentityFields.parseSerialValue(m.groupValues[1]) == null) m.value else ""
+        }
         // 3. Strip FQ prefix remnants.
         residual = FQ_PREFIX_TAIL.replace(residual, "")
         // 4. The `(default)` note is the sole tolerated suffix: at most one.
@@ -358,37 +381,49 @@ object SamsungProfileAdapter {
     private val EXPLICIT_SEP =
         Regex("(?<![A-Za-z0-9.])${USER_TYPE_PREFIX}\\s*[:=]", RegexOption.IGNORE_CASE)
 
-    // `parentId=0`, `parent: 0`, `parentId: -10000`, ... (case-insensitive).
-    // Left boundary so `transparentId`/`grandparentId` never match.
-    private val PARENT_ID = Regex("(?<![A-Za-z0-9])parent(?:Id)?\\s*[:=]\\s*(-?\\d+)", RegexOption.IGNORE_CASE)
+    // `parentId=0`, `parent: 0`, `parentId: -10000`, ... and
+    // `serialNo=15`, `serial: 15`, `Serial number: 15`, `serialnumber=99`,
+    // ... are built from the SAME heads the row parser uses as its structural
+    // ambiguity detector (VerboseIdentityFields, issue #87 R10b). A spelling
+    // extractable here is therefore always detectable there, and vice versa.
+    // Both heads keep the left alnum boundary, so `transparentId`/
+    // `grandparentId`/`personalSerialNo` never contribute evidence.
+    private val PARENT_ID = VerboseIdentityFields.parentWithValue()
+    private val SERIAL = VerboseIdentityFields.serialWithValue()
 
-    // `serialNo=15`, `serial: 15`, `Serial number: 15`, ... Case-insensitive.
-    // `serialNo` (no separator) is covered by the optional separator class.
-    // Left boundary so `personalSerialNo` never matches.
-    private val SERIAL =
-        Regex("(?<![A-Za-z0-9])serial(?:No|\\s*number)?\\s*[:=]\\s*(\\d+)", RegexOption.IGNORE_CASE)
-
-    // Parses `cmd user list -v` verbose output into one claim per user.
+    // Parses `cmd user list -v` verbose output into ONE CLAIM PER PARSED
+    // ROW/BLOCK (issue #87 R2: no collapsing, no last-wins overwrite).
     // Dual-format (PR-33 D2): legacy UserInfo{...} blocks are parsed as
     // before; new-ROM lines (`N: id=<id>, name=<label>, type=<type>, ...`,
     // no UserInfo header, no serial line, S24 實機) are parsed per line with
     // the label taken from `name=` and the type/parent evidence from the
     // `type=` token plus the flag/parent tail (the label never enters the
-    // body). Results merge by userId with UserInfo winning a duplicate
-    // (the two formats never coexist in practice). Tolerant otherwise:
-    // line order, letter case, `:` vs `=` separators and missing lines are
-    // all accepted; a block without any type token yields userType UNKNOWN
-    // (never guessed from the label). The header label is retained
-    // display-only and never affects userType.
+    // body). BOTH claim lists are returned as-is, concatenated in parse order:
+    // a new row and a legacy block (or two rows / two blocks) naming the same
+    // userId each contribute their own claim. This is deliberate -- the old
+    // merge compared only `userType` and let a legacy claim overwrite a fresh
+    // one when the types agreed, erasing contradictory `parentId`/`serial`
+    // evidence. Consistency is NOT decided here: resolveDual() aggregates
+    // ALL claims and refuses a same-id parent/serial contradiction (while a
+    // missing parent/serial is still tolerated on the confirm path). Malformed
+    // / REJECTED rows emit bare UNKNOWN/LOW claims with no parent/serial, so
+    // their presence vetoes a same-channel CLONE via the resolver's missing-
+    // parent gate instead of being overwritten by a later valid row. Combined
+    // with the classification shared with the strict gate, an inline
+    // `UserInfo{...}` inside a `name=` label cannot create a competing legacy
+    // claim in the first place (a NEW_ROW line is never also scanned as a
+    // legacy header). Tolerant otherwise: line order, letter case, `:` vs `=`
+    // separators and missing lines are all accepted; a block without any type
+    // token yields userType UNKNOWN (never guessed from the label). The header
+    // label is retained display-only and never affects userType.
     fun parseUserListVerbose(text: String): List<ProfileIdentity> {
-        val legacy = parseBlocks(text, IdentitySource.USER_LIST_V)
-        val fresh = parseNewVerboseLines(text)
-        if (fresh.isEmpty()) return legacy
-        if (legacy.isEmpty()) return fresh
-        val merged = LinkedHashMap<Int, ProfileIdentity>()
-        for (e in fresh) merged[e.userId] = e
-        for (e in legacy) merged[e.userId] = e
-        return merged.values.toList()
+        // ONE classification per raw physical line, shared with the gate: both
+        // parsers below consume these lines, neither re-parses/re-splits text.
+        val lines = classifyIdentityLines(text)
+        // R2 aggregation: preserve every claim. NO associateBy/LinkedHashMap
+        // collapse -- a same-id duplicate may be the contradictory evidence
+        // that must reach resolveDual (see KDoc above).
+        return parseBlocks(lines, IdentitySource.USER_LIST_V) + parseNewVerboseLines(lines)
     }
 
     // Parses `dumpsys user` output into one claim per UserInfo{...} block.
@@ -396,13 +431,44 @@ object SamsungProfileAdapter {
     // insensitive, missing type line yields UNKNOWN. Looks for the
     // `usertype profile.CLONE`, `parent` and `serial` lines dumpsys emits.
     fun parseDumpsysUser(text: String): List<ProfileIdentity> =
-        parseBlocks(text, IdentitySource.DUMPSYS)
+        parseBlocks(classifyIdentityLines(text), IdentitySource.DUMPSYS)
 
-    // Shared block splitter/parser for both verbose channels. Cuts the
-    // output at each UserInfo{...} header; the lines following a header up
-    // to the next header form that user's block. Type/parent/serial are
-    // searched in the block BODY only, so the header label can never leak
-    // into the authorization-relevant userType.
+    // LF/CRLF-only physical split + shared classification. Kept in one place
+    // so PmOutputParser's gate and BOTH adapter parsers see exactly the same
+    // raw-line kinds (no caller may classify a pre-stripped copy of the text).
+    private fun classifyIdentityLines(text: String): List<ClassifiedIdentityLine> =
+        VerboseUserRow.verboseLines(text).map { IdentityLineClassifier.classify(it) }
+
+    // A REJECTED line (unsafe separator, malformed new attempt, malformed
+    // legacy attempt) contributes NO type, parent or serial. When an id can
+    // still be recovered, emit a bare UNKNOWN/LOW claim so the id is not
+    // silently forgotten (fail closed). Both recovery regexes are
+    // diagnostic-only; never an authorization path.
+    private fun rejectedClaim(line: ClassifiedIdentityLine, source: IdentitySource): ProfileIdentity? {
+        val userId = VerboseUserRow.ROW_LIKE_ID.find(line.text)?.groupValues?.get(1)?.toIntOrNull()
+            ?: LegacyHeaderParser.recoverId(line.text)
+            ?: return null
+        return ProfileIdentity(
+            userId = userId,
+            userType = ProfileUserType.UNKNOWN,
+            source = source,
+            confidence = IdentityConfidence.LOW,
+        )
+    }
+
+    // Shared block splitter/parser for both verbose channels (also used by
+    // parseDumpsysUser). Cuts the canonical (LF-normalized, classified)
+    // physical lines at each confirmed LEGACY_HEADER label; the lines
+    // following a header up to the next header, the next NEW_ROW/REJECTED line
+    // or a column-0 section form that user's block. Type/parent/serial are
+    // searched in the block BODY only, so the header label can never leak into
+    // userType. NEW_ROW and REJECTED lines are never treated as legacy headers:
+    // each OWNS its own line and TERMINATES any earlier legacy body (R8), so
+    // another user's indented row (or a malformed row-like attempt) can no
+    // longer be stitched into a preceding block as authorization evidence.
+    // Lines after such a break and before the next header belong to nobody --
+    // they are handled only by the new-row parser, never as legacy evidence.
+    // REJECTED lines emit a bare UNKNOWN/LOW claim and are omitted from bodies.
     // Section guard (PR-33 D3, S24 實機 blocking): the LAST header has no
     // next header, so without a cap its body would extend to EOF and swallow
     // the trailing global catalog. On the S24 `dumpsys user` output the Users
@@ -421,18 +487,78 @@ object SamsungProfileAdapter {
     // below is line-oriented and immune; it shares this guard through the
     // legacy path only. PmOutputParser.parseUsers stays line-oriented and
     // untouched.
-    private fun parseBlocks(text: String, source: IdentitySource): List<ProfileIdentity> {
-        val headers = HEADER.findAll(text).toList()
-        if (headers.isEmpty()) return emptyList()
+    private fun parseBlocks(
+        lines: List<ClassifiedIdentityLine>,
+        source: IdentitySource,
+    ): List<ProfileIdentity> {
         val out = mutableListOf<ProfileIdentity>()
+        // REJECTED lines never enter a legacy block body (no hidden record
+        // separator may contribute type/parent/serial). They are represented
+        // by a bare UNKNOWN/LOW claim instead.
+        for (line in lines) {
+            if (line.kind == IdentityLineKind.REJECTED) {
+                rejectedClaim(line, source)?.let { out.add(it) }
+            }
+        }
+        if (lines.isEmpty()) return out
+
+        // Rebuild ONE canonical text with uniform LF boundaries, aligned 1:1
+        // with ALL classified lines (R8). A REJECTED line is represented by an
+        // EMPTY placeholder, never its raw text: offsets stay aligned with the
+        // classifier's line indices while none of its type/parent/serial can
+        // leak into a body. Offsets are indices into [canonical], never into
+        // the original output.
+        val canonicalLines = lines.map { if (it.kind == IdentityLineKind.REJECTED) "" else it.text }
+        val canonical = canonicalLines.joinToString("\n")
+        val lineStarts = IntArray(lines.size)
+        var offset = 0
+        for (i in lines.indices) {
+            lineStarts[i] = offset
+            offset += canonicalLines[i].length + 1 // +1 for the joining '\n'
+        }
+
+        // Evidence ownership fence (R8): a NEW_ROW line -- even an indented
+        // one -- and a REJECTED line both TERMINATE every legacy body that
+        // started earlier. Walk in reverse so breakStart[i] is the first such
+        // line STRICTLY after i (canonical.length when there is none). A legacy
+        // body therefore ends at its own break even when there is no following
+        // header/column-0 section, and lines between a break and the next
+        // header are owned by nobody (fail closed).
+        val breakStart = IntArray(lines.size)
+        var nextBreak = canonical.length
+        for (i in lines.indices.reversed()) {
+            breakStart[i] = nextBreak
+            if (lines[i].kind == IdentityLineKind.NEW_ROW ||
+                lines[i].kind == IdentityLineKind.REJECTED
+            ) {
+                nextBreak = lineStarts[i]
+            }
+        }
+
+        // Header candidates come ONLY from LEGACY_HEADER-classified lines,
+        // parsed by the shared parser on that single physical line (no (?m)
+        // line-boundary trick). The classifier has already validated the id
+        // and flags; there is NO second regex and no silent `toIntOrNull()
+        // ?: continue` that could drop an invalid header into a body.
+        // NEW_ROW/REJECTED/OTHER lines are never scanned as headers.
+        val headers = mutableListOf<Pair<Int, LegacyHeaderFields>>()
+        for ((i, line) in lines.withIndex()) {
+            if (line.kind != IdentityLineKind.LEGACY_HEADER) continue
+            headers.add(i to line.fields!!)
+        }
         for (i in headers.indices) {
-            val h = headers[i]
-            val userId = h.groupValues[1].toIntOrNull() ?: continue
-            val label = h.groupValues[2].trim()
-            val bodyStart = h.range.last + 1
-            val nextHeader = if (i + 1 < headers.size) headers[i + 1].range.first else text.length
-            val bodyEnd = minOf(nextHeader, sectionEnd(text, bodyStart))
-            val body = text.substring(bodyStart, bodyEnd)
+            val (lineIndex, fields) = headers[i]
+            val userId = fields.id
+            val label = fields.label
+            val bodyStart = lineStarts[lineIndex] + fields.headerEnd
+            val nextHeader = if (i + 1 < headers.size) {
+                val (nextLineIndex, nextFields) = headers[i + 1]
+                lineStarts[nextLineIndex] + nextFields.headerStart
+            } else {
+                canonical.length
+            }
+            val bodyEnd = minOf(nextHeader, sectionEnd(canonical, bodyStart), breakStart[lineIndex])
+            val body = canonical.substring(bodyStart, bodyEnd)
             out.add(parseOneBlock(userId = userId, label = label, body = body, source = source))
         }
         return out
@@ -454,56 +580,125 @@ object SamsungProfileAdapter {
     }
 
     // New-ROM `cmd user list -v` line parser (PR-33 D2, S24 實機): one claim
-    // per `N: id=<id>, name=<label>, type=<type>, ...` line. The label is
-    // taken from `name=` only; the body searched for type/parent/serial is
-    // the `type=` token plus the flag/parent tail, so the label can never
-    // leak into the authorization-relevant userType (same guarantee as the
-    // UserInfo body-only rule above). `type=profile.CLONE` classifies CLONE
-    // via CLONE_MARKER; any other explicit type (profile.PRIVATE,
-    // full.SYSTEM, ...) classifies OTHER via the shared classifier; a line
-    // without a type token is UNKNOWN. `parentId=N` in the tail yields the
-    // parent (absent, e.g. owner, yields null); there is no serial line on
-    // this ROM, so serial stays null (dumpsys serialNo= is authoritative).
-    private fun parseNewVerboseLines(text: String): List<ProfileIdentity> {
+    // per `N: id=<id>, name=<label>, type=<type>, ...` line. All row structure
+    // now comes from the shared VerboseUserRow parser used by
+    // PmOutputParser's strict gate, so the two callers can never disagree on
+    // which `, type=` declaration is real:
+    // - the name span (everything up to the FIRST `, type=`) is DISPLAY ONLY;
+    //   an injected `, type=profile.CLONE` inside `name=` is never authorized;
+    // - the real type is the LAST `, type=` declaration's non-empty token,
+    //   allowed only when it is STRUCTURAL (its window carries flags/parent/
+    //   serial), no earlier declaration is structural, and the strict
+    //   canonical `, flags=` / ` (flags=` suffix starts at the exact token
+    //   end; its token is normalized to a `userType=` statement;
+    // - the flags/parent tail goes on its own line: it carries no type keyword
+    //   so a flags tail like `(flags=A|B)` never contributes profile.X tokens
+    //   to the type mention (display-only metadata), while parentId/serial
+    //   extraction still scans the whole body;
+    // - a MALFORMED row (empty/non-canonical last declaration, an earlier
+    //   structural declaration -- including one with a space before its comma
+    //   -- a control/Unicode-separator char in the name, e.g.
+    //   `type=profile.CLONE, type=, flags=...`, or a label smuggling a full
+    //   canonical declaration) emits UNKNOWN with LOW confidence and no
+    //   parent/serial -- never a fallback to a label token. REJECTED raw lines
+    //   (lone CR / U+0085/U+2028/U+2029) are handled in parseBlocks the same
+    //   way and never contribute type/parent/serial.
+    // `type=profile.CLONE` classifies CLONE; any other explicit type
+    // (profile.PRIVATE, full.SYSTEM, ...) classifies OTHER; missing/malformed
+    // type stays UNKNOWN. `parentId=N` in a valid tail yields the parent
+    // (absent, e.g. owner, yields null); there is no serial line on this ROM,
+    // so serial stays null (dumpsys serialNo= is authoritative).
+    private fun parseNewVerboseLines(lines: List<ClassifiedIdentityLine>): List<ProfileIdentity> {
         val out = mutableListOf<ProfileIdentity>()
-        for (raw in text.lines()) {
-            val m = NEW_VERBOSE_LINE.find(raw) ?: continue
-            val userId = m.groupValues[1].toIntOrNull() ?: continue
-            val label = m.groupValues[2].trim()
-            val typeToken = m.groupValues[3].trim()
-            // Normalized to a userType= statement so the shared classifier
-            // sees the explicit type; the name=... segment (inside the match
-            // prefix) is excluded by construction. The flags/parent tail goes
-            // on its own line(s): it carries no type keyword so the
-            // classifier ignores it (a flags tail like
-            // "(flags=A|B)" must never contribute profile.X tokens to the
-            // type mention -- display-only metadata), while parentId/serial
-            // extraction still scans the whole body.
-            val body = "userType=$typeToken\n" + raw.substring(m.range.last + 1)
-            out.add(parseOneBlock(userId = userId, label = label, body = body, source = IdentitySource.USER_LIST_V))
+        for (classified in lines) {
+            // Already classified + parsed by the shared classifier; NO second
+            // parse and NO re-splitting. REJECTED lines are represented by
+            // parseBlocks' UNKNOWN/LOW claim and never reach this path.
+            if (classified.kind != IdentityLineKind.NEW_ROW) continue
+            val row = classified.row ?: continue
+            if (row.malformed) {
+                out.add(
+                    ProfileIdentity(
+                        userId = row.userId,
+                        userType = ProfileUserType.UNKNOWN,
+                        source = IdentitySource.USER_LIST_V,
+                        confidence = IdentityConfidence.LOW,
+                        label = row.displayName,
+                    ),
+                )
+                continue
+            }
+            // A valid row always has a real token; if none, drop the row
+            // entirely (fail closed) rather than emitting a typed claim.
+            val typeToken = row.typeToken ?: continue
+            val body = "userType=$typeToken\n" + row.tail
+            out.add(parseOneBlock(userId = row.userId, label = row.displayName, body = body, source = IdentitySource.USER_LIST_V))
         }
         return out
+    }
+
+    // One field's complete evidence in ONE block (issue #87 R14). Every
+    // occurrence is inspected: strictly parsable values are pooled; ANY
+    // recognized-but-malformed/overflow occurrence marks the field invalid.
+    // A malformed value is NOT dropped as if the field were absent and NOT
+    // truncated into a plausible prefix, so it can no longer disappear before
+    // R9 aggregation.
+    private data class FieldEvidence(val values: List<Int>, val invalid: Boolean)
+
+    private fun readField(body: String, regex: Regex, parse: (String) -> Int?): FieldEvidence {
+        val values = mutableListOf<Int>()
+        var invalid = false
+        for (match in regex.findAll(body)) {
+            val value = parse(match.groupValues[1])
+            if (value == null) invalid = true else values.add(value)
+        }
+        return FieldEvidence(values, invalid)
     }
 
     // Parses one user's block body into a single claim. Pure.
     // Intra-block parent/serial contradiction (P1-B): more than one
     // distinct parsable parentId (or serial) value inside the SAME block
     // forces userType UNKNOWN (fail closed). The first parsable value is
-    // retained for diagnosis; confidence follows the final userType.
+    // retained for DIAGNOSIS ONLY (issue #87 R9): it is not an authorization
+    // value and is flagged via evidenceInvalid so resolveDual() vetoes the
+    // claim on that id even when a duplicate good CLONE claim exists.
+    // R14 adds the strict value grammar: a recognized malformed/overflow
+    // value also forces UNKNOWN + evidenceInvalid (even with no retained
+    // value), instead of being truncated/dropped into a clean CLONE claim.
+    // SCOPE (honest note): this closes the ENUMERATED numeric-evidence gaps
+    // (malformed/overflow parent & serial, valid+invalid duplicates, trailing
+    // colon/negative/unsigned spellings); it does NOT claim to validate every
+    // possible malformed string in this flat-text format.
     private fun parseOneBlock(
         userId: Int,
         label: String,
         body: String,
         source: IdentitySource,
     ): ProfileIdentity {
-        var userType = classifyType(body)
-        val parentIds = PARENT_ID.findAll(body).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
-        val serials = SERIAL.findAll(body).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
-        if (parentIds.distinct().size > 1 || serials.distinct().size > 1) {
-            userType = ProfileUserType.UNKNOWN
+        val classifiedType = classifyType(body)
+        val parentEvidence = readField(body, PARENT_ID, VerboseIdentityFields::parseParentValue)
+        val serialEvidence = readField(body, SERIAL, VerboseIdentityFields::parseSerialValue)
+        val fieldInvalid = parentEvidence.invalid || serialEvidence.invalid
+        val contradictory = parentEvidence.values.distinct().size > 1 ||
+            serialEvidence.values.distinct().size > 1
+        val userType = if (fieldInvalid || contradictory) {
+            ProfileUserType.UNKNOWN
+        } else {
+            classifiedType
         }
-        val parentId = parentIds.firstOrNull()
-        val serial = serials.firstOrNull()
+        // First strictly-parsable value only (diagnosis). A valid+overflow
+        // duplicate keeps the valid value here but is marked invalid above,
+        // so it can never authorize a Confirm.
+        val parentId = parentEvidence.values.firstOrNull()
+        val serial = serialEvidence.values.firstOrNull()
+        // R9 invariant: an UNKNOWN that still carries a parent/serial, OR one
+        // carrying a recognized malformed/overflow value (fieldInvalid), is
+        // invalid evidence. Retaining any value for logs must never let it
+        // authorize a Confirm; mark the whole claim invalid so resolveDual()
+        // vetoes it. Bare UNKNOWN (no values, no malformed field) stays
+        // unflagged -> two-tier Unknown at the resolver, never Refused.
+        val evidenceInvalid = userType == ProfileUserType.UNKNOWN &&
+            (parentId != null || serial != null || fieldInvalid)
         // Single-source confidence cap: a typed claim is MED (still needs a
         // second source for HIGH); an untyped block is LOW.
         val confidence = when (userType) {
@@ -518,6 +713,7 @@ object SamsungProfileAdapter {
             source = source,
             confidence = confidence,
             label = label,
+            evidenceInvalid = evidenceInvalid,
         )
     }
 
@@ -764,9 +960,13 @@ object SamsungProfileAdapter {
     //   equal, and == 0. Either side missing -> Unknown (insufficient
     //   evidence); values differ -> Refused("conflicting parent ...");
     //   equal but != 0 -> Refused("non-owner parent ... policy ...").
-    //   Only dual-channel-agreed parentId 0 passes (single-device S24
-    //   evidence parentId=0, issue #21; other models unverified -- a
-    //   non-zero parent fails closed to Unknown/Refused, never confirms).
+    //   An explicit disagreement among the non-null parents is reported as
+    //   Refused BEFORE a missing parent is treated as Unknown (issue #87 R2:
+    //   same-id duplicate claims are preserved, so contradictory evidence
+    //   cannot be overwritten). Only dual-channel-agreed parentId 0 passes
+    //   (single-device S24 evidence parentId=0, issue #21; other models
+    //   unverified -- a non-zero parent fails closed to Unknown/Refused,
+    //   never confirms).
     // - serial: when BOTH channels carry a serial for the id and they
     //   differ -> Refused("conflicting serial ..."). A missing serial on
     //   either side is tolerated (verbose dumps do not always carry serial,
@@ -826,7 +1026,7 @@ object SamsungProfileAdapter {
         }
         val id = cloneIds.single()
         // Owner profile is off-limits even when explicitly typed CLONE.
-        // HEADER only matches \d+, so id is never negative here.
+        // LEGACY_HEADER only matches \d+, so id is never negative here.
         if (id == 0) return DualResolution.Refused("owner profile (0) is off-limits")
 
         // Same-id contradiction: another channel explicitly typed this id
@@ -838,6 +1038,26 @@ object SamsungProfileAdapter {
         }
         if (conflict) {
             return DualResolution.Refused("conflicting type evidence for user $id")
+        }
+
+        // Issue #87 R9: for the id about to be Confirmed, ANY claim that is
+        // UNKNOWN or carries contradictory/invalid evidence vetoes, regardless
+        // of the retained parent/serial values, channel, or claim order.
+        // parseOneBlock flags an UNKNOWN that still carries values (two
+        // distinct parents/serials in one block, or an ambiguous type with
+        // values) as evidenceInvalid: its FIRST value is kept for diagnosis
+        // only and must never authorize. Refused is the stronger, explicit
+        // verdict for such evidence; a plain/bare UNKNOWN (malformed/rejected
+        // row, no type line) only means insufficient evidence -> Unknown.
+        // This preserves the existing clonePlusUnknown_* / bare-UNKNOWN
+        // two-tier contract while closing the "UNKNOWN(0,15) + CLONE(0,15)
+        // still confirms" gap. Checks cover ALL typed claims on this id, not
+        // just the CLONE subset.
+        if (typed.any { it.userId == id && it.evidenceInvalid }) {
+            return DualResolution.Refused("contradictory evidence for user $id")
+        }
+        if (typed.any { it.userId == id && it.userType == ProfileUserType.UNKNOWN }) {
+            return DualResolution.Unknown
         }
 
         if (effectiveProp != null && effectiveProp != id) {
@@ -859,6 +1079,14 @@ object SamsungProfileAdapter {
         // Either side missing (no claim or null parentId) is insufficient
         // evidence -> Unknown (fail closed); disagreement or a non-zero
         // agreed parent is a policy refusal, never a target.
+        // Issue #87 R2: an EXPLICIT contradiction is reported before a
+        // missing value. parseUserListVerbose now preserves every same-id
+        // claim (no last-wins merge), so a contradictory parent (e.g. 10 vs 0)
+        // coexists with the agreeing CLONE claims; it must surface as Refused
+        // even if another claim on that id also carries a null parent. A
+        // missing parent with no contradiction stays Unknown (tolerated only
+        // for serial, never for parent). The two-channel presence requirement
+        // below is unchanged.
         val verboseParents = typed.filter {
             it.source == IdentitySource.USER_LIST_V && it.userId == id
         }.map { it.parentId }.toSet()
@@ -866,16 +1094,15 @@ object SamsungProfileAdapter {
             it.source == IdentitySource.DUMPSYS && it.userId == id
         }.map { it.parentId }.toSet()
         if (verboseParents.isEmpty() || dumpsysParents.isEmpty()) return DualResolution.Unknown
-        if (verboseParents.any { it == null } || dumpsysParents.any { it == null }) {
-            return DualResolution.Unknown
-        }
-        val agreedParents = (verboseParents + dumpsysParents).filterNotNull().toSet()
-        if (agreedParents.size > 1) {
+        val allParents = verboseParents + dumpsysParents
+        val nonNullParents = allParents.filterNotNull().toSet()
+        if (nonNullParents.size > 1) {
             return DualResolution.Refused(
                 "conflicting parent for user $id: verbose=$verboseParents vs dumpsys=$dumpsysParents",
             )
         }
-        val agreedParent = agreedParents.single()
+        if (allParents.any { it == null }) return DualResolution.Unknown
+        val agreedParent = nonNullParents.single()
         if (agreedParent != 0) {
             return DualResolution.Refused(
                 "non-owner parent $agreedParent for user $id: policy requires parentId 0",
@@ -886,8 +1113,14 @@ object SamsungProfileAdapter {
         // a serial and they disagree. A missing serial on either side is
         // tolerated (S24 verbose evidence does not guarantee serial); the
         // agreed value is the deduplicated single serial or null.
+        // Issue #87 R9: pool ALL typed claims on this id, not just the CLONE
+        // subset -- comparing only CLONEs could discard a contradictory
+        // serial carried by a same-id claim. OTHER claims already Refused
+        // above and UNKNOWN claims already vetoed above, so at this point
+        // every remaining claim for the id is CLONE; widening the pool is
+        // safe and makes the no-evidence-is-dropped invariant explicit.
         val serials = typed.filter {
-            it.userId == id && it.userType == ProfileUserType.CLONE
+            it.userId == id
         }.mapNotNull { it.serial }.toSet()
         if (serials.size > 1) {
             return DualResolution.Refused("conflicting serial for user $id: $serials")
@@ -923,6 +1156,16 @@ object SamsungProfileAdapter {
         val confirmed = resolveDual(candidates, propertyId) as? DualResolution.Confirmed
             ?: return null
         val id = confirmed.userId
+        // R9 defense in depth: even if a future resolver change let an
+        // UNKNOWN/invalid claim coexist with a Confirm, the serial-bound
+        // target must stay null. Only the two verified verbose channels are
+        // consulted (PROP is id-only and never identity evidence).
+        if (candidates.any {
+                it.userId == id &&
+                    (it.source == IdentitySource.USER_LIST_V || it.source == IdentitySource.DUMPSYS) &&
+                    (it.userType == ProfileUserType.UNKNOWN || it.evidenceInvalid)
+            }
+        ) return null
         // Carry the resolver's agreed parentId (#53): resolveDual requires
         // both verbose channels to carry it, equal and == 0, so a Confirmed
         // target always bears a non-null parent; a null here (policy change
