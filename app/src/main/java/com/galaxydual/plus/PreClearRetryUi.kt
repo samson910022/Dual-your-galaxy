@@ -448,3 +448,20 @@ internal class WarningRestartController {
         }
     }
 }
+
+// PR #89 Round-3 R3-1: revoke the accepted warning action ONLY when the VM
+// actually cleared the pending (QUEUED cancel) AND that action is still live.
+// A refused cancel (SAVING/RECONCILING/in-flight/stale) must keep the action.
+internal fun cancelOwnershipAccepted(vmCancelled: Boolean, actionLive: Boolean): Boolean =
+    vmCancelled && actionLive
+
+// PR #89 Round-3 R3-3: after rotation, an orphan QUEUED pending that was rebuilt
+// from saved state and has no live consent action must be invalidated. SAVING /
+// RECONCILING / IDLE and any live action are never invalidated here.
+// PolicyWritePhase is a framework-free enum in this same package, so this
+// predicate stays JVM-testable (no android.* dependency).
+internal fun shouldInvalidateOrphanPendingOnRebuild(
+    rebuiltFromSavedState: Boolean,
+    phase: PolicyWritePhase,
+    consentActionIdLive: Boolean,
+): Boolean = rebuiltFromSavedState && phase == PolicyWritePhase.QUEUED && !consentActionIdLive

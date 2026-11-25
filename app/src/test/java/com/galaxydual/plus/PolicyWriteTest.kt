@@ -332,7 +332,10 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.ACCEPTED,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(setOf("com.ok.app"), vm.state.value.policyDraft)
@@ -371,7 +374,10 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.TERMINAL,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(0, fake.saveCalls.get())
 
@@ -488,7 +494,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.cancelPolicyWrite(pending)
+        assertTrue("QUEUED cancel must report actual ownership transfer", vm.cancelPolicyWrite(pending))
         assertNull(vm.state.value.pendingPolicyWrite)
 
         vm.confirmPolicyWrite(pending, pending.generation)
@@ -645,7 +651,7 @@ class PolicyWriteTest {
         assertTrue(vm.policyWriteCommitInProgress)
 
         // 5.1.1:寫入進行中取消被拒絕 (pending 保留,不產生「已取消」訊息)。
-        vm.cancelPolicyWrite(pending)
+        assertFalse("SAVING cancel must report refusal", vm.cancelPolicyWrite(pending))
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertFalse(vm.state.value.msg.contains("已取消寫入政策"))
         assertTrue(vm.state.value.loading)
@@ -848,7 +854,10 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.example.b"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingA, pendingA.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pendingA, pendingA.generation),
+        )
 
         assertEquals(0, fake.saveCalls.get())
         assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
@@ -868,7 +877,10 @@ class PolicyWriteTest {
         setPendingPolicyWrite(vm, pending)
 
         // 未勾選確認框：VM 不得寫入，pending 保留。
-        vm.confirmPolicyWrite(pending, null)
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pending, null),
+        )
         await(timeoutMs = 5_000L) {
             vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
         }
@@ -877,7 +889,10 @@ class PolicyWriteTest {
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
 
         // 勾選後重試（帶出勾選時綁定的世代：ack 綁定到本 pending）：正常寫入。
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.ACCEPTED,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(1, fake.saveCalls.get())
         assertEquals(setOf("com.example.a"), fake.saved)
@@ -896,7 +911,10 @@ class PolicyWriteTest {
         setPendingPolicyWrite(vm, pending)
 
         // 世代不符：不寫 store、不清 pending、POLICY_NOT_ACKNOWLEDGED。
-        vm.confirmPolicyWrite(pending, pending.generation + 1L)
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pending, pending.generation + 1L),
+        )
         await(timeoutMs = 5_000L) {
             vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
         }
@@ -905,7 +923,10 @@ class PolicyWriteTest {
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
 
         // 正確世代：正常寫入。
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.ACCEPTED,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(1, fake.saveCalls.get())
         assertEquals(setOf("com.example.a"), fake.saved)
@@ -918,7 +939,7 @@ class PolicyWriteTest {
         val vm = makeVm(fake.store, userId = 0)
 
         val dummy = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
-        vm.confirmPolicyWrite(dummy, dummy.generation)
+        assertEquals(PolicyWriteConfirmAdmission.TERMINAL, vm.confirmPolicyWrite(dummy, dummy.generation))
 
         assertEquals("沒有待確認的政策寫入", vm.state.value.msg)
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
@@ -1172,7 +1193,10 @@ class PolicyWriteTest {
         )
 
         // 重複維：核對中重複 confirm 不耗第二次 save。
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await(timeoutMs = 5_000L) { vm.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText() }
         assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm.state.value.msg)
         // IN_PROGRESS 覆寫 TIMEOUT 後，pending/相位仍保留（僅 msg 變化）。
@@ -1188,7 +1212,7 @@ class PolicyWriteTest {
         vm.clearPolicyDraft()
         assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
         val msgBeforeCancel = vm.state.value.msg
-        vm.cancelPolicyWrite(pending)
+        assertFalse("RECONCILING cancel must report refusal", vm.cancelPolicyWrite(pending))
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(msgBeforeCancel, vm.state.value.msg)
 
@@ -1451,7 +1475,10 @@ class PolicyWriteTest {
         setPendingPolicyWrite(vm, pending)
         val beforeMsg = vm.state.value.msg
 
-        vm.cancelPolicyWrite(pending.copy(generation = pending.generation + 1))
+        assertFalse(
+            "stale/mismatched expected must report refusal",
+            vm.cancelPolicyWrite(pending.copy(generation = pending.generation + 1)),
+        )
 
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(beforeMsg, vm.state.value.msg)
@@ -3167,7 +3194,7 @@ class PolicyWriteTest {
         assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
         assertTrue(vm.state.value.policyEpoch > epochBefore)
 
-        vm.cancelPolicyWrite(pending!!)
+        assertTrue("QUEUED cancel must report actual clearance", vm.cancelPolicyWrite(pending!!))
 
         assertNull(vm.state.value.pendingPolicyWrite)
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
@@ -3205,7 +3232,7 @@ class PolicyWriteTest {
 
         // saving 中取消/Back 一律禁用：cancel 為 no-op，pending 同一實例保留。
         assertFalse(policyDialogShouldBeCancelable(policySaving = true))
-        vm.cancelPolicyWrite(pending)
+        assertFalse(vm.cancelPolicyWrite(pending))
         assertSame(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(PolicyWritePhase.SAVING, vm.state.value.policyWritePhase)
 
@@ -11170,7 +11197,10 @@ class PolicyWriteTest {
             // stale 生效：後續 confirm 被強制重讀擋住（UNKNOWN_REFRESH、零寫入）。
             val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pending)
-            vm.confirmPolicyWrite(pending, pending.generation)
+            assertEquals(
+                PolicyWriteConfirmAdmission.TERMINAL,
+                vm.confirmPolicyWrite(pending, pending.generation),
+            )
             await { vm.state.value.pendingPolicyWrite == null }
             assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
             assertEquals(0, fake.saveCalls.get())
