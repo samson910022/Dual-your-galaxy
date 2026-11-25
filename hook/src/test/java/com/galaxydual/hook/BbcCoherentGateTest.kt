@@ -4,6 +4,7 @@ package com.galaxydual.hook
 import android.content.SharedPreferences
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.Callable
@@ -21,6 +22,14 @@ import java.util.concurrent.atomic.AtomicReference
 // SharedPreferences fake counts getAll() and makes edit() throw/count: ZERO
 // writes must occur on the timeout, contention, flip and normal paths.
 class BbcCoherentGateTest {
+    companion object {
+        // A cold JVM loading/JIT-compiling classes on the fresh executor thread
+        // can exceed the production 15 ms wall-clock ceiling. Determinism-
+        // sensitive tests inject this generous timeout so a timeout can never
+        // masquerade as a policy decision: the corrupt-key half must reach the
+        // wrong-type fail-closed path, not time out into a null snapshot.
+        private const val GENEROUS_READ_TIMEOUT_MS = 2_000L
+    }
 
     private fun newExecutor(): ThreadPoolExecutor =
         PolicyRefreshBudget.newPolicyRefreshExecutor("test-bbc-coherent-gate")
@@ -89,18 +98,24 @@ class BbcCoherentGateTest {
     }
 
     // Mirrors production bbcPolicy(): ONE bounded task for the coherent
-    // snapshot, then BOTH stages decide from that same snapshot.
+    // snapshot, then BOTH stages decide from that same snapshot. The timeout
+    // defaults to production's BBC_GATE_MAX_MS; determinism-sensitive tests can
+    // inject a generous value, and snapshotSpy observes what the bounded read
+    // actually returned (null == timeout/contention, non-null == a real snapshot)
+    // so a timeout can be distinguished from a wrong-type fail-closed decision.
     private fun finalGate(
         prefs: CountingPrefs,
         executor: CountingExecutor,
         compileTimeGate: Boolean = true,
         hybridOpen: (Boolean?) -> Boolean = freshHybrid(),
+        timeoutMs: Long = DualHook.BBC_GATE_MAX_MS,
+        snapshotSpy: ((BbcCoherentPrefsSnapshot?) -> Unit)? = null,
     ): Boolean = bbcCoherentEffectGateBounded(
         compileTimeGate = compileTimeGate,
         readBoundedSnapshot = {
-            readBbcPreactivationBounded(executor, DualHook.BBC_GATE_MAX_MS) {
+            readBbcPreactivationBounded(executor, timeoutMs) {
                 BbcPreactivationHookReader.readCoherent(prefs)
-            }
+            }.also { snapshotSpy?.invoke(it) }
         },
         hybridOpen = hybridOpen,
     )
@@ -229,6 +244,65 @@ class BbcCoherentGateTest {
         } finally {
             release.countDown()
             executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun absentRuntimeKeyWithAuthorizedLegacyInstallOpensButReadFailureCloses() {
+        // Honest semantics pinned end-to-end (still read-only / zero writes):
+        // an ABSENT bbc_injection_enabled key maps to defValue=true only because
+        // there is no explicit opt-out. It is NOT a default-on basis: legacy
+        // consent must still be authorized by the owner App's durable
+        // PRE_UPGRADE_EXISTING classification + trusted marker.
+        val authorizedLegacy = mapOf(
+            PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION to
+                PolicySource.INSTALL_CLASSIFICATION_PRE_UPGRADE_EXISTING,
+            PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED to true,
+            PolicySource.POLICY_KEY_EXTRA_PACKAGES to setOf("com.example.pkg"),
+            PolicySource.POLICY_KEY_EXTRA_VERSION to 4L,
+        )
+        val absentExecutor = CountingExecutor(newExecutor())
+        val absentPrefs = CountingPrefs(authorizedLegacy)
+        val absentSnapshot = AtomicReference<BbcCoherentPrefsSnapshot?>()
+        try {
+            assertTrue("absent runtime key = no explicit opt-out; legacy authority decides",
+                finalGate(absentPrefs, absentExecutor,
+                    timeoutMs = GENEROUS_READ_TIMEOUT_MS,
+                    snapshotSpy = { absentSnapshot.set(it) }))
+            assertEquals(1, absentPrefs.getAllCalls)
+            assertEquals(0, absentPrefs.editCalls)
+            assertEquals(1, absentExecutor.submissions.get())
+            // The bounded read COMPLETED (not a timeout): one coherent generation
+            // resolved the absent runtime key to "no explicit opt-out" (true).
+            val observedAbsent = absentSnapshot.get()
+            assertNotNull("bounded read must return a snapshot, not time out", observedAbsent)
+            assertTrue("absent runtime key is honored as no explicit opt-out",
+                observedAbsent!!.coherent && observedAbsent.runtimeEnabled == true)
+        } finally {
+            absentExecutor.shutdownNow()
+        }
+
+        // A corrupt runtime key is NOT absence. One coherent snapshot fails
+        // closed, so even the same authorized legacy install gets OFF.
+        val failedExecutor = CountingExecutor(newExecutor())
+        val failedPrefs = CountingPrefs(authorizedLegacy + (runtimeKey to 1L))
+        val failedSnapshot = AtomicReference<BbcCoherentPrefsSnapshot?>()
+        try {
+            assertFalse("a runtime read failure must close even an authorized legacy install",
+                finalGate(failedPrefs, failedExecutor,
+                    timeoutMs = GENEROUS_READ_TIMEOUT_MS,
+                    snapshotSpy = { failedSnapshot.set(it) }))
+            assertEquals(1, failedPrefs.getAllCalls)
+            assertEquals(0, failedPrefs.editCalls)
+            assertEquals(1, failedExecutor.submissions.get())
+            // With the generous timeout the bounded read COMPLETED, so the
+            // snapshot is genuinely fail-closed because the present runtime key
+            // has the WRONG TYPE (Long, not Boolean) -- NOT because of a timeout,
+            // which would have produced a null snapshot instead.
+            assertEquals("wrong-type runtime must yield the fail-closed snapshot, not a timeout null",
+                BbcCoherentPrefsSnapshot.failClosed(), failedSnapshot.get())
+        } finally {
+            failedExecutor.shutdownNow()
         }
     }
 

@@ -20,6 +20,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
@@ -1217,49 +1219,64 @@ class BbcActivationConsentStateMachineTest {
         assertEquals(BbcEffectStatus.Confirmed(false), runtime.effectStatus.value)
     }
 
+    /**
+     * Deterministic rotation: ONE virtual TestScheduler drives the app IO
+     * consumer AND both UI collectors. `commits` is synchronized, and the
+     * completion barrier is the FULL effect pipeline — `effectStatus` is
+     * published by `state.mark()` after its atomic state update, not by the
+     * raw commit list. No real thread spin / no happens-before race remains.
+     */
     @Test
-    fun rotationDuringBlockedConsentWrite_convergesWithExactlyOneEffectToggle() = runBlocking {
-        val io = Executors.newSingleThreadExecutor { r -> Thread(r, "bbc-consent-rotation-io") }.asCoroutineDispatcher()
-        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val entered = CountDownLatch(1)
-        val release = CountDownLatch(1)
+    fun rotationDuringBlockedConsentWrite_convergesWithExactlyOneEffectToggle() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val effectConfirmed = CompletableDeferred<Unit>()
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
         try {
             val holder = BbcActivationConsentHolder()
             holder.onServiceGenerationChanged(1L)
             holder.resolve(read(1L, optIn = false))
-            val commits = mutableListOf<Boolean>()
+            val commits = Collections.synchronizedList(mutableListOf<Boolean>())
             val runtime = BbcToggleRuntimeState(initialConfirmed = false)
             val coordinator = BbcToggleCoordinator(
                 scope = appScope, state = runtime,
-                commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) }, io = io,
+                commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) }, io = dispatcher,
                 consentCommit = {
-                    entered.countDown()
+                    entered.complete(Unit)
                     release.await()
                     BbcWriteOutcome.Confirmed(true)
                 },
                 consentHolder = holder,
             )
-            val a = BbcConsentTestHarness(holder, coordinator, Dispatchers.Unconfined)
+            // Barrier tied to the published mark, not to the commit seam.
+            val effectObserver = launch(dispatcher) {
+                runtime.effectStatus.first { it == BbcEffectStatus.Confirmed(true) }
+                effectConfirmed.complete(Unit)
+            }
+            val a = BbcConsentTestHarness(holder, coordinator, dispatcher)
 
             // Fresh install: first tap is durable runtime OFF.
             a.userToggle(false)
-            withTimeout(5_000L) { while (commits.isEmpty()) yield() }
+            withTimeout(5_000L) { testScheduler.advanceUntilIdle() }
             commits.clear() // below we count only the ENABLE handoff
 
             a.userToggle(true) // first ON -> consent dialog
             a.accept()         // enqueue consent write; A's callback will be dropped
-            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            withTimeout(5_000L) { testScheduler.advanceUntilIdle() }
+            assertTrue("the consent commit must be blocked before rotation", entered.isCompleted)
             a.dispose()        // rotation: UI-only teardown; the commit survives
             assertFalse("a disposed UI must be dead", a.alive)
 
             // Rebuilt Activity shares only the app-scoped holder/coordinator.
-            val b = BbcConsentTestHarness(holder, coordinator, Dispatchers.Unconfined)
+            val b = BbcConsentTestHarness(holder, coordinator, dispatcher)
             b.seedFromHolder() // still NotGranted while the consent write is blocked
             assertEquals(0, b.toggleCalls.size)
 
-            release.countDown()
-            withTimeout(5_000L) { while (holder.currentState() !is BbcActivationConsentState.Granted) yield() }
-            withTimeout(5_000L) { while (commits.isEmpty()) yield() }
+            release.complete(Unit)
+            withTimeout(5_000L) { testScheduler.advanceUntilIdle() }
+            withTimeout(5_000L) { effectConfirmed.await() }
 
             assertEquals(BbcActivationConsentState.Granted, holder.currentState())
             assertEquals("rebuilt UI must agree with the effect instead of showing a false ON",
@@ -1270,46 +1287,60 @@ class BbcActivationConsentStateMachineTest {
             assertEquals("the dead UI must never dispatch the enable", listOf(false), a.toggleCalls)
             assertEquals("granted install must not re-ask after reopen", 0, b.dialogsShown.size)
             b.dispose()
+            effectObserver.cancel()
         } finally {
             appScope.cancel()
-            io.close()
         }
     }
 
+    /**
+     * Same deterministic virtual-time model as the rotation test above: the
+     * old consent write is parked on a CompletableDeferred, and the post-release
+     * barrier waits for the published `Confirmed(true)` effect mark before any
+     * UI assertion. No real-thread scheduling remains in this test.
+     */
     @Test
-    fun rotationThenReopenedDialog_doesNotDoubleToggle_thePendingEnable() = runBlocking {
-        val io = Executors.newSingleThreadExecutor { r -> Thread(r, "bbc-consent-reopen-io") }.asCoroutineDispatcher()
-        val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val entered = CountDownLatch(1)
-        val release = CountDownLatch(1)
+    fun rotationThenReopenedDialog_doesNotDoubleToggle_thePendingEnable() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val effectConfirmed = CompletableDeferred<Unit>()
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
         try {
             val holder = BbcActivationConsentHolder()
             holder.onServiceGenerationChanged(1L)
             holder.resolve(read(1L, optIn = false))
+            val runtime = BbcToggleRuntimeState(initialConfirmed = false)
             val coordinator = BbcToggleCoordinator(
-                scope = appScope, state = BbcToggleRuntimeState(initialConfirmed = false),
-                commit = { BbcWriteOutcome.Confirmed(it) }, io = io,
+                scope = appScope, state = runtime,
+                commit = { BbcWriteOutcome.Confirmed(it) }, io = dispatcher,
                 consentCommit = {
-                    entered.countDown()
+                    entered.complete(Unit)
                     release.await()
                     BbcWriteOutcome.Confirmed(true)
                 },
                 consentHolder = holder,
             )
-            val a = BbcConsentTestHarness(holder, coordinator, Dispatchers.Unconfined)
+            val effectObserver = launch(dispatcher) {
+                runtime.effectStatus.first { it == BbcEffectStatus.Confirmed(true) }
+                effectConfirmed.complete(Unit)
+            }
+            val a = BbcConsentTestHarness(holder, coordinator, dispatcher)
             a.userToggle(true)
             a.accept()
-            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            withTimeout(5_000L) { testScheduler.advanceUntilIdle() }
+            assertTrue("the consent commit must be blocked before rotation", entered.isCompleted)
             a.dispose()
 
-            val b = BbcConsentTestHarness(holder, coordinator, Dispatchers.Unconfined)
+            val b = BbcConsentTestHarness(holder, coordinator, dispatcher)
             b.seedFromHolder()
             b.userToggle(true) // a NEW dialog is pending before the old write lands
             assertEquals(1, b.dialogsShown.size)
 
-            release.countDown()
-            withTimeout(5_000L) { while (holder.currentState() !is BbcActivationConsentState.Granted) yield() }
-            yield()
+            release.complete(Unit)
+            withTimeout(5_000L) { testScheduler.advanceUntilIdle() }
+            withTimeout(5_000L) { effectConfirmed.await() }
             assertEquals("a pending dialog must suppress the replay", 0, b.toggleCalls.size)
 
             b.cancel() // OFF-wins invalidates the stale enable intent
@@ -1319,9 +1350,9 @@ class BbcActivationConsentStateMachineTest {
             b.userToggle(true) // Granted: this one explicit tap is the single effect intent
             assertEquals(listOf(true), b.toggleCalls)
             b.dispose()
+            effectObserver.cancel()
         } finally {
             appScope.cancel()
-            io.close()
         }
     }
 

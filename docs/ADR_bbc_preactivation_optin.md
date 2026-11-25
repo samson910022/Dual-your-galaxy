@@ -42,11 +42,15 @@ fail-closed，並把 legacy 判定從「目前的草稿 bytes」改為 App 持�
    packages／version bytes **不是** consent 證據；普通草稿保存不能隱含授權。
 2. **既有安裝由 App 分類與遷移。** 分類鍵缺席且判定為升級前既有草稿
    （`extra_whitelist_packages` 非空或 `extra_whitelist_version` Present）時，owner App
-   在同一 commit 寫入 `install_classification=PRE_UPGRADE_EXISTING` 與一次性
-   `bbc_legacy_migrated=true`；Hook 只讀取這兩個鍵。**舊政策草稿位元不變**
-   （不刪除、不清空、不改寫）。commit 失敗、binder 未 bind、重試中都不構成 migration
-   證據；App 的 pending intent 會在重試時重新寫入相同鍵值，直到 `Confirmed` 為止。
-   Hook 端 API 102 remote prefs 唯讀，**不聲稱 Hook 曾完成任何 marker 寫入**。
+   在**每一次 bind** 的同一個 forced durable commit 寫入
+   `install_classification=PRE_UPGRADE_EXISTING` 與一次性 `bbc_legacy_migrated=true`；
+   Hook 只讀取這兩個鍵。**舊政策草稿位元不變**
+   （不刪除、不清空、不改寫）。**草稿 bytes 本身不被當成 legacy 同意證據**
+   （App 只用它們判別升級前既有，並把結果寫入分類鍵；Hook 永不從草稿推斷同意）；
+   升級後 App 從未被開啟至少一次，或 bind commit 持續失敗／仍在重試時，注入維持 OFF
+   （刻意 fail-closed）。只有 `Confirmed` 的分類＋標記 commit 才算 migration 完成，
+   下一次 bind 會重寫相同鍵值。Hook 端 API 102 remote prefs 唯讀，
+   **不聲稱 Hook 曾完成任何 marker 寫入**。
    App 授權端比照 Hook gate：`PRE_UPGRADE_EXISTING` 亦須 authoritative marker
    read 為 `true` 才進入 `Legacy`（`MIGRATED`／`EXPLICITLY_GRANTED` 不需要）；
    bind-time 分類 commit 失敗時，App 不從被污染的 local mMap resync，而是對該
@@ -58,15 +62,40 @@ fail-closed，並把 legacy 判定從「目前的草稿 bytes」改為 App 持�
 5. **Compile-time gate 改為緊急開關。** `BBC_AVAILABLE_APPS_INJECTION` 不再作為
    「預設開」的依據；保留為最終 AND 的一環（`false` 即零偏好讀取、零合併），設 `false`
    即 BBC 零合併。
-6. **混合閘也 fail-closed。** 執行期 opt-out 鍵缺席不再視為「預設開」；讀取失敗、
+6. **混合閘也 fail-closed。** 執行期 opt-out 鍵缺席不再是「預設開」的依據
+   （缺席只表示沒有明確 opt-out；新安裝仍須明確 opt-in）；讀取失敗、
    timeout、contention、clock/CAS 例外一律 closed；confirmed OFF 的 sticky 語意
    （`BBC_STICKY_MAX_AGE_MS`，process-local）維持不變。Hook 以單一 `getAll()` 的
    coherent snapshot 同時判定 pre-activation 與 hybrid 兩層；torn generation／錯型別
    即整份 fail-closed。
-7. **durable Unknown fence。** App consent 狀態機在 `commit(false)`／拋錯後安裝跨
-   store／controller／Activity／service rebinding 的 Unknown fence；只有 `Confirmed`
-   grant 或較新 service generation 的權威 resync 可升級為 `Granted`，被樂觀污染的
-   local `mMap` 不可清除該 fence。
+7. **durable Unknown fence（單調）。** App consent 狀態機在 `commit(false)`／拋錯後安裝跨
+   store／controller／Activity／service rebinding 的 Unknown fence；fence 的 generation
+   只升不降（`maxOf`），同一 generation 的本地／污染讀取永遠不能清除它。只有 `Confirmed`
+   grant 或較新 service generation 的權威 resync 可升級為 `Granted`，
+   被樂觀污染的 local `mMap` 不可清除該 fence。
+
+### 目前實作的取捨（PR #90 Phases 1–3）
+
+- **Hook 完全唯讀，不寫任何 marker。** hooked app 的 API 102 remote preferences 唯讀；
+  Hook 不寫入 `bbc_legacy_migrated`、`install_classification`、`bbc_enable_pending`，
+  也不改政策草稿（位元不變）。所有 durable 寫入都由 owner App 在其可寫入的
+  `XposedService.getRemotePreferences` 通道完成；Hook 只讀取同一批 coherent 鍵。
+- **owner App 每次 bind 都重新確認分類。** 分類＋一次性遷移標記在同一個 forced durable
+  commit 寫入，只有 `Confirmed` 算數；bind commit 失敗會對該 generation 安裝 Unknown
+  fence，下一次 bind 重試。App 從未開啟或 commit 一直失敗時，既有安裝維持 OFF。
+- **app-only `bbc_enable_pending` 讓 cold-start／rebind 收斂，但不反轉 OFF。** grant 時
+  App 在同一個 atomic forced commit 寫入 `bbc_preactivation_optin=true` 與
+  `bbc_enable_pending=true`；其後每一次 runtime 偏好寫入（consumer 的 enable 與使用者的
+  OFF 都算）都在同一個 commit 把此標記清除。bind/resync 的 coherent 讀取必須同時看到
+  optin=true 與 marker=true，app IO consumer 才補寫一次 effect enable；已持久化的 OFF
+  已清除標記，背景 resync 因此不會把 OFF 翻回 ON。此標記只給 App 用，Hook gate 永不讀它。
+- **進程死亡殘餘（如實揭露）。** 若 grant 已 `Confirmed`、runtime enable 尚未寫入時進程死亡，
+  marker 仍在，App 下次 bind/resync 會補上該 enable；但若 coherent 讀取讀不到 optin／marker，
+  或該 commit 回報 Unknown，resync 不補寫、效應維持 OFF（fail-closed）。hook 行程的
+  RemotePreferences 快取也可能仍落後，需重啟 hook 行程／開機才觀察到新值。
+  這不是即時跨行程保證，也不是 #75 防護或資料安全保證。
+- `POLICY_KEY_EXTRA_VERSION`（`extra_whitelist_version`）損毀／讀取失敗會讓整份 coherent
+  snapshot fail-closed，效應 OFF 直到修復（C3）；草稿曾非空不能繞過它，也不是 consent 證據。
 
 ### 純函式決策表（`bbcPreactivationGate`）
 
@@ -105,11 +134,14 @@ fail-closed，並把 legacy 判定從「目前的草稿 bytes」改為 App 持�
   (`BbcMigrationMarkerTest.kt`) 已隨其 production writer 一併移除（Hook 唯讀），
   並由 read-only／owner-write 測試取代。
 - **已知限制（App opt-in commit Unknown 與冷行程）**：`commit(false)`／拋錯時如實
-  回報 Unknown 且不寫 BBC 開關；本地 mMap 可能被樂觀污染，但 durable fence 不允許
-  同 generation 的讀取或污染值清除 Unknown。因此**不能**宣稱「Hook 一定不提前
-  生效」，也**不能**宣稱「App 重啟一定自癒」──若 grant 已落盤而 runtime opt-out
-  寫入缺席，cold process start 之後仍可能出現授權與效應不一致；重啟只是重新讀取，
-  不保證回到重新詢問。這是同意 UX 的可觀測限制，不據此宣稱已修正或資料安全。
+  回報 Unknown 且不寫 BBC 開關；本地 mMap 可能被樂觀污染，但單調 durable fence 不允許
+  同 generation 的讀取或污染值清除 Unknown。有 `bbc_enable_pending=true` 的
+  `Confirmed` grant 在 cold start／rebind 的 coherent resync 會被 app IO consumer 補寫一次
+  effect enable（而不會反轉已清除標記的 durable OFF）；但 grant 已落盤而 runtime 寫入
+  缺席時，若下次讀取讀不到 optin／marker 或 commit 仍為 Unknown，就不補寫，
+  授權與效應仍可能不一致。因此**不能**宣稱「Hook 一定不提前生效」，也**不能**宣稱
+  「App 重啟一定自癒」；重啟只是重新讀取，不保證回到重新詢問，hook 行程的快取亦可能
+  落後。這是同意 UX 的可觀測限制，不據此宣稱已修正或資料安全。
 - 真實 LSPosed 跨行程可見性（remote prefs 的 daemon／`mMap` 快取是否如預期重同步）
   仍 **DEVICE-UNVERIFIED**；Samsung 冷啟動刪除（#75，DELETE 早於 BBC 回調）亦
   **DEVICE-UNVERIFIED**。opt-in 只校正「生效前取得同意」的時機，**不是 #75 防護**，

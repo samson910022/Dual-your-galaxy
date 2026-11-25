@@ -26,6 +26,21 @@ class RiskDisclosureStringTest {
 
     private val maps: Map<String, Map<String, String>> by lazy { locales.associateWith { stringMap(it) } }
 
+    // PR #90 Phase 4: the runtime opt-out key's ABSENCE is not an enabled
+    // preference (it only means "no explicit opt-out") and not a consent proof;
+    // new installs still need opt-in, and read failures fail closed. All three
+    // locales must carry this honest sentence and none may carry the old false
+    // "missing key is no longer treated as enabled" claim.
+    private val honestAbsentKeySentence = mapOf(
+        "values" to "執行期偏好鍵缺席只表示沒有明確 opt-out、不再是「預設開」的依據；新安裝仍須明確 opt-in 才會生效，任何讀取失敗則 fail-closed（關閉）。",
+        "values-b+zh+Hant" to "執行期偏好鍵缺席只表示沒有明確 opt-out、不再是「預設開」的依據；新安裝仍須明確 opt-in 才會生效，任何讀取失敗則 fail-closed（關閉）。",
+        "values-en" to "An absent runtime opt-out key only means there is no explicit opt-out and is no longer a basis for default on; new installs still require an explicit opt-in before the effect applies, and read failures fail closed (OFF).",
+    )
+    private val falseAbsentKeyClaims = listOf(
+        "執行期偏好鍵缺席不再視為啟用",
+        "A missing runtime preference key is no longer treated as enabled",
+    )
+
     private fun resFile(locale: String): File {
         val candidates = listOf(File("src/main/res/$locale/strings.xml"), File("app/src/main/res/$locale/strings.xml"))
         return candidates.firstOrNull { it.isFile }
@@ -126,6 +141,22 @@ class RiskDisclosureStringTest {
         assertTrue("en full must state restoration is impossible", en.contains("cannot restore") || en.contains("cannot be fully restored"))
         assertTrue("en full must name BBC_AVAILABLE_APPS_INJECTION", en.contains("BBC_AVAILABLE_APPS_INJECTION"))
         assertFalse("en must not claim consent before activation", en.contains("obtained consent before activation"))
+    }
+
+    @Test
+    fun riskDetailsFull_allLocalesPinHonestAbsentRuntimeKeySemantics() {
+        for (locale in locales) {
+            val text = maps.getValue(locale).getValue("risk_details_full")
+            assertTrue(
+                "$locale risk_details_full must state: absent = no explicit opt-out, " +
+                    "new installs still need opt-in, read failures fail closed",
+                text.contains(honestAbsentKeySentence.getValue(locale)),
+            )
+            for (falseClaim in falseAbsentKeyClaims) {
+                assertFalse("$locale must not claim '$falseClaim'", text.contains(falseClaim))
+            }
+            assertTrue("$locale must keep the #75 caveat", text.contains("issue #75"))
+        }
     }
 
     @Test
