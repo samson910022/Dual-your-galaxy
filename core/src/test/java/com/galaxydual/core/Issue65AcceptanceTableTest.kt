@@ -9,9 +9,10 @@ import org.junit.runners.Parameterized
 
 // Issue #65 parameterized acceptance table: neither the renamed user's id nor
 // the display-only `name=` label may affect authorization. 3 renamed users
-// (owner 0 / dual 95 / other 150) x 8 labels (error keywords, a comma, an
+// (owner 0 / dual 95 / other 150) x 11 labels (error keywords, a comma, an
 // injected `type=` declaration, an inline UserInfo header, multiple commas,
-// flags-like text BEFORE the real `, type=`) = 24 cases. Only UNAMBIGUOUS
+// flags-like text BEFORE the real `, type=`, and three colon-bearing names
+// from the R13 legacy-label compatibility matrix) = 33 cases. Only UNAMBIGUOUS
 // compat labels are listed here; a composite label with an earlier
 // error-semantic declaration (e.g. `, type=Error, ...`) is intentionally NOT
 // display-only and must fail the strict gate -- see VerboseUserRow KDoc and
@@ -44,6 +45,12 @@ class Issue65AcceptanceTableTest(
                 // the neutralized name span (nameEnd = first `, type=`), so it
                 // is display-only and the real CLONE declaration still wins.
                 "foo, flags=X",
+                // R13: a user rename may legally contain a colon (AOSP does
+                // not quote it). Display-only in both the new `name=` span
+                // and the shared legacy UserInfo label parser.
+                "Work:Error",
+                "a:Failure",
+                "a:not found",
             )
             return users.flatMap { uid ->
                 labels.map { displayName -> arrayOf<Any>(uid, displayName) }

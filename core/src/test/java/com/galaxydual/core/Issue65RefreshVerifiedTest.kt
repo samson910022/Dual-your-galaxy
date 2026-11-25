@@ -31,6 +31,10 @@ class Issue65RefreshVerifiedTest {
         // R9: override the dumpsys payload so an UNKNOWN-on-target dumpsys
         // snapshot can be exercised through the full refreshVerified() flow.
         private val dumpsysOutput: String? = null,
+        // R13: override the diagnostic `pm list users` payload so a
+        // colon-bearing legacy label can be exercised there too. The default
+        // below stays unchanged for every pre-existing test.
+        private val listUsersOutput: String? = null,
     ) : CmdGateway {
         override val privilege: Privilege = Privilege.SHELL
         var verboseOutput: String = verbose
@@ -47,7 +51,7 @@ class Issue65RefreshVerifiedTest {
             return when (cmd) {
                 DualRepository.CMD_LIST_USERS -> CmdResult(
                     exit = 0,
-                    out = "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:DUAL_APP:400} running\n",
+                    out = listUsersOutput ?: "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:DUAL_APP:400} running\n",
                     err = "",
                 )
                 DualRepository.CMD_USER_LIST_VERBOSE ->
@@ -729,5 +733,140 @@ class Issue65RefreshVerifiedTest {
         val row = "1: id=95, name=OK, type=profile.PRIVATE serial number: 99, " +
             "type=profile.CLONE, flags=X (parentId=0)"
         assertFailClosed(FakeGateway(verboseWithRow(row)), "R10b: serial number structural alias")
+    }
+
+    // ---- R12: malformed record attempts own their own evidence (full flow) ----
+
+    // A parent-less legacy u95 CLONE(serial 15) plus one trailing malformed
+    // attempt. Before R12 that attempt was OTHER, so its `parentId=0` was
+    // stitched into u95's body and could make the resolver Confirm u95.
+    private fun r12Verbose(vararg trailing: String) = (
+        listOf(
+            "Users:",
+            "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+            "    userType=android.os.usertype.profile.CLONE",
+        ) + trailing
+        ).joinToString("\n")
+
+    @Test
+    fun r12_reviewPocMalformedLegacyHeader_failsClosedWithoutPackageRead() {
+        val verbose = r12Verbose("  UserInfo{150:parentId=0}")
+        assertEquals(IdentityLineKind.REJECTED, IdentityLineClassifier.classify("  UserInfo{150:parentId=0}").kind)
+        val u95 = SamsungProfileAdapter.parseUserListVerbose(verbose).single { it.userId == 95 }
+        assertNull("u95 must not borrow the malformed attempt's parentId", u95.parentId)
+        assertEquals(15, u95.serial)
+        assertFailClosed(FakeGateway(verbose), "R12 review PoC: malformed legacy attempt")
+    }
+
+    @Test
+    fun r12_malformedLegacyAttemptsAtEveryIndent_failsClosedWithoutPackageRead() {
+        for (indent in listOf("", "  ", "\t")) {
+            for (attempt in listOf(
+                "UserInfo{150:parentId=0}",
+                "UserInfo{150:Neutral}",
+                "UserInfo{150:Broken:400",
+                "UserInfo{foo Failure}",
+                "UserInfo{150:Work:Error:400}}",
+            )) {
+                val trailing = indent + attempt
+                val verbose = r12Verbose(trailing)
+                assertEquals(
+                    "$trailing must be REJECTED",
+                    IdentityLineKind.REJECTED,
+                    IdentityLineClassifier.classify(trailing).kind,
+                )
+                assertFailClosed(FakeGateway(verbose), "R12: malformed legacy attempt [$trailing]")
+            }
+        }
+    }
+
+    @Test
+    fun r12_spacedIdEqualsAttempts_failsClosedWithoutPackageRead() {
+        for (attempt in listOf(
+            "  2: id =150, name=parentId=0, type=profile.PRIVATE, flags=X",
+            "2: id\t=150, name=parentId=0, type=profile.PRIVATE, flags=X",
+            " 2: id  = 150, name=parentId=0, type=profile.PRIVATE, flags=X",
+        )) {
+            val verbose = r12Verbose(attempt)
+            assertEquals("$attempt must be REJECTED", IdentityLineKind.REJECTED, IdentityLineClassifier.classify(attempt).kind)
+            val u95 = SamsungProfileAdapter.parseUserListVerbose(verbose).single { it.userId == 95 }
+            assertNull("u95 must not borrow a spaced id= attempt's parent", u95.parentId)
+            assertFailClosed(FakeGateway(verbose), "R12: spaced id = attempt [$attempt]")
+        }
+    }
+
+    @Test
+    fun r12_overflowLegacyId_failsClosedWithoutPackageRead() {
+        val verbose = r12Verbose("  UserInfo{99999999999999999999:parentId=0}")
+        assertEquals(
+            IdentityLineKind.REJECTED,
+            IdentityLineClassifier.classify("  UserInfo{99999999999999999999:parentId=0}").kind,
+        )
+        assertFailClosed(FakeGateway(verbose), "R12: overflow legacy id")
+    }
+
+    // ---- R13: colon-bearing legacy labels stay display-only (full flow) ----
+
+    private val r13Labels = listOf("Work:Error", "a:Failure", "a:not found")
+
+    private fun r13Verbose(renamedUid: Int, label: String) = listOf(
+        "Users:",
+        "  0: id=0, name=${if (renamedUid == 0) label else "Owner"}, type=full.SYSTEM, flags=0x00000013 (parentId=0)",
+        "  1: id=95, name=${if (renamedUid == 95) label else "DUAL_APP"}, type=profile.CLONE, flags=0x00000190 (parentId=0)",
+        "  2: id=150, name=${if (renamedUid == 150) label else "Secure Folder"}, type=profile.PRIVATE, flags=0x00000030 (parentId=0)",
+    ).joinToString("\n")
+
+    private fun r13Dumpsys(label: String) = listOf(
+        "Users:",
+        "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:",
+        "    userType=android.os.usertype.full.SYSTEM",
+        "  UserInfo{95:$label:400} serialNo=15:",
+        "    parentId=0",
+        "    userType=android.os.usertype.profile.CLONE",
+    ).joinToString("\n")
+
+    private fun r13ListUsers(label: String) =
+        "Users:\n\tUserInfo{0:Owner:13} running\n\tUserInfo{95:$label:400} running\n"
+
+    @Test
+    fun r13_colonLabelsOnAnyUserInAnyChannelStillConfirmWithAbsolutePins() {
+        for (uid in listOf(0, 95, 150)) {
+            for (label in r13Labels) {
+                val gateway = FakeGateway(
+                    r13Verbose(uid, label),
+                    dumpsysOutput = r13Dumpsys(label),
+                    listUsersOutput = r13ListUsers(label),
+                )
+                val outcome = runSuspend { DualRepository(gateway).refreshVerified() }
+                assertTrue("expected GroundTruth (uid=$uid, label=$label), got: $outcome", outcome is RefreshOutcome.GroundTruth)
+                val truth = outcome as RefreshOutcome.GroundTruth
+                assertEquals(95, truth.target.userId)
+                assertEquals(15, truth.target.serial)
+                assertEquals(0, truth.target.parentId)
+                assertEquals(listOf("com.example.chat", "com.example.mail"), truth.cloned)
+            }
+        }
+    }
+
+    @Test
+    fun r13_colonLabelWithGenuineTailErrorOrMalformedFlags_failsClosedWithoutPackageRead() {
+        for (header in listOf(
+            "  UserInfo{95:Work:Error:400} serialNo=15: Failure [INSTALL_FAILED_INVALID_APK: bad]",
+            "  UserInfo{95:Work:Error:400oops} serialNo=15:",
+            "  UserInfo{95:Work:Error} serialNo=15:",
+        )) {
+            val dumpsys = listOf(
+                "Users:",
+                "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:",
+                "    userType=android.os.usertype.full.SYSTEM",
+                header,
+                "    parentId=0",
+                "    userType=android.os.usertype.profile.CLONE",
+            ).joinToString("\n")
+            assertFailClosed(
+                FakeGateway(verboseWithName("DUAL_APP"), dumpsysOutput = dumpsys),
+                "R13: colon label with genuine tail error / malformed flags [$header]",
+            )
+        }
     }
 }

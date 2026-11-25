@@ -59,9 +59,11 @@ sealed interface TrustedList {
 // 為 App 側線性掃描，複雜度 O(行數)，N=512 行仍為微秒級，見 hook 側 BbcMergeTimingTest
 // 的 N=50/200/512 合併耗時基準同級量級，但兩者預算獨立、不得混用）。
 object PmOutputParser {
-    // Matches lines like "UserInfo{0:Owner:13} running" or "UserInfo{95:DUAL_APP:400}".
-    // Group 3 (flag/type field) is retained, never dropped (C1 safety audit, issue #2).
-    private val USER_INFO = Regex("UserInfo\\{(\\d+):([^:}]*):([^}]*)\\}")
+    // Loose fragment locator for DIAGNOSTIC pm-list output only. The fragment
+    // is then parsed by the SAME LegacyHeaderParser the strict gate and the
+    // claim parser use, so colon-bearing labels and AOSP hex flags are split
+    // identically everywhere (issue #87 R13). Never authorization.
+    private val USER_INFO_FRAGMENT = Regex("""UserInfo\{\d+:[^}]*\}""")
 
     // Keywords indicating failure even when the caller reports exit 0.
     // Phase C2 (issue #8): these are LINE-LEVEL error-semantic patterns, never
@@ -321,16 +323,27 @@ object PmOutputParser {
     // UserInfo{<id>:<label>:<flags>} entry (C1 safety audit, issue #2).
     // New function; parseUsers() above delegates to it so existing callers
     // keep working unchanged (they simply ignore the extra flags field).
+    //
+    // R13: the loose fragment is located per raw physical line, then parsed by
+    // LegacyHeaderParser with requireLineStart=false. NEW_ROW / REJECTED lines
+    // and invalid fragments are SKIPPED (no silent toIntOrNull fallback and no
+    // first-colon label split). label/flags stay display/diagnostic only --
+    // never authorization, exactly as in the strict gate and claim parser.
     fun parseUsersDetailed(output: String): List<DualProfile> {
         val out = mutableListOf<DualProfile>()
-        for (raw in output.lines()) {
-            val line = raw.trim()
-            if (line.isEmpty()) continue
-            val match = USER_INFO.find(line) ?: continue
-            val id = match.groupValues[1].toIntOrNull() ?: continue
-            val label = match.groupValues[2].trim()
-            val flags = match.groupValues[3].trim()
-            out.add(DualProfile(userId = id, label = label, flags = flags))
+        for (raw in VerboseUserRow.verboseLines(output)) {
+            val classified = IdentityLineClassifier.classify(raw)
+            if (classified.kind == IdentityLineKind.NEW_ROW ||
+                classified.kind == IdentityLineKind.REJECTED
+            ) {
+                continue
+            }
+            val fragment = USER_INFO_FRAGMENT.find(raw) ?: continue
+            val fields = when (val parsed = LegacyHeaderParser.parse(fragment.value, requireLineStart = false)) {
+                is LegacyParseResult.Ok -> parsed.fields
+                else -> continue
+            }
+            out.add(DualProfile(userId = fields.id, label = fields.label, flags = fields.flags))
         }
         return out
     }
@@ -554,15 +567,18 @@ object PmOutputParser {
     // - No EXEMPT_LINE filtering: package:/path echoes and "installed for
     //   user" success echoes are pm success payloads, never legitimate
     //   identity content; every non-blank line is tested against ERROR_LINE.
-    // - Per-line classification (R5): each RAW physical line is classified by
-    //   IdentityLineClassifier using the SAME rule the adapter uses. There is
-    //   NO global unanchored `UserInfo{...}` deletion: a confirmed legacy
-    //   header has ONLY its label group neutralized, a valid new-format row
-    //   has ONLY its `name=` span neutralized, and everything else is scanned
-    //   verbatim. A renamed label carrying error keywords
-    //   (`UserInfo{95:Error:400}`, `name=Failure`, `{10:not found:30}`) can
-    //   therefore never trip ERROR_LINE, while a header-like token in a type/
-    //   flags tail (`flags=UserInfo{1:Failure:0}`) survives and still fails.
+    // - Per-line classification (R5/R13): each RAW physical line is classified
+    //   by IdentityLineClassifier using the SAME rule the adapter uses. There
+    //   is NO global unanchored `UserInfo{...}` deletion: a confirmed legacy
+    //   header has ONLY its [labelStart, labelEnd) span neutralized (the
+    //   shared LegacyHeaderParser finds the label end at the valid flags
+    //   suffix, so `Work:Error:400` keeps the whole colon label display-only),
+    //   a valid new-format row has ONLY its `name=` span neutralized, and
+    //   everything else is scanned verbatim. A renamed label carrying error
+    //   keywords (`UserInfo{95:Error:400}`, `name=Failure`, `{10:not found:30}`)
+    //   can therefore never trip ERROR_LINE, while a header-like token in a
+    //   type/flags tail (`flags=UserInfo{1:Failure:0}`) survives and still
+    //   fails.
     // - Fail-closed classification: a malformed NEW_ROW (empty/non-canonical
     //   last declaration, an earlier STRUCTURAL declaration, or a control char
     //   in the name) and any REJECTED line (lone CR or U+0085/U+2028/U+2029)
@@ -573,17 +589,19 @@ object PmOutputParser {
     // ALREADY_EXISTS exemption is checked before exit and can still report
     // success on a non-zero exit).
 
-    // Issue #65 / R5 (fail-closed): the two identity formats are handled by
-    // ONE classifier over ONE physical line each. `name=` (new format) and the
-    // `UserInfo{id:label:flags}` label group (legacy) are DISPLAY ONLY, so only
-    // those exact spans are replaced with neutral placeholders. The old
+    // Issue #65 / R5 / R13 (fail-closed): the two identity formats are handled
+    // by ONE classifier over ONE physical line each. `name=` (new format) and
+    // the legacy `UserInfo{id:label:flags}` label span are DISPLAY ONLY, so
+    // only those exact spans are replaced with neutral placeholders. The old
     // whole-output header strip could delete a tail-embedded
     // `UserInfo{1:Failure:0}` before the error scan; the old greedy
     // `(.*)`-to-LAST-`, type=` sanitizer swallowed genuine `Failure [...]` /
     // second type declarations. Neither shortcut exists now. The shared
     // structured parser (VerboseUserRow) locates the name span and enforces
     // the structural invariant (one structural canonical declaration, last,
-    // non-empty, no control chars). No line is deleted or exempted, so an
+    // non-empty, no control chars); the shared LegacyHeaderParser locates the
+    // legacy label end at a VALID flags suffix (colon labels preserved, no
+    // cross-body greedy brace scan). No line is deleted or exempted, so an
     // error token anywhere else stays visible to ERROR_LINE.
     private data class SanitizedIdentity(
         // Same physical lines, same order, LF-normalized only by the shared
@@ -619,13 +637,14 @@ object PmOutputParser {
                     }
                 }
                 IdentityLineKind.LEGACY_HEADER -> {
-                    // Replace ONLY the label group (group 2), never the whole
-                    // header: the id/flags tail keeps its error semantics.
-                    val label = classified.header!!.groups[2]!!
+                    // Replace ONLY the confirmed display-label span, never the
+                    // whole header: the flags/tail after labelEnd stays visible
+                    // to ERROR_LINE (a genuine `Failure [...]` still fails).
+                    val fields = classified.fields!!
                     lines.add(
-                        classified.text.substring(0, label.range.first) +
+                        classified.text.substring(0, fields.labelStart) +
                             "<display-label>" +
-                            classified.text.substring(label.range.last + 1),
+                            classified.text.substring(fields.labelEnd),
                     )
                 }
                 IdentityLineKind.REJECTED -> {

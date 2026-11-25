@@ -32,13 +32,14 @@ sealed interface DualResolution {
 // parsing (see PmOutputParser.resolveDualUserIdVerified); the label-only
 // resolveDualUserId() is Deprecated and must not authorize new writes.
 object SamsungProfileAdapter {
-    // Legacy header regex lives in IdentityLineClassifier.LEGACY_HEADER and
-    // is applied to ONE classified physical line at a time (no `(?m)`): the
-    // old `(?m)^` anchor treated U+0085/U+2028/U+2029 and lone CR as line
-    // starts, so a header-like token after such a char could manufacture a
-    // second legacy claim. Classification also keeps NEW_ROW lines out of the
-    // legacy header scan entirely, so an inline `UserInfo{95:x:400}` inside a
-    // `name=` label can never produce a competing claim.
+    // Legacy headers are parsed by the shared LegacyHeaderParser (called from
+    // IdentityLineClassifier) on ONE classified physical line at a time (no
+    // `(?m)`): the old `(?m)^` anchor treated U+0085/U+2028/U+2029 and lone CR
+    // as line starts, so a header-like token after such a char could
+    // manufacture a second legacy claim. Classification also keeps NEW_ROW /
+    // REJECTED lines out of the legacy header scan entirely, so an inline
+    // `UserInfo{95:x:400}` inside a `name=` label can never produce a
+    // competing claim.
 
     // New-ROM `cmd user list -v` line format (One UI 6.1+/S24, PR-33 D2):
     // no UserInfo header and no serial line, e.g.
@@ -430,13 +431,14 @@ object SamsungProfileAdapter {
     private fun classifyIdentityLines(text: String): List<ClassifiedIdentityLine> =
         VerboseUserRow.verboseLines(text).map { IdentityLineClassifier.classify(it) }
 
-    // A REJECTED line (lone CR or U+0085/U+2028/U+2029) contributes NO type,
-    // parent or serial. When an id can still be recovered, emit a bare
-    // UNKNOWN/LOW claim so the id is not silently forgotten (fail closed).
-    private val REJECTED_ROW_ID = Regex("""^[ \t]*\d+:[ \t]*id=(\d+)""")
+    // A REJECTED line (unsafe separator, malformed new attempt, malformed
+    // legacy attempt) contributes NO type, parent or serial. When an id can
+    // still be recovered, emit a bare UNKNOWN/LOW claim so the id is not
+    // silently forgotten (fail closed). Both recovery regexes are
+    // diagnostic-only; never an authorization path.
     private fun rejectedClaim(line: ClassifiedIdentityLine, source: IdentitySource): ProfileIdentity? {
-        val userId = REJECTED_ROW_ID.find(line.text)?.groupValues?.get(1)?.toIntOrNull()
-            ?: IdentityLineClassifier.LEGACY_HEADER.find(line.text)?.groupValues?.get(1)?.toIntOrNull()
+        val userId = VerboseUserRow.ROW_LIKE_ID.find(line.text)?.groupValues?.get(1)?.toIntOrNull()
+            ?: LegacyHeaderParser.recoverId(line.text)
             ?: return null
         return ProfileIdentity(
             userId = userId,
@@ -526,22 +528,24 @@ object SamsungProfileAdapter {
         }
 
         // Header candidates come ONLY from LEGACY_HEADER-classified lines,
-        // matched on that single physical line (no (?m) line-boundary trick).
-        // NEW_ROW/OTHER lines are never scanned as headers.
-        val headers = mutableListOf<Pair<Int, MatchResult>>()
+        // parsed by the shared parser on that single physical line (no (?m)
+        // line-boundary trick). The classifier has already validated the id
+        // and flags; there is NO second regex and no silent `toIntOrNull()
+        // ?: continue` that could drop an invalid header into a body.
+        // NEW_ROW/REJECTED/OTHER lines are never scanned as headers.
+        val headers = mutableListOf<Pair<Int, LegacyHeaderFields>>()
         for ((i, line) in lines.withIndex()) {
             if (line.kind != IdentityLineKind.LEGACY_HEADER) continue
-            val match = IdentityLineClassifier.LEGACY_HEADER.find(line.text) ?: continue
-            headers.add(i to match)
+            headers.add(i to line.fields!!)
         }
         for (i in headers.indices) {
-            val (lineIndex, h) = headers[i]
-            val userId = h.groupValues[1].toIntOrNull() ?: continue
-            val label = h.groupValues[2].trim()
-            val bodyStart = lineStarts[lineIndex] + h.range.last + 1
+            val (lineIndex, fields) = headers[i]
+            val userId = fields.id
+            val label = fields.label
+            val bodyStart = lineStarts[lineIndex] + fields.headerEnd
             val nextHeader = if (i + 1 < headers.size) {
-                val (nextLineIndex, nextHeaderMatch) = headers[i + 1]
-                lineStarts[nextLineIndex] + nextHeaderMatch.range.first
+                val (nextLineIndex, nextFields) = headers[i + 1]
+                lineStarts[nextLineIndex] + nextFields.headerStart
             } else {
                 canonical.length
             }

@@ -1095,4 +1095,225 @@ class Issue65ParserRegressionTest {
         assertEquals("99", VerboseIdentityFields.serialWithValue().find("serial number: 99")!!.groupValues[1])
         assertEquals("-10000", VerboseIdentityFields.parentWithValue().find("parentId: -10000")!!.groupValues[1])
     }
+
+    // ---- R12: malformed record attempts are OWNED, never borrowed ----
+
+    // Parent-less legacy u95 CLONE(serial 15). Any following malformed record
+    // attempt must be REJECTED: its raw text is excluded from the legacy body,
+    // so a `parentId=0` inside it cannot authorize u95.
+    private val r12LegacyNoParent = listOf(
+        "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+        "    userType=android.os.usertype.profile.CLONE",
+    )
+
+    private fun assertMalformedAttemptFailsClosed(attempt: String, reason: String) {
+        assertEquals("$reason must be REJECTED", IdentityLineKind.REJECTED, IdentityLineClassifier.classify(attempt).kind)
+        val text = (r12LegacyNoParent + listOf(attempt)).joinToString("\n")
+        val u95 = SamsungProfileAdapter.parseUserListVerbose(text).single { it.userId == 95 }
+        assertNull("$reason must not donate a parent to u95", u95.parentId)
+        assertEquals("$reason must not change u95's serial", 15, u95.serial)
+        assertFalse("$reason must fail the identity gate", PmOutputParser.isIdentityChannelOk(text, 0))
+        assertFalse("$reason must fail the pm-list-users gate", PmOutputParser.isListUsersOutputOk(text, 0))
+    }
+
+    @Test
+    fun r12_malformedLegacyAttemptsAreRejectedAndNeverBorrowParent() {
+        for (attempt in listOf(
+            "  UserInfo{150:parentId=0}", // review PoC: no flags delimiter
+            "  UserInfo{150:Neutral}", // missing flags
+            "  UserInfo{150:Broken:400", // unclosed header
+            "  UserInfo{foo Failure}", // bad id head
+            "  UserInfo{99999999999999999999:parentId=0}", // id overflow
+            "  UserInfo{150:Work:{parentId=0:400}", // inner brace
+            "  UserInfo{150:Work:parentId=0:400}}", // brace after close
+            "  UserInfo{150:Work:parentId=0:400}{extra}",
+        )) {
+            assertMalformedAttemptFailsClosed(attempt, attempt)
+        }
+    }
+
+    @Test
+    fun r12_spacedIdEqualsAttemptsAreRejectedAndNeverBorrowParent() {
+        for (attempt in listOf(
+            "  2: id =150, name=parentId=0, type=profile.PRIVATE, flags=X",
+            "2: id\t=150, name=parentId=0, type=profile.PRIVATE, flags=X",
+            " 2: id  = 150, name=parentId=0, type=profile.PRIVATE, flags=X",
+            "  2: id =99999999999999999999, name=parentId=0, type=profile.PRIVATE, flags=X",
+        )) {
+            assertNull("spaced id= is not the strict authorization row", VerboseUserRow.parse(attempt))
+            assertMalformedAttemptFailsClosed(attempt, attempt)
+        }
+    }
+
+    @Test
+    fun r12_sectionHeadersProseAndInlineHeaderStayOtherAndClean() {
+        for (line in listOf(
+            "Users:", "User types (12 types):", "  Device properties:", "just prose", "",
+            "see UserInfo{95:x:400} above",
+        )) {
+            assertEquals("$line must be OTHER", IdentityLineKind.OTHER, IdentityLineClassifier.classify(line).kind)
+        }
+        val inline = "1: id=95, name=UserInfo{95:x:400}, type=profile.CLONE, flags=X (parentId=0)"
+        assertEquals(IdentityLineKind.NEW_ROW, IdentityLineClassifier.classify(inline).kind)
+        assertTrue("clean inline-label snapshot must pass", PmOutputParser.isIdentityChannelOk(r10CleanVerbose, 0))
+        assertTrue("clean inline-label snapshot must pass pm gate", PmOutputParser.isListUsersOutputOk(r10CleanVerbose, 0))
+    }
+
+    @Test
+    fun r12_validExtraLegacyHeaderOwnsItsOwnEvidence() {
+        val text = listOf(
+            "  UserInfo{95:DUAL_APP:400} serialNo=15:",
+            "    userType=android.os.usertype.profile.CLONE",
+            "  UserInfo{150:Neutral:30} serialNo=99:",
+            "    parentId=0",
+            "    userType=android.os.usertype.profile.PRIVATE",
+        ).joinToString("\n")
+        val claims = SamsungProfileAdapter.parseUserListVerbose(text)
+        val u95 = claims.single { it.userId == 95 }
+        assertNull("the later header's parent belongs to u150 only", u95.parentId)
+        assertEquals(15, u95.serial)
+        val u150 = claims.single { it.userId == 150 }
+        assertEquals(0, u150.parentId)
+        assertEquals(99, u150.serial)
+        assertEquals(ProfileUserType.OTHER, u150.userType)
+        assertTrue("two well-formed headers keep the gate clean", PmOutputParser.isIdentityChannelOk(text, 0))
+    }
+
+    @Test
+    fun r12_rejectedLegacyAttemptClaimIsBareUnknownLow() {
+        for (attempt in listOf("  UserInfo{150:parentId=0}", "  2: id =150, name=parentId=0")) {
+            val claim = SamsungProfileAdapter.parseUserListVerbose(attempt).single()
+            assertEquals(150, claim.userId)
+            assertEquals(ProfileUserType.UNKNOWN, claim.userType)
+            assertEquals(IdentityConfidence.LOW, claim.confidence)
+            assertNull("a REJECTED attempt may never claim a parent", claim.parentId)
+            assertNull("a REJECTED attempt may never claim a serial", claim.serial)
+            assertEquals("", claim.label)
+            assertFalse(claim.evidenceInvalid)
+        }
+    }
+
+    // ---- R13: colon-bearing legacy labels are display-only ----
+
+    private fun r13LegacySnapshot(label: String, flags: String) = listOf(
+        "Users:",
+        "  UserInfo{0:Owner:13} serialNo=0 isPrimary=true:",
+        "    userType=android.os.usertype.full.SYSTEM",
+        "  UserInfo{95:$label:$flags} serialNo=15:",
+        "    parentId=0",
+        "    userType=android.os.usertype.profile.CLONE",
+    ).joinToString("\n")
+
+    @Test
+    fun r13_colonLabelsWithRomanAndHexFlagsAreDisplayOnly() {
+        val cases = listOf(
+            "Work:Error" to "400",
+            "a:Failure" to "30",
+            "a:not found" to "30",
+            "Work:Error" to "0x190",
+            "a:not found" to "c13",
+            "Work:Error" to "4c13",
+            "a:Failure" to "20001010",
+            "Work:Error" to "61010",
+            "a:Failure" to "0x00000400",
+        )
+        for ((label, flags) in cases) {
+            val text = r13LegacySnapshot(label, flags)
+            val headerLine = VerboseUserRow.verboseLines(text).first { it.contains("UserInfo{95:") }
+            val classified = IdentityLineClassifier.classify(headerLine)
+            assertEquals("$label/$flags must be a legacy header", IdentityLineKind.LEGACY_HEADER, classified.kind)
+            assertEquals(label, classified.fields!!.label)
+            assertEquals(flags, classified.fields!!.flags)
+            // The neutralized span is exactly the label, not the flags/tail.
+            assertEquals(
+                label,
+                headerLine.substring(classified.fields!!.labelStart, classified.fields!!.labelEnd),
+            )
+
+            val claim = SamsungProfileAdapter.parseUserListVerbose(text).single { it.userId == 95 }
+            assertEquals("type must come from the body only", ProfileUserType.CLONE, claim.userType)
+            assertEquals(label, claim.label)
+            assertEquals(0, claim.parentId)
+            assertEquals(15, claim.serial)
+            assertTrue("$label/$flags identity gate", PmOutputParser.isIdentityChannelOk(text, 0))
+            assertTrue("$label/$flags pm-list gate", PmOutputParser.isListUsersOutputOk(text, 0))
+
+            // pm-list diagnostics use the SAME label/flags split.
+            val profiles = PmOutputParser.parseUsersDetailed(text)
+            val diagnostic = profiles.single { it.userId == 95 }
+            assertEquals(label, diagnostic.label)
+            assertEquals(flags, diagnostic.flags)
+        }
+    }
+
+    @Test
+    fun r13_colonLabelsForOwnerDualAndOtherKeepTypeFromBodyOnly() {
+        // owner / dual / other ids x colon-bearing names x the three decimal
+        // flag spellings already present in ROM fixtures. The label (including
+        // its error keyword) is never type evidence, and the strict gates pass.
+        val cases = listOf(
+            Triple(0, "Work:Error", "13"),
+            Triple(95, "a:Failure", "400"),
+            Triple(10, "a:not found", "30"),
+        )
+        for ((id, name, flag) in cases) {
+            val text = listOf(
+                "  UserInfo{$id:$name:$flag} serialNo=$id:",
+                "    userType=android.os.usertype.profile.MANAGED",
+            ).joinToString("\n")
+            val headerLine = VerboseUserRow.verboseLines(text).first()
+            val classified = IdentityLineClassifier.classify(headerLine)
+            assertEquals("$name/$flag must classify as LEGACY_HEADER", IdentityLineKind.LEGACY_HEADER, classified.kind)
+            assertEquals(name, classified.fields!!.label)
+            assertEquals(flag, classified.fields!!.flags)
+            val claim = SamsungProfileAdapter.parseUserListVerbose(text).single { it.userId == id }
+            assertEquals("type must come from the body only", ProfileUserType.OTHER, claim.userType)
+            assertEquals(name, claim.label)
+            assertTrue("$name/$flag identity gate", PmOutputParser.isIdentityChannelOk(text, 0))
+            assertTrue("$name/$flag pm-list gate", PmOutputParser.isListUsersOutputOk(text, 0))
+        }
+    }
+
+    @Test
+    fun r13_aospSpacedFlagsSuffixKeepsTheColonLabel() {
+        val header = "  UserInfo{95:Work:Error 400} serialNo=15:"
+        val fields = when (val parsed = LegacyHeaderParser.parse(header)) {
+            is LegacyParseResult.Ok -> parsed.fields
+            else -> error("AOSP spaced flags must parse: $parsed")
+        }
+        assertEquals(95, fields.id)
+        assertEquals("Work:Error", fields.label)
+        assertEquals("400", fields.flags)
+        assertEquals("Work:Error", header.substring(fields.labelStart, fields.labelEnd))
+        assertEquals(IdentityLineKind.LEGACY_HEADER, IdentityLineClassifier.classify(header).kind)
+        val text = r13LegacySnapshot("Work:Error", "400")
+        assertTrue(PmOutputParser.isIdentityChannelOk(text, 0))
+    }
+
+    @Test
+    fun r13_malformedFlagsAreRejectedAndFailBothGates() {
+        for (header in listOf(
+            "  UserInfo{95:Work:Error:400oops} serialNo=15:",
+            "  UserInfo{95:Error} serialNo=15:",
+            "  UserInfo{95:Work:Error:400}} serialNo=15:",
+            "  UserInfo{95:Work:{Error:400} serialNo=15:",
+            "  UserInfo{95:Work:Error:400}{extra}",
+        )) {
+            assertEquals("$header must be REJECTED", IdentityLineKind.REJECTED, IdentityLineClassifier.classify(header).kind)
+            val text = listOf("Users:", header, "    parentId=0", "    userType=android.os.usertype.profile.CLONE").joinToString("\n")
+            assertFalse("$header must fail the identity gate", PmOutputParser.isIdentityChannelOk(text, 0))
+            assertFalse("$header must fail the pm-list gate", PmOutputParser.isListUsersOutputOk(text, 0))
+        }
+    }
+
+    @Test
+    fun r13_genuineTailErrorAfterColonLabelStillFailsGate() {
+        val text = "Users:\n  UserInfo{95:Work:Error:400} Failure [INSTALL_FAILED_INVALID_APK: bad]\n" +
+            "    parentId=0\n    userType=android.os.usertype.profile.CLONE"
+        val classified = IdentityLineClassifier.classify(VerboseUserRow.verboseLines(text)[1])
+        assertEquals(IdentityLineKind.LEGACY_HEADER, classified.kind)
+        assertEquals("Work:Error", classified.fields!!.label)
+        assertFalse("neutralizing only the label must keep the tail error visible", PmOutputParser.isIdentityChannelOk(text, 0))
+        assertFalse(PmOutputParser.isListUsersOutputOk(text, 0))
+    }
 }
