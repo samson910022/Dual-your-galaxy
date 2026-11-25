@@ -197,9 +197,17 @@ object SamsungProfileAdapter {
         }
         sb.append(mention, cursor, mention.length)
         var residual = sb.toString()
-        // 2. Strip co-located structured fields (authorized separately).
-        residual = PARENT_ID.replace(residual, "")
-        residual = SERIAL.replace(residual, "")
+        // 2. Strip co-located structured fields (authorized separately) ONLY
+        //    when their WHOLE value passes the strict decimal grammar. A
+        //    malformed/overflow value must REMAIN in the residual so a
+        //    would-be CLONE mention fails closed to OTHER instead of being
+        //    laundered by a broad value-capture match (issue #87 R14).
+        residual = PARENT_ID.replace(residual) { m ->
+            if (VerboseIdentityFields.parseParentValue(m.groupValues[1]) == null) m.value else ""
+        }
+        residual = SERIAL.replace(residual) { m ->
+            if (VerboseIdentityFields.parseSerialValue(m.groupValues[1]) == null) m.value else ""
+        }
         // 3. Strip FQ prefix remnants.
         residual = FQ_PREFIX_TAIL.replace(residual, "")
         // 4. The `(default)` note is the sole tolerated suffix: at most one.
@@ -629,6 +637,24 @@ object SamsungProfileAdapter {
         return out
     }
 
+    // One field's complete evidence in ONE block (issue #87 R14). Every
+    // occurrence is inspected: strictly parsable values are pooled; ANY
+    // recognized-but-malformed/overflow occurrence marks the field invalid.
+    // A malformed value is NOT dropped as if the field were absent and NOT
+    // truncated into a plausible prefix, so it can no longer disappear before
+    // R9 aggregation.
+    private data class FieldEvidence(val values: List<Int>, val invalid: Boolean)
+
+    private fun readField(body: String, regex: Regex, parse: (String) -> Int?): FieldEvidence {
+        val values = mutableListOf<Int>()
+        var invalid = false
+        for (match in regex.findAll(body)) {
+            val value = parse(match.groupValues[1])
+            if (value == null) invalid = true else values.add(value)
+        }
+        return FieldEvidence(values, invalid)
+    }
+
     // Parses one user's block body into a single claim. Pure.
     // Intra-block parent/serial contradiction (P1-B): more than one
     // distinct parsable parentId (or serial) value inside the SAME block
@@ -636,6 +662,13 @@ object SamsungProfileAdapter {
     // retained for DIAGNOSIS ONLY (issue #87 R9): it is not an authorization
     // value and is flagged via evidenceInvalid so resolveDual() vetoes the
     // claim on that id even when a duplicate good CLONE claim exists.
+    // R14 adds the strict value grammar: a recognized malformed/overflow
+    // value also forces UNKNOWN + evidenceInvalid (even with no retained
+    // value), instead of being truncated/dropped into a clean CLONE claim.
+    // SCOPE (honest note): this closes the ENUMERATED numeric-evidence gaps
+    // (malformed/overflow parent & serial, valid+invalid duplicates, trailing
+    // colon/negative/unsigned spellings); it does NOT claim to validate every
+    // possible malformed string in this flat-text format.
     private fun parseOneBlock(
         userId: Int,
         label: String,
@@ -643,23 +676,29 @@ object SamsungProfileAdapter {
         source: IdentitySource,
     ): ProfileIdentity {
         val classifiedType = classifyType(body)
-        val parentIds = PARENT_ID.findAll(body).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
-        val serials = SERIAL.findAll(body).mapNotNull { it.groupValues[1].toIntOrNull() }.toList()
-        val userType = if (parentIds.distinct().size > 1 || serials.distinct().size > 1) {
+        val parentEvidence = readField(body, PARENT_ID, VerboseIdentityFields::parseParentValue)
+        val serialEvidence = readField(body, SERIAL, VerboseIdentityFields::parseSerialValue)
+        val fieldInvalid = parentEvidence.invalid || serialEvidence.invalid
+        val contradictory = parentEvidence.values.distinct().size > 1 ||
+            serialEvidence.values.distinct().size > 1
+        val userType = if (fieldInvalid || contradictory) {
             ProfileUserType.UNKNOWN
         } else {
             classifiedType
         }
-        val parentId = parentIds.firstOrNull()
-        val serial = serials.firstOrNull()
-        // R9 invariant: an UNKNOWN that still carries a parent/serial either
-        // came from contradictory values in this block or from an ambiguous
-        // type classification. Retaining the first value for logs must never
-        // let it authorize a Confirm; mark the whole claim invalid instead.
-        // Bare UNKNOWN (no values) stays unflagged -> two-tier Unknown at the
-        // resolver, never Refused.
+        // First strictly-parsable value only (diagnosis). A valid+overflow
+        // duplicate keeps the valid value here but is marked invalid above,
+        // so it can never authorize a Confirm.
+        val parentId = parentEvidence.values.firstOrNull()
+        val serial = serialEvidence.values.firstOrNull()
+        // R9 invariant: an UNKNOWN that still carries a parent/serial, OR one
+        // carrying a recognized malformed/overflow value (fieldInvalid), is
+        // invalid evidence. Retaining any value for logs must never let it
+        // authorize a Confirm; mark the whole claim invalid so resolveDual()
+        // vetoes it. Bare UNKNOWN (no values, no malformed field) stays
+        // unflagged -> two-tier Unknown at the resolver, never Refused.
         val evidenceInvalid = userType == ProfileUserType.UNKNOWN &&
-            (parentId != null || serial != null)
+            (parentId != null || serial != null || fieldInvalid)
         // Single-source confidence cap: a typed claim is MED (still needs a
         // second source for HIGH); an untyped block is LOW.
         val confidence = when (userType) {

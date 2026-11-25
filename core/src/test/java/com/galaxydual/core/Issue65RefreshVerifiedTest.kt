@@ -869,4 +869,94 @@ class Issue65RefreshVerifiedTest {
             )
         }
     }
+
+    // ---- R14: malformed numeric evidence never reaches a package read ----
+
+    private fun r14Dumpsys(parent: String = "0", serial: String = "15") = """
+        Users:
+          UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+            userType=android.os.usertype.full.SYSTEM
+          UserInfo{95:DUAL_APP:400} serialNo=$serial:
+            parentId=$parent
+            userType=android.os.usertype.profile.CLONE
+    """.trimIndent()
+
+    private val r14BadParentRow =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0x10) serialNo=15"
+    private val r14BadSerialRow =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15oops"
+
+    @Test
+    fun r14_malformedParentInNewRow_failsClosedWithoutPackageRead() {
+        val verbose = verboseWithRow(r14BadParentRow)
+        val claim = SamsungProfileAdapter.parseUserListVerbose(verbose).single { it.userId == 95 }
+        assertEquals("malformed parent must make the claim UNKNOWN", ProfileUserType.UNKNOWN, claim.userType)
+        assertTrue("malformed parent must be flagged invalid", claim.evidenceInvalid)
+        assertNull("malformed parent must not be retained as authorization", claim.parentId)
+        assertFailClosed(FakeGateway(verbose), "R14: malformed parent in new row")
+    }
+
+    @Test
+    fun r14_malformedSerialInNewRow_failsClosedWithoutPackageRead() {
+        val verbose = verboseWithRow(r14BadSerialRow)
+        val claim = SamsungProfileAdapter.parseUserListVerbose(verbose).single { it.userId == 95 }
+        assertEquals("malformed serial must make the claim UNKNOWN", ProfileUserType.UNKNOWN, claim.userType)
+        assertTrue("malformed serial must be flagged invalid", claim.evidenceInvalid)
+        assertNull("malformed serial must not be retained as authorization", claim.serial)
+        assertFailClosed(FakeGateway(verbose), "R14: malformed serial in new row")
+    }
+
+    @Test
+    fun r14_malformedParentInDumpsys_failsClosedWithoutPackageRead() {
+        val dumpsys = r14Dumpsys(parent = "0x10")
+        val claim = SamsungProfileAdapter.parseDumpsysUser(dumpsys).single { it.userId == 95 }
+        assertEquals("malformed dumpsys parent must make the claim UNKNOWN", ProfileUserType.UNKNOWN, claim.userType)
+        assertTrue("malformed dumpsys parent must be flagged invalid", claim.evidenceInvalid)
+        assertFailClosed(
+            FakeGateway(verboseWithName("DUAL_APP"), dumpsysOutput = dumpsys),
+            "R14: malformed parent in dumpsys",
+        )
+    }
+
+    @Test
+    fun r14_malformedSerialInDumpsys_failsClosedWithoutPackageRead() {
+        val dumpsys = r14Dumpsys(serial = "15oops")
+        val claim = SamsungProfileAdapter.parseDumpsysUser(dumpsys).single { it.userId == 95 }
+        assertEquals("malformed dumpsys serial must make the claim UNKNOWN", ProfileUserType.UNKNOWN, claim.userType)
+        assertTrue("malformed dumpsys serial must be flagged invalid", claim.evidenceInvalid)
+        assertFailClosed(
+            FakeGateway(verboseWithName("DUAL_APP"), dumpsysOutput = dumpsys),
+            "R14: malformed serial in dumpsys",
+        )
+    }
+
+    @Test
+    fun r14_validPlusOverflowDuplicate_failsClosedWithoutPackageReadBothOrders() {
+        // The overflow occurrence must NOT be dropped: both the parent and
+        // serial duplicate forms invalidate the row even though the first
+        // valid value is retained for diagnosis.
+        for (badRow in listOf(
+            "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) (parentId=2147483648) serialNo=15",
+            "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0) serialNo=15 serialNo=2147483648",
+        )) {
+            for (rows in listOf(listOf(badRow, r9GoodClone), listOf(r9GoodClone, badRow))) {
+                val verbose = verboseWithTrailingClaims(rows)
+                val invalid = SamsungProfileAdapter.parseUserListVerbose(verbose).single { it.userId == 95 && it.evidenceInvalid }
+                assertEquals("the duplicate row must be UNKNOWN", ProfileUserType.UNKNOWN, invalid.userType)
+                assertFailClosed(FakeGateway(verbose), "R14: valid+overflow duplicate [$badRow]")
+            }
+        }
+    }
+
+    @Test
+    fun r14_cleanNumericSpellingsStillResolveGroundTruthWithAbsolutePins() {
+        // Positive control: legacy trailing-colon serial and a clean parent
+        // still confirm; strict parsing did not turn valid spellings invalid.
+        val verbose = verboseWithTrailingClaims(listOf(r9GoodClone))
+        val result = ground(FakeGateway(verbose, dumpsysOutput = r14Dumpsys()))
+        assertEquals(95, result.target.userId)
+        assertEquals(15, result.target.serial)
+        assertEquals(0, result.target.parentId)
+        assertEquals(listOf("com.example.chat", "com.example.mail"), result.cloned)
+    }
 }

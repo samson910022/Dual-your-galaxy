@@ -847,6 +847,83 @@ class ProfileIdentityTest {
         )
     }
 
+    // ---- R14: strict numeric value grammar reaches the resolver ----
+
+    private val r14CleanVerbose = claim(95, ProfileUserType.CLONE, IdentitySource.USER_LIST_V, serial = 15)
+    private val r14CleanDumpsys = claim(95, ProfileUserType.CLONE, IdentitySource.DUMPSYS, serial = 15)
+
+    @Test
+    fun r14_malformedNumericClaimOnTargetRefusesBothChannelsAndOrders() {
+        // Real parsed claims (not hand-built flags): a malformed parent in the
+        // verbose channel and a malformed serial in the dumpsys channel must
+        // both survive to the R9 veto, in either claim order.
+        val malformedVerbose = SamsungProfileAdapter.parseUserListVerbose(
+            "1: id=95, name=OK, type=profile.CLONE, flags=X (parentId=0x10) serialNo=15",
+        ).single()
+        val malformedDumpsys = SamsungProfileAdapter.parseDumpsysUser(
+            """
+            Users:
+              UserInfo{0:Owner:13} serialNo=0 isPrimary=true:
+                userType=android.os.usertype.full.SYSTEM
+              UserInfo{95:DUAL_APP:400} serialNo=15oops:
+                parentId=0
+                userType=android.os.usertype.profile.CLONE
+            """.trimIndent(),
+        ).single { it.userId == 95 }
+
+        for (invalid in listOf(malformedVerbose, malformedDumpsys)) {
+            assertEquals("${invalid.source}: must be UNKNOWN", ProfileUserType.UNKNOWN, invalid.userType)
+            assertTrue("${invalid.source}: must be flagged invalid", invalid.evidenceInvalid)
+            for (candidates in listOf(
+                listOf(invalid, r14CleanVerbose, r14CleanDumpsys),
+                listOf(r14CleanVerbose, r14CleanDumpsys, invalid),
+            )) {
+                val res = SamsungProfileAdapter.resolveDual(candidates, propertyId = 95)
+                assertTrue("${invalid.source}: invalid target evidence must refuse: $res", res is DualResolution.Refused)
+                assertNull(
+                    "${invalid.source}: no target may survive",
+                    SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun r14_malformedNumericClaimOnOtherIdDoesNotVetoTarget() {
+        val invalidOther = SamsungProfileAdapter.parseUserListVerbose(
+            "1: id=96, name=OK, type=profile.CLONE, flags=X (parentId=2147483648)",
+        ).single()
+        assertEquals(96, invalidOther.userId)
+        assertEquals(ProfileUserType.UNKNOWN, invalidOther.userType)
+        assertTrue(invalidOther.evidenceInvalid)
+        for (candidates in listOf(
+            listOf(invalidOther, r14CleanVerbose, r14CleanDumpsys),
+            listOf(r14CleanVerbose, r14CleanDumpsys, invalidOther),
+        )) {
+            assertEquals(DualResolution.Confirmed(95, 15, 0), SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+            assertEquals(
+                VerifiedDualTarget(userId = 95, serial = 15, parentId = 0),
+                SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95),
+            )
+        }
+    }
+
+    @Test
+    fun r14_bareUnknownWithoutNumericEvidenceStaysUnknownNotRefused() {
+        // A malformed ROW (empty type) emits bare UNKNOWN/LOW with no values
+        // and no malformed field: two-tier contract -> Unknown, not Refused.
+        val bare = SamsungProfileAdapter.parseUserListVerbose(
+            "1: id=95, name=OK, type=, flags=X",
+        ).single()
+        assertEquals(ProfileUserType.UNKNOWN, bare.userType)
+        assertNull(bare.parentId)
+        assertNull(bare.serial)
+        assertTrue(!bare.evidenceInvalid)
+        val candidates = listOf(r14CleanVerbose, r14CleanDumpsys, bare)
+        assertEquals(DualResolution.Unknown, SamsungProfileAdapter.resolveDual(candidates, propertyId = 95))
+        assertNull(SamsungProfileAdapter.resolveDualTarget(candidates, propertyId = 95))
+    }
+
     @Test
     fun identityGate_headerErrorLabelsDoNotFail() {
         val verbose = """
