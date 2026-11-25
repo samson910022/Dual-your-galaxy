@@ -4192,6 +4192,72 @@ class DualViewModel(
     // null/Unknown/通道失敗一律由呼叫端 fail closed。cancellation 透傳。
     suspend fun fetchFreshVerifiedTarget(): VerifiedTarget? = onIo { repo.fetchFreshVerifiedTarget() }
 
+    // #68 / PR #88 F2: shared decision used by BOTH clone and remove Success
+    // branches. A successful write must not be spliced into a FRESH inventory
+    // that still claims an older (id, serial) pin. Inputs:
+    // - writtenTargetId: the dualId the operation actually used (repo Success).
+    // - verifiedSerial: the serial from the freshest target that authorized
+    //   that write (carried by CloneOutcome/RemoveOutcome.Success).
+    // - consentSerial: remove-only, the serial pinned at request time
+    //   (pendingRemove.dualSerial) -- an additional same-id rebuild signal.
+    //
+    // Rules (all fail closed, none re-issues a write):
+    // - not FRESH: keep the existing "non-FRESH stays as-is" behavior.
+    // - (id) already differs: proven drift, return true WITHOUT the eager
+    //   extra identity fetch (keeps the opMutex critical section short).
+    // - extra identity fetch null, or a previously known serial (inventory
+    //   pin / operation / consent / fresh triple) becoming null now: evidence
+    //   loss, true.
+    // - any two known serials (INCLUDING fresh.serial) disagree, or the fresh
+    //   id differs: true. A same-id rebuild can happen after core's own
+    //   verified serial was captured, so omitting fresh.serial here would
+    //   fail open (issue #68 stale splice).
+    // - pinned serial unknown (null) but any other evidence now carries a
+    //   serial: true. This is an EVIDENCE UPGRADE (an old FRESH id-only pin
+    //   whose serial simply was not observable at listing time, while the
+    //   operation/consent/live triple can read it now), NOT proof that the
+    //   target was rebuilt. It is deliberately not a "target 已重建" note
+    //   nor a VERIFY_MISMATCH diagnostic: rebuiltNote stays gated on an id
+    //   change (false here) and recordOp keeps diagnose = null. The single
+    //   read-only refreshLocked() is enough to build a complete snapshot
+    //   without re-issuing the write.
+    // - serial null everywhere (never observable): no fabricated drift.
+    // The caller degrades the inventory out of FRESH and runs a read-only
+    // refreshLocked(); this helper never mutates state nor persists anything.
+    private suspend fun needsTargetRebuildRefresh(
+        writtenTargetId: Int,
+        verifiedSerial: Int?,
+        consentSerial: Int? = null,
+    ): Boolean {
+        val pinned = _state.value.inventory
+        if (pinned.freshness != InventoryFreshness.FRESH) return false
+        // Proven by the operation's own id -- no extra IO needed.
+        if (pinned.targetId != writtenTargetId) return true
+        val fresh = fetchFreshVerifiedTarget()
+            ?: return true // evidence loss: never "no drift"
+        // pinned.targetId == writtenTargetId here (checked above), so one id
+        // comparison is enough; fresh.serial is compared by VALUE below.
+        if (fresh.userId != pinned.targetId) return true
+        if (fresh.serial == null &&
+            (pinned.targetSerial != null || verifiedSerial != null || consentSerial != null)
+        ) {
+            return true // known -> unknown is evidence loss, not agreement
+        }
+        // fresh.serial MUST participate: core's verifiedSerial is captured at
+        // write time and can still be the OLD serial when a same-id rebuild
+        // happens before this extra query. Comparing only the three older
+        // serials would fail open ([15,15,null] or [15,null,null] look agreed).
+        // All-null stays tolerated: listOfNotNull() leaves an empty list.
+        // fresh.serial MUST stay in the list: it is the newly observable
+        // evidence that upgrades an id-only pin (see KDoc above).
+        val knownSerials = listOfNotNull(pinned.targetSerial, verifiedSerial, consentSerial, fresh.serial)
+        // Evidence upgrade, not a proven rebuild: the old pin had no serial
+        // while a later operation/consent/live read does. Do not emit any
+        // "target 已重建" / VERIFY_MISMATCH diagnostic for this branch.
+        if (pinned.targetSerial == null && knownSerials.isNotEmpty()) return true
+        return knownSerials.distinct().size > 1
+    }
+
     // Phase N2 Shizuku binding teardown (issue #34 re-review), hardened by
     // Phase B P2-2: ViewModel has no onCleared, so the retained + current
     // Shizuku instances skipped by the swap guards (old !== retained) leaked
@@ -5250,13 +5316,23 @@ class DualViewModel(
                             // 結果 B 不得留在舊 target 清單——當次寫入包已排除在舊清單外，
                             // 整單標 STALE 待重查），再對新 verified target 做全量 refresh
                             //（已在 opMutex 內，直接調 refreshLocked，不重入加鎖）。
-                            // 觸發條件僅 FRESH mismatch（UNKNOWN/STALE 本已非新鮮，維持原
+                            // 觸發條件為 FRESH 下的身份證據不一致或證據消失
+                            //（id/serial 漂移、已知 serial 消失、extra fetch 為 null；見
+                            // needsTargetRebuildRefresh）。UNKNOWN/STALE 本已非新鮮，維持原
                             // count 對齊待下次 refresh，避免冷啟動 UNKNOWN 覆寫成功提示）。
                             // rebuiltNote 保留原邏輯不變（FRESH + 舊 id + 上次釘舊 id 才附註）。
                             val newTarget = res.dualId
-                            val needRebuildRefresh =
-                                _state.value.inventory.freshness == InventoryFreshness.FRESH &&
-                                    _state.value.inventory.targetId != newTarget
+                            // #68 / PR #88 F2：Success 現在帶操作當下已查證的 serial，
+                            // 連同 opMutex 內新取的 gateway identity triple 一起比對
+                            // (id, serial) 配對。證據消失（extra fetch 為 null、已知
+                            // serial 變 null）與 id/serial 不一致一律 fail closed：
+                            // 降原 inventory 為非 FRESH 並跑唯讀 refreshLocked()，
+                            // 絕不重送 install。helper 在 id 已證明不同時略過 extra fetch。
+                            // 既有 rebuiltNote（id-only）行為不變。
+                            val needRebuildRefresh = needsTargetRebuildRefresh(
+                                writtenTargetId = newTarget,
+                                verifiedSerial = res.verifiedSerial,
+                            )
                             _state.update { cur ->
                                 val current: List<String> =
                                     if (needRebuildRefresh) {
@@ -5483,7 +5559,11 @@ class DualViewModel(
                             }
                         }
                         is CloneOutcome.VerifyUnknown -> {
-                            _state.update {
+                            // PR #88 F3：VerifyUnknown 可能發生在寫前（core preDrift／
+                            // 身份證據消失）或寫後，install 是否執行並不確定。
+                            // 只有 FRESH 才降 STALE；UNKNOWN 不得被提升為 STALE。
+                            val now = nowWallMs()
+                            _state.update { st ->
                                 val (op, diag) = recordOp(
                                     opId = key,
                                     appKey = trimmed,
@@ -5492,8 +5572,22 @@ class DualViewModel(
                                     detail = res.detail,
                                     diagnose = res.toDiagnoseEvent(),
                                 )
-                                it.copy(
+                                val degraded =
+                                    if (st.inventory.freshness == InventoryFreshness.FRESH) {
+                                        st.inventory.toStaleOrUnknown(
+                                            now = now,
+                                            source = st.inventory.source,
+                                            targetId = st.inventory.targetId,
+                                        )
+                                    } else {
+                                        st.inventory
+                                    }
+                                st.copy(
                                     loading = false,
+                                    // #69 / PR #88 F3：可能已寫入未驗證，FRESH 不得謊稱
+                                    // 新鮮（比照批次 successful/unknown 路徑）；只降
+                                    // freshness，profiles/cloned/count/身份皆保留。
+                                    inventory = degraded,
                                     lastOperation = op,
                                     diagnose = diag,
                                     // 理由 (本機回音原文)：msg 的包名回音顯示原文；
@@ -5551,10 +5645,12 @@ class DualViewModel(
                     // 例外逃逸：寫後是否執行未知 -> phase UNKNOWN (非 FAILED)，
                     // pinnedTarget 保留當次已知 dualId (取自 inventory，無則哨兵)，
                     // diagnose 為 VERIFY_UNKNOWN (寫後未查證，需重新查證，
-                    // 非 OP_FAILED)。
+                    // 非 OP_FAILED)。PR #88 F3：FRESH 亦須降非 FRESH；
+                    // UNKNOWN 不得被提升為 STALE。
+                    val now = nowWallMs()
                     val knownTarget =
                         _state.value.inventory.targetId.takeIf { it > NO_TARGET_ID } ?: NO_TARGET_ID
-                    _state.update {
+                    _state.update { st ->
                         val (op, diag) = recordOp(
                             opId = key,
                             appKey = trimmed,
@@ -5566,8 +5662,19 @@ class DualViewModel(
                                 techDetail = sanitizeForDisplay(e.message ?: "clone failed"),
                             ),
                         )
-                        it.copy(
+                        val degraded =
+                            if (st.inventory.freshness == InventoryFreshness.FRESH) {
+                                st.inventory.toStaleOrUnknown(
+                                    now = now,
+                                    source = st.inventory.source,
+                                    targetId = st.inventory.targetId,
+                                )
+                            } else {
+                                st.inventory
+                            }
+                        st.copy(
                             loading = false,
+                            inventory = degraded,
                             lastOperation = op,
                             diagnose = diag,
                             msg = "clone failed: " +
@@ -6402,13 +6509,27 @@ class DualViewModel(
                                             return@withLock
                                         }
                                         is VerifyState.Unknown -> {
-                                            // M3 補 diagnose：寫後無法查證為 VERIFY_UNKNOWN，
-                                            // techDetail 經 sanitizeForDisplay。
-                                            _state.update {
-                                                it.copy(
+                                            // PR #88 F3：這是「寫前」verifyState，core 的
+                                            // post-list fence 亦可在此回 Unknown（不必等寫入）。
+                                            // FRESH 必須降非 FRESH；UNKNOWN 不得被提升為 STALE。
+                                            // 不偽造 lastOperation：此處 uninstall 尚未執行。
+                                            val now = nowWallMs()
+                                            _state.update { current ->
+                                                val degraded =
+                                                    if (current.inventory.freshness == InventoryFreshness.FRESH) {
+                                                        current.inventory.toStaleOrUnknown(
+                                                            now = now,
+                                                            source = current.inventory.source,
+                                                            targetId = current.inventory.targetId,
+                                                        )
+                                                    } else {
+                                                        current.inventory
+                                                    }
+                                                current.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
+                                                    inventory = degraded,
                                                     diagnose = diagnoseEvent(
                                                         DiagnoseCode.VERIFY_UNKNOWN,
                                                         techDetail = sanitizeForDisplay(
@@ -6449,11 +6570,20 @@ class DualViewModel(
                                             // 為 STALE（不清 cloned，只降新鮮度；remaining 已排除
                                             // 當次包，跨目標結果不混入舊清單，整單標 STALE 待重查），
                                             // 再對新 verified target 做全量 refresh（已在 opMutex
-                                            // 內，直接調 refreshLocked，不重入加鎖）。觸發條件僅
-                                            // FRESH mismatch；rebuiltNote 保留原邏輯不變。
-                                            val needRebuildRefresh =
-                                                _state.value.inventory.freshness == InventoryFreshness.FRESH &&
-                                                    _state.value.inventory.targetId != cur.dualId
+                                            // 內，直接調 refreshLocked，不重入加鎖）。觸發條件為
+                                            // FRESH 下的身份證據不一致或證據消失（見
+                                            // needsTargetRebuildRefresh）；rebuiltNote 保留原邏輯不變。
+                                            // #68 / PR #88 F2：與 clone 共用 fail-closed
+                                            // helper；另有同意時釘住的 cur.dualSerial 作為
+                                            // 同 id 重建的額外訊號。Success 帶的 serial 是
+                                            // core 已查證的移除目標 serial；證據消失時降
+                                            // 非 FRESH + 唯讀 refreshLocked()，絕不重送
+                                            // uninstall。rebuiltNote 仍維持 id-only。
+                                            val needRebuildRefresh = needsTargetRebuildRefresh(
+                                                writtenTargetId = cur.dualId,
+                                                verifiedSerial = res.verifiedSerial,
+                                                consentSerial = cur.dualSerial,
+                                            )
                                             _state.update {
                                                 val remaining =
                                                     it.cloned.filterNot { p -> p == cur.pkg }
@@ -6704,7 +6834,12 @@ class DualViewModel(
                                             }
                                         }
                                         is RemoveOutcome.VerifyUnknown -> {
-                                            _state.update {
+                                            // PR #88 F3：VerifyUnknown 可能發生在寫前（core
+                                            // preDrift／身份證據消失）或寫後，uninstall 是否
+                                            // 執行並不確定。只有 FRESH 才降 STALE；
+                                            // UNKNOWN 不得被提升為 STALE。
+                                            val now = nowWallMs()
+                                            _state.update { st ->
                                                 val (op, diag) = recordOp(
                                                     opId = key,
                                                     appKey = cur.pkg,
@@ -6713,10 +6848,24 @@ class DualViewModel(
                                                     detail = res.detail,
                                                     diagnose = res.toDiagnoseEvent(),
                                                 )
-                                                it.copy(
+                                                val degraded =
+                                                    if (st.inventory.freshness == InventoryFreshness.FRESH) {
+                                                        st.inventory.toStaleOrUnknown(
+                                                            now = now,
+                                                            source = st.inventory.source,
+                                                            targetId = st.inventory.targetId,
+                                                        )
+                                                    } else {
+                                                        st.inventory
+                                                    }
+                                                st.copy(
                                                     loading = false,
                                                     profiles = snap.profiles,
                                                     pendingRemove = null,
+                                                    // #69 / PR #88 F3：可能已寫入未驗證，
+                                                    // FRESH 必須降 STALE（比照批次路徑）；
+                                                    // cloned/身份/count 皆保留，只降新鮮度。
+                                                    inventory = degraded,
                                                     lastOperation = op,
                                                     diagnose = diag,
                                                     // 理由 (本機回音原文)：msg 的包名回音顯示原文；
@@ -6797,8 +6946,10 @@ class DualViewModel(
                         // 例外逃逸：寫後是否執行未知 -> phase UNKNOWN (非 FAILED)，
                         // pinnedTarget 保留當次已知 dualId (pending 目標)，
                         // diagnose 為 VERIFY_UNKNOWN (寫後未查證，需重新查證，
-                        // 非 OP_FAILED).
-                        _state.update {
+                        // 非 OP_FAILED). PR #88 F3：FRESH 亦須降非 FRESH；
+                        // UNKNOWN 不得被提升為 STALE。
+                        val now = nowWallMs()
+                        _state.update { st ->
                             val (op, diag) = recordOp(
                                 opId = key,
                                 appKey = pendingAtCall.pkg,
@@ -6810,9 +6961,20 @@ class DualViewModel(
                                     techDetail = sanitizeForDisplay(e.message ?: "remove failed"),
                                 ),
                             )
-                            it.copy(
+                            val degraded =
+                                if (st.inventory.freshness == InventoryFreshness.FRESH) {
+                                    st.inventory.toStaleOrUnknown(
+                                        now = now,
+                                        source = st.inventory.source,
+                                        targetId = st.inventory.targetId,
+                                    )
+                                } else {
+                                    st.inventory
+                                }
+                            st.copy(
                                 loading = false,
                                 pendingRemove = null,
+                                inventory = degraded,
                                 lastOperation = op,
                                 diagnose = diag,
                                 msg = "remove failed: " +
@@ -6871,8 +7033,16 @@ class DualViewModel(
         // PR-37 Phase B #2：補觸恢復攜帶當下 verified (id, serial) 配對。
         val target = SelectionTarget(inv.targetId, inv.targetSerial)
         if (selectionRestoredForTarget == target) return
+        // #70 queued-restore token：在入隊（launch）當下快照 gen。clearSelectionLocal
+        // 是同步 UI 方法、不持 opMutex，故可能在此之後、restore 真正取得 mutex
+        // 之前推進 gen；攜帶此快照才能讓晚到的 restore 自我作廢（見
+        // restoreSelectionLocked 的 expectedGen 守衛）。不為此另加 catalog/請求
+        // token——catalog 引用與 verified 身份的維度已由守衛 (b)(c) 覆蓋。
+        val expectedGen = selectionGen.get()
         viewModelScope.launch {
-            opMutex.withLock { restoreSelectionLocked(target.id, target.serial) }
+            opMutex.withLock {
+                restoreSelectionLocked(target.id, target.serial, expectedGen = expectedGen)
+            }
         }
     }
 
@@ -6935,18 +7105,23 @@ class DualViewModel(
     // 清空勾選 (記憶體):只改 selectedKeys,不跑任何 uninstall,不碰持久化。
     // 語意:「取消勾選」≠「卸載分身」。
     fun clearSelectionLocal() {
-        var changed = false
         _state.update { cur ->
-            if (cur.selectedKeys.isEmpty()) return@update cur
-            changed = true
-            cur.copy(
-                selectedKeys = emptySet(),
-                batchReport = null,
-                msg = "已清除勾選（未卸載任何分身）",
-                msgKind = MsgKind.INFO,
-            )
+            if (cur.selectedKeys.isEmpty()) {
+                cur
+            } else {
+                cur.copy(
+                    selectedKeys = emptySet(),
+                    batchReport = null,
+                    msg = "已清除勾選（未卸載任何分身）",
+                    msgKind = MsgKind.INFO,
+                )
+            }
         }
-        if (changed) selectionGen.incrementAndGet()
+        // #70：此入口永遠是「明確使用者 clear」，即使當下選取本來就為空也必須
+        // 推進 gen。restoreSelectionLocked 的 ABA 守衛只認 gen（isEmpty 無法
+        // 區分從未選取與已清除），不推進就擋不住 clear 之前啟動的晚到 restore。
+        // 不碰任何 uninstall／持久化：取消勾選 ≠ 卸載分身。
+        selectionGen.incrementAndGet()
         // Phase B #1：清空即解綁（空集合無歸屬）。
         selectionBoundTarget = SELECTION_BOUND_NONE
     }
@@ -12976,6 +13151,8 @@ class DualViewModel(
     // - PR-37 Phase B #2：serial 綁定——調用端傳 id，本體以 inventory 的 serial
     //   配對驗證（inventory id == targetId 才取其 serial，否則 null 嚴格比對，
     //   外來 id 永不借用他目標的 serial）。
+    // 顯式恢復刻意不帶 expectedGen token（null）：使用者本次明確請求就是最新
+    // 意圖，不應被入隊後的其他選取變更作廢；此路徑仍受 (a)(b)(c) 守衛約束。
     fun restoreSelection(targetId: Int, availableKeys: Set<String>? = null) {
         viewModelScope.launch {
             val inv = _state.value.inventory
@@ -13002,10 +13179,16 @@ class DualViewModel(
     //     當前 catalog（交集仍有效）；
     // (c) 當前 (id,serial) 仍等於起始 verified 身份且等於本次請求目標（防
     //     請求外 stale＋中途遷移）。
+    // #70 queued-restore token：expectedGen 是「入隊當下」的 selectionGen 快照
+    //（僅 setSourceCatalog 自動補觸傳入；refresh／公開 restoreSelection 傳 null）。
+    // 攜此 token 的 restore 若在等待 opMutex 期間被 clearSelectionLocal 等方法
+    // 推進 gen，即使鎖內 startGen 讀到的是清除後的新值也必須放棄，避免晚到的
+    // 佇列 restore 把已清空的選取重新填回。null 表示顯式恢復，不受此 token 約束。
     private suspend fun restoreSelectionLocked(
         targetId: Int,
         targetSerial: Int? = null,
         availableKeys: Set<String>? = null,
+        expectedGen: Long? = null,
     ) {
         val store = selectionStore ?: return
         if (targetId <= NO_TARGET_ID) return
@@ -13024,6 +13207,10 @@ class DualViewModel(
         // (setSourceCatalog 補觸或下一次 refresh/restore) 仍可重試。
         if (cur.sourceCatalog.isEmpty()) return
         val startGen = selectionGen.get()
+        // #70：入隊快照失效早拒——等待 opMutex 期間若 gen 已變（典型為
+        // clearSelectionLocal），連 store I/O 都不做，直接放棄（不燒 marker、
+        // 不碰持久化）。鎖內 startGen 已被重新讀取，故此處比較 expectedGen 即可。
+        if (expectedGen != null && expectedGen != startGen) return
         val startCatalog = cur.sourceCatalog
         val startVerified =
             SelectionTarget(cur.inventory.targetId, cur.inventory.targetSerial)
@@ -13055,6 +13242,12 @@ class DualViewModel(
         val latest = _state.value
         // (a) 選取仍允許自動恢復：為空且期間無任何選取變更（gen 守 ABA）。
         if (latest.selectedKeys.isNotEmpty() || selectionGen.get() != startGen) return
+        // (a2) #70 queued-restore token：入隊快照必須仍等於提交當下的 gen。
+        // 攜 token 的 restore 在等待 opMutex 之前若已被 clear 推進 gen，其
+        // startGen 是鎖內重新讀的新值，(a) 攔不到；唯有比對入隊快照才能擋住
+        // 晚到的佇列 restore 重新填回已清空的選取。此守衛不燒 marker、
+        // 不刪持久化，也不影響後續不帶 token 的顯式 restoreSelection()。
+        if (expectedGen != null && selectionGen.get() != expectedGen) return
         // (b) catalog 未變：引用同一實例＋交集仍有效。
         if (latest.sourceCatalog !== startCatalog) return
         val curKeys = latest.sourceCatalog.map { it.appKey }.toSet()
