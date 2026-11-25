@@ -4815,7 +4815,7 @@ class MainActivity : ComponentActivity() {
                         shownPolicyWrite = null
                         shownPolicyWriteSaving = false
                     } else {
-                        vm.cancelPolicyWrite(pending)
+                        cancelWritePendingAndRevoke(pending, pending.consent?.actionId)
                     }
                 }
                 .show()
@@ -4884,7 +4884,7 @@ class MainActivity : ComponentActivity() {
                 shownPolicyWrite = null
                 shownPolicyWriteSaving = false
             } else {
-                vm.cancelPolicyWrite(pending)
+                cancelWritePendingAndRevoke(pending, pending.consent?.actionId)
             }
         }
         // Stage J4：稍后刷新（RECONCILING 期手動恢復入口）：觸發一次顯式重讀
@@ -6443,6 +6443,18 @@ class MainActivity : ComponentActivity() {
         if (pendingWarningConsent?.actionId == actionId) pendingWarningConsent = null
         setPendingClearConfirm(false)
         onCancel()
+    }
+
+    // PR #89 Round-3 R3-1: FINAL policy-write confirmation dialog cancel.
+    // A cancel that really clears the QUEUED pending must ALSO revoke the
+    // accepted warning action, otherwise the suspended revalidation coroutine's
+    // later abort schedules a restart for an already-cancelled WRITE. A refused
+    // cancel (SAVING/RECONCILING/in-flight/stale) keeps the action live.
+    private fun cancelWritePendingAndRevoke(pending: PendingPolicyWrite, actionId: Long?) {
+        val vmCancelled = try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { false }
+        if (cancelOwnershipAccepted(vmCancelled, warningRestartController.isLive(actionId))) {
+            cancelAcceptedWarning(actionId) { }   // isLive→revoke→remove owned Runnable→clear own consent; NO onCancel side effect
+        }
     }
 
     // D03b fixer M3：abort 後共用清理——清 consent、顯示既有 recheck 訊息，

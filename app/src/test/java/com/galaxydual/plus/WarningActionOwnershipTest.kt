@@ -354,6 +354,111 @@ class WarningActionOwnershipTest {
         assertEquals(1, hits.size)
     }
 
+    // PR #89 Round-3 R3-1 regression: controller-level late-abort fencing after
+    // a real VM cancel. Mirrors the ownership decision of
+    // cancelWritePendingAndRevoke: a REAL VM cancel (QUEUED actually cleared ->
+    // Boolean predicate true) on a still-live action must revoke that action.
+    // A suspended revalidation abort arriving AFTER the cancel must then find
+    // no live owner: it cannot schedule (or deliver) a restart for the
+    // already-cancelled WRITE. Fails if revoke is skipped or the ownership
+    // predicate is gated on the wrong value. The pre-scheduled-token-staleness
+    // half runs first; the late-abort half then uses a FRESH restart budget so a
+    // missing revoke cannot be hidden by the one-restart cap. This is a
+    // controller-level late-abort fence, not a suspended-revalidation reenactment.
+    @Test
+    fun finalConfirmCancel_afterRealVmCancel_revokesOwnActionAndStaleTokenCannotDeliver() {
+        // The predicate itself: AND, never OR / negation. A refused VM cancel
+        // or a superseded action must keep the accepted action live.
+        assertTrue("real cancel + live action -> accepted", cancelOwnershipAccepted(true, true))
+        assertFalse("refused cancel must not revoke", cancelOwnershipAccepted(false, true))
+        assertFalse("non-live action must not be revoked", cancelOwnershipAccepted(true, false))
+
+        val controller = WarningRestartController()
+        val posted = mutableListOf<Posted>()
+        val hits = mutableListOf<String>()
+
+        // Temporal reverse first: a restart token posted BEFORE the cancel goes
+        // stale once the accepted WRITE is revoked. The already-posted token
+        // must run nothing via either the captured body or deliver().
+        val pre = controller.install(
+            action = WarningRestartAction.WRITE,
+            candidateKey = "pkg.final.cancel.prescheduled",
+            generation = 1,
+            callback = { hits.add("write:pkg.final.cancel.prescheduled") },
+            resetBudget = true,
+        )
+        assertTrue(
+            controller.schedule(true, MAX_AUTO_WARNING_RESTARTS, capture(posted), expectedRequestId = pre.identity.id),
+        )
+        assertEquals(1, posted.size)
+        assertEquals(pre.identity.id, posted[0].requestId)
+        assertEquals(posted[0].tokenId, controller.scheduledTokenId)
+        assertTrue(
+            "real QUEUED cancel must be accepted",
+            cancelOwnershipAccepted(true, controller.isLive(pre.identity.id)),
+        )
+        assertTrue(controller.revoke(pre.identity.id))
+        posted[0].body()
+        assertFalse(controller.deliver(posted[0].tokenId, posted[0].requestId, true))
+        assertTrue("stale token from cancelled WRITE must run no callback", hits.isEmpty())
+
+        // Real cancel-before-abort order: a FRESH accepted WRITE (fresh restart
+        // budget, no pre-scheduled token) is revoked by the FINAL-dialog cancel,
+        // then the suspended revalidation abort arrives. The FINAL-dialog cancel
+        // arm: vm.cancelPolicyWrite returned TRUE (the QUEUED pending really
+        // cleared), so the ownership gate accepts and the action is revoked with
+        // no onCancel side effect.
+        val write = controller.install(
+            action = WarningRestartAction.WRITE,
+            candidateKey = "pkg.final.cancel",
+            generation = 1,
+            callback = { hits.add("write:pkg.final.cancel") },
+            resetBudget = true,
+        )
+        val actionId = write.identity.id
+        val vmCancelled = true // simulated real DualViewModel.cancelPolicyWrite(expected) result
+        val ownershipAccepted = cancelOwnershipAccepted(vmCancelled, controller.isLive(actionId))
+        assertTrue("real QUEUED cancel must be accepted", ownershipAccepted)
+        if (ownershipAccepted) {
+            controller.revoke(actionId)
+        }
+        assertFalse("revoked WRITE action must not be live", controller.isLive(actionId))
+        assertNull(controller.currentRequestId())
+        assertNull(controller.scheduledTokenId)
+
+        // The suspended revalidation abort arrives LATE, after the real VM
+        // cancel already revoked the WRITE. It must not schedule a replacement
+        // restart for the cancelled action: no live owner, no post, no budget
+        // consumed by the stale abort.
+        val latePosts = mutableListOf<Posted>()
+        assertFalse(
+            "late abort for revoked final-cancel WRITE must not schedule",
+            controller.schedule(true, MAX_AUTO_WARNING_RESTARTS, capture(latePosts), expectedRequestId = actionId),
+        )
+        assertTrue("late abort must post nothing", latePosts.isEmpty())
+        assertEquals("late abort must not add a post beyond the original", 1, posted.size)
+
+        // A NEWER accepted action still owns a working scheduled token: revoke
+        // is identity-conditional, not a global clear, and does not poison it.
+        val newer = controller.install(
+            action = WarningRestartAction.WRITE,
+            candidateKey = "pkg.newer",
+            generation = 2,
+            callback = { hits.add("write:pkg.newer") },
+            resetBudget = true,
+        )
+        assertTrue(
+            controller.schedule(true, MAX_AUTO_WARNING_RESTARTS, capture(posted), expectedRequestId = newer.identity.id),
+        )
+        assertEquals(2, posted.size)
+        assertEquals(newer.identity.id, posted[1].requestId)
+        assertNotEquals(posted[0].tokenId, posted[1].tokenId)
+        posted[1].body()
+        assertEquals(listOf("write:pkg.newer"), hits)
+        assertTrue(controller.isLive(newer.identity.id))
+        assertFalse(controller.isLive(actionId))
+    }
+
     private fun installClear(
         controller: WarningRestartController,
         generation: Int,

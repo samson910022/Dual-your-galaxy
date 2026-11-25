@@ -423,8 +423,8 @@ class WarningRetryLifecycleSourceTest {
             indicesOf(main, "cancelAcceptedWarning(actionId) { onCancel() }").size,
         )
         assertEquals(
-            "cancelAcceptedWarning has one definition and six call sites",
-            7,
+            "cancelAcceptedWarning has one definition, six warning call sites, and one helper call site",
+            8,
             indicesOf(main, "cancelAcceptedWarning(").size,
         )
 
@@ -495,8 +495,8 @@ class WarningRetryLifecycleSourceTest {
             indicesOf(editor, "cancelAcceptedWarning(actionId) { onCancel() }").size,
         )
         assertEquals(
-            "cancelAcceptedWarning has one definition and three call sites",
-            4,
+            "cancelAcceptedWarning has one definition, three warning call sites, and one helper call site",
+            5,
             indicesOf(editor, "cancelAcceptedWarning(").size,
         )
         assertEquals(
@@ -528,5 +528,96 @@ class WarningRetryLifecycleSourceTest {
         val gateAt = body.indexOf("if (!warningRestartController.isLive(actionId))")
         assertTrue("probe settle gate must precede when(probe)", gateAt in 0 until body.indexOf("when (probe) {"))
         assertTrue("probe settle gate must precede consent write", gateAt in 0 until body.indexOf("pendingWarningConsent = buildPolicyWriteConsent("))
+    }
+
+    // PR #89 Round-3 R3-1: the FINAL policy-write confirmation dialog's two
+    // cancel arms (OnCancel + Negative) must route through the ownership-revoking
+    // helper, never a raw VM cancel. A cancel that clears the QUEUED pending but
+    // leaves the accepted warning action live lets the suspended revalidation
+    // abort schedule a restart for an already-cancelled WRITE.
+    @Test
+    fun finalWriteDialogCancels_routeThroughOwnershipRevokingHelper() {
+        data class DialogSeam(
+            val name: String,
+            val src: String,
+            val dialogFn: String,
+            val cancelAnchors: List<String>,
+        )
+        for (seam in listOf(
+            DialogSeam(
+                "MainActivity", main, "private fun syncPolicyWriteDialog(",
+                listOf("setOnCancelListener", "BUTTON_NEGATIVE)?.setOnClickListener"),
+            ),
+            DialogSeam(
+                "PolicyActivity", editor, "private fun showConfirmDialog(",
+                listOf("setOnCancelListener", "BUTTON_NEGATIVE)?.apply"),
+            ),
+        )) {
+            val body = block(seam.src, seam.dialogFn)
+            // Both cancel arms must use the helper with the accepted action id,
+            // and the final dialog body must contain no raw VM cancel at all.
+            assertEquals(
+                "${seam.name} final dialog must expose exactly two helper cancel arms",
+                2,
+                indicesOf(body, "cancelWritePendingAndRevoke(pending, pending.consent?.actionId)").size,
+            )
+            assertEquals(
+                "${seam.name} final dialog must not call the raw VM cancel directly",
+                0,
+                indicesOf(body, "vm.cancelPolicyWrite(").size,
+            )
+            for (anchor in seam.cancelAnchors) {
+                val at = body.indexOf(anchor)
+                assertTrue("${seam.name} final dialog must expose the $anchor cancel arm", at >= 0)
+                // Whole-lambda slice: a raw cancel appended after a nested
+                // `{ }` on the same line must not escape this scan.
+                val lambda = cancelLambda(body, at)
+                assertTrue(
+                    "${seam.name} $anchor arm must route through cancelWritePendingAndRevoke",
+                    lambda.contains("cancelWritePendingAndRevoke(pending, pending.consent?.actionId)"),
+                )
+                val helperAt = lambda.indexOf("cancelWritePendingAndRevoke(")
+                val rawAt = lambda.indexOf("vm.cancelPolicyWrite(")
+                assertFalse("${seam.name} $anchor arm must not call the raw VM cancel", rawAt >= 0)
+                // Gate ordering: the helper must precede any raw VM cancel.
+                assertTrue(
+                    "${seam.name} helper must precede any raw VM cancel in the $anchor arm",
+                    rawAt < 0 || helperAt < rawAt,
+                )
+                // QUEUED-only: the final-dialog cancel lambda has SAVING /
+                // RECONCILING early arms that must NOT cancel the pending write.
+                // Slice from the last `} else {` (the QUEUED arm) so a helper
+                // call parked in an unrelated branch cannot satisfy the scan.
+                val queuedElseAt = lambda.lastIndexOf("} else {")
+                assertTrue("${seam.name} $anchor arm must expose a QUEUED else branch", queuedElseAt >= 0)
+                val queuedArm = lambda.substring(queuedElseAt)
+                assertTrue(
+                    "${seam.name} $anchor QUEUED arm must route through cancelWritePendingAndRevoke",
+                    queuedArm.contains("cancelWritePendingAndRevoke(pending, pending.consent?.actionId)"),
+                )
+                assertFalse(
+                    "${seam.name} $anchor QUEUED arm must not call the raw VM cancel",
+                    queuedArm.contains("vm.cancelPolicyWrite("),
+                )
+            }
+            // The helper itself gates revocation on BOTH the real VM result and
+            // the live action identity, then revokes with an empty onCancel.
+            val helper = block(seam.src, "private fun cancelWritePendingAndRevoke(")
+            assertTrue(
+                "${seam.name} helper must gate on real VM cancel AND live action",
+                helper.contains("cancelOwnershipAccepted(vmCancelled, warningRestartController.isLive(actionId))"),
+            )
+            assertTrue(
+                "${seam.name} helper must read the Boolean VM cancel result",
+                helper.contains("try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { false }"),
+            )
+            // Strip comment-only lines so a commented-out revoke cannot satisfy
+            // this check: the production call itself must be present in code.
+            val helperCode = helper.lines().filterNot { it.trimStart().startsWith("//") }.joinToString("\n")
+            val gateAt = helperCode.indexOf("cancelOwnershipAccepted(")
+            val revokeAt = helperCode.indexOf("cancelAcceptedWarning(actionId) { }")
+            assertTrue("${seam.name} helper must revoke in code, not just in a comment", revokeAt >= 0)
+            assertTrue("${seam.name} ownership gate must precede revocation", gateAt in 0 until revokeAt)
+        }
     }
 }

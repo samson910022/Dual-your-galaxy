@@ -888,6 +888,18 @@ class PolicyActivity : ComponentActivity() {
         onCancel()
     }
 
+    // PR #89 Round-3 R3-1: FINAL policy-write confirmation dialog cancel.
+    // A cancel that really clears the QUEUED pending must ALSO revoke the
+    // accepted warning action, otherwise the suspended revalidation coroutine's
+    // later abort schedules a restart for an already-cancelled WRITE. A refused
+    // cancel (SAVING/RECONCILING/in-flight/stale) keeps the action live.
+    private fun cancelWritePendingAndRevoke(pending: PendingPolicyWrite, actionId: Long?) {
+        val vmCancelled = try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { false }
+        if (cancelOwnershipAccepted(vmCancelled, warningRestartController.isLive(actionId))) {
+            cancelAcceptedWarning(actionId) { }   // isLive→revoke→remove owned Runnable→clear own consent; NO onCancel side effect
+        }
+    }
+
     // D03b fixer M3：abort 清理不再同步 invoke restart（避免遞迴／死路）。
     // R4-1 (E01)：寫入 abort 用寫入文案；清除路徑（Main）沿用既有清除文案。
     // G2: a stale abort has NO side effect at all; only the request that failed
@@ -1276,7 +1288,7 @@ class PolicyActivity : ComponentActivity() {
                     try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }
                     policyConfirmDialog = null
                 } else {
-                    vm.cancelPolicyWrite(pending)
+                    cancelWritePendingAndRevoke(pending, pending.consent?.actionId)
                 }
             }
             .show()
@@ -1330,7 +1342,7 @@ class PolicyActivity : ComponentActivity() {
                     try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }
                     policyConfirmDialog = null
                 } else {
-                    vm.cancelPolicyWrite(pending)
+                    cancelWritePendingAndRevoke(pending, pending.consent?.actionId)
                 }
             }
         }
