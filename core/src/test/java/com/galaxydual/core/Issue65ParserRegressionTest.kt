@@ -1094,6 +1094,21 @@ class Issue65ParserRegressionTest {
         }
         assertEquals("99", VerboseIdentityFields.serialWithValue().find("serial number: 99")!!.groupValues[1])
         assertEquals("-10000", VerboseIdentityFields.parentWithValue().find("parentId: -10000")!!.groupValues[1])
+
+        // R14: the value-bearing regex captures the WHOLE candidate token;
+        // strict full-token parsing then decides valid vs invalid. A malformed
+        // value is never truncated into a plausible decimal prefix.
+        for (raw in listOf("0x10", "15oops", "2147483648", "+15", "", "15:400", "15::")) {
+            assertNull("parent value '$raw' must not parse", VerboseIdentityFields.parseParentValue(raw))
+            assertNull("serial value '$raw' must not parse", VerboseIdentityFields.parseSerialValue(raw))
+        }
+        assertNull("negative serial must not parse", VerboseIdentityFields.parseSerialValue("-15"))
+        assertEquals(-10000, VerboseIdentityFields.parseParentValue("-10000"))
+        assertEquals(0, VerboseIdentityFields.parseParentValue("0"))
+        assertEquals(15, VerboseIdentityFields.parseParentValue("15:"))
+        assertEquals(15, VerboseIdentityFields.parseSerialValue("15"))
+        // Legacy `serialNo=15:` keeps its single optional trailing colon.
+        assertEquals(15, VerboseIdentityFields.parseSerialValue("15:"))
     }
 
     // ---- R12: malformed record attempts are OWNED, never borrowed ----
@@ -1315,5 +1330,92 @@ class Issue65ParserRegressionTest {
         assertEquals("Work:Error", classified.fields!!.label)
         assertFalse("neutralizing only the label must keep the tail error visible", PmOutputParser.isIdentityChannelOk(text, 0))
         assertFalse(PmOutputParser.isListUsersOutputOk(text, 0))
+    }
+
+    // ---- R14: recognized malformed/overflow numeric evidence stays invalid ----
+
+    // A structurally valid CLONE row whose tail carries [tail]. The type is
+    // canonical, so WITHOUT strict value validation these cases would stay
+    // CLONE with a truncated/dropped parent or serial and could Confirm.
+    private fun r14Row(tail: String) =
+        "1: id=95, name=OK, type=profile.CLONE, flags=X $tail"
+
+    private fun assertInvalidNumericField(tail: String, parent: Int?, serial: Int?) {
+        val claim = SamsungProfileAdapter.parseUserListVerbose(r14Row(tail)).single()
+        assertEquals("$tail: a malformed field must force UNKNOWN", ProfileUserType.UNKNOWN, claim.userType)
+        assertTrue("$tail: a malformed field must be flagged invalid", claim.evidenceInvalid)
+        assertEquals("$tail: parent (diagnosis only)", parent, claim.parentId)
+        assertEquals("$tail: serial (diagnosis only)", serial, claim.serial)
+        assertEquals(IdentityConfidence.LOW, claim.confidence)
+    }
+
+    @Test
+    fun r14_malformedParentValuesAreInvalidNotTruncated() {
+        for (tail in listOf(
+            "(parentId=0x10)", // hex was silently read as parent 0
+            "(parentId=2147483648)", // single Int overflow
+            "parentId=", // present but empty
+        )) {
+            assertInvalidNumericField(tail, parent = null, serial = null)
+        }
+    }
+
+    @Test
+    fun r14_malformedSerialValuesAreInvalidNotTruncated() {
+        for (tail in listOf(
+            "serialNo=15oops", // trailing word was silently read as serial 15
+            "serialNo=2147483648", // single Int overflow
+            "serialNo=-15", // serial is unsigned
+            "serial=+15", // no leading '+'
+            "serialNo=15:400", // extra colon segment is not a value
+            "serialNo=", // present but empty
+        )) {
+            assertInvalidNumericField(tail, parent = null, serial = null)
+        }
+    }
+
+    @Test
+    fun r14_validPlusOverflowDuplicateKeepsFirstValidForDiagnosis() {
+        // The overflow occurrence is NOT dropped: it invalidates the claim
+        // while the first valid value is retained for diagnosis only.
+        for ((tail, parent, serial) in listOf(
+            Triple("(parentId=0) (parentId=2147483648)", 0, null),
+            Triple("parentId=0 parentId=0x10", 0, null),
+            Triple("serialNo=15 serialNo=2147483648", null, 15),
+            Triple("serialNo=15 serialNo=15oops", null, 15),
+        )) {
+            assertInvalidNumericField(tail, parent = parent, serial = serial)
+        }
+    }
+
+    @Test
+    fun r14_positiveNumericSpellingsKeepExactValues() {
+        for ((tail, parent, serial) in listOf(
+            Triple("(parentId=0)", 0, null),
+            Triple("parentId: -10000", -10000, null),
+            Triple("serialNo=15:", null, 15),
+            Triple("serial number: 15", null, 15),
+            Triple("Serial Number : 15", null, 15),
+            Triple("serialnumber=99", null, 99),
+            Triple("parentId=0, serialNo=15", 0, 15),
+            Triple("personalSerialNo=7 mySerial=8 grandparentId=3", null, null),
+        )) {
+            val claim = SamsungProfileAdapter.parseUserListVerbose(r14Row(tail)).single()
+            assertEquals("$tail: clean value must keep CLONE", ProfileUserType.CLONE, claim.userType)
+            assertFalse("$tail: clean value must not be flagged", claim.evidenceInvalid)
+            assertEquals("$tail parent", parent, claim.parentId)
+            assertEquals("$tail serial", serial, claim.serial)
+        }
+    }
+
+    @Test
+    fun r14_leftBoundaryGuardsContributeNoNumericEvidence() {
+        for (tail in listOf("personalSerialNo=7", "mySerial=8", "grandparentId=3")) {
+            val claim = SamsungProfileAdapter.parseUserListVerbose(r14Row(tail)).single()
+            assertEquals("$tail must not change the type", ProfileUserType.CLONE, claim.userType)
+            assertNull("$tail must not contribute a serial", claim.serial)
+            assertNull("$tail must not contribute a parent", claim.parentId)
+            assertFalse(claim.evidenceInvalid)
+        }
     }
 }

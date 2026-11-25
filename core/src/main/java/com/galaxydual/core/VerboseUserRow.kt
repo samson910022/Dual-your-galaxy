@@ -250,13 +250,38 @@ internal object VerboseIdentityFields {
     internal val FLAGS_HEAD =
         Regex("""(?:[ \t]*,[ \t]*|[ \t]*\()[ \t]*flags[ \t]*=""", RegexOption.IGNORE_CASE)
 
-    // Value-bearing form of each head. The value is ALWAYS capture group 1
-    // (signed for parent, unsigned for serial, matching the legacy grammar).
+    // Value-bearing form of each head. The value is ALWAYS capture group 1.
+    // The capture is deliberately WIDE: the whole maximal candidate run up to
+    // a structural delimiter (whitespace, comma, `)`), NOT a decimal prefix.
+    // That way `0x10`, `15oops` and an overflowing token are OBSERVED as
+    // malformed instead of being silently truncated to a plausible `0`/`15`
+    // (issue #87 R14). Strict full-token validation lives in the parseXValue
+    // helpers below; a wide match whose value cannot be parsed is INVALID
+    // evidence, never an absent field.
     fun parentWithValue(): Regex =
-        Regex(PARENT_HEAD.pattern + """\s*(-?\d+)""", RegexOption.IGNORE_CASE)
+        Regex(PARENT_HEAD.pattern + """[ \t]*([^\s,)]*)""", RegexOption.IGNORE_CASE)
 
     fun serialWithValue(): Regex =
-        Regex(SERIAL_HEAD.pattern + """\s*(\d+)""", RegexOption.IGNORE_CASE)
+        Regex(SERIAL_HEAD.pattern + """[ \t]*([^\s,)]*)""", RegexOption.IGNORE_CASE)
+
+    // Strict value grammar (issue #87 R14). A recognized field is valid ONLY
+    // when its whole captured token is an optional single trailing `:` (legacy
+    // `serialNo=15:`) followed by a COMPLETE decimal in Int range: signed for
+    // parent, unsigned for serial. Hex, a trailing word, `+15`, a negative
+    // serial, an overflowing token and an empty value are all null -- never
+    // coerced or truncated into a smaller plausible number.
+    private val SIGNED_DECIMAL = Regex("""-?[0-9]+""")
+    private val UNSIGNED_DECIMAL = Regex("""[0-9]+""")
+
+    private fun parseDecimal(raw: String, signed: Boolean): Int? {
+        val token = if (raw.endsWith(':')) raw.dropLast(1) else raw
+        val grammar = if (signed) SIGNED_DECIMAL else UNSIGNED_DECIMAL
+        if (!grammar.matches(token)) return null
+        return token.toIntOrNull()
+    }
+
+    fun parseParentValue(raw: String): Int? = parseDecimal(raw, signed = true)
+    fun parseSerialValue(raw: String): Int? = parseDecimal(raw, signed = false)
 }
 
 // Shared legacy `UserInfo{id:label:flags}` header fields, parsed by ONE
