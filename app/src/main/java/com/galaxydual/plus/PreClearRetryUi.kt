@@ -455,12 +455,12 @@ internal class WarningRestartController {
 internal fun cancelOwnershipAccepted(vmCancelled: Boolean, actionLive: Boolean): Boolean =
     vmCancelled && actionLive
 
-// PR #89 Round-3 R3-2 / Phase 1: this is the SYNCHRONOUS verdict gate only —
-// a RETRYABLE_RETAINED refusal keeps the accepted action live; a dispatched
-// write or a terminal no-write path both retire it. The ASYNC outcome gate
-// (`confirmAttemptRetiresAction`) is wired into the Activities/VM in a LATER
-// phase; flipping this to TERMINAL-only before that wiring lands atomically
-// would strand normal ACCEPTED writes with a live action and no async producer.
+// PR #89 Round-3 R3-2: this is the SYNCHRONOUS verdict gate only — a
+// RETRYABLE_RETAINED refusal keeps the accepted action live, and a terminal
+// no-write path retires it. R4-1: ACCEPTED is NOT passed here; the Activity
+// hands that case to the VM's async outcome gate (`confirmAttemptRetiresAction`,
+// fed by `onAttemptComplete`). Keeping this gate's truth table unchanged avoids
+// an interim regression where a dispatched write had no retirement producer.
 internal fun confirmRevocationAccepted(admission: PolicyWriteConfirmAdmission): Boolean =
     admission != PolicyWriteConfirmAdmission.RETRYABLE_RETAINED
 
