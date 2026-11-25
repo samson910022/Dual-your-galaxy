@@ -448,6 +448,168 @@ class BbcConsentDurabilityFenceTest {
     }
 
     @Test
+    fun staleUnknownAfterOffAbandon_stillInstallsDurableFence() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val service = newService()
+        holder.resolve(service.authoritativeRead(1L))
+        assertEquals(BbcActivationConsentState.NotGranted, holder.currentState())
+
+        // An opt-in commit entered gen 1, then OFF/abandon advanced the intent
+        // fence; only THEN did its Unknown outcome arrive.
+        val seq = holder.nextIntentSequence()
+        holder.notePendingEnable(seq, 1L)
+        holder.supersedeActiveIntent()
+        assertFalse("a stale outcome must get no callback", holder.markConsentWriteOutcome(Unknown(), seq, 1L))
+        assertFalse("a stale outcome must not revive the enable", holder.consumePendingEnable(seq, 1L))
+        assertEquals("durability evidence survives the stale UI outcome",
+            BbcActivationConsentState.Unknown, holder.currentState())
+
+        // The polluted same-generation instance cannot clear its own fence.
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 1L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+
+        // Only an authoritative resync from a NEW service generation may clear it.
+        holder.onServiceGenerationChanged(2L)
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 2L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+    }
+
+    @Test
+    fun queuedGen1WriteTouchedGen2_fencesGen2AndNeverGrants() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        resolveFresh(holder, newService(), 1L)
+        val service = newService()
+        val outcomes = mutableListOf<BbcWriteOutcome>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { BbcWriteOutcome.Confirmed(it) }, io = dispatcher,
+            consentCommitAt = { captured ->
+                assertEquals(1L, captured) // captured at user-intent time
+                // Binder death/rebind before the commit: the write touched the
+                // NEW generation's prefs instance. A Confirmed reply from the
+                // dead captured generation must be forced to Unknown.
+                holder.onServiceGenerationChanged(2L)
+                BbcConsentWriteResult(Unknown(), touchedGeneration = 2L)
+            },
+            consentRead = { generation ->
+                BbcConsentAuthoritativeRead(
+                    serviceGeneration = generation, optIn = BbcOptInValue.TRUE,
+                    classification = null, migrated = null, legacyRuntimeEnabled = true,
+                )
+            },
+            consentHolder = holder,
+        )
+        coordinator.submitConsentWrite(1L, 1L, onResult = { outcomes.add(it) })
+        testScheduler.advanceUntilIdle()
+
+        assertEquals(listOf(BbcWriteOutcome.Unknown), outcomes)
+        assertEquals("a mismatched generation must never grant",
+            BbcActivationConsentState.Unknown, holder.currentState())
+
+        // The gen-2 resync sees opt-in=true in its OWN prefs instance. The
+        // fence is at gen 2, so it may NOT clear itself into a false grant.
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+
+        // A genuinely newer generation may clear the fence authoritatively.
+        holder.onServiceGenerationChanged(3L)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+    }
+
+    @Test
+    fun confirmedFromMismatchedGeneration_neverGrantsAndFencesTouchedGeneration() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(newService().authoritativeRead(1L))
+        val seq = holder.nextIntentSequence()
+        assertTrue(holder.markConsentWriteOutcome(Confirmed(), seq, touchedGeneration = 2L))
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+        // The reply was attributed to gen 2: make gen 2 the CURRENT generation,
+        // otherwise resolve(2) is rejected before the fence logic runs and the
+        // fence-attribution assertion below would be vacuous.
+        holder.onServiceGenerationChanged(2L)
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 2L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+            ),
+        )
+        assertEquals("a gen-2 read must not clear a fence raised on gen 2",
+            BbcActivationConsentState.Unknown, holder.currentState())
+        holder.onServiceGenerationChanged(3L)
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 3L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+    }
+
+    /**
+     * Phase 2 fixer (BLOCKING 3): a stale reply from a DEAD generation must
+     * never LOWER a fence already raised on a newer one. Old code computed
+     * `touchedGeneration` alone (cur.fence=2, touched=1 -> 1) and the
+     * `fence != cur.fenceGeneration` guard accepted the downgrade while
+     * preserving Granted; the weakened fence could later be cleared.
+     */
+    @Test
+    fun deadGenerationReplyNeverLowersAnExistingFence() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(2L)
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 2L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+        val seq = holder.nextIntentSequence()
+        assertTrue(holder.markConsentWriteOutcome(Confirmed(), seq, 2L))
+
+        // A STALE Unknown outcome that really touched the CURRENT generation
+        // records pollution evidence without downgrading the confirmed grant.
+        assertFalse(holder.markConsentWriteOutcome(Unknown(), seq, 2L))
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+        assertEquals(2L, holder.currentFenceGeneration())
+
+        // A late reply attributed to the DEAD gen 1 used to lower it to 1.
+        assertFalse(holder.markConsentWriteOutcome(Unknown(), seq, 1L))
+        assertEquals("a dead generation must not weaken the current fence", 2L, holder.currentFenceGeneration())
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+
+        // One more dead reply still cannot lower it: its evidence belongs to
+        // gen 1, not the current gen 2.
+        assertFalse(holder.markConsentWriteOutcome(Unknown(), seq, 1L))
+        assertEquals(2L, holder.currentFenceGeneration())
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 2L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+    }
+
+    @Test
     fun offWinsOverPendingConsent() = runTest {
         val service = newService()
         val holder = BbcActivationConsentHolder()

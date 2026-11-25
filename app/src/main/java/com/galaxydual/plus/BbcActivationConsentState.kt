@@ -87,6 +87,14 @@ data class BbcConsentDurableSnapshot(
     /** Authoritative `contains()`-based read; `null` = absent (not default true). */
     val legacyRuntimeEnabled: Boolean?,
     val coherent: Boolean = true,
+    /**
+     * APP-ONLY durable "enable pending" marker, read from the SAME coherent
+     * copy as [optIn]. A Confirmed consent grant writes optin=true and this
+     * marker=true in ONE commit; every runtime preference commit (the consumer
+     * enable AND any user OFF) clears it in ONE commit. `null`/false means no
+     * resync-driven enable is allowed. The Hook gate NEVER reads this key.
+     */
+    val enablePending: Boolean? = null,
 ) {
     companion object {
         fun failClosed(): BbcConsentDurableSnapshot = BbcConsentDurableSnapshot(
@@ -95,6 +103,7 @@ data class BbcConsentDurableSnapshot(
             migrated = null,
             legacyRuntimeEnabled = null,
             coherent = false,
+            enablePending = null,
         )
     }
 
@@ -106,6 +115,7 @@ data class BbcConsentDurableSnapshot(
             migrated = migrated,
             legacyRuntimeEnabled = legacyRuntimeEnabled,
             coherent = coherent,
+            enablePending = enablePending,
         )
 }
 
@@ -162,6 +172,8 @@ internal data class BbcConsentAuthoritativeRead(
     val migrated: Boolean?,
     val legacyRuntimeEnabled: Boolean?,
     val coherent: Boolean = true,
+    /** APP-ONLY enable-pending marker; see [BbcConsentDurableSnapshot.enablePending]. */
+    val enablePending: Boolean? = null,
 )
 
 /** Authorization-only seed for a freshly built UI. Never a final value. */
@@ -263,13 +275,30 @@ private val LEGACY_CLASSIFICATIONS = setOf(
  *  - [abandonIntent] advances the outcome fence (cancel / OFF / show failure)
  *    and invalidates the pending enable for that intent: zero writes, zero
  *    state claims, and a late commit result can no longer land.
- *  - An ENABLE handed off to the effect controller is recorded app-scoped at
- *    accept time and consumed exactly once (see [notePendingEnable],
- *    [consumePendingEnable], [consumePendingEnableForReplay]). This is what
- *    keeps the checkbox and the runtime preference converged across a UI
- *    rebuild; a grant alone is never treated as effect proof.
+ *  - An ENABLE was recorded app-scoped at accept time and the consume seams
+ *    ([notePendingEnable], [consumePendingEnable],
+ *    [consumePendingEnableForReplay], [isEnableHandledBy]) are TEST-ONLY: no
+ *    production code consumes that record. Phase 2: the app IO consumer that
+ *    confirms the opt-in owns the actual effect write; UI callbacks and state
+ *    replay are presentation-only and can never toggle it a second time. A
+ *    grant alone is never treated as effect proof.
+ *  - Cold-start convergence ALSO requires the app-only durable enable-pending
+ *    marker from the SAME coherent read as optin=true. The marker is cleared
+ *    in the same commit as a user OFF, so an authoritative resync can never
+ *    reverse a durable OFF; it is NOT a Hook authorization key.
+ *  - Enable ownership is a GENERATION-SCOPED monotonic token shared by the
+ *    consumer and the resync. A newer claim is never regressed by a later
+ *    Confirmed intent on the same generation, but a rebind may claim the same
+ *    still-owed enable once on a NEW generation.
  */
-internal class BbcActivationConsentHolder {
+internal class BbcActivationConsentHolder(
+    /**
+     * Shared with [BbcToggleRuntimeState] in production so an OFF toggle and a
+     * pending consent intent live in ONE sequence domain. Tests that construct
+     * the holder alone get their own monotonic counter.
+     */
+    private val sequence: AtomicLong = AtomicLong(),
+) {
 
     private data class Fenced(
         val state: BbcActivationConsentState,
@@ -297,7 +326,58 @@ internal class BbcActivationConsentHolder {
     private val fenced = AtomicReference(
         Fenced(BbcActivationConsentState.Initializing, 0L, 0L, -1L, -1L),
     )
-    private val sequence = AtomicLong(0L)
+
+    /**
+     * App-scoped dialog intent sequence (replaces MainActivity's per-Activity
+     * field): a rebuilt Activity still recognises/supersedes an older pending
+     * grant, so a late accept can never win over a newer OFF.
+     */
+    @Volatile
+    private var activeIntentSequence: Long = 0L
+
+    /**
+     * Highest OFF/cancel sequence in the shared domain. The consumer compares
+     * this with a grant's sequence before writing the phase-2 enable, so an OFF
+     * that arrived while the opt-in commit was in flight always wins.
+     */
+    @Volatile
+    private var latestAbandonSequence: Long = 0L
+
+    /**
+     * Generation-scoped enable ownership. A Confirmed grant owns the effect
+     * enable in the generation whose prefs instance it actually touched; a
+     * rebind to a NEW generation re-arms the SAME owed enable exactly once.
+     * Tokens are compared lexicographically (generation first, then sequence):
+     * an older generation's token is evidence for that dead instance only and
+     * can never block a new generation, while within one generation a newer
+     * claim is never regressed by a later Confirmed S<R.
+     */
+    private data class EnableOwner(val generation: Long, val sequence: Long) {
+        fun outranks(other: EnableOwner?): Boolean =
+            other == null || generation > other.generation ||
+                (generation == other.generation && sequence > other.sequence)
+    }
+
+    /** Current enable owner, published atomically with the grant/claim itself. */
+    @Volatile
+    private var enableOwner: EnableOwner? = null
+
+    /**
+     * Sequence of the last CONFIRMED consent grant. A resync-driven enable
+     * compares OFF/cancel evidence against THIS sequence (the grant's own
+     * intent), never against a freshly minted sequence that would be newer
+     * than every recorded abandon and make the OFF guard inert.
+     */
+    @Volatile
+    private var confirmedGrantSequence: Long = 0L
+
+    /** The single generation whose resync is allowed to drive a runtime enable. */
+    @Volatile
+    private var resyncEnableGeneration: Long = -1L
+
+    /** Generation in which the user (or cancel) said OFF: resync may not re-enable it. */
+    @Volatile
+    private var resyncEnableBlockedGeneration: Long = -1L
 
     /**
      * PR #90 Phase C (P2): an ENABLE that was enqueued with a Confirmed consent
@@ -340,11 +420,161 @@ internal class BbcActivationConsentHolder {
     /** Monotonic, app-wide user-intent sequence (never reset by UI rebuilds). */
     fun nextIntentSequence(): Long = sequence.incrementAndGet()
 
+    /** True only for the app-scoped dialog intent currently awaiting an answer. */
+    fun isActiveIntent(intentSequence: Long): Boolean =
+        intentSequence != 0L && intentSequence == activeIntentSequence
+
+    /** Start a new consent dialog intent, superseding any older one app-wide. */
+    @Synchronized
+    fun startConsentIntent(): Long {
+        activeIntentSequence = nextIntentSequence()
+        return activeIntentSequence
+    }
+
     /**
-     * P2: record the ENABLE app-scoped BEFORE the consent write is enqueued.
-     * The grant alone is only AUTHORIZATION — it is not proof that the runtime
-     * opt-out preference was ever written. A rebuilt UI uses the recorded
-     * intent to converge the effect exactly once.
+     * OFF / cancel / show-failure supersedes the active dialog intent. Called
+     * UNCONDITIONALLY by the OFF branch: a rebuilt Activity must abandon an
+     * older pending grant even when its own local field was never set.
+     */
+    @Synchronized
+    fun supersedeActiveIntent(): Long {
+        val next = nextIntentSequence()
+        activeIntentSequence = next
+        abandonIntent(next)
+        return next
+    }
+
+    /** Highest abandon/OFF sequence in the shared intent domain. */
+    fun latestAbandonSequence(): Long = latestAbandonSequence
+
+    /**
+     * Execution-time authority check for a QUEUED consent write. Accept() may
+     * enqueue the opt-in commit and the user may then tap OFF before the app IO
+     * consumer drains the slot. Such a grant must not enter the store AT ALL:
+     * its atomic optin=true + marker=true write would re-arm a cold-start
+     * enable after the OFF already cleared the marker, reversing the user.
+     *
+     * Does NOT consult [activeIntentSequence]: framework-free callers may submit
+     * a consent write without opening a dialog, and a rebind clears the active
+     * intent while durable authority is still checked by generation below.
+     */
+    internal fun isConsentWriteStillAuthoritative(sequence: Long, generation: Long): Boolean {
+        if (sequence <= 0L) return false
+        val cur = fenced.get()
+        return generation == cur.generation &&
+            sequence > latestAbandonSequence &&
+            sequence > cur.appliedIntentSequence
+    }
+
+    /**
+     * TEST-ONLY seam (no production caller): true when the app-consumer enable
+     * ownership token already covers this intent. [generation] is part of the
+     * check — a token belonging to a dead prefs instance is NOT evidence that
+     * this generation handled the intent. The default keeps existing
+     * framework-free call sites compiling while asking about the current
+     * generation, which is the only one production could care about.
+     */
+    fun isEnableHandledBy(
+        intentSequence: Long,
+        generation: Long = currentGeneration(),
+    ): Boolean {
+        val owner = enableOwner ?: return false
+        return owner.generation == generation &&
+            owner.sequence >= intentSequence && owner.sequence >= 0L
+    }
+
+    /** Test/telemetry seam: the current monotonic enable-ownership token. */
+    internal fun latestEnableDrivenSequence(): Long = enableOwner?.sequence ?: -1L
+
+    /**
+     * True only when THIS intent is the current enable owner FOR THIS
+     * GENERATION. A resync that claimed a newer sequence R keeps ownership at R;
+     * a later Confirmed S<R must not be treated as a fresh, second enable. A
+     * token from a dead generation is not ownership of the new instance.
+     */
+    internal fun isEnableOwner(intentSequence: Long, generation: Long): Boolean {
+        val owner = enableOwner ?: return false
+        return owner.generation == generation &&
+            owner.sequence == intentSequence && intentSequence >= 0L
+    }
+
+    /**
+     * True when an enable for [sequence] is already owned in [generation].
+     * Ownership from an OLDER generation is deliberately NOT authority here:
+     * the whole point of generation scoping is that a rebind may claim the same
+     * still-owed enable once on its new prefs instance. Ownership from a NEWER
+     * generation still blocks going backwards.
+     */
+    private fun enableAlreadyOwned(generation: Long, sequence: Long): Boolean {
+        val owner = enableOwner ?: return false
+        return when {
+            owner.generation > generation -> true
+            owner.generation == generation -> owner.sequence >= sequence
+            else -> false
+        }
+    }
+
+    /** The grant sequence that a cold-start resync must compare OFFs against. */
+    internal fun confirmedGrantSequence(): Long = confirmedGrantSequence
+
+    /** Test/telemetry seam: the generation owning the current (Unknown) fence. */
+    internal fun currentFenceGeneration(): Long = fenced.get().fenceGeneration
+
+    /**
+     * Atomic, once-per-generation claim for a resync-driven enable.
+     *
+     * COLD-START CONVERGENCE WITHOUT REVERSING A DURABLE OFF: the durable
+     * opt-in key alone is not enough. The app-only [enablePending] marker is
+     * written in the SAME commit as optin=true on a Confirmed grant and cleared
+     * in the SAME commit as every runtime write (including a user OFF). It is
+     * therefore true after process death only when an enable is genuinely
+     * still owed; an OFF that survived the daemon cleared it. The marker is
+     * NOT a Hook authorization key.
+     *
+     * [reasonSequence] is the CONFIRMED grant's intent sequence — OFF/cancel
+     * evidence is compared against it, not against a freshly minted sequence
+     * that would outrank every recorded abandon. [claimSequence] is a fresh
+     * monotonic ownership token so a later Confirmed S cannot regress it into
+     * a second enable.
+     */
+    @Synchronized
+    fun tryClaimResyncEnable(
+        generation: Long,
+        reasonSequence: Long,
+        enablePending: Boolean,
+        claimSequence: Long = reasonSequence,
+    ): Boolean {
+        val cur = fenced.get()
+        if (generation != cur.generation) return false
+        // Only an explicit/authoritative GRANT authorises converging the
+        // runtime enable. Legacy(false) means the durable opt-out is OFF:
+        // auto-enabling there would override the user's persisted choice.
+        if (cur.state !is BbcActivationConsentState.Granted) return false
+        if (!enablePending) return false
+        if (resyncEnableGeneration >= generation) return false
+        if (resyncEnableBlockedGeneration >= generation) return false
+        // Generation-aware token: a grant the PREVIOUS generation already drove
+        // (possibly with an Unknown outcome) must not block the NEW generation
+        // from claiming the still-owed enable. Within THIS generation the
+        // maxOf-equivalent below still prevents a second enable.
+        if (enableAlreadyOwned(generation, reasonSequence)) return false
+        if (latestAbandonSequence > reasonSequence) return false
+        resyncEnableGeneration = generation
+        // Never regress a newer ownership token (the dialog's Confirmed S may
+        // arrive after a resync claimed R>S). Because the token carries its
+        // generation, a new generation legitimately re-arms its own sequence.
+        val candidate = EnableOwner(generation, claimSequence)
+        if (candidate.outranks(enableOwner)) enableOwner = candidate
+        return true
+    }
+
+    /**
+     * TEST-ONLY handoff bookkeeping (no production consumer). Production still
+     * records the intent at accept time, but the phase-2 effect write is owned
+     * and driven by the app IO consumer in [BbcToggleCoordinator], never by this
+     * record; new production code must not rely on it. Kept for the
+     * framework-free exactly-once handoff tests. The grant alone is only
+     * AUTHORIZATION — it is not proof that the runtime preference was written.
      */
     @Synchronized
     fun notePendingEnable(sequence: Long, generation: Long) {
@@ -352,9 +582,10 @@ internal class BbcActivationConsentHolder {
     }
 
     /**
-     * P2: handoff from the consent-write UI callback. Returns true exactly once
-     * for a matching (sequence, generation); a rebuilt UI that already replayed
-     * the intent gets false and must NOT toggle a second time.
+     * TEST-ONLY seam (no production caller): handoff from a consent-write UI
+     * callback. Returns true exactly once for a matching (sequence, generation);
+     * a rebuilt UI that already replayed the intent gets false and must NOT
+     * toggle a second time.
      */
     @Synchronized
     fun consumePendingEnable(sequence: Long, generation: Long): Boolean {
@@ -365,10 +596,10 @@ internal class BbcActivationConsentHolder {
     }
 
     /**
-     * P2: replay hook for a rebuilt Activity that observes [Granted] without a
-     * matching confirmed effect mark. Generation must still be current (a
-     * rebind invalidates the old instance's intent) and the intent is consumed
-     * exactly once.
+     * TEST-ONLY seam (no production caller): replay hook for a rebuilt Activity
+     * in the framework-free tests. Generation must still be current (a rebind
+     * invalidates the old instance's intent) and the intent is consumed exactly
+     * once. Production convergence never uses a state-flow replay.
      */
     @Synchronized
     fun consumePendingEnableForReplay(generation: Long): Boolean {
@@ -388,8 +619,18 @@ internal class BbcActivationConsentHolder {
     fun onServiceGenerationChanged(generation: Long) {
         val cur = fenced.get()
         if (generation == cur.generation) return
-        // A dead service instance cannot certify an enable handoff either.
+        // A dead service instance cannot certify an enable handoff either. A
+        // dialog callback from the dead binder is stale in the app-wide domain.
         pendingEnable = null
+        activeIntentSequence = 0L
+        // A durable OFF is now carried by the APP-ONLY marker (cleared in the
+        // same commit as runtime=false), so a rebind must NOT discard the
+        // in-process OFF guard. Clearing it here was one reason both guards
+        // were inert after a rebind.
+        resyncEnableGeneration = -1L
+        // The enable OWNERSHIP token is deliberately kept: it is generation-
+        // scoped, so the dead instance's sequence can neither block nor be
+        // duplicated on this generation. A new resync claims one token here.
         val next = when (cur.state) {
             is BbcActivationConsentState.Granted,
             is BbcActivationConsentState.Legacy,
@@ -492,23 +733,44 @@ internal class BbcActivationConsentHolder {
     }
 
     /**
-     * Fold a consent commit outcome into the durable state. [generation] is the
-     * service generation captured at user-intent time; a mismatch (service died
-     * mid-write) maps even a Confirmed reply to the Unknown fence — the new
-     * service instance has not confirmed anything.
+     * Fold a consent commit outcome into the durable state.
      *
+     * [touchedGeneration] is the generation of the prefs instance the commit
+     * ACTUALLY touched (reported by the generation-aware seam), not merely the
+     * generation captured at user-intent time. Only a Confirmed reply on the
+     * CURRENT generation may grant; a generation mismatch maps even Confirmed
+     * to the durable Unknown fence.
+     *
+     * TWO SEPARATE CONCERNS, in this order:
+     *  1. Durability evidence: any commit that entered and returned Unknown (or
+     *     Confirmed from a dead instance) may have polluted the local mMap of
+     *     [touchedGeneration]. That instance is fenced BEFORE the stale check,
+     *     so a later OFF/abandon cannot swallow the fence and let a same-gen
+     *     resync falsely resolve Granted.
+     *  2. UI-intent outcome: a stale sequence still gets no grant and no
+     *     callback; it must never advance the applied-intent fence either.
+     *
+     * @param consumerOwnsEnable when true (the app coordinator consumer), a
+     *   Confirmed grant consumes the pending UI handoff and records that the
+     *   effect enable is driven by the consumer, BEFORE Granted is published.
+     *   Direct holder callers keep the legacy exactly-once UI handoff.
      * @return false for an older/already-applied intent; its callback is stale.
      */
     @Synchronized
     fun markConsentWriteOutcome(
         outcome: BbcWriteOutcome,
         intentSequence: Long,
-        generation: Long,
+        touchedGeneration: Long,
+        consumerOwnsEnable: Boolean = false,
     ): Boolean {
+        // A skipped/superseded write NEVER entered a store commit: no pollution
+        // evidence, no fence, no state claim and no enable ownership. Reporting
+        // it here keeps the callback honest without inventing durability facts.
+        if (outcome is BbcWriteOutcome.Skipped) return false
         val cur = fenced.get()
         val stale = intentSequence <= cur.appliedIntentSequence
         val grants = !stale && outcome is BbcWriteOutcome.Confirmed &&
-            generation == cur.generation
+            touchedGeneration == cur.generation
         // Only a Confirmed grant on the CURRENT generation keeps the enable
         // intent alive for the UI handoff/replay. Unknown, a stale intent, or a
         // reply from a dead service drops it — that is OFF-wins / fail-closed.
@@ -516,26 +778,45 @@ internal class BbcActivationConsentHolder {
         if (pending != null && pending.sequence <= intentSequence && !grants) {
             pendingEnable = null
         }
+
+        // (1) Durability evidence FIRST — never behind `if (stale) return false`.
+        // A stale Confirmed for the CURRENT generation is not pollution: a
+        // successful daemon commit cannot poison the local mMap. Unknown and a
+        // reply from a DEAD instance are the cases that need a fence.
+        if (!grants && (outcome is BbcWriteOutcome.Unknown || touchedGeneration != cur.generation)) {
+            val fence = fenceForTouchedGeneration(cur, touchedGeneration)
+            // A stale/late failure must not DOWNGRADE a newer authorisation, but
+            // its pollution evidence is still recorded on the fence generation.
+            val evidenceState = if (cur.state is BbcActivationConsentState.Granted ||
+                cur.state is BbcActivationConsentState.Legacy
+            ) cur.state else BbcActivationConsentState.Unknown
+            if (evidenceState is BbcActivationConsentState.Unknown ||
+                fence != cur.fenceGeneration
+            ) {
+                fenced.set(
+                    Fenced(
+                        evidenceState, cur.generation, cur.appliedIntentSequence,
+                        fence, cur.classificationConfirmedGeneration,
+                    ),
+                )
+                if (evidenceState !== cur.state) _state.value = evidenceState
+            }
+        }
+
+        // (2) UI-intent outcome: no grant, no callback for a stale sequence.
         if (stale) return false
         val next = if (grants) BbcActivationConsentState.Granted else BbcActivationConsentState.Unknown
-        val fenceGeneration = if (next is BbcActivationConsentState.Unknown) {
-            if (generation == cur.generation) {
-                // A failed commit on the CURRENT generation polluted THIS
-                // prefs instance's local mMap. Even if an older Unknown fence
-                // was preserved across a rebind, it must advance to the
-                // current generation: only a NEWER instance may now clear it.
-                cur.generation
-            } else if (cur.state is BbcActivationConsentState.Unknown) {
-                // Dead-generation reply while already fenced: keep the older
-                // fence rather than weakening it.
-                cur.fenceGeneration
-            } else {
-                // A generation mismatch means the only evidence came from the
-                // DEAD service generation, so an authoritative read from the
-                // CURRENT (newer) instance may clear this fence on resync.
-                minOf(cur.generation, generation)
-            }
-        } else -1L
+        val fenceGeneration = if (grants) -1L else fenceForTouchedGeneration(cur, touchedGeneration)
+        if (grants) confirmedGrantSequence = intentSequence
+        if (grants && consumerOwnsEnable) {
+            // Record app-consumer ownership before publishing Granted: a rebuilt
+            // UI's collector must not dispatch a second effect toggle. NEVER
+            // regress a newer resync claim R when a stale Confirmed S<R lands;
+            // the token now also records WHICH generation granted the enable.
+            val candidate = EnableOwner(cur.generation, intentSequence)
+            if (candidate.outranks(enableOwner)) enableOwner = candidate
+            pendingEnable = null
+        }
         fenced.set(
             Fenced(
                 next, cur.generation, intentSequence, fenceGeneration,
@@ -547,6 +828,24 @@ internal class BbcActivationConsentHolder {
     }
 
     /**
+     * Fence the prefs instance the commit ACTUALLY touched. When that is the
+     * current instance, the fence is the CURRENT generation, so a same-gen read
+     * (which may be the polluted local mMap) can never clear it.
+     *
+     * A fence records POLLUTION EVIDENCE: it is cumulative and may only move
+     * forward. `maxOf(cur.fenceGeneration, touchedGeneration)` is therefore
+     * required for EVERY state, including Granted/Legacy: a reply from a DEAD
+     * generation (touched < cur.fence) must never lower the fence while the
+     * authorisation is preserved, otherwise a later same-gen read could clear
+     * the weakened fence into a false grant. `<= 0` is the no-commit sentinel:
+     * keep the existing fence (no commit entered, so no new evidence).
+     */
+    private fun fenceForTouchedGeneration(cur: Fenced, touchedGeneration: Long): Long {
+        if (touchedGeneration <= 0L) return cur.fenceGeneration
+        return maxOf(cur.fenceGeneration, touchedGeneration)
+    }
+
+    /**
      * Cancel / OFF / dialog-show-failure: invalidate one intent with ZERO
      * writes and no state claim. A late commit result for that sequence (or any
      * older one) is dropped; newer intents still advance normally.
@@ -555,7 +854,13 @@ internal class BbcActivationConsentHolder {
     fun abandonIntent(intentSequence: Long) {
         val cur = fenced.get()
         // OFF/cancel invalidates the enable handoff even if the fence was
-        // already advanced by an earlier outcome for this same intent.
+        // already advanced by an earlier outcome for this same intent. Record
+        // it app-wide EVEN when the outcome fence is already newer: the app
+        // consumer uses it to reject an enable driven by a stale grant.
+        latestAbandonSequence = maxOf(latestAbandonSequence, intentSequence)
+        // OFF/cancel in this generation blocks resync-driven enabling: a later
+        // authoritative read must not resurrect the effect the user turned off.
+        resyncEnableBlockedGeneration = fenced.get().generation
         val pending = pendingEnable
         if (pending != null && pending.sequence <= intentSequence) pendingEnable = null
         if (intentSequence <= cur.appliedIntentSequence) return

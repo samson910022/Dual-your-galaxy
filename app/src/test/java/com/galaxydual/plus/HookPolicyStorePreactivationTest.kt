@@ -35,6 +35,12 @@ class HookPolicyStorePreactivationTest {
             private set
         var commitSucceeds = true
         var commitThrows = false
+        /**
+         * A daemon may persist and then lose the reply (pinned by
+         * persistedThenReplyThrows_isUnknownEvenThoughKeyIsVisible). false models
+         * the opposite case: a commit the daemon REFUSED, so no key is durable.
+         */
+        var flushOnFailedCommit = true
         var booleanReadThrows = false
         val writtenKeys = mutableListOf<String>()
         val removedKeys = mutableListOf<String>()
@@ -87,7 +93,7 @@ class HookPolicyStorePreactivationTest {
                 return this
             }
             override fun commit(): Boolean {
-                flush()
+                if (commitSucceeds || flushOnFailedCommit) flush()
                 commitCalls++
                 if (commitThrows) throw RuntimeException("commit binder dead")
                 return commitSucceeds
@@ -142,6 +148,82 @@ class HookPolicyStorePreactivationTest {
         assertTrue(store.isBbcPreactivationOptIn())
         assertTrue("a fresh store over the same group must see the opt-in",
             remoteHookPolicyStore { prefs }.isBbcPreactivationOptIn())
+    }
+
+    // --- Phase 2 marker invariant: BEHAVIOUR, not source text ----------------
+
+    @Test
+    fun consentGrantWritesOptinAndMarkerInOneCommit() {
+        val prefs = OptinPrefs()
+        val store = remoteHookPolicyStore { prefs }
+
+        assertEquals(BbcWriteOutcome.Confirmed(true), store.setBbcConsentGrantDetailed())
+
+        assertEquals("one edit, one synchronous commit", 1, prefs.commitCalls)
+        assertEquals("never apply(): the grant must be durable before its callback",
+            0, prefs.applyCalls)
+        assertEquals(
+            "the opt-in and app-only marker must be written in the SAME commit",
+            listOf(OPTIN_KEY, BBC_ENABLE_PENDING_PREF_KEY),
+            prefs.writtenKeys,
+        )
+        assertEquals(true, prefs.data[OPTIN_KEY])
+        assertEquals(true, prefs.data[BBC_ENABLE_PENDING_PREF_KEY])
+    }
+
+    @Test
+    fun runtimeWriteClearsMarkerInOneCommit() {
+        val prefs = OptinPrefs()
+        prefs.data[OPTIN_KEY] = true
+        prefs.data[BBC_ENABLE_PENDING_PREF_KEY] = true // enable still owed after grant
+        prefs.data[PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED] = true
+        val store = remoteHookPolicyStore { prefs }
+
+        assertEquals(
+            BbcWriteOutcome.Confirmed(false),
+            store.setBbcRuntimeAndEnablePendingDetailed(false),
+        )
+
+        assertEquals(1, prefs.commitCalls)
+        assertEquals(0, prefs.applyCalls)
+        assertEquals(
+            "runtime value and marker must be written in the SAME commit",
+            listOf(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, BBC_ENABLE_PENDING_PREF_KEY),
+            prefs.writtenKeys,
+        )
+        assertEquals(false, prefs.data[PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED])
+        assertEquals(false, prefs.data[BBC_ENABLE_PENDING_PREF_KEY])
+        assertEquals("the opt-in grant is untouched by a runtime OFF", true, prefs.data[OPTIN_KEY])
+    }
+
+    @Test
+    fun refusedConsentGrantCommitLeavesNeitherKeyDurable() {
+        val prefs = OptinPrefs()
+        prefs.commitSucceeds = false
+        prefs.flushOnFailedCommit = false // the daemon refused the write entirely
+        val store = remoteHookPolicyStore { prefs }
+
+        assertTrue(store.setBbcConsentGrantDetailed() is BbcWriteOutcome.Unknown)
+        assertEquals(1, prefs.commitCalls)
+        assertFalse("no opt-in may be durable after a refused commit", prefs.data.containsKey(OPTIN_KEY))
+        assertFalse("no enable marker may be durable after a refused commit",
+            prefs.data.containsKey(BBC_ENABLE_PENDING_PREF_KEY))
+    }
+
+    @Test
+    fun refusedRuntimeCommitDoesNotClearTheMarker() {
+        val prefs = OptinPrefs()
+        prefs.data[PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED] = true
+        prefs.data[BBC_ENABLE_PENDING_PREF_KEY] = true
+        prefs.commitSucceeds = false
+        prefs.flushOnFailedCommit = false
+        val store = remoteHookPolicyStore { prefs }
+
+        assertTrue(store.setBbcRuntimeAndEnablePendingDetailed(false) is BbcWriteOutcome.Unknown)
+        assertEquals(1, prefs.commitCalls)
+        assertEquals(true, prefs.data[PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED])
+        assertEquals("the still-owed enable must survive a refused runtime write",
+            true, prefs.data[BBC_ENABLE_PENDING_PREF_KEY])
     }
 
     @Test

@@ -33,4 +33,13 @@ internal sealed class BbcWriteOutcome {
 
     /** Commit failed/threw; local mMap may be polluted. Never "restored to old". */
     data object Unknown : BbcWriteOutcome()
+
+    /**
+     * The intent was rejected BEFORE entering any store commit (it had already
+     * been superseded/abandoned/applied, or addressed a dead service instance).
+     * No durable key was touched, so this carries NO pollution evidence and must
+     * never install an Unknown fence or grant an enable. It is reported to the
+     * enqueuing caller only so the callback is honest about what happened.
+     */
+    data object Skipped : BbcWriteOutcome()
 }

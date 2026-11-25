@@ -63,6 +63,18 @@ internal const val EVIDENCE_MAX_ENTRIES = 128
 internal const val EVIDENCE_GEN_TTL = 32L
 internal const val FALLBACK_CORRUPT_TYPE = "ClassCastException"
 
+/**
+ * PR #90 Phase 2: APP-ONLY durable "enable pending" marker. It lives in the
+ * same remote-prefs group but is deliberately NOT a PolicySource key: the
+ * Hook gate never reads it, so it cannot change Hook authorization semantics.
+ *
+ * Written in the SAME commit as optin=true on a Confirmed consent grant, and
+ * cleared in the SAME commit as every runtime preference write (the consumer's
+ * enable AND any user OFF). That makes cold-start convergence possible without
+ * ever reversing a durable user OFF: an OFF cleared the marker on the daemon.
+ */
+internal const val BBC_ENABLE_PENDING_PREF_KEY = "bbc_enable_pending"
+
 internal val poisonEvictCount = AtomicLong(0L)
 internal val evidenceEvictCount = AtomicLong(0L)
 internal val identityMismatchCount = AtomicLong(0L)
@@ -687,6 +699,14 @@ class HookPolicyStore(
     // Direct-injected test backends default to absent / failed write.
     private val loadBbcPreactivationOptinRaw: () -> Boolean? = { null },
     private val saveBbcPreactivationOptinRaw: (Boolean) -> Boolean = { false },
+    // Phase 2: the "enable pending" marker is written ATOMICALLY with optin=true
+    // on a Confirmed grant. The legacy single-key seam above is left intact for
+    // its existing callers/tests; production grant uses this paired seam.
+    // Direct-injected test backends default to a failed commit (fail closed).
+    private val saveBbcConsentGrantRaw: () -> Boolean = { false },
+    // Phase 2: every runtime preference write also clears the pending marker
+    // in the SAME commit, so a user OFF atomically cancels a pending enable.
+    private val saveBbcRuntimeAndPendingRaw: (Boolean, Boolean) -> Boolean = { _, _ -> false },
     // PR #90 Phase C (+ final fixer): AUTHORITATIVE durable reads for the app-scoped
     // consent holder. These are `contains()`-style reads from the CURRENT service
     // generation's prefs instance, used only on bind/resync. A failed read is
@@ -808,14 +828,61 @@ class HookPolicyStore(
     // Best-effort single-key commit of the consent preference. Boolean wrapper
     // is true ONLY for a Confirmed write; never infer confirmation from a
     // follow-up read of the optimistic local mMap.
+    @Deprecated(
+        "test compatibility only; use setBbcConsentGrantDetailed / consentCommitAt",
+        ReplaceWith("setBbcConsentGrantDetailed()"),
+    )
     fun setBbcPreactivationOptIn(enabled: Boolean): Boolean =
         setBbcPreactivationOptInDetailed(enabled) is BbcWriteOutcome.Confirmed
 
     // Tri-state write seam mirroring setBbcInjectionEnabledDetailed(): a
     // commit(false)/throw is Unknown, NOT "the old value survived". No hook
     // behavior is asserted: Confirmed only means the daemon persisted the key.
+    @Deprecated(
+        "test compatibility only; use setBbcConsentGrantDetailed / consentCommitAt",
+        ReplaceWith("setBbcConsentGrantDetailed()"),
+    )
     internal fun setBbcPreactivationOptInDetailed(enabled: Boolean): BbcWriteOutcome = try {
         if (saveBbcPreactivationOptinRaw(enabled)) {
+            BbcWriteOutcome.Confirmed(enabled)
+        } else {
+            BbcWriteOutcome.Unknown
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcWriteOutcome.Unknown
+    }
+
+    /**
+     * Phase 2 cold-start fix: the Confirmed consent write that persists
+     * optin=true ALSO persists the app-only enable-pending marker in the same
+     * atomic commit. Only this seam may set the marker. CancellationException
+     * remains an interruption; any other throwable is Unknown (fail closed).
+     */
+    internal fun setBbcConsentGrantDetailed(): BbcWriteOutcome = try {
+        if (saveBbcConsentGrantRaw()) {
+            BbcWriteOutcome.Confirmed(true)
+        } else {
+            BbcWriteOutcome.Unknown
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcWriteOutcome.Unknown
+    }
+
+    /**
+     * Phase 2 cold-start fix: a runtime preference commit also clears the
+     * enable-pending marker in the SAME commit. This is what makes a durable
+     * user OFF cancel a pending enable across process death. [pending] is
+     * always false in production; the parameter documents the atomic contract.
+     */
+    internal fun setBbcRuntimeAndEnablePendingDetailed(
+        enabled: Boolean,
+        pending: Boolean = false,
+    ): BbcWriteOutcome = try {
+        if (saveBbcRuntimeAndPendingRaw(enabled, pending)) {
             BbcWriteOutcome.Confirmed(enabled)
         } else {
             BbcWriteOutcome.Unknown
@@ -1690,6 +1757,50 @@ fun remoteHookPolicyStore(
                 }
             }
         },
+        // Phase 2: ONE atomic edit persists optin=true AND the app-only marker.
+        // The Hook gate ignores the marker; it exists solely so a cold-start
+        // resync can tell "consent granted but effect not yet enabled" from a
+        // durable user OFF (which clears it in the runtime commit below).
+        saveBbcConsentGrantRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                false
+            } else {
+                try {
+                    synchronized(versionCommitLock) {
+                        prefs.edit()
+                            .putBoolean(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN, true)
+                            .putBoolean(BBC_ENABLE_PENDING_PREF_KEY, true)
+                            .commit()
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+        },
+        // Phase 2: every runtime write atomically clears the marker. Used for
+        // the consumer-owned enable AND for the user's OFF toggle.
+        saveBbcRuntimeAndPendingRaw = { enabled, pending ->
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                false
+            } else {
+                try {
+                    synchronized(versionCommitLock) {
+                        prefs.edit()
+                            .putBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, enabled)
+                            .putBoolean(BBC_ENABLE_PENDING_PREF_KEY, pending)
+                            .commit()
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+        },
         readBbcInstallClassificationRaw = {
             val prefs = resolvePrefs()
             if (prefs == null) {
@@ -1827,6 +1938,10 @@ fun remoteHookPolicyStore(
                     // Authoritative runtime seed for Legacy. ABSENT => null; a
                     // default-true fallback here would fabricate a checked state.
                     val runtime = booleanKey(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED)
+                    // APP-ONLY marker, from the SAME copy. It is NOT authorization
+                    // evidence: a wrong-typed value only disables the resync
+                    // enable, it must not mask the durable opt-in/classification.
+                    val enablePending = copy[BBC_ENABLE_PENDING_PREF_KEY] as? Boolean
 
                     // Failure detector ONLY (never legacy evidence): a hostile
                     // package-set value must mask the whole snapshot, matching
@@ -1859,6 +1974,7 @@ fun remoteHookPolicyStore(
                             migrated = migrated,
                             legacyRuntimeEnabled = runtime,
                             coherent = true,
+                            enablePending = enablePending,
                         )
                     }
                 }

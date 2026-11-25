@@ -19,6 +19,7 @@
 // DEVICE-UNVERIFIED: real View styling in MainActivity.renderEffect is not exercised.
 package com.galaxydual.plus
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -824,6 +825,368 @@ class BbcToggleConcurrencyTest {
             appScope.cancel()
             io.close()
         }
+    }
+
+    // --- PR #90 Phase 2: split lanes, explicit same-axis supersession --------
+
+    private fun TestScope.splitLaneCoordinator(
+        sink: Sink,
+        holder: BbcActivationConsentHolder,
+        consentCommit: suspend () -> BbcWriteOutcome = { BbcWriteOutcome.Unknown },
+        consentRead: suspend (Long) -> BbcConsentAuthoritativeRead = { generation ->
+            BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
+        },
+        state: BbcToggleRuntimeState = BbcToggleRuntimeState(initialConfirmed = false),
+    ): BbcToggleCoordinator {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        return BbcToggleCoordinator(
+            scope = appScope, state = state, commit = { sink.commit(it) }, io = dispatcher,
+            consentCommit = consentCommit, consentRead = consentRead, consentHolder = holder,
+        )
+    }
+
+    @Test
+    fun queuedConsentReadNeverReplacesQueuedOff() = runTest {
+        val sink = Sink(initial = false)
+        val gate0 = CompletableDeferred<Unit>()
+        sink.gates[0] = gate0
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val reads = mutableListOf<Long>()
+        val coordinator = splitLaneCoordinator(
+            sink, holder,
+            consentRead = { generation -> reads.add(generation); BbcConsentDurableSnapshot.failClosed().forGeneration(generation) },
+        )
+
+        assertEquals(
+            BbcWorkEnqueue.Accepted,
+            coordinator.submit(1L, true, onResult = {}),
+        )
+        testScheduler.runCurrent()
+        assertEquals(listOf(true), sink.commits) // seq 1 holds the one writer
+
+        var offReplaced = false
+        var offOutcome: BbcWriteOutcome? = null
+        assertEquals(
+            "OFF must be accepted while another commit is in flight",
+            BbcWorkEnqueue.Accepted,
+            coordinator.submit(
+                2L, false,
+                onReplaced = { offReplaced = true },
+                onResult = { offOutcome = it },
+            ),
+        )
+        assertEquals("a read must not displace the queued OFF",
+            BbcWorkEnqueue.Accepted, coordinator.submitConsentRead {})
+
+        gate0.complete(Unit)
+        testScheduler.advanceUntilIdle()
+
+        assertEquals("the read must NOT replace the OFF", listOf(true, false), sink.commits)
+        assertEquals(false, sink.persisted)
+        assertEquals(BbcWriteOutcome.Confirmed(false), offOutcome)
+        assertFalse("the OFF must not be reported as replaced", offReplaced)
+        assertEquals(1, reads.size)
+    }
+
+    @Test
+    fun queuedConsentReadNeverReplacesGrantWrite() = runTest {
+        val sink = Sink(initial = false)
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val gate = CompletableDeferred<Unit>()
+        var consentWrites = 0
+        var outcomes = 0
+        val reads = mutableListOf<Long>()
+        val coordinator = splitLaneCoordinator(
+            sink, holder,
+            consentCommit = {
+                consentWrites++
+                gate.await()
+                BbcWriteOutcome.Confirmed(true)
+            },
+            consentRead = { generation -> reads.add(generation); BbcConsentDurableSnapshot.failClosed().forGeneration(generation) },
+        )
+
+        assertEquals(BbcWorkEnqueue.Accepted, coordinator.submitConsentWrite(1L, 1L) { outcomes++ })
+        testScheduler.runCurrent()
+        assertEquals(1, consentWrites)
+        assertEquals("the read must not take the consent writer's slot",
+            BbcWorkEnqueue.Accepted, coordinator.submitConsentRead {})
+
+        gate.complete(Unit)
+        testScheduler.advanceUntilIdle()
+
+        assertEquals("the grant write must still run", 1, consentWrites)
+        assertEquals(1, outcomes)
+        assertEquals(1, reads.size)
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+        // The same app consumer converges phase 2: exactly one runtime enable.
+        assertEquals(listOf(true), sink.commits)
+    }
+
+    @Test
+    fun sameAxisSupersessionIsExplicitAndReported() = runTest {
+        val sink = Sink(initial = false)
+        val gateToggle = CompletableDeferred<Unit>()
+        sink.gates[0] = gateToggle
+        val gateConsent = CompletableDeferred<Unit>()
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        var consentCalls = 0
+        val coordinator = splitLaneCoordinator(
+            sink, holder,
+            consentCommit = { consentCalls++; gateConsent.await(); BbcWriteOutcome.Unknown },
+        )
+
+        var olderToggleReplaced = false
+        var olderToggleResult: BbcWriteOutcome? = null
+        // The callback belongs to the DISPLACED caller: register it on the
+        // older intent, not on the newer one that does the replacing.
+        assertEquals(BbcWorkEnqueue.Accepted, coordinator.submit(
+            1L, false,
+            onReplaced = { olderToggleReplaced = true },
+            onResult = { olderToggleResult = it },
+        ))
+        // Both submits happen before the consumer is driven: the second one
+        // must explicitly replace the pending first one (not silently drop it).
+        var newerToggleOutcome: BbcWriteOutcome? = null
+        assertEquals("a newer Toggle supersedes an older Toggle only",
+            BbcWorkEnqueue.ReplacedOlder,
+            coordinator.submit(2L, true) { newerToggleOutcome = it },
+        )
+        assertEquals("an older Toggle cannot displace the newer pending Toggle",
+            BbcWorkEnqueue.SupersededByNewer,
+            coordinator.submit(1L, false) {},
+        )
+
+        var olderConsentReplaced = false
+        var olderConsentResult: BbcWriteOutcome? = null
+        assertEquals(BbcWorkEnqueue.Accepted, coordinator.submitConsentWrite(
+            1L, 1L,
+            onReplaced = { olderConsentReplaced = true },
+            onResult = { olderConsentResult = it },
+        ))
+        var newerConsentResult: BbcWriteOutcome? = null
+        assertEquals(BbcWorkEnqueue.ReplacedOlder,
+            coordinator.submitConsentWrite(2L, 1L) { newerConsentResult = it })
+
+        gateToggle.complete(Unit)
+        gateConsent.complete(Unit)
+        testScheduler.advanceUntilIdle()
+
+        assertTrue("the displaced Toggle must be told it was replaced", olderToggleReplaced)
+        assertTrue("the displaced consent write must be told it was replaced", olderConsentReplaced)
+        assertNull("a replaced intent must get no outcome", olderToggleResult)
+        assertNull("a replaced consent write must get no outcome", olderConsentResult)
+        assertEquals(BbcWriteOutcome.Confirmed(true), newerToggleOutcome)
+        assertEquals(BbcWriteOutcome.Unknown, newerConsentResult)
+        assertEquals(listOf(true), sink.commits)
+        assertEquals(1, consentCalls)
+    }
+
+    @Test
+    fun readsCoalesceWithReadsOnlyAndReportDisplacement() = runTest {
+        val sink = Sink(initial = false)
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val gate = CompletableDeferred<Unit>()
+        val reads = mutableListOf<Long>()
+        val coordinator = splitLaneCoordinator(
+            sink, holder,
+            consentCommit = { gate.await(); BbcWriteOutcome.Unknown },
+            consentRead = { generation -> reads.add(generation); BbcConsentDurableSnapshot.failClosed().forGeneration(generation) },
+        )
+        var firstReadCoalesced = false
+        var firstReadResult: BbcConsentAuthoritativeRead? = null
+        var secondReadResult: BbcConsentAuthoritativeRead? = null
+
+        assertEquals(BbcWorkEnqueue.Accepted, coordinator.submitConsentWrite(1L, 1L) {})
+        testScheduler.runCurrent() // consent write holds the writer
+        assertEquals(BbcWorkEnqueue.Accepted,
+            coordinator.submitConsentRead(onCoalesced = { firstReadCoalesced = true }) {
+                firstReadResult = it
+            })
+        assertEquals("the second read replaces only the first read",
+            BbcWorkEnqueue.ReplacedOlder, coordinator.submitConsentRead(onResult = {
+                secondReadResult = it
+            }))
+        assertEquals("a read never displaces user work",
+            BbcWorkEnqueue.Accepted, coordinator.submit(2L, false) {})
+
+        gate.complete(Unit)
+        testScheduler.advanceUntilIdle()
+
+        assertTrue(firstReadCoalesced)
+        assertNull(firstReadResult)
+        assertTrue("the surviving read must run", secondReadResult != null)
+        assertEquals(listOf(1L), reads)
+        assertEquals("OFF still ran behind the coalesced reads", listOf(false), sink.commits)
+    }
+
+    /**
+     * Re-review P1-A: a consent grant already superseded before the consumer
+     * drains its slot must be SKIPPED before the store seam is entered. No
+     * optin/marker write, and the enqueuing caller gets an honest non-granting
+     * outcome instead of a fabricated Confirmed/Unknown.
+     */
+    @Test
+    fun supersededConsentWrite_isSkippedBeforeAnyStoreWrite() = runTest {
+        val sink = Sink(initial = false)
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        var consentCalls = 0
+        val outcomes = mutableListOf<BbcWriteOutcome>()
+        val coordinator = splitLaneCoordinator(
+            sink, holder,
+            consentCommit = { consentCalls++; BbcWriteOutcome.Confirmed(true) },
+        )
+
+        val grantSeq = holder.startConsentIntent()
+        holder.supersedeActiveIntent() // OFF/cancel arrives before the drain
+        assertEquals(BbcWorkEnqueue.Accepted,
+            coordinator.submitConsentWrite(grantSeq, 1L, onResult = { outcomes.add(it) }))
+        testScheduler.advanceUntilIdle()
+
+        assertEquals("no superseded grant may enter the consent store", 0, consentCalls)
+        assertEquals(listOf<BbcWriteOutcome>(BbcWriteOutcome.Skipped), outcomes)
+        assertEquals(0, sink.commits.size)
+        assertFalse(holder.currentState() is BbcActivationConsentState.Granted)
+    }
+
+    // --- Phase 2 fixer (BLOCKING 4): never promise work to a dead consumer ---
+
+    @Test
+    fun deadConsumer_neverReportsAcceptedAndNeverRunsWork() = runTest {
+        val sink = Sink(initial = false)
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { sink.commit(it) }, io = dispatcher,
+        )
+        testScheduler.runCurrent()
+        assertTrue("consumer must be alive before cancellation", coordinator.isConsumerActive())
+        appScope.cancel()
+        testScheduler.runCurrent()
+        assertFalse("consumer must be dead after app-scope cancellation", coordinator.isConsumerActive())
+
+        var toggleResult: BbcWriteOutcome? = null
+        var toggleReplaced = false
+        var consentResult: BbcWriteOutcome? = null
+        var consentReplaced = false
+        var readResult: BbcConsentAuthoritativeRead? = null
+        var readCoalesced = false
+        assertEquals("a dead consumer cannot accept a toggle", BbcWorkEnqueue.Rejected,
+            coordinator.submit(1L, false, onReplaced = { toggleReplaced = true },
+                onResult = { toggleResult = it }))
+        assertEquals("a dead consumer cannot accept a consent write", BbcWorkEnqueue.Rejected,
+            coordinator.submitConsentWrite(2L, 1L, onReplaced = { consentReplaced = true },
+                onResult = { consentResult = it }))
+        assertEquals("a dead consumer cannot accept a read", BbcWorkEnqueue.Rejected,
+            coordinator.submitConsentRead(onCoalesced = { readCoalesced = true },
+                onResult = { readResult = it }))
+        testScheduler.advanceUntilIdle()
+
+        assertEquals(0, sink.commits.size)
+        assertNull("a rejected toggle must get no outcome", toggleResult)
+        assertNull("a rejected consent write must get no outcome", consentResult)
+        assertNull("a rejected read must get no result", readResult)
+        assertFalse("nothing was displaced, so no replaced callback may fire", toggleReplaced)
+        assertFalse(consentReplaced)
+        assertFalse(readCoalesced)
+    }
+
+    @Test
+    fun commitCancellationWhileAppScopeAlive_mapsToUnknownAndKeepsConsumer() = runTest {
+        var commitCalls = 0
+        val outcomes = mutableListOf<BbcWriteOutcome>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { commitCalls++; throw CancellationException("seam interrupted") },
+            io = dispatcher,
+        )
+        assertEquals(BbcWorkEnqueue.Accepted, coordinator.submit(1L, false, onResult = { outcomes.add(it) }))
+        testScheduler.advanceUntilIdle()
+        assertEquals("a commit CancellationException is not an app-scope shutdown",
+            listOf(BbcWriteOutcome.Unknown), outcomes)
+        assertTrue("the single app-lifetime consumer must survive", coordinator.isConsumerActive())
+
+        assertEquals(BbcWorkEnqueue.Accepted, coordinator.submit(2L, true, onResult = { outcomes.add(it) }))
+        testScheduler.advanceUntilIdle()
+        assertEquals("a second submit must still run on the same consumer", 2, commitCalls)
+    }
+
+    @Test
+    fun consentCommitCancellationWhileAppScopeAlive_installsFenceNotCrash() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val outcomes = mutableListOf<BbcWriteOutcome>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { BbcWriteOutcome.Confirmed(it) }, io = dispatcher,
+            consentCommit = { throw CancellationException("binder interrupted") },
+            consentHolder = holder,
+        )
+        assertEquals(BbcWorkEnqueue.Accepted,
+            coordinator.submitConsentWrite(1L, 1L, onResult = { outcomes.add(it) }))
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(BbcWriteOutcome.Unknown), outcomes)
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+        assertTrue(coordinator.isConsumerActive())
+    }
+
+    /**
+     * Regression: a toggle whose commit was skipped before touching any store
+     * must leave the app-scoped effect holder untouched — no fence advance, no
+     * erasure of a prior Confirmed(true), no Unknown status emission — while the
+     * enqueuing caller still receives the honest Skipped outcome.
+     */
+    @Test
+    fun skippedToggleOutcome_leavesHolderUntouchedButStillCallsBack() = runTest {
+        val state = BbcToggleRuntimeState(initialConfirmed = true)
+        assertTrue(state.mark(BbcWriteOutcome.Confirmed(true), 1L))
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        var commitOutcome: BbcWriteOutcome = BbcWriteOutcome.Skipped
+        val commits = mutableListOf<Boolean>()
+        val outcomes = mutableListOf<BbcWriteOutcome>()
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = state,
+            commit = { value -> commits.add(value); commitOutcome },
+            io = dispatcher,
+        )
+
+        assertEquals(BbcWorkEnqueue.Accepted,
+            coordinator.submit(2L, false, onResult = { outcomes.add(it) }))
+        testScheduler.advanceUntilIdle()
+
+        assertEquals(listOf(false), commits)
+        assertEquals(listOf<BbcWriteOutcome>(BbcWriteOutcome.Skipped), outcomes)
+        assertEquals("no durable key was touched: prior confirmation survives",
+            true, state.confirmedOrUnknown)
+        assertEquals("Skipped must never emit an Unknown effect status",
+            BbcEffectStatus.Confirmed(true), state.effectStatus.value)
+
+        // Fence probe: Skipped did not advance state to seq2, so a real Confirmed
+        // at that same sequence must still apply.
+        commitOutcome = BbcWriteOutcome.Confirmed(false)
+        assertEquals(BbcWorkEnqueue.Accepted,
+            coordinator.submit(2L, false, onResult = { outcomes.add(it) }))
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false, false), commits)
+        assertEquals(
+            listOf<BbcWriteOutcome>(BbcWriteOutcome.Skipped, BbcWriteOutcome.Confirmed(false)),
+            outcomes,
+        )
+        assertEquals(false, state.confirmedOrUnknown)
     }
 
     @Test

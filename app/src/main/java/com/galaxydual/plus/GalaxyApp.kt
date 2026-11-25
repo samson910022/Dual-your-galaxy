@@ -47,6 +47,11 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         PolicyTxCoordinator(repairHintStore = hintStore)
     }
 
+    // PR #90 Phase 2 (A2/E1): ONE app-scoped sequence domain for effect toggles
+    // and consent dialog intents. A rebuilt Activity's OFF must be comparable
+    // with (and newer than) a grant accepted before the rotation.
+    private val bbcConsentIntentSequence = AtomicLong(0L)
+
     // PR #74 R3-1: app-process-local BBC toggle state (last KNOWN write outcome
     // + monotonic intent sequence). Lazy because the XposedService binder is not
     // bound yet in Application.onCreate(); first access reinitializes from the
@@ -59,6 +64,7 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
             initialConfirmed = remoteHookPolicyStore {
                 remotePreferences(PolicySource.POLICY_PREFS_NAME)
             }.isBbcInjectionEnabled(),
+            sequence = bbcConsentIntentSequence,
         )
     }
 
@@ -68,7 +74,7 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     // legacy default-true runtime flag — that was the fresh-install ON bug.
     // Survives every store/controller/Activity rebuild in this process.
     internal val bbcActivationConsentHolder: BbcActivationConsentHolder by lazy {
-        BbcActivationConsentHolder()
+        BbcActivationConsentHolder(sequence = bbcConsentIntentSequence)
     }
 
     // PR #74 R3 D05: the ONE BBC write serializer for this app process. Built
@@ -83,17 +89,23 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
             scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
             state = bbcToggleRuntimeState,
             commit = { enabled ->
+                // Phase 2 cold-start fix: EVERY runtime commit clears the
+                // app-only enable-pending marker in the SAME atomic edit. This
+                // is what makes a durable user OFF cancel a pending enable.
                 remoteHookPolicyStore {
                     remotePreferences(PolicySource.POLICY_PREFS_NAME)
-                }.setBbcInjectionEnabledDetailed(enabled)
+                }.setBbcRuntimeAndEnablePendingDetailed(enabled, pending = false)
             },
             // PR #90 Phase C: consent grant + authoritative resync share the
             // SAME app-lifetime consumer / IO lane as the runtime opt-out. No
             // binder or versionCommitLock wait ever happens on the Main thread.
-            consentCommit = {
-                remoteHookPolicyStore {
-                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
-                }.setBbcPreactivationOptInDetailed(true)
+            // Phase 2 (B3): generation-aware. The snapshot captured at bind
+            // entry pairs (generation, service, provider); prefs are resolved
+            // on this IO lane and the identity is verified BEFORE and AFTER the
+            // commit. A reply from a dead generation can never grant, and the
+            // fence is attributed to the instance actually touched.
+            consentCommitAt = { capturedGeneration ->
+                performBbcConsentWrite(capturedGeneration)
             },
             consentRead = { generation ->
                 val store = remoteHookPolicyStore {
@@ -170,6 +182,107 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         isBindSnapshotCurrent(attempt) &&
             bbcClassificationBoundPrefs.get() === attempt.resolvedPrefs
 
+    // PR #90 Phase 2 (B3): the same atomic bind-snapshot discipline for the
+    // consent OPT-IN commit. A user accepts at generation N; the commit may run
+    // after binder death/rebind. Capturing `serviceRef` at execution time would
+    // pair gen N with gen N+1 prefs, report a false grant, and let a gen N+1
+    // resync clear the fence at gen N (minOf(current, captured)). Instead the
+    // (generation, service, provider) triple is published atomically at bind
+    // entry, checked before AND after the blocking commit, and the touched
+    // generation is what the holder fences.
+    private class BbcConsentWriteAttempt(
+        val generation: Long,
+        val service: XposedService?,
+        val provider: () -> SharedPreferences?,
+    ) {
+        @Volatile
+        var resolvedPrefs: SharedPreferences? = null
+    }
+
+    private val bbcConsentWriteSnapshotLock = Any()
+    private val bbcConsentWriteAttempt = AtomicReference<BbcConsentWriteAttempt?>(null)
+    private val bbcConsentWriteBoundPrefs = AtomicReference<SharedPreferences?>(null)
+
+    private fun isBbcConsentWriteSnapshotCurrent(attempt: BbcConsentWriteAttempt): Boolean {
+        val current = bbcConsentWriteAttempt.get() ?: return false
+        return current === attempt &&
+            bbcConsentServiceGeneration.get() == attempt.generation &&
+            serviceRef.get() === attempt.service &&
+            bbcClassificationPrefsProvider === attempt.provider
+    }
+
+    private fun isBbcConsentWriteAttemptCurrent(attempt: BbcConsentWriteAttempt): Boolean =
+        isBbcConsentWriteSnapshotCurrent(attempt) &&
+            bbcConsentWriteBoundPrefs.get() === attempt.resolvedPrefs
+
+    /**
+     * The generation-aware consent commit seam, executed on the app IO lane.
+     * The generation comes from the user-intent snapshot; prefs are resolved
+     * from that SAME snapshot. On any mismatch the outcome is forced to Unknown:
+     *  - if NO commit entered (stale snapshot / prefs null / failed pre-check),
+     *    the NO-GENERATION sentinel 0L is reported — no local pollution exists,
+     *    so no fence (especially not a spurious CURRENT-generation one) is
+     *    installed;
+     *  - if the commit did enter and only the REPLY is stale, the holder fences
+     *    the instance actually touched, never a re-sampled current generation.
+     */
+    private fun performBbcConsentWrite(capturedGeneration: Long): BbcConsentWriteResult {
+        val attempt = bbcConsentWriteAttempt.get()
+        if (attempt == null ||
+            attempt.generation != capturedGeneration ||
+            !isBbcConsentWriteSnapshotCurrent(attempt)
+        ) {
+            // NO-GENERATION sentinel (0L): no commit entered, so NO local mMap
+            // was polluted and there is nothing to fence. Reporting the current
+            // generation here used to install a spurious current-gen Unknown
+            // fence that blocked that very generation's authoritative resync
+            // until gen 3. `fenceForTouchedGeneration` keeps the old fence on <=0.
+            return BbcConsentWriteResult(BbcWriteOutcome.Unknown, NO_CONSENT_COMMIT_GENERATION)
+        }
+        val prefs = try {
+            attempt.provider()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            null
+        }
+        if (prefs == null) {
+            // Still no commit: no pollution, no fence (see above).
+            return BbcConsentWriteResult(BbcWriteOutcome.Unknown, NO_CONSENT_COMMIT_GENERATION)
+        }
+        attempt.resolvedPrefs = prefs
+        val safeToCommit = synchronized(bbcConsentWriteSnapshotLock) {
+            if (!isBbcConsentWriteSnapshotCurrent(attempt)) false else {
+                bbcConsentWriteBoundPrefs.set(prefs)
+                isBbcConsentWriteAttemptCurrent(attempt)
+            }
+        }
+        if (!safeToCommit) {
+            // A rebind won the race BEFORE the write: never commit against a
+            // serviceRef whose generation differs from the captured one, and
+            // never fence the NEW generation with an outcome that never ran.
+            return BbcConsentWriteResult(BbcWriteOutcome.Unknown, NO_CONSENT_COMMIT_GENERATION)
+        }
+        // ONE commit persists optin=true AND the app-only enable-pending marker.
+        // A durable OFF clears that marker in its own runtime commit, so a
+        // cold-start resync can never reverse it. The Hook ignores the marker.
+        val outcome = try {
+            remoteHookPolicyStore { prefs }.setBbcConsentGrantDetailed()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            BbcWriteOutcome.Unknown
+        }
+        // Verify AFTER the blocking commit. The write really landed on the
+        // captured generation's prefs instance; a rebind in between only
+        // invalidates the reply (Unknown), it does not re-label the fence.
+        val stillCurrent = isBbcConsentWriteAttemptCurrent(attempt)
+        return BbcConsentWriteResult(
+            if (stillCurrent) outcome else BbcWriteOutcome.Unknown,
+            attempt.generation,
+        )
+    }
+
     /** Resolve the consent state from durable keys on the app IO lane. */
     private fun refreshBbcActivationConsent() {
         bbcToggleCoordinator.submitConsentRead()
@@ -238,6 +351,19 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
             provider = bbcClassificationPrefsProvider,
         )
         bbcClassificationAttempt.set(attempt)
+        // Phase 2 B3: publish the consent-write snapshot atomically with the
+        // same bind entry. Generation, service identity and provider are fixed
+        // before any IO coroutine can capture them.
+        synchronized(bbcConsentWriteSnapshotLock) {
+            bbcConsentWriteAttempt.set(
+                BbcConsentWriteAttempt(
+                    generation = generation,
+                    service = serviceRef.get(),
+                    provider = bbcClassificationPrefsProvider,
+                ),
+            )
+            bbcConsentWriteBoundPrefs.set(null)
+        }
         // PR #90 P1-1: confirm classification on EVERY bind, including a rebind
         // that arrives without a death callback (or whose stale death callback
         // lost the CAS). A rebind bumps the consent generation, which resets
@@ -323,6 +449,12 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
                 bbcClassificationAttempt.set(null)
                 bbcClassificationBoundPrefs.set(null)
             }
+            // Phase 2 B3: invalidate the consent-write snapshot too. An in-flight
+            // write must see the mismatch both before and after its commit.
+            synchronized(bbcConsentWriteSnapshotLock) {
+                bbcConsentWriteAttempt.set(null)
+                bbcConsentWriteBoundPrefs.set(null)
+            }
             // 通知監聽者服務已斷線,讓呼叫端重新評估 (fail-closed)。
             notifyServiceListeners()
         }
@@ -344,6 +476,13 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     }
 
     companion object {
+        /**
+         * NO-GENERATION sentinel for a consent commit that never entered: 0L is
+         * treated by [BbcActivationConsentHolder.fenceForTouchedGeneration] as
+         * "keep the existing fence", so no spurious current-gen fence is set.
+         */
+        const val NO_CONSENT_COMMIT_GENERATION = 0L
+
         private val serviceRef = AtomicReference<XposedService?>(null)
 
         // 5.1.5:service 綁定監聽者 (CopyOnWriteArrayList 供併發安全)。

@@ -75,6 +75,10 @@ internal class BbcConsentTestHarness(
     @Volatile
     private var pendingIntentChecked: Boolean? = null
 
+    /** The app-consumer-owned enable this UI has already observed, at most once. */
+    @Volatile
+    private var recordedEnableSequence: Long = -1L
+
     /** The ONE checkbox write path, mirroring MainActivity's setToggleChecked. */
     private fun setToggleChecked(value: Boolean) {
         lastSettledChecked = value
@@ -127,20 +131,25 @@ internal class BbcConsentTestHarness(
     private fun renderConsentState(state: BbcActivationConsentState) {
         if (!alive) return
         currentAuthorization = state
-        // P2: Granted is AUTHORIZATION only. If this UI (or its destroyed
-        // predecessor) never handed the enable to the effect controller, replay
-        // it exactly once. The holder's consume is atomic, so a racing live
-        // callback can never produce a second toggle.
-        // MainActivity reads its cached `currentEffect` axis (fed by the
-        // controller's effect collector), not a fresh StateFlow read here.
+        // Phase 2: the app-scoped consumer that confirmed the opt-in key owns
+        // the phase-2 effect write. The UI only OBSERVES it (exactly once); it
+        // never dispatches a second toggle from a StateFlow replay or a dead
+        // Activity callback. The fallback token covers a holder used directly
+        // without the coordinator consumer (legacy handoff tests).
         val alreadyEnabled = (currentEffect as? BbcEffectStatus.Confirmed)?.value == true
-        if (state is BbcActivationConsentState.Granted &&
-            !dialogPending &&
-            !alreadyEnabled &&
-            holder.consumePendingEnableForReplay(holder.currentGeneration())
-        ) {
-            toggleCalls.add(true)
-            controller.onToggle(true)
+        if (state is BbcActivationConsentState.Granted && !dialogPending) {
+            // The effect status may already have been marked Confirmed(true) by
+            // the consumer's enable commit before this collector runs, so the
+            // app-owned observation must NOT be gated on alreadyEnabled.
+            if (holder.isEnableHandledBy(activeSeq) && recordedEnableSequence != activeSeq) {
+                recordedEnableSequence = activeSeq
+                toggleCalls.add(true)
+            } else if (!alreadyEnabled &&
+                holder.consumePendingEnableForReplay(holder.currentGeneration())
+            ) {
+                toggleCalls.add(true)
+                controller.onToggle(true)
+            }
         }
         renderToggle()
     }
@@ -160,11 +169,9 @@ internal class BbcConsentTestHarness(
         if (!alive) return
         // OFF short-circuits BEFORE any consent state read.
         if (!checked) {
-            val stale = activeSeq
-            if (stale != 0L) {
-                activeSeq = holder.nextIntentSequence()
-                holder.abandonIntent(stale)
-            }
+            // Phase 2: unconditional APP-SCOPED supersession — a rebuilt UI
+            // cannot lose the OFF just because its local sequence was 0.
+            activeSeq = holder.supersedeActiveIntent()
             dialogPending = false
             controller.setConsentPending(false)
             pendingIntentChecked = false
@@ -179,7 +186,7 @@ internal class BbcConsentTestHarness(
         consentStateReads++
         val state = holder.currentState()
         if (state.requiresConsentFor(true)) {
-            val seq = holder.nextIntentSequence()
+            val seq = holder.startConsentIntent()
             activeSeq = seq
             dialogPending = true
             controller.setConsentPending(true)
@@ -195,7 +202,7 @@ internal class BbcConsentTestHarness(
 
     /** Positive dialog callback; a superseded/abandoned intent is dropped. */
     fun accept(seq: Long = activeSeq) {
-        if (!alive || seq != activeSeq || seq == 0L) return
+        if (!alive || seq != activeSeq || !holder.isActiveIntent(seq)) return
         // P2: note the enable app-scoped BEFORE enqueueing the consent write.
         val generation = holder.currentGeneration()
         holder.notePendingEnable(seq, generation)
@@ -204,27 +211,23 @@ internal class BbcConsentTestHarness(
         pendingIntentChecked = true
         coordinator.state.noteLatestUserIntent(true)
         renderToggle()
-        coordinator.submitConsentWrite(seq, generation) { outcome ->
+        coordinator.submitConsentWrite(seq, generation, onResult = { outcome ->
             // Mirrors the Main-thread result hop: still sequence/disposal guarded.
             if (!alive || seq != activeSeq) return@submitConsentWrite
             when (outcome) {
-                is BbcWriteOutcome.Confirmed -> {
-                    // Exactly-once: a rebuilt UI may already have replayed it.
-                    if (holder.consumePendingEnable(seq, generation)) {
-                        toggleCalls.add(true)
-                        controller.onToggle(true)
-                    }
-                }
+                is BbcWriteOutcome.Confirmed -> Unit // no UI write: consumer owns it
                 BbcWriteOutcome.Unknown -> failureToasts.add(seq)
+                // A superseded intent was rejected before any commit: it is not
+                // a failed write, so no toast and no UI state change.
+                BbcWriteOutcome.Skipped -> Unit
             }
-        }
+        })
     }
 
     /** Cancel/back/outside/show-failure: zero writes, prior value restored. */
     fun cancel(seq: Long = activeSeq) {
-        if (!alive || seq != activeSeq || seq == 0L) return
-        activeSeq = holder.nextIntentSequence()
-        holder.abandonIntent(seq)
+        if (!alive || !holder.isActiveIntent(seq) || seq == 0L) return
+        activeSeq = holder.supersedeActiveIntent()
         dialogPending = false
         controller.setConsentPending(false)
         pendingIntentChecked = lastSettledChecked

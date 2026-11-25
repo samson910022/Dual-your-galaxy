@@ -81,6 +81,8 @@ class BbcPreactivationConsentTest {
             listener.contains("shouldRequestPreactivationOptIn("))
         assertTrue("OFF must invalidate any pending consent dialog",
             listener.contains("dismissBbcConsentDialogSilently()"))
+        assertTrue("OFF must supersede the app-scoped intent unconditionally",
+            listener.contains("consentHolder.supersedeActiveIntent()"))
     }
 
     @Test
@@ -145,22 +147,29 @@ class BbcPreactivationConsentTest {
             accept.contains("submitConsentWrite("))
         assertTrue("accept must fence with the captured service generation",
             accept.contains("consentHolder.currentGeneration()"))
-        assertTrue("confirmed opt-in must continue to the unchanged controller",
-            accept.contains("bbcToggleController?.onToggle(checked)"))
+        assertTrue("the dialog callback must be presentation-only: the app consumer owns the enable",
+            accept.contains("submitConsentWrite(") && !accept.contains("bbcToggleController?.onToggle("))
+        assertTrue("Unknown must be the prefix of the durable-fence failure branch",
+            accept.contains("if (outcome is BbcWriteOutcome.Unknown)"))
         assertTrue("Unknown must render the durable-fence failure path",
-            accept.contains("BbcWriteOutcome.Unknown -> markPreactivationOptInFailed(seq)"))
-        assertTrue("result must hop back to Main with a sequence guard",
-            accept.contains("mainHandler.post") && accept.contains("seq != activeBbcConsentSequence"))
+            accept.contains("markPreactivationOptInFailed(seq)"))
+        assertTrue("presentation must hop back to Main with an app-scoped sequence guard",
+            accept.contains("mainHandler.post") && accept.contains("!consentHolder.isActiveIntent(seq)"))
         assertFalse("no blocking preference write on Main",
             accept.contains("setBbcPreactivationOptInDetailed("))
-        assertTrue("the opt-in write is ordered BEFORE the effect toggle",
-            accept.indexOf("submitConsentWrite(") < accept.indexOf("onToggle("))
+        assertTrue("the checkpoint must not rely on a state-flow replay for the durable enable",
+            !main.contains("consumePendingEnableForReplay"))
 
         val galaxy = prodFile("GalaxyApp.kt").readText()
-        assertTrue("the owner app must own the opt-in commit seam",
-            galaxy.contains("setBbcPreactivationOptInDetailed(true)"))
-        assertTrue("consent I/O must share the app serializer",
-            galaxy.contains("consentCommit = {"))
+        assertTrue("the owner app must own the paired opt-in + marker commit seam",
+            galaxy.contains("setBbcConsentGrantDetailed()"))
+        assertTrue("runtime writes must clear the app-only marker in the same commit",
+            galaxy.contains("setBbcRuntimeAndEnablePendingDetailed(enabled, pending = false)"))
+        assertTrue("consent I/O must share the generation-aware app serializer",
+            galaxy.contains("consentCommitAt = {") && galaxy.contains("performBbcConsentWrite("))
+        val coordinator = prodFile("BbcToggleCoordinator.kt").readText()
+        assertTrue("the app consumer must drive the phase-2 effect enable",
+            coordinator.contains("driveConsumerEnable(") && coordinator.contains("maybeDriveResyncEnable("))
 
         val store = prodFile("HookPolicyStore.kt").readText()
         assertTrue("the durable opt-in key must still be written",
@@ -172,9 +181,8 @@ class BbcPreactivationConsentTest {
     @Test
     fun cancelRestoresConfirmableStateWithZeroWrites() {
         val cancel = block(main, "fun cancelPreactivationOptIn(")
-        assertTrue("cancel must invalidate the intent so a late write is dropped",
-            cancel.contains("consentHolder.nextIntentSequence()"))
-        assertTrue(cancel.contains("consentHolder.abandonIntent(seq)"))
+        assertTrue("cancel must supersede the APP-SCOPED intent so a late write is dropped",
+            cancel.contains("consentHolder.supersedeActiveIntent()"))
         assertTrue("cancel must atomically restore the controller UI state",
             cancel.contains("bbcToggleController?.restoreConsentUi(lastSettledChecked)"))
         assertTrue(cancel.contains("setChecked(lastSettledChecked)"))

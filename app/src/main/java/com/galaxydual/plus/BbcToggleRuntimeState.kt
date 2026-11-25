@@ -42,6 +42,12 @@ import kotlinx.coroutines.flow.asStateFlow
  */
 internal class BbcToggleRuntimeState(
     initialConfirmed: Boolean? = null,
+    /**
+     * Shared with [BbcActivationConsentHolder] in production so a user OFF and
+     * a pending consent intent are compared in ONE app-scoped sequence domain.
+     * A standalone holder keeps its own counter unless one is supplied.
+     */
+    private val sequence: AtomicLong = AtomicLong(),
 ) {
     /**
      * Immutable snapshot so the sequence fence and value can move in one CAS.
@@ -53,9 +59,6 @@ internal class BbcToggleRuntimeState(
         val value: Boolean?,
         val confirmed: Boolean,
     )
-
-    /** User intents issued in this process (never reset by a UI rebuild). */
-    private val sequence = AtomicLong(0L)
 
     /**
      * Highest applied sequence and confirmed/unknown value held together.
@@ -175,6 +178,7 @@ internal class BbcToggleRuntimeState(
 
     /**
      * Fold a write outcome into the app-scoped state; Unknown clears confirmation.
+     * [BbcWriteOutcome.Skipped] is a true no-op (see [applyOutcome]).
      *
      * Sequence-aware: an outcome whose [sequence] is `<=` the highest sequence
      * already applied is ignored (a stale in-flight commit must not overwrite
@@ -204,18 +208,25 @@ internal class BbcToggleRuntimeState(
      * before publishing, so a late/duplicate failure can never grey out the UI
      * and a late success can never falsely clear it.
      *
+     * [BbcWriteOutcome.Skipped] is handled BEFORE this CAS: it means no durable
+     * key was touched and no pollution evidence exists, so it must not advance
+     * the fence, erase a prior [BbcWriteOutcome.Confirmed] value, or emit an
+     * Unknown status (which would show a false "effect unverified" toast). It
+     * still reports `true` so the coordinator delivers the caller's callback.
+     *
      * @param targetSequence non-null for the sequence-aware overload; `null`
      *   for the legacy overload, which leaves the fence untouched.
      */
     @Synchronized // keep the CAS state and the UI projection in one critical section
     private fun applyOutcome(outcome: BbcWriteOutcome, targetSequence: Long?): Boolean {
+        if (outcome is BbcWriteOutcome.Skipped) return true
         val value = when (outcome) {
             is BbcWriteOutcome.Confirmed -> outcome.value
-            BbcWriteOutcome.Unknown -> null
+            BbcWriteOutcome.Unknown, BbcWriteOutcome.Skipped -> null
         }
         val status = when (outcome) {
             is BbcWriteOutcome.Confirmed -> BbcEffectStatus.Confirmed(outcome.value)
-            BbcWriteOutcome.Unknown -> BbcEffectStatus.Unknown
+            BbcWriteOutcome.Unknown, BbcWriteOutcome.Skipped -> BbcEffectStatus.Unknown
         }
         while (true) {
             val cur = state.get()

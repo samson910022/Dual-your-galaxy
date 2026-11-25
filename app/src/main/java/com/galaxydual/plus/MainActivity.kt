@@ -321,11 +321,11 @@ class MainActivity : ComponentActivity() {
     // 舊實例（只切斷 UI 回呼），Activity.onDestroy 再 dispose 最後一個，避免孤兒
     // 回呼持有舊 View。寫入序列化與在飛提交由 GalaxyApp 的 app 層級 coordinator 持有。
     private var bbcToggleController: BbcInjectionToggleController? = null
-    // PR #90 Phase C: app-scoped consent-intent fencing. A callback carrying an
-    // older sequence (stale dialog, superseded accept, post-rotation result) is
-    // dropped; the latest user intent always wins. Sequence values come from
-    // the app-scoped holder, so they stay monotonic across UI rebuilds.
-    private var activeBbcConsentSequence: Long = 0L
+    // PR #90 Phase 2: the active consent intent sequence is APP-SCOPED in
+    // BbcActivationConsentHolder (startConsentIntent / isActiveIntent /
+    // supersedeActiveIntent). A rebuilt Activity therefore still invalidates a
+    // pending grant on OFF; no per-Activity field can let a replayed enable
+    // overwrite a newer OFF.
     // Dedupe the honest "consent persistence Unknown" toast per intent (the
     // existing unknownToastShown dedupes the separate effect-unknown toast).
     private var consentFailureToastSequence: Long = -1L
@@ -2762,25 +2762,14 @@ class MainActivity : ComponentActivity() {
 
         fun renderConsentState(state: BbcActivationConsentState) {
             currentAuthorization = state
-            // P2 convergence: a Confirmed consent commit grants AUTHORIZATION
-            // only — it does NOT write the runtime opt-out preference. If the
-            // Activity that accepted was rotated away before its UI callback
-            // handed the enable to the controller, this rebuilt UI replays it
-            // EXACTLY ONCE (the holder consume is atomic). Without no confirmed
-            // effect mark yet, leaving the box ON would contradict effect OFF.
-            // "Matching" mark means Confirmed(true): a stale Confirmed(false)
-            // from a prior OFF is exactly the contradiction being repaired.
-            val alreadyEnabled = (currentEffect as? BbcEffectStatus.Confirmed)?.value == true
-            if (state is BbcActivationConsentState.Granted &&
-                !consentDialogPending &&
-                !alreadyEnabled &&
-                consentHolder.consumePendingEnableForReplay(consentHolder.currentGeneration())
-            ) {
-                bbcToggleController?.onToggle(true)
-            }
-            // A newer Granted emission can no longer flip a confirmed OFF back
-            // ON: the ONE projection reads the effect axis, not a hardcoded
-            // authorization-derived value.
+            // Phase 2: this collector is PRESENTATION-ONLY. The app-scoped IO
+            // consumer that confirmed the opt-in key also writes the phase-2
+            // runtime enable (idempotently by generation/sequence), so process
+            // death, rotation and a dropped callback cannot lose the durable
+            // enable. A state-flow replay must never issue a second toggle, nor
+            // override a newer OFF. Authorization alone still never fabricates
+            // a checked ON: only the ONE projection (effect axis + app-scoped
+            // intent) decides the checkbox value.
             renderToggle()
         }
 
@@ -2825,10 +2814,13 @@ class MainActivity : ComponentActivity() {
         // before touching the UI; the holder has already folded the durable
         // grant/fence in on the consumer thread.
         fun acceptPreactivationOptIn(seq: Long, checked: Boolean) {
-            if (isFinishing || isDestroyed || seq != activeBbcConsentSequence) return
-            // P2: record the pending ENABLE app-scoped BEFORE enqueueing. A
-            // rotation can drop this Activity's callback; the rebuilt Activity
-            // must still converge the effect with the now-Granted checkbox.
+            if (isFinishing || isDestroyed || !consentHolder.isActiveIntent(seq)) return
+            // App-scoped: a rebuilt Activity/OFF supersedes this intent, so a
+            // late accept from a dead dialog can never write a stale grant.
+            // Legacy test-seam bookkeeping: no production code consumes this
+            // pending-enable record. The CONSUMER that confirms the opt-in owns
+            // the phase-2 durable enable, so this note is NOT part of production
+            // convergence (see BbcActivationConsentHolder's test-only seams).
             val generation = consentHolder.currentGeneration()
             consentHolder.notePendingEnable(seq, generation)
             consentDialogPending = false
@@ -2847,30 +2839,33 @@ class MainActivity : ComponentActivity() {
             app.bbcToggleCoordinator.submitConsentWrite(
                 sequence = seq,
                 generation = generation,
-            ) { outcome ->
-                mainHandler.post {
-                    if (isFinishing || isDestroyed || seq != activeBbcConsentSequence) return@post
-                    when (outcome) {
-                        is BbcWriteOutcome.Confirmed -> {
-                            // Exactly-once handoff: a rebuilt UI may already
-                            // have replayed the enable while this was queued.
-                            if (consentHolder.consumePendingEnable(seq, generation)) {
-                                bbcToggleController?.onToggle(checked)
-                            }
-                        }
-                        BbcWriteOutcome.Unknown -> markPreactivationOptInFailed(seq)
+                onResult = { outcome ->
+                // Presentation-only, including the Main-thread hop for Toast.
+                // The consumer that wrote the opt-in key has already folded the
+                // durable grant/fence and, on Confirmed, has enqueued the runtime
+                // enable itself — no Activity/Settings reopen and no state-flow
+                // replay is required to complete the durable enable.
+                if (outcome is BbcWriteOutcome.Unknown) {
+                    mainHandler.post {
+                        if (isFinishing || isDestroyed ||
+                            !consentHolder.isActiveIntent(seq)
+                        ) return@post
+                        markPreactivationOptInFailed(seq)
                     }
                 }
-            }
+                },
+            )
         }
 
         // Cancel/back/outside/show-failure: restore the confirmable pre-dialog
         // value with ZERO writes, invalidate the intent so a late commit result
         // is dropped, and make NO claim about the hook effect.
         fun cancelPreactivationOptIn(seq: Long) {
-            if (isFinishing || isDestroyed || seq != activeBbcConsentSequence) return
-            activeBbcConsentSequence = consentHolder.nextIntentSequence()
-            consentHolder.abandonIntent(seq)
+            if (isFinishing || isDestroyed || !consentHolder.isActiveIntent(seq)) return
+            // App-scoped supersession: invalidate the dialog intent even when a
+            // rebuilt Activity's local field was never set, so a late accept or
+            // a replayed enable cannot override this cancel.
+            consentHolder.supersedeActiveIntent()
             consentDialogPending = false
             bbcToggleController?.setConsentPending(false)
             dismissBbcConsentDialogSilently()
@@ -2914,11 +2909,11 @@ class MainActivity : ComponentActivity() {
             // binder, no commit lock, no consent query. Invalidate a pending
             // dialog silently so a late accept cannot resurrect the grant.
             if (!checked) {
-                val stale = activeBbcConsentSequence
-                if (stale != 0L) {
-                    activeBbcConsentSequence = consentHolder.nextIntentSequence()
-                    consentHolder.abandonIntent(stale)
-                }
+                // OFF always supersedes app-wide — even when this Activity was
+                // rebuilt and has no local dialog sequence. The app-scoped
+                // holder rejects a later grant/OUT-of-order enable and a late
+                // accept callback from the old dialog.
+                consentHolder.supersedeActiveIntent()
                 consentDialogPending = false
                 bbcToggleController?.setConsentPending(false)
                 dismissBbcConsentDialogSilently()
@@ -2936,8 +2931,7 @@ class MainActivity : ComponentActivity() {
             // states fail closed and demand consent again.
             val state = consentHolder.currentState()
             if (state.requiresConsentFor(checked)) {
-                val seq = consentHolder.nextIntentSequence()
-                activeBbcConsentSequence = seq
+                val seq = consentHolder.startConsentIntent()
                 consentDialogPending = true
                 bbcToggleController?.setConsentPending(true)
                 showBbcPreactivationOptInDialog(

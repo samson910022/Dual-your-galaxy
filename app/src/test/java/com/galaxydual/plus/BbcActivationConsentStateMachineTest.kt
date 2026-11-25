@@ -6,8 +6,10 @@
 package com.galaxydual.plus
 
 import com.galaxydual.hook.PolicySource
+import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -41,7 +43,10 @@ class BbcActivationConsentStateMachineTest {
         runtime: Boolean? = false,
         migrated: Boolean? = null,
         coherent: Boolean = true,
-    ) = bbcConsentAuthoritativeReadLegacyBoolean(generation, optIn, classification, migrated, runtime, coherent)
+        enablePending: Boolean? = null,
+    ) = bbcConsentAuthoritativeReadLegacyBoolean(
+        generation, optIn, classification, migrated, runtime, coherent,
+    ).copy(enablePending = enablePending)
 
     /** Explicit enum helper for the ABSENT-vs-FALSE-vs-UNAVAILABLE parity cases. */
     private fun read(
@@ -51,7 +56,10 @@ class BbcActivationConsentStateMachineTest {
         runtime: Boolean? = false,
         migrated: Boolean? = null,
         coherent: Boolean = true,
-    ) = BbcConsentAuthoritativeRead(generation, optIn, classification, migrated, runtime, coherent)
+        enablePending: Boolean? = null,
+    ) = BbcConsentAuthoritativeRead(
+        generation, optIn, classification, migrated, runtime, coherent, enablePending,
+    )
 
     /** Shared app-scoped coordinator on one TestScheduler, as in BbcToggleConcurrencyTest. */
     private fun TestScope.newCoordinator(
@@ -424,9 +432,13 @@ class BbcActivationConsentStateMachineTest {
             val holder = BbcActivationConsentHolder()
             holder.onServiceGenerationChanged(1L)
             holder.resolve(read(1L, optIn = false))
+            val effectCommits = mutableListOf<Boolean>()
             val coordinator = BbcToggleCoordinator(
                 scope = appScope, state = BbcToggleRuntimeState(initialConfirmed = false),
-                commit = { BbcWriteOutcome.Confirmed(it) }, io = io,
+                // Oracle integrity: the phase-2 enable must reach a REAL effect
+                // commit. A no-op driveConsumerEnable can no longer satisfy the
+                // UI-observation list alone.
+                commit = { value -> effectCommits.add(value); BbcWriteOutcome.Confirmed(value) }, io = io,
                 consentCommit = {
                     commitThread = Thread.currentThread().name
                     entered.countDown()
@@ -455,6 +467,11 @@ class BbcActivationConsentStateMachineTest {
             withTimeout(5_000L) { while (holder.currentState() !is BbcActivationConsentState.Granted) yield() }
             withTimeout(5_000L) { while (h.toggleCalls.isEmpty()) yield() }
             assertEquals(listOf(true), h.toggleCalls)
+            // The UI observation is emitted by the holder BEFORE the consumer
+            // enqueues the effect write, so wait for the REAL commit separately.
+            withTimeout(5_000L) { while (effectCommits.isEmpty()) yield() }
+            assertEquals("the observed enable must be a REAL effect commit",
+                listOf(true), effectCommits)
 
             // The authoritative consent READ lane must be just as off-Main as
             // the write, and must share the same app-scoped IO consumer.
@@ -569,6 +586,635 @@ class BbcActivationConsentStateMachineTest {
         rebound.onServiceGenerationChanged(2L)
         assertFalse(rebound.consumePendingEnable(staleSeq, 1L))
         assertFalse(rebound.consumePendingEnableForReplay(2L))
+    }
+
+    /**
+     * Process death / rebind convergence: a NEW holder + coordinator sees the
+     * durable opt-in key but a runtime preference of false. No Activity, no
+     * callback, no state-flow replay — the app consumer that owns the opt-in
+     * lane must still write the effect enable exactly once.
+     */
+    @Test
+    fun freshProcessOptInTrueRuntimeFalse_convergesViaConsumerExactlyOnce() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = BbcOptInValue.TRUE, runtime = false, enablePending = true))
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+
+        val effectCommits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> effectCommits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentCommitAt = { generation -> BbcConsentWriteResult(BbcWriteOutcome.Unknown, generation) },
+            consentRead = { generation ->
+                read(generation, optIn = BbcOptInValue.TRUE, runtime = false, enablePending = true)
+            },
+            consentHolder = holder,
+        )
+
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("durable opt-in + pending marker must drive exactly one runtime enable",
+            listOf(true), effectCommits)
+        assertEquals(true, runtime.confirmedOrUnknown)
+        assertEquals("no UI/abandon was involved", 0L, holder.latestAbandonSequence())
+
+        // Repeated resyncs (or a rebuilt UI replay) must not write it again.
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(true), effectCommits)
+    }
+
+    /**
+     * Phase 2 fixer (BLOCKING 1): a durable OFF writes ONLY the effect pref,
+     * so a cold-start resync with optin=true must NOT re-enable it. The
+     * app-only enable-pending marker is cleared in the SAME commit as the OFF
+     * and survives process death; without it the resync reverses the user.
+     */
+    private class ColdStartDurable {
+        var optIn: Boolean = false
+        var pending: Boolean = false
+        var runtimeEnabled: Boolean = false
+
+        fun read(generation: Long) = BbcConsentAuthoritativeRead(
+            serviceGeneration = generation,
+            optIn = if (optIn) BbcOptInValue.TRUE else BbcOptInValue.ABSENT,
+            classification = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
+            migrated = null,
+            legacyRuntimeEnabled = runtimeEnabled,
+            coherent = true,
+            enablePending = pending,
+        )
+    }
+
+    @Test
+    fun coldStartPendingMarkerTrue_runtimeFalse_enablesExactlyOnce() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = BbcOptInValue.TRUE, runtime = false, enablePending = true))
+        val effectCommits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> effectCommits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentCommitAt = { generation -> BbcConsentWriteResult(BbcWriteOutcome.Unknown, generation) },
+            consentRead = { generation ->
+                read(generation, optIn = BbcOptInValue.TRUE, runtime = false, enablePending = true)
+            },
+            consentHolder = holder,
+        )
+
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("fresh process + pending marker -> exactly one enable", listOf(true), effectCommits)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("a repeated resync must not enable twice", listOf(true), effectCommits)
+    }
+
+    @Test
+    fun coldStartOptInTrueButNoPendingMarker_neverCommitsAnyEnable() = runTest {
+        val holder = BbcActivationConsentHolder()
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = BbcOptInValue.TRUE, runtime = false, enablePending = false))
+        val effectCommits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> effectCommits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentCommitAt = { generation -> BbcConsentWriteResult(BbcWriteOutcome.Unknown, generation) },
+            consentRead = { generation ->
+                read(generation, optIn = BbcOptInValue.TRUE, runtime = false, enablePending = false)
+            },
+            consentHolder = holder,
+        )
+
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("optin=true alone is not a pending enable", BbcActivationConsentState.Granted, holder.currentState())
+        assertTrue("no enable commit may be enqueued", effectCommits.isEmpty())
+        assertEquals("the provisional effect seed must stay untouched",
+            BbcEffectStatus.Provisional, runtime.effectStatus.value)
+    }
+
+    @Test
+    fun grantThenOffThenColdStart_neverReenables() = runTest {
+        val durable = ColdStartDurable()
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(durable.read(1L))
+        val firstCommits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            // ONE atomic runtime commit: value + marker(false). This is what
+            // HookPolicyStore.setBbcRuntimeAndEnablePendingDetailed does.
+            commit = { value ->
+                durable.runtimeEnabled = value
+                durable.pending = false
+                firstCommits.add(value)
+                BbcWriteOutcome.Confirmed(value)
+            },
+            io = dispatcher,
+            consentCommitAt = { generation ->
+                durable.optIn = true
+                durable.pending = true
+                BbcConsentWriteResult(BbcWriteOutcome.Confirmed(true), generation)
+            },
+            consentRead = { generation -> durable.read(generation) },
+            consentHolder = holder,
+        )
+        val h = harness(holder, coordinator)
+
+        h.userToggle(true)
+        h.accept()
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(true), firstCommits)
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+
+        // The user's OFF clears the marker in the SAME commit as runtime=false.
+        h.userToggle(false)
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(true, false), firstCommits)
+        assertFalse("OFF must clear the durable enable-pending marker", durable.pending)
+        h.dispose()
+
+        // Cold start: a NEW holder sees optin=true + runtime=false, but the
+        // marker the OFF cleared did not survive -> zero commits.
+        val coldSequence = AtomicLong(0L)
+        val coldHolder = BbcActivationConsentHolder(coldSequence)
+        val coldRuntime = BbcToggleRuntimeState(initialConfirmed = false, sequence = coldSequence)
+        coldHolder.onServiceGenerationChanged(2L)
+        coldHolder.resolve(durable.read(2L))
+        val coldCommits = mutableListOf<Boolean>()
+        val coldScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { coldScope.cancel() }
+        val coldCoordinator = BbcToggleCoordinator(
+            scope = coldScope, state = coldRuntime,
+            commit = { value -> coldCommits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentCommitAt = { generation -> BbcConsentWriteResult(BbcWriteOutcome.Unknown, generation) },
+            consentRead = { generation -> durable.read(generation) },
+            consentHolder = coldHolder,
+        )
+        coldCoordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals(BbcActivationConsentState.Granted, coldHolder.currentState())
+        assertTrue("a durable user OFF must never be reversed on cold start", coldCommits.isEmpty())
+    }
+
+    /**
+     * Re-review P1-A: accept() queues the opt-in commit, then the user taps OFF
+     * BEFORE the IO consumer is driven (no scheduler advance in between). The
+     * consumer drains the toggle lane first, so the now-superseded grant must
+     * NOT enter the store at all: its atomic optin=true + marker=true write
+     * would re-arm a cold-start enable and reverse the user's OFF.
+     */
+    @Test
+    fun supersededConsentWriteNeverPersistsGrantMarker_coldStartStaysOff() = runTest {
+        val durable = ColdStartDurable()
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(durable.read(1L)) // fresh install: NotGranted, runtime=false
+        assertEquals(BbcActivationConsentState.NotGranted, holder.currentState())
+
+        val effectCommits = mutableListOf<Boolean>()
+        var consentCommits = 0
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            // ONE atomic runtime commit: value + marker(false), as in production.
+            commit = { value ->
+                durable.runtimeEnabled = value
+                durable.pending = false
+                effectCommits.add(value)
+                BbcWriteOutcome.Confirmed(value)
+            },
+            io = dispatcher,
+            consentCommitAt = { generation ->
+                consentCommits++
+                durable.optIn = true
+                durable.pending = true
+                BbcConsentWriteResult(BbcWriteOutcome.Confirmed(true), generation)
+            },
+            consentRead = { generation -> durable.read(generation) },
+            consentHolder = holder,
+        )
+        val h = harness(holder, coordinator)
+
+        h.userToggle(true) // dialog intent S=1
+        val grantIntent = h.dialogsShown.single()
+        h.accept(grantIntent) // queued consent write; NO scheduler advance yet
+        h.userToggle(false) // newer OFF supersedes S=1 before the consumer drains
+        testScheduler.advanceUntilIdle()
+
+        assertEquals("the user's OFF must be the only effect commit",
+            listOf(false), effectCommits)
+        assertEquals("a superseded grant must never enter the consent store",
+            0, consentCommits)
+        assertFalse("superseded grant must not persist optin=true", durable.optIn)
+        assertFalse("superseded grant must not re-arm the enable marker", durable.pending)
+        assertFalse(durable.runtimeEnabled)
+
+        // Cold start with a FRESH holder on a NEW generation: no in-process OFF
+        // guard exists, only the durable keys. A stale marker would claim an
+        // owed enable and reverse the user's OFF.
+        val coldSequence = AtomicLong(0L)
+        val coldHolder = BbcActivationConsentHolder(coldSequence)
+        val coldRuntime = BbcToggleRuntimeState(initialConfirmed = false, sequence = coldSequence)
+        coldHolder.onServiceGenerationChanged(2L)
+        coldHolder.resolve(durable.read(2L))
+        val coldCommits = mutableListOf<Boolean>()
+        val coldScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { coldScope.cancel() }
+        val coldCoordinator = BbcToggleCoordinator(
+            scope = coldScope, state = coldRuntime,
+            commit = { value -> coldCommits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentCommitAt = { gen -> BbcConsentWriteResult(BbcWriteOutcome.Unknown, gen) },
+            consentRead = { gen -> durable.read(gen) },
+            consentHolder = coldHolder,
+        )
+        coldCoordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertTrue("cold start must not re-enable a durable OFF", coldCommits.isEmpty())
+        assertFalse(durable.runtimeEnabled)
+        assertFalse("the enable marker must not survive the OFF", durable.pending)
+        h.dispose()
+    }
+
+    /**
+     * Phase 2 fixer (BLOCKING 6): a resync may claim a NEWER enable ownership R
+     * than a still-pending consent intent S. When S later lands Confirmed it
+     * must not regress R to S; otherwise a second enable is enqueued.
+     */
+    @Test
+    fun resyncClaimNewerThanGrant_isNotRegressedByLaterConfirmed() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false))
+        val durable = ColdStartDurable()
+        val commits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentCommitAt = { generation ->
+                durable.optIn = true
+                BbcConsentWriteResult(BbcWriteOutcome.Confirmed(true), generation)
+            },
+            consentRead = { generation -> durable.read(generation).copy(enablePending = true) },
+            consentHolder = holder,
+        )
+        val h = harness(holder, coordinator)
+        h.userToggle(true)
+        val stale = h.dialogsShown.single()
+
+        // Rebind: the resync owns a fresh enable for gen 2 (R > S).
+        durable.optIn = true
+        holder.onServiceGenerationChanged(2L)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("the resync enable must run", listOf(true), commits)
+        val owner = holder.latestEnableDrivenSequence()
+        assertTrue("resync claim must be newer than the stale dialog", owner > stale)
+
+        // The stale dialog's Confirmed reply (S < R) arrives afterwards.
+        holder.notePendingEnable(stale, 2L)
+        coordinator.submitConsentWrite(stale, 2L) {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("a regressed S must not enqueue a second enable", listOf(true), commits)
+        assertEquals("enable ownership must stay at R", owner, holder.latestEnableDrivenSequence())
+        h.dispose()
+    }
+
+    /**
+     * Re-review P1-B: a Confirmed grant at gen1 drives an enable whose commit
+     * returns Unknown (the durable marker therefore stays true). After a rebind
+     * to gen2 the SAME owed enable must be claimable ONCE — the gen1 ownership
+     * token is generation-scoped and cannot block a new generation — and a
+     * repeated resync at gen2 must not enqueue a second enable.
+     */
+    @Test
+    fun rebindClaimsOwedEnableExactlyOnce_afterUnknownEnable() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false))
+        val durable = ColdStartDurable()
+        val commits = mutableListOf<Boolean>()
+        var firstEnable = true
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value ->
+                commits.add(value)
+                // The enable commit fails: the daemon never clears the marker.
+                if (firstEnable) {
+                    firstEnable = false
+                    BbcWriteOutcome.Unknown
+                } else BbcWriteOutcome.Confirmed(value)
+            },
+            io = dispatcher,
+            consentCommitAt = { gen ->
+                durable.optIn = true
+                durable.pending = true
+                BbcConsentWriteResult(BbcWriteOutcome.Confirmed(true), gen)
+            },
+            // A rebind always sees the STILL-OWED marker on its own instance.
+            consentRead = { gen ->
+                durable.read(gen).copy(optIn = BbcOptInValue.TRUE, enablePending = true)
+            },
+            consentHolder = holder,
+        )
+        val h = harness(holder, coordinator)
+        h.userToggle(true)
+        h.accept()
+        testScheduler.advanceUntilIdle()
+        assertEquals("the gen1 enable was attempted", listOf(true), commits)
+        assertTrue("an Unknown enable is not an acknowledgement",
+            runtime.effectStatus.value is BbcEffectStatus.Unknown)
+        assertTrue(durable.pending)
+        h.dispose()
+
+        // Binder death / rebind: new prefs instance, same app-scoped holder.
+        holder.onServiceGenerationChanged(2L)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("the owed enable must be claimed once on the NEW generation",
+            listOf(true, true), commits)
+
+        repeat(2) {
+            coordinator.submitConsentRead {}
+            testScheduler.advanceUntilIdle()
+        }
+        assertEquals("repeated resyncs at gen2 must not enable twice",
+            listOf(true, true), commits)
+    }
+
+    /**
+     * Re-review P1-B, holder level: enable ownership is a (generation, sequence)
+     * token — an old generation's Confirmed drive cannot block the new instance,
+     * the new instance may claim only once, and a newer OFF keeps the block.
+     */
+    @Test
+    fun resyncEnableOwnership_isGenerationScopedAndOncePerGeneration() {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false))
+        val grant = holder.startConsentIntent()
+        assertTrue(holder.markConsentWriteOutcome(
+            BbcWriteOutcome.Confirmed(true), grant, 1L, consumerOwnsEnable = true,
+        ))
+        assertEquals(grant, holder.latestEnableDrivenSequence())
+        assertTrue(holder.isEnableOwner(grant, 1L))
+        assertFalse("no second enable in the granting generation",
+            holder.tryClaimResyncEnable(1L, grant, true, holder.nextIntentSequence()))
+
+        // Rebind: the gen-1 token is evidence for gen 1 only.
+        holder.onServiceGenerationChanged(2L)
+        holder.resolve(read(2L, optIn = BbcOptInValue.TRUE, enablePending = true))
+        assertFalse("a dead generation's token is not ownership of gen 2",
+            holder.isEnableOwner(grant, 2L))
+        val claim = holder.nextIntentSequence()
+        assertTrue("the owed enable is claimable once on the NEW generation",
+            holder.tryClaimResyncEnable(2L, grant, true, claim))
+        assertEquals(claim, holder.latestEnableDrivenSequence())
+        assertTrue(holder.isEnableOwner(claim, 2L))
+        assertFalse("the same generation cannot claim twice",
+            holder.tryClaimResyncEnable(2L, grant, true, holder.nextIntentSequence()))
+
+        // A newer OFF at gen 3 still wins over the owed marker.
+        holder.onServiceGenerationChanged(3L)
+        holder.resolve(read(3L, optIn = BbcOptInValue.TRUE, enablePending = true))
+        holder.supersedeActiveIntent()
+        assertFalse("a newer OFF at the new generation blocks the resync",
+            holder.tryClaimResyncEnable(3L, grant, true, holder.nextIntentSequence()))
+    }
+
+    /**
+     * Re-review P1-B OFF guard: the generation-scoped ownership re-arm must not
+     * weaken the newer-OFF rule. A fresh OFF at gen2 installs a higher abandon
+     * sequence and blocks that generation's resync even though the durable
+     * marker still reads true and the effect axis is still Unknown.
+     */
+    @Test
+    fun newerOffAfterRebind_blocksOwedResyncEnable() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false))
+        val commits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Unknown },
+            io = dispatcher,
+            consentCommitAt = { gen -> BbcConsentWriteResult(BbcWriteOutcome.Confirmed(true), gen) },
+            consentRead = { gen ->
+                read(gen, optIn = BbcOptInValue.TRUE, runtime = false, enablePending = true)
+            },
+            consentHolder = holder,
+        )
+        val h = harness(holder, coordinator)
+        h.userToggle(true)
+        h.accept()
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(true), commits) // gen1 enable, Unknown
+        h.dispose()
+
+        holder.onServiceGenerationChanged(2L)
+        // The user turns OFF in the NEW generation: app-scoped abandon + block.
+        holder.supersedeActiveIntent()
+        assertTrue(holder.latestAbandonSequence() > holder.confirmedGrantSequence())
+
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("a newer OFF at gen2 must block the owed enable", listOf(true), commits)
+    }
+
+    /** A newer OFF after a grant wins: the resync must not re-enable the effect. */
+    @Test
+    fun newerOffAfterGrant_suppressesResyncDrivenEnable() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = true, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = BbcOptInValue.TRUE, runtime = true))
+        val commits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentCommitAt = { generation -> BbcConsentWriteResult(BbcWriteOutcome.Unknown, generation) },
+            consentRead = { generation -> read(generation, optIn = BbcOptInValue.TRUE, runtime = true) },
+            consentHolder = holder,
+        )
+
+        // The user's OFF supersedes the grant in the shared sequence domain.
+        holder.supersedeActiveIntent()
+        coordinator.submit(runtime.nextSequence(), false) {}
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false), commits)
+
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("a newer OFF must never be overridden by a resync enable",
+            listOf(false), commits)
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+    }
+
+    /**
+     * FINAL RACE (grant path): the consumer used to run its OFF-authority checks
+     * BEFORE minting the effect-axis sequence. An OFF toggle enqueued with a
+     * sequence X older than the freshly minted enable Y was then silently
+     * replaced by enqueueToggle(Y, true), reversing a durable OFF. The TEST-ONLY
+     * seam parks the consumer after the mint, so Main's OFF is recorded and
+     * enqueued deterministically inside the vulnerable window.
+     */
+    @Test
+    fun consumerEnableCannotDisplaceOffEnqueuedAfterEffectSequenceMint() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false))
+        val commits = Collections.synchronizedList(mutableListOf<Boolean>())
+
+        val minted = CompletableDeferred<Long>()
+        val release = CompletableDeferred<Unit>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentCommitAt = { gen -> BbcConsentWriteResult(BbcWriteOutcome.Confirmed(true), gen) },
+            consentRead = { gen -> read(gen, false) },
+            consentHolder = holder,
+        )
+        coordinator.effectSequenceMintHook = { effectSequence ->
+            minted.complete(effectSequence)
+            release.await()
+        }
+
+        val grant = holder.startConsentIntent() // AUTHORISATION sequence
+        // The OFF toggle's sequence is minted BEFORE the consumer mints its
+        // enable (X > grant but X < Y): exactly the window of the old race.
+        val offSequence = runtime.nextSequence()
+        coordinator.submitConsentWrite(grant, 1L) {}
+
+        testScheduler.advanceUntilIdle() // consumer parks in the seam
+        assertTrue("the consumer must be paused after the mint", minted.isCompleted)
+        assertTrue("enable sequence must be newer than the queued OFF", minted.getCompleted() > offSequence)
+
+        // Main's OFF handler, while the consumer is paused: record app-wide and
+        // enqueue the toggle. The enable must not displace it afterwards.
+        holder.supersedeActiveIntent()
+        runtime.noteLatestUserIntent(false)
+        coordinator.submit(offSequence, false) {}
+        release.complete(Unit)
+        testScheduler.advanceUntilIdle()
+
+        assertEquals("the OFF must be the only runtime commit", listOf(false), commits)
+        assertEquals(false, runtime.confirmedOrUnknown)
+        assertEquals(false, runtime.latestIntentProjectedValue())
+        assertEquals(BbcEffectStatus.Confirmed(false), runtime.effectStatus.value)
+    }
+
+    /**
+     * FINAL RACE (resync path): same mint ordering, but the enable is claimed by
+     * a cold-start resync instead of a Confirmed grant. The OFF recorded inside
+     * the test-only pause must stay the single runtime commit.
+     */
+    @Test
+    fun resyncEnableCannotDisplaceOffEnqueuedAfterEffectSequenceMint() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false))
+        val grant = holder.startConsentIntent()
+        assertTrue(holder.markConsentWriteOutcome(
+            BbcWriteOutcome.Confirmed(true), grant, 1L, consumerOwnsEnable = true,
+        ))
+        holder.onServiceGenerationChanged(2L) // new instance still owes the enable
+        holder.resolve(read(2L, optIn = BbcOptInValue.TRUE, enablePending = true))
+
+        val commits = Collections.synchronizedList(mutableListOf<Boolean>())
+        val minted = CompletableDeferred<Long>()
+        val release = CompletableDeferred<Unit>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentRead = { gen -> read(gen, optIn = BbcOptInValue.TRUE, enablePending = true) },
+            consentHolder = holder,
+        )
+        coordinator.effectSequenceMintHook = { effectSequence ->
+            minted.complete(effectSequence)
+            release.await()
+        }
+
+        val offSequence = runtime.nextSequence() // newer than grant, older than enable
+        coordinator.submitConsentRead {}
+
+        testScheduler.advanceUntilIdle()
+        assertTrue("the consumer must be paused after the mint", minted.isCompleted)
+        assertTrue("enable sequence must be newer than the queued OFF", minted.getCompleted() > offSequence)
+
+        holder.supersedeActiveIntent() // OFF also blocks this generation's resync
+        runtime.noteLatestUserIntent(false)
+        coordinator.submit(offSequence, false) {}
+        release.complete(Unit)
+        testScheduler.advanceUntilIdle()
+
+        assertEquals("the OFF must be the only runtime commit", listOf(false), commits)
+        assertEquals(false, runtime.confirmedOrUnknown)
+        assertEquals(false, runtime.latestIntentProjectedValue())
+        assertEquals(BbcEffectStatus.Confirmed(false), runtime.effectStatus.value)
     }
 
     @Test

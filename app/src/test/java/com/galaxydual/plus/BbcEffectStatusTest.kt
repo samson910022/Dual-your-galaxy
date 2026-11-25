@@ -77,6 +77,46 @@ class BbcEffectStatusTest {
         collector.cancel()
     }
 
+    /**
+     * BbcWriteOutcome.Skipped means NO durable key was touched and NO pollution
+     * evidence exists. It must be a true no-op on the effect lane: no sequence
+     * fence advance, no erasure of a prior Confirmed mark, and no _effectStatus
+     * emission (an Unknown emission would show a false "effect unverified" toast).
+     *
+     * The same-sequence Confirmed(false) below is the deterministic fence probe:
+     * it can only apply if Skipped left the applied fence at seq1.
+     */
+    @Test
+    fun skippedOutcome_isTrueNoOpAndDoesNotPoisonFence() = runTest {
+        val holder = BbcToggleRuntimeState(initialConfirmed = true)
+        val statuses = mutableListOf<BbcEffectStatus>()
+        val collector = launch(Dispatchers.Unconfined) {
+            holder.effectStatus.collect { statuses.add(it) }
+        }
+
+        assertTrue(holder.mark(BbcWriteOutcome.Confirmed(true), 1L))
+        val afterConfirmed = listOf<BbcEffectStatus>(BbcEffectStatus.Provisional, BbcEffectStatus.Confirmed(true))
+        assertEquals(afterConfirmed, statuses)
+
+        // seq2 is a skipped/superseded intent: nothing durable happened.
+        assertTrue("Skipped reports applied so the enqueuing caller still gets its callback",
+            holder.mark(BbcWriteOutcome.Skipped, 2L))
+        assertEquals("mark() never mints an issued sequence", 0L, holder.latestSequence())
+        assertEquals("Skipped must not erase a prior confirmation", true, holder.confirmedOrUnknown)
+        assertEquals("Skipped must emit no status at all", afterConfirmed, statuses)
+
+        // Fence probe: seq2 still applies; a poisoned fence at seq2 would drop it.
+        assertTrue("a later Confirmed at the skipped sequence must still apply",
+            holder.mark(BbcWriteOutcome.Confirmed(false), 2L))
+        assertEquals(false, holder.confirmedOrUnknown)
+        assertEquals(afterConfirmed + BbcEffectStatus.Confirmed(false), statuses)
+
+        // A genuinely newer sequence is applied normally as well.
+        assertTrue(holder.mark(BbcWriteOutcome.Confirmed(false), 3L))
+        assertEquals(0L, holder.latestSequence())
+        collector.cancel()
+    }
+
     @Test
     fun bbcEffectPresentation_unconfirmedRendersUnverifiedConfirmedKeepsCaveat() {
         val unknown = bbcEffectPresentationFor(BbcEffectStatus.Unknown)

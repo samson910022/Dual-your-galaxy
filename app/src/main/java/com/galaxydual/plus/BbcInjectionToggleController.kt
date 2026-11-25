@@ -190,6 +190,11 @@ internal class BbcInjectionToggleController(
                         onUnknown?.invoke()
                         onFailed?.invoke()
                     }
+                    // A superseded effect write never entered a commit: no
+                    // rollback, no Unknown styling, no toast. The newer intent
+                    // already owns the CheckBox. (Consent writes use this
+                    // outcome too; they do not reach this effect callback.)
+                    BbcWriteOutcome.Skipped -> Unit
                 }
             }
         }

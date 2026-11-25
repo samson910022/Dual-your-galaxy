@@ -11,6 +11,7 @@ import java.util.concurrent.TimeUnit
 import java.lang.reflect.Proxy
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +20,9 @@ import kotlinx.coroutines.cancel
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNotSame
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -121,6 +125,37 @@ class GalaxyAppTest {
     }
 
     @Test
+    fun consentWriteBindSnapshot_isPublishedAtomicallyAndInvalidatedOnDeath() {
+        // Phase 2 B3: the generation-aware consent commit must not re-sample
+        // serviceRef at execution time. Its (generation, service, provider)
+        // snapshot is published at bind entry and cleared on the owning death.
+        fun snapshot(): Any? = (GalaxyApp::class.java
+            .getDeclaredField("bbcConsentWriteAttempt").apply { isAccessible = true }
+            .get(app) as java.util.concurrent.atomic.AtomicReference<*>).get()
+
+        val service1 = createFakeXposedService()
+        val service2 = createFakeXposedService()
+        assertNull("no snapshot before bind", snapshot())
+
+        app.onServiceBind(service1)
+        val first = snapshot()
+        assertNotNull("bind must publish the consent-write snapshot", first)
+        assertEquals(1L, app.bbcActivationConsentHolder.currentGeneration())
+
+        app.onServiceBind(service2) // rebind without a death callback
+        val second = snapshot()
+        assertNotNull(second)
+        assertNotSame("a new bind must replace the snapshot atomically", first, second)
+        assertEquals(2L, app.bbcActivationConsentHolder.currentGeneration())
+
+        app.onServiceDied(service1) // stale death must not clobber the new snapshot
+        assertNotNull("stale death must keep service2's snapshot", snapshot())
+
+        app.onServiceDied(service2)
+        assertNull("the owning death must invalidate the snapshot", snapshot())
+    }
+
+    @Test
     fun remotePreferences_returnsNullWhenDisconnected() {
         assertFalse(GalaxyApp.isServiceConnected())
         val prefs = GalaxyApp.remotePreferences("test_group")
@@ -175,6 +210,8 @@ class GalaxyAppTest {
         val data = LinkedHashMap<String, Any>(initial)
         /** false models a failed daemon commit. */
         var commitSucceeds = true
+        /** Test oracle: a no-commit path must never reach an editor commit. */
+        var commitCount = 0
         /** A failed bind commit still pollutes THIS instance's optimistic mMap. */
         var flushOnFailedCommit = false
         /** Test-only hook at commit entry; lets a rebind land mid-commit. */
@@ -207,6 +244,7 @@ class GalaxyAppTest {
             }
             override fun clear(): SharedPreferences.Editor { pending.clear(); return this }
             override fun commit(): Boolean {
+                commitCount++
                 beforeCommit?.invoke()
                 if (!commitSucceeds) {
                     if (flushOnFailedCommit) data.putAll(pending)
@@ -229,6 +267,178 @@ class GalaxyAppTest {
         val field = GalaxyApp::class.java.getDeclaredField("bbcConsentServiceGeneration")
         field.isAccessible = true
         return field.get(app) as AtomicLong
+    }
+
+    private fun invokeConsentWrite(capturedGeneration: Long): BbcConsentWriteResult {
+        val method = GalaxyApp::class.java.getDeclaredMethod(
+            "performBbcConsentWrite", Long::class.java,
+        )
+        method.isAccessible = true
+        return method.invoke(app, capturedGeneration) as BbcConsentWriteResult
+    }
+
+    /**
+     * The enable-pending marker is an APP-ONLY durability bookkeeping key. It
+     * must not change the Hook gate for any marker value — Hook code is not
+     * even aware of the key.
+     */
+    @Test
+    fun appOnlyEnablePendingMarker_isIgnoredByHookGate() {
+        val base = linkedMapOf<String, Any>(
+            PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN to true,
+            PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED to true,
+            PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION to
+                PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
+        )
+        val without = BbcPreactivationHookReader.effectOpen(true, MemPrefs(base))
+        assertTrue("the base opt-in gate must be open", without)
+        for (marker in listOf(true, false)) {
+            val withMarker = MemPrefs(base + (BBC_ENABLE_PENDING_PREF_KEY to marker))
+            assertEquals("the app-only marker must not change Hook authorization",
+                without, BbcPreactivationHookReader.effectOpen(true, withMarker))
+        }
+    }
+
+    /**
+     * Phase 2 fixer (BLOCKING 2 / F1): a consent-write attempt whose bind
+     * snapshot was superseded BEFORE the commit entered must report a NO-
+     * GENERATION sentinel, not the current generation. Otherwise the holder
+     * installs a spurious current-gen Unknown fence that blocks the gen-2
+     * authoritative resync until gen 3.
+     */
+    @Test
+    fun consentWriteWithNoCommit_doesNotFenceTheCurrentGeneration() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val durable = linkedMapOf<String, Any>(
+            PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED to true,
+        )
+        val prefs1 = MemPrefs(durable)
+        val prefs2 = MemPrefs(durable)
+        var currentPrefs: SharedPreferences? = prefs1
+        app.bbcClassificationPrefsProvider = { currentPrefs }
+        val service1 = createFakeXposedService()
+        val service2 = createFakeXposedService()
+        try {
+            app.onServiceBind(service1) // gen 1 captures prefs1 + service1
+            assertEquals(1L, generationCounter().get())
+
+            // Rebind to a genuinely DIFFERENT prefs instance without a death.
+            currentPrefs = prefs2
+            app.onServiceBind(service2)
+            assertEquals(2L, app.bbcActivationConsentHolder.currentGeneration())
+
+            // The gen-1 attempt is stale BEFORE any commit: no local pollution.
+            val result = invokeConsentWrite(1L)
+            assertEquals(BbcWriteOutcome.Unknown, result.outcome)
+            assertEquals("no commit -> NO generation sentinel, not current gen 2",
+                0L, result.touchedGeneration)
+            assertEquals(0, prefs1.commitCount)
+            assertEquals(0, prefs2.commitCount)
+
+            // The gen-2 resync resolves normally because nothing fenced it.
+            app.bbcActivationConsentHolder.resolve(
+                BbcConsentAuthoritativeRead(
+                    serviceGeneration = 2L,
+                    optIn = BbcOptInValue.TRUE,
+                    classification = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
+                    migrated = null,
+                    legacyRuntimeEnabled = true,
+                ),
+            )
+            assertEquals("a spurious current-gen fence must not block resync",
+                BbcActivationConsentState.Granted,
+                app.bbcActivationConsentHolder.currentState(),
+            )
+        } finally {
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            app.bbcClassificationPrefsProvider = { null }
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
+    }
+
+    /**
+     * Same race, but the rebind lands INSIDE the opt-in commit. The write did
+     * touch prefs1, so its reply is forced to Unknown and the touched
+     * generation must stay 1 — the fresh gen-2 resync is still allowed.
+     */
+    @Test
+    fun consentWriteRebindMidCommit_forcesUnknownButFencesOnlyTouchedGeneration() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val commitEntered = CountDownLatch(1)
+        val releaseCommit = CountDownLatch(1)
+        val prefs1 = MemPrefs().apply {
+            beforeCommit = {
+                commitEntered.countDown()
+                check(releaseCommit.await(10, TimeUnit.SECONDS)) {
+                    "stale opt-in commit never reached its blocking point"
+                }
+            }
+        }
+        val prefs2 = MemPrefs()
+        var currentPrefs: SharedPreferences? = prefs1
+        app.bbcClassificationPrefsProvider = { currentPrefs }
+        val service1 = createFakeXposedService()
+        val service2 = createFakeXposedService()
+        val result = AtomicReference<BbcConsentWriteResult>()
+        val writer = Thread({
+            result.set(invokeConsentWrite(1L))
+        }, "stale-consent-commit").apply { isDaemon = true }
+        try {
+            app.onServiceBind(service1)
+            writer.start()
+            check(commitEntered.await(10, TimeUnit.SECONDS)) { "commit never entered" }
+
+            currentPrefs = prefs2
+            app.onServiceBind(service2) // rebind during the blocking commit
+            assertEquals(2L, app.bbcActivationConsentHolder.currentGeneration())
+            releaseCommit.countDown()
+            writer.join(10_000)
+            check(!writer.isAlive) { "stale writer never finished" }
+
+            assertEquals(BbcWriteOutcome.Unknown, result.get().outcome)
+            assertEquals("the fence belongs to the instance actually touched", 1L, result.get().touchedGeneration)
+            assertEquals(1, prefs1.commitCount)
+
+            app.bbcActivationConsentHolder.resolve(
+                BbcConsentAuthoritativeRead(
+                    serviceGeneration = 2L,
+                    optIn = BbcOptInValue.TRUE,
+                    classification = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
+                    migrated = null,
+                    legacyRuntimeEnabled = true,
+                ),
+            )
+            assertEquals(BbcActivationConsentState.Granted,
+                app.bbcActivationConsentHolder.currentState())
+        } finally {
+            releaseCommit.countDown()
+            writer.join(10_000)
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            app.bbcClassificationPrefsProvider = { null }
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
     }
 
     @Test
