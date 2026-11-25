@@ -15,14 +15,18 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -761,6 +765,213 @@ class GalaxyAppTest {
             scope.cancel()
             scopeField.set(app, previousScope)
             app.bbcClassificationPrefsProvider = { null }
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
+    }
+
+    // --- PR #90 Phase 3 (R3-06a/E2, R3-06b/E3, E5) ------------------------------
+
+    /**
+     * E2: the app-scoped runtime holder must be NEUTRAL and must not perform a
+     * binder read while Main acquires it. Before the fix the lazy initializer
+     * called isBbcInjectionEnabled(), which defaults to true on read failure —
+     * so this NEUTRAL assertion fails (confirmedOrUnknown == true) if a binder
+     * read ever returns to the initializer.
+     */
+    @Test
+    fun bbcToggleRuntimeState_isNeutralWithoutBinderRead() {
+        assertNull("no binder read may seed a Confirmed effect on Main",
+            app.bbcToggleRuntimeState.confirmedOrUnknown)
+        assertEquals(BbcEffectStatus.Provisional, app.bbcToggleRuntimeState.effectStatus.value)
+    }
+
+    /**
+     * E3: onServiceDied must never acquire versionCommitLock on the service
+     * callback thread. We hold that monitor on another thread and assert the
+     * death callback returns promptly AND has already bumped the generation.
+     * Latches only — no wall-clock polling.
+     */
+    @Test
+    fun onServiceDied_doesNotWaitForVersionCommitLockAndBumpsFirst() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+
+        val lockHeld = CountDownLatch(1)
+        val releaseLock = CountDownLatch(1)
+        val lockHolder = Thread({
+            synchronized(versionCommitLock) {
+                lockHeld.countDown()
+                check(releaseLock.await(10, TimeUnit.SECONDS)) { "lock holder never released" }
+            }
+        }, "version-commit-lock-holder").apply { isDaemon = true }
+
+        val service = createFakeXposedService()
+        val deathReturned = CountDownLatch(1)
+        try {
+            app.onServiceBind(service)
+            assertEquals(1L, app.bbcActivationConsentHolder.currentGeneration())
+
+            lockHolder.start()
+            check(lockHeld.await(10, TimeUnit.SECONDS)) { "versionCommitLock was not held" }
+
+            val deathThread = Thread({
+                app.onServiceDied(service)
+                deathReturned.countDown()
+            }, "service-death-callback").apply { isDaemon = true }
+            deathThread.start()
+
+            assertTrue("onServiceDied must not block on versionCommitLock",
+                deathReturned.await(3, TimeUnit.SECONDS))
+            deathThread.join(10_000)
+            check(!deathThread.isAlive) { "death callback never finished" }
+            assertEquals("generation bump is immediate, not behind the commit lock",
+                2L, app.bbcActivationConsentHolder.currentGeneration())
+            assertFalse(GalaxyApp.isServiceConnected())
+        } finally {
+            releaseLock.countDown()
+            lockHolder.join(10_000)
+            scope.cancel()
+            scopeField.set(app, previousScope)
+        }
+    }
+
+    /** Pending-intent cleanup is deferred to the app IO lane, under the lock. */
+    @Test
+    fun onServiceDied_defersPendingClassificationClearToIo() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val pending = PendingBbcClassification.of(
+            MemPrefs(),
+            BbcClassificationPlan.Write(NEW_GENERATION_NOT_CONSENTED, false),
+        )
+        pendingBbcClassification.set(pending)
+        val service = createFakeXposedService()
+        try {
+            app.onServiceBind(service)
+            app.onServiceDied(service)
+            assertSame("the clear must run on IO, not on the callback thread",
+                pending, pendingBbcClassification.get())
+            dispatcher.drainQueued()
+            assertNull("the owning death clears the pending intent on IO",
+                pendingBbcClassification.get())
+        } finally {
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
+    }
+
+    /** The deferred clear must not drop a retry intent installed by a newer bind. */
+    @Test
+    fun onServiceDied_deferredClearDoesNotDropNewerBindsPendingIntent() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val deadPending = PendingBbcClassification.of(
+            MemPrefs(), BbcClassificationPlan.Write(NEW_GENERATION_NOT_CONSENTED, false),
+        )
+        pendingBbcClassification.set(deadPending)
+        val newerPending = PendingBbcClassification.of(
+            MemPrefs(), BbcClassificationPlan.Write(PRE_UPGRADE_EXISTING, true),
+        )
+        val service = createFakeXposedService()
+        try {
+            app.onServiceBind(service)
+            app.onServiceDied(service) // captures deadPending, queues the IO clear
+            pendingBbcClassification.set(newerPending) // newer bind re-armed the retry
+            dispatcher.drainQueued()
+            assertSame("a stale death must never clear a newer bind's retry intent",
+                newerPending, pendingBbcClassification.get())
+        } finally {
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
+    }
+
+    /**
+     * E5: when the death bump invalidates an in-flight bind attempt, the app must
+     * schedule a consent resync for the NEW generation — the stale attempt
+     * deliberately skips its own refresh, so without this the holder is stranded
+     * at Initializing until the user reopens Settings.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun deathBumpInvalidatingBind_schedulesResyncForNewGeneration() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+
+        val scheduler = TestCoroutineScheduler()
+        val coordinatorDispatcher = StandardTestDispatcher(scheduler)
+        val coordinatorScope = CoroutineScope(SupervisorJob() + coordinatorDispatcher)
+        val holder = app.bbcActivationConsentHolder
+        val reads = mutableListOf<Long>()
+        val coordinator = BbcToggleCoordinator(
+            scope = coordinatorScope,
+            state = BbcToggleRuntimeState(),
+            commit = { BbcWriteOutcome.Confirmed(it) },
+            io = coordinatorDispatcher,
+            consentRead = { generation ->
+                reads.add(generation)
+                BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
+            },
+            consentHolder = holder,
+        )
+        val coordinatorField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcToggleCoordinator") }
+        coordinatorField.isAccessible = true
+        val previousCoordinator = coordinatorField.get(app)
+        coordinatorField.set(app, lazy { coordinator })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val service = createFakeXposedService()
+        try {
+            app.onServiceBind(service) // gen 1, bind attempt captured
+            assertEquals(1L, holder.currentGeneration())
+            assertTrue("the bind attempt must be queued, not completed", dispatcher.hasQueued())
+
+            app.onServiceDied(service) // bumps to gen 2; attempt is now stale
+            assertEquals(2L, holder.currentGeneration())
+            assertTrue("no resync before the IO bookkeeping runs", reads.isEmpty())
+
+            dispatcher.drainQueued() // deferred cleanup + resync scheduling
+            scheduler.advanceUntilIdle() // the coordinator drains its read lanes
+            assertEquals("the invalidated bind must trigger a resync at the new generation",
+                listOf(2L), reads)
+        } finally {
+            coordinatorScope.cancel()
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            coordinatorField.set(app, previousCoordinator)
             clearPendingBbcClassification()
             resetRemotePoisonForTests()
         }

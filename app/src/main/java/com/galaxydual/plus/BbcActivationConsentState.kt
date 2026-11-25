@@ -187,10 +187,12 @@ internal data class BbcActivationToggleUi(
  * effect status). [checked] == null means "leave the CheckBox as-is" — neither
  * authorization nor a provisional read may fabricate a value.
  *
- * Rule, in priority order:
+ * Rule, in priority order (PR #90 Phase 3 keeps Phase 2's ordering intact):
  *  1. a pending user intent wins (the user's latest, still-unverified choice);
  *  2. [BbcEffectStatus.Confirmed] supplies the acknowledged effect value;
- *  3. Provisional/Unknown supplies NO value and renders neutral/unverified.
+ *  3. [BbcEffectStatus.ProvisionalRead] supplies the persisted value read on the
+ *     IO lane (a neutral seed, NOT a write acknowledgement);
+ *  4. Provisional/Unknown supplies NO value and renders neutral/unverified.
  *
  * Authorization does not decide the checkbox value: [Granted] is permission
  * to skip the consent dialog, NOT proof that the effect is on. It only affects
@@ -210,6 +212,7 @@ internal fun bbcToggleUiProjection(
     val checked = when {
         pendingIntent != null -> pendingIntent
         effect is BbcEffectStatus.Confirmed -> effect.value
+        effect is BbcEffectStatus.ProvisionalRead -> effect.value
         else -> null
     }
     val neutral = checked == null ||

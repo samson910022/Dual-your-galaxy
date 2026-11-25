@@ -2662,10 +2662,12 @@ class MainActivity : ComponentActivity() {
         // as-is. A Granted permission is NOT proof of a live effect and must
         // never fabricate a checked ON (cold start: consent=true/runtime=false).
         val initialUi = initialConsentState.toggleUi()
-        // D04: after commit(false)/throw the local mMap may be optimistically
-        // polluted, so isBbcInjectionEnabled() is NOT authority. The app-scoped
-        // holder's null means UNKNOWN from a prior failed write; render the
-        // honest "effect unknown" row regardless of any preference read.
+        // PR #90 Phase 3 (R3-06a/E2): NO binder read on Main. The holder is
+        // seeded NEUTRAL (confirmedOrUnknown == null, effectStatus Provisional)
+        // and the persisted value is read on the app IO lane by the coordinator's
+        // effect work item below. Until that read lands (and after a failed
+        // commit, whose local mMap may be optimistically polluted) the row is
+        // honestly rendered "effect unknown" / neutral.
         val effectUnknownOnOpen = app.bbcToggleRuntimeState.confirmedOrUnknown == null
         lateinit var toggle: CheckBox
         // Last UI value we can honestly stand behind. Updated ONLY by the one
@@ -2950,11 +2952,17 @@ class MainActivity : ComponentActivity() {
             }
         }
         // A fresh process starts Initializing until the bind-time authoritative
-        // read lands. Ask the app IO lane to resync; the state collector below
-        // repaints the neutral row when it resolves.
+        // read lands. Ask the app IO lane to resync (non-blocking enqueue — no
+        // binder call on Main); the state collector below repaints the neutral
+        // row when it resolves.
         if (initialConsentState is BbcActivationConsentState.Initializing) {
             app.bbcToggleCoordinator.submitConsentRead()
         }
+        // PR #90 Phase 3 (R3-06a/E2): seed the effect value from a durable read
+        // on the app IO lane, never from a Main-thread preference read. Until it
+        // lands the row stays neutral/unverified; when it lands the checkbox
+        // shows the persisted value as a PROVISIONAL seed (never Confirmed).
+        app.bbcToggleCoordinator.submitEffectRead()
         bbcConsentStateJob = lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 consentHolder.state.collect { state -> renderConsentState(state) }

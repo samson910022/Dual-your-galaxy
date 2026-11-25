@@ -837,6 +837,7 @@ class BbcToggleConcurrencyTest {
             BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
         },
         state: BbcToggleRuntimeState = BbcToggleRuntimeState(initialConfirmed = false),
+        effectRead: suspend () -> Boolean? = { null },
     ): BbcToggleCoordinator {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appScope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -844,6 +845,7 @@ class BbcToggleConcurrencyTest {
         return BbcToggleCoordinator(
             scope = appScope, state = state, commit = { sink.commit(it) }, io = dispatcher,
             consentCommit = consentCommit, consentRead = consentRead, consentHolder = holder,
+            effectRead = effectRead,
         )
     }
 
@@ -1054,6 +1056,43 @@ class BbcToggleConcurrencyTest {
         assertEquals(listOf<BbcWriteOutcome>(BbcWriteOutcome.Skipped), outcomes)
         assertEquals(0, sink.commits.size)
         assertFalse(holder.currentState() is BbcActivationConsentState.Granted)
+    }
+
+    /**
+     * PR #90 Phase 3 (R3-06a/E2): the authoritative effect read is a dedicated
+     * lane on the app IO consumer. It seeds the row provisionally, never
+     * Confirmed, never advances the write fence, and never enqueues a commit.
+     * Reads coalesce with reads only.
+     */
+    @Test
+    fun effectRead_runsOnIoLaneSeedsProvisionalNeverConfirms() = runTest {
+        val sink = Sink(initial = false)
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val state = BbcToggleRuntimeState() // production-neutral seed
+        var reads = 0
+        val coordinator = splitLaneCoordinator(
+            sink, holder, state = state, effectRead = { reads++; false },
+        )
+
+        assertEquals(BbcWorkEnqueue.Accepted, coordinator.submitEffectRead())
+        testScheduler.advanceUntilIdle()
+
+        assertEquals(1, reads)
+        assertEquals(BbcEffectStatus.ProvisionalRead(false), state.effectStatus.value)
+        assertNull("a read is not a Confirmed write outcome", state.confirmedOrUnknown)
+        assertTrue("a read must never drive an effect commit", sink.commits.isEmpty())
+        assertEquals(0L, state.latestSequence())
+
+        var firstCoalesced = false
+        assertEquals(BbcWorkEnqueue.Accepted,
+            coordinator.submitEffectRead(onCoalesced = { firstCoalesced = true }))
+        assertEquals("a newer read replaces only the older read",
+            BbcWorkEnqueue.ReplacedOlder, coordinator.submitEffectRead())
+        testScheduler.advanceUntilIdle()
+        assertTrue(firstCoalesced)
+        assertEquals(2, reads) // only the surviving read ran
+        assertEquals(BbcEffectStatus.ProvisionalRead(false), state.effectStatus.value)
     }
 
     // --- Phase 2 fixer (BLOCKING 4): never promise work to a dead consumer ---

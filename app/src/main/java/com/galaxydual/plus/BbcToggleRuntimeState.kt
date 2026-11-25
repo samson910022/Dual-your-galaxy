@@ -18,10 +18,14 @@ import kotlinx.coroutines.flow.asStateFlow
  * be interpreted as "restored to the old value". The value here is only what
  * THIS app process last saw confirmed, not a re-read of the persisted source.
  *
- * This holder is scoped to the Application process, NOT persisted. After an
- * app restart it is reinitialized from the persisted preference (default true
- * on read failure). A dialog/Activity rebuild must reuse the app-scoped
- * instance so [nextSequence] stays monotonic across rebuilds.
+ * This holder is scoped to the Application process, NOT persisted. In
+ * production it is seeded NEUTRAL: no binder read happens in the Application's
+ * lazy initializer (PR #90 Phase 3 R3-06a/E2 — a Main-thread binder read could
+ * block behind the lazy monitor held by the bind IO coroutine). The persisted
+ * value is instead read on the app IO lane by [BbcToggleCoordinator]'s effect
+ * work item and folded in via [seedEffectFromPersistedRead] as a PROVISIONAL
+ * value, never as a Confirmed write acknowledgement. A dialog/Activity rebuild
+ * must reuse the app-scoped instance so [nextSequence] stays monotonic.
  *
  * This is NOT the hook process's `bbcConfirmedOffAtMs`, which governs BBC gate
  * decisions when the hook cannot read the preference. It is also NOT a
@@ -33,12 +37,15 @@ import kotlinx.coroutines.flow.asStateFlow
  * over an immutable state snapshot, so concurrent marks cannot let an older
  * sequence's value win.
  *
- * @param initialConfirmed **Provisional UI seed only** — the value read from
- *   `isBbcInjectionEnabled()` at construction. It is NOT a write confirmation
- *   and must not be treated as acknowledged until the first
- *   `mark(Confirmed(...))` for a submitted intent. A read of the preference
- *   cannot tell whether a prior write was acknowledged (the local mMap may be
- *   optimistically polluted, and the hook may still serve a cached value).
+ * @param initialConfirmed **Provisional UI seed only** — supplied by framework-
+ *   free tests and legacy callers. Production passes no value (NEUTRAL) so no
+ *   binder call is made on the Main thread while acquiring this holder; the
+ *   authoritative value arrives later through [seedEffectFromPersistedRead] on
+ *   the IO lane. It is NOT a write confirmation and must not be treated as
+ *   acknowledged until the first `mark(Confirmed(...))` for a submitted intent.
+ *   A read of the preference cannot tell whether a prior write was acknowledged
+ *   (the local mMap may be optimistically polluted, and the hook may serve a
+ *   cached value).
  */
 internal class BbcToggleRuntimeState(
     initialConfirmed: Boolean? = null,
@@ -85,18 +92,44 @@ internal class BbcToggleRuntimeState(
      * newly subscribed dialog, so a rebuilt dialog learns the outcome of an
      * in-flight app-scoped commit; a live dialog sees every later mark.
      *
-     * Emitted ONLY from [mark] (via [applyOutcome]), never from submit()/tap
-     * paths: D05's global serialization stays the single ordering authority.
+     * Emitted from [mark] (via [applyOutcome]) and from
+     * [seedEffectFromPersistedRead], never from submit()/tap paths: D05's global
+     * serialization stays the single ordering authority. A provisional read is
+     * always a weaker seed than a Confirmed mark.
      */
     private val _effectStatus = MutableStateFlow<BbcEffectStatus>(BbcEffectStatus.Provisional)
     val effectStatus: StateFlow<BbcEffectStatus> = _effectStatus.asStateFlow()
 
     /**
      * `null` means UNKNOWN. The getter reads the value from the latest state
-     * successfully committed by [mark].
+     * successfully committed by [mark]. An IO-lane persisted read does NOT
+     * touch this value: it is strictly a write-outcome record, so a read can
+     * never be mistaken for a write acknowledgement (see
+     * [seedEffectFromPersistedRead]).
      */
     val confirmedOrUnknown: Boolean?
         get() = state.get().value
+
+    /**
+     * PR #90 Phase 3 (R3-06a/E2): fold an authoritative persisted value that was
+     * read on the app IO lane into the UI projection as a NEUTRAL seed.
+     *
+     * This deliberately does NOT call [mark] and does NOT advance the sequence
+     * fence: a read is not a write outcome. It emits
+     * [BbcEffectStatus.ProvisionalRead] (unverified presentation) instead of
+     * [BbcEffectStatus.Confirmed], so the checkbox shows the persisted value
+     * without claiming the daemon acknowledged a write. A later Confirmed mark
+     * always wins; a confirmed write is never downgraded by a late read.
+     *
+     * `null` (absent / unreadable key) supplies no value — the row stays neutral
+     * rather than fabricating the legacy default-true seed.
+     */
+    @Synchronized // same critical section as [applyOutcome]
+    internal fun seedEffectFromPersistedRead(value: Boolean?) {
+        if (value == null) return
+        if (_effectStatus.value is BbcEffectStatus.Confirmed) return
+        _effectStatus.value = BbcEffectStatus.ProvisionalRead(value)
+    }
 
     /** Globally monotonic intent sequence for this app process (never resets on UI rebuild). */
     fun nextSequence(): Long = sequence.incrementAndGet()

@@ -140,6 +140,15 @@ internal class BbcToggleCoordinator(
     },
     /** The one app-scoped authorization holder; shared across all UI rebuilds. */
     internal val consentHolder: BbcActivationConsentHolder = BbcActivationConsentHolder(),
+    /**
+     * PR #90 Phase 3 (R3-06a/E2): authoritative persisted effect-value read.
+     * Always executes on [io] inside the SAME app-lifetime consumer, never on
+     * Main. Returns `null` for ABSENT / unreadable / disconnected (no fabricated
+     * default-true seed). The value is folded into [BbcToggleRuntimeState] as a
+     * PROVISIONAL read, never as a Confirmed write acknowledgement. Defaults to
+     * fail closed so a caller that forgot to wire it leaves the row neutral.
+     */
+    private val effectRead: suspend () -> Boolean? = { null },
 ) {
     /**
      * TEST-ONLY seam (mirrors GalaxyApp.bbcClassificationPrefsProvider): invoked
@@ -171,6 +180,17 @@ internal class BbcToggleCoordinator(
             val onResult: (BbcConsentAuthoritativeRead) -> Unit,
             val onCoalesced: () -> Unit,
         ) : Work
+
+        /**
+         * PR #90 Phase 3: authoritative persisted EFFECT read. Separate from
+         * [ConsentRead] on purpose — a consent resync must not fabricate a
+         * write acknowledgement, and a UI effect read must not disturb the
+         * consent holder's generation/fence resolution.
+         */
+        data class EffectRead(
+            val onResult: (Boolean?) -> Unit,
+            val onCoalesced: () -> Unit,
+        ) : Work
     }
 
     // Per-axis pending slots. A newer intent of the SAME axis may replace the
@@ -181,10 +201,11 @@ internal class BbcToggleCoordinator(
     private val pendingToggle = AtomicReference<Work.Toggle?>(null)
     private val pendingConsentWrite = AtomicReference<Work.ConsentWrite?>(null)
     private val pendingRead = AtomicReference<Work.ConsentRead?>(null)
+    private val pendingEffectRead = AtomicReference<Work.EffectRead?>(null)
 
     // CONFLATED wake-up only: after every signal the consumer drains ALL lanes
-    // (user work first, reads last). A signal arriving during draining is
-    // buffered, so no work is lost.
+    // (user work first, reads last, then the effect read). A signal arriving
+    // during draining is buffered, so no work is lost.
     private val wake = Channel<Unit>(Channel.CONFLATED)
 
     // #81 atomic-submit lane: the 2-arg submit() mints its sequence and enqueues
@@ -219,6 +240,7 @@ internal class BbcToggleCoordinator(
         for (unit in wake) {
             drainUserWork()
             drainRead()
+            drainEffectRead()
         }
     }
 
@@ -272,6 +294,32 @@ internal class BbcToggleCoordinator(
         maybeDriveResyncEnable(generation, result.enablePending == true)
         try {
             read.onResult(result)
+        } catch (_: Throwable) {
+            // A UI callback must never kill the process-wide consumer.
+        }
+    }
+
+    /**
+     * PR #90 Phase 3: run the authoritative persisted-effect read on [io].
+     * The result is a PROVISIONAL seed only — [BbcToggleRuntimeState] records it
+     * without advancing the intent fence and without emitting Confirmed, so no
+     * binder read ever happens on Main and no read impersonates a write
+     * acknowledgement. The consent holder is untouched (its own [drainRead]
+     * resolves authorization from the coherent snapshot).
+     */
+    private suspend fun drainEffectRead() {
+        val read = pendingEffectRead.getAndSet(null) ?: return
+        val value = try {
+            withContext(io) { effectRead() }
+        } catch (ce: CancellationException) {
+            if (!scope.isActive) throw ce
+            null
+        } catch (_: Throwable) {
+            null
+        }
+        state.seedEffectFromPersistedRead(value)
+        try {
+            read.onResult(value)
         } catch (_: Throwable) {
             // A UI callback must never kill the process-wide consumer.
         }
@@ -600,6 +648,35 @@ internal class BbcToggleCoordinator(
             pendingRead.set(work)
             if (!wakeConsumer()) {
                 pendingRead.compareAndSet(work, old)
+                BbcWorkEnqueue.Rejected
+            } else if (old == null) {
+                BbcWorkEnqueue.Accepted
+            } else {
+                coalesced = old.onCoalesced
+                BbcWorkEnqueue.ReplacedOlder
+            }
+        }
+        coalesced?.let(::notifyReplaced)
+        return result
+    }
+
+    /**
+     * PR #90 Phase 3: schedule the authoritative persisted-effect read on the
+     * app IO lane (never a Main-thread binder call). Reads coalesce with OTHER
+     * effect reads only; a displaced read's callback is reported via
+     * [onCoalesced]. User writes are never touched.
+     */
+    fun submitEffectRead(
+        onCoalesced: () -> Unit = {},
+        onResult: (Boolean?) -> Unit = {},
+    ): BbcWorkEnqueue {
+        var coalesced: (() -> Unit)? = null
+        val result = synchronized(slotLock) {
+            val old = pendingEffectRead.get()
+            val work = Work.EffectRead(onResult, onCoalesced)
+            pendingEffectRead.set(work)
+            if (!wakeConsumer()) {
+                pendingEffectRead.compareAndSet(work, old)
                 BbcWorkEnqueue.Rejected
             } else if (old == null) {
                 BbcWorkEnqueue.Accepted

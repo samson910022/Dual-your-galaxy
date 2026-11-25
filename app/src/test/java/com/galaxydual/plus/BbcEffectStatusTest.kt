@@ -117,6 +117,67 @@ class BbcEffectStatusTest {
         collector.cancel()
     }
 
+    /**
+     * PR #90 Phase 3 (R3-06a/E2): an authoritative persisted value read on the
+     * IO lane supplies the checkbox value but is NEVER a write acknowledgement.
+     * It must not emit Confirmed, must not move the write-outcome fence, and a
+     * later real Confirmed mark always wins (a late read cannot downgrade it).
+     */
+    @Test
+    fun provisionalPersistedRead_isNeutralSeedNotAWriteConfirmation() = runTest {
+        val holder = BbcToggleRuntimeState() // production seed: NEUTRAL
+        val statuses = mutableListOf<BbcEffectStatus>()
+        val collector = launch(Dispatchers.Unconfined) {
+            holder.effectStatus.collect { statuses.add(it) }
+        }
+        assertEquals(listOf<BbcEffectStatus>(BbcEffectStatus.Provisional), statuses)
+        assertNull(holder.confirmedOrUnknown)
+
+        // The IO read lands: the row may show the persisted value, but the
+        // status stays PROVISIONAL (unverified) and no write is acknowledged.
+        holder.seedEffectFromPersistedRead(false)
+        assertEquals(
+            listOf<BbcEffectStatus>(BbcEffectStatus.Provisional, BbcEffectStatus.ProvisionalRead(false)),
+            statuses,
+        )
+        assertNull("a read is not a Confirmed write outcome", holder.confirmedOrUnknown)
+        assertEquals("a read must not advance the intent fence", 0L, holder.latestSequence())
+
+        // Phase 2 projection ordering is preserved: the provisional value fills
+        // the neutral tier, but an app-scoped user intent still wins over it.
+        val neutral = bbcToggleUiProjection(
+            BbcActivationConsentState.Initializing, holder.effectStatus.value, null,
+        )
+        assertEquals(false, neutral.checked)
+        assertTrue("an IO read alone is still neutral/unverified", neutral.neutral)
+        val withIntent = bbcToggleUiProjection(
+            BbcActivationConsentState.Granted, holder.effectStatus.value, true,
+        )
+        assertEquals(true, withIntent.checked)
+
+        // A real Confirmed mark overrides the provisional read, and a later
+        // read of the same preference cannot downgrade it back.
+        assertTrue(holder.mark(BbcWriteOutcome.Confirmed(true), holder.nextSequence()))
+        assertEquals(BbcEffectStatus.Confirmed(true), holder.effectStatus.value)
+        holder.seedEffectFromPersistedRead(false)
+        assertEquals("a late read must never downgrade a Confirmed write",
+            BbcEffectStatus.Confirmed(true), holder.effectStatus.value)
+        collector.cancel()
+    }
+
+    /** ABSENT / unreadable reads supply no value (no default-true fabrication). */
+    @Test
+    fun provisionalPersistedRead_nullKeepsNeutral() = runTest {
+        val holder = BbcToggleRuntimeState()
+        holder.seedEffectFromPersistedRead(null)
+        assertEquals(BbcEffectStatus.Provisional, holder.effectStatus.value)
+        assertNull(
+            bbcToggleUiProjection(
+                BbcActivationConsentState.NotGranted, holder.effectStatus.value, null,
+            ).checked,
+        )
+    }
+
     @Test
     fun bbcEffectPresentation_unconfirmedRendersUnverifiedConfirmedKeepsCaveat() {
         val unknown = bbcEffectPresentationFor(BbcEffectStatus.Unknown)
@@ -130,6 +191,13 @@ class BbcEffectStatusTest {
         assertEquals(R.string.settings_bbc_injection_effect_unknown, provisional.summaryRes)
         assertTrue(provisional.dimmed)
         assertTrue(provisional.italic)
+
+        // An IO-lane persisted read renders IDENTICALLY to unverified: a read
+        // is not a write acknowledgement and never claims the effect is live.
+        val provisionalRead = bbcEffectPresentationFor(BbcEffectStatus.ProvisionalRead(true))
+        assertEquals(R.string.settings_bbc_injection_effect_unknown, provisionalRead.summaryRes)
+        assertTrue(provisionalRead.dimmed)
+        assertTrue(provisionalRead.italic)
 
         // Confirmed keeps its caveat-bearing summary (a persisted preference
         // acknowledgement only, NOT an effect-success claim).

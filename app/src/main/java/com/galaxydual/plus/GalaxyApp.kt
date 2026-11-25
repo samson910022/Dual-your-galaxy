@@ -52,20 +52,18 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     // with (and newer than) a grant accepted before the rotation.
     private val bbcConsentIntentSequence = AtomicLong(0L)
 
-    // PR #74 R3-1: app-process-local BBC toggle state (last KNOWN write outcome
-    // + monotonic intent sequence). Lazy because the XposedService binder is not
-    // bound yet in Application.onCreate(); first access reinitializes from the
-    // PERSISTED preference via the same remote store seam MainActivity uses
-    // (default true on read failure). Dialog/Activity rebuilds MUST reuse this
-    // instance. NOT persisted, NOT the hook process's bbcConfirmedOffAtMs, and
-    // NOT a Samsung cold-start deletion guard (issue #75).
+    // PR #74 R3-1 + PR #90 Phase 3 (R3-06a/E2): app-process-local BBC toggle
+    // state (last KNOWN write outcome + monotonic intent sequence). Seeded
+    // NEUTRAL on purpose: the lazy initializer performs NO binder call, so a
+    // bind-time IO coroutine can never hold this lazy's monitor while Main opens
+    // Settings and blocks on it. The persisted value is instead read on the app
+    // IO lane (see [bbcToggleCoordinator]'s effectRead seam) and folded in as a
+    // PROVISIONAL read — never as a Confirmed write acknowledgement. Dialog/
+    // Activity rebuilds MUST reuse this instance so the sequence stays monotonic.
+    // NOT persisted, NOT the hook process's bbcConfirmedOffAtMs, and NOT a
+    // Samsung cold-start deletion guard (issue #75).
     internal val bbcToggleRuntimeState: BbcToggleRuntimeState by lazy {
-        BbcToggleRuntimeState(
-            initialConfirmed = remoteHookPolicyStore {
-                remotePreferences(PolicySource.POLICY_PREFS_NAME)
-            }.isBbcInjectionEnabled(),
-            sequence = bbcConsentIntentSequence,
-        )
+        BbcToggleRuntimeState(sequence = bbcConsentIntentSequence)
     }
 
     // PR #90 Phase C: the ONE app-scoped activation/consent holder. Seeded
@@ -117,6 +115,15 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
                 // (never the default-true legacy read), and a single all-or-
                 // nothing failure flag. The holder still fences by generation.
                 store.readBbcConsentAuthoritative().forGeneration(generation)
+            },
+            // PR #90 Phase 3 (R3-06a/E2): the persisted effect value is read on
+            // this SAME app IO lane, never on Main. It comes from the coherent
+            // snapshot (ABSENT/unreadable => null => neutral, no default-true)
+            // and is folded in as a PROVISIONAL value, not a write outcome.
+            effectRead = {
+                remoteHookPolicyStore {
+                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
+                }.readBbcInjectionEnabledAuthoritative()
             },
             consentHolder = bbcActivationConsentHolder,
         )
@@ -286,6 +293,9 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     /** Resolve the consent state from durable keys on the app IO lane. */
     private fun refreshBbcActivationConsent() {
         bbcToggleCoordinator.submitConsentRead()
+        // Phase 3 (R3-06a/E2): the effect value also comes from a durable read
+        // on the IO lane — no binder call on Main, provisional (not Confirmed).
+        bbcToggleCoordinator.submitEffectRead()
     }
 
     override fun onCreate() {
@@ -432,22 +442,27 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
     override fun onServiceDied(service: XposedService) {
         // 原子 CAS：只清同一 instance，避免新 binder 被舊的 death 回調清掉。
+        // A stale death callback does NOTHING (no generation bump, no resync).
         if (serviceRef.compareAndSet(service, null)) {
-            // PR #90 P0: a rebound service exposes a DIFFERENT remote-prefs
-            // instance. Drop the old intent and re-arm bind-time classification
-            // so the new service cannot inherit stale process state.
-            synchronized(versionCommitLock) {
-                clearPendingBbcClassification()
-            }
-            // PR #90 Phase C: bump the consent trust generation. Granted/Legacy
-            // degrade to Initializing (must resync on next bind); a durable
-            // Unknown fence is intentionally preserved across binder death.
-            bumpBbcConsentServiceGeneration()
-            // P1-B: invalidate the dead bind's snapshot; its in-flight attempt
-            // must not apply a confirm/fence to the new instance.
-            synchronized(bbcClassificationSnapshotLock) {
+            // PR #90 Phase 3 (R3-06b/E3 + E5): BUMP FIRST, on the callback
+            // thread, as an in-memory atomic. No versionCommitLock is acquired
+            // here — that monitor is held around blocking binder commits and
+            // must never stall death bookkeeping. Granted/Legacy degrade to
+            // Initializing immediately; a durable Unknown fence is preserved.
+            val newGeneration = bumpBbcConsentServiceGeneration()
+
+            // E5: a bind may have captured an attempt for an older generation
+            // between this CAS and the bump. That attempt will now deliberately
+            // skip its own refresh, so record that a resync for THIS generation
+            // is required. No loop: a read never bumps the generation.
+            val bindAttemptInvalidated = synchronized(bbcClassificationSnapshotLock) {
+                val attempt = bbcClassificationAttempt.get()
+                val invalidated = attempt != null && attempt.generation != newGeneration
+                // P1-B: invalidate the dead bind's snapshot; its in-flight
+                // attempt must not apply a confirm/fence to the new instance.
                 bbcClassificationAttempt.set(null)
                 bbcClassificationBoundPrefs.set(null)
+                invalidated
             }
             // Phase 2 B3: invalidate the consent-write snapshot too. An in-flight
             // write must see the mismatch both before and after its commit.
@@ -455,8 +470,31 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
                 bbcConsentWriteAttempt.set(null)
                 bbcConsentWriteBoundPrefs.set(null)
             }
+            // Capture the pending classification intent identity WITHOUT a lock.
+            // The deferred clear below must never drop a NEWER bind's retry
+            // intent; a stale pending entry is keyed by prefs identity and is
+            // self-clearing via PendingBbcClassification.matches() anyway.
+            val pendingAtDeath = pendingBbcClassification.get()
+
             // 通知監聽者服務已斷線,讓呼叫端重新評估 (fail-closed)。
             notifyServiceListeners()
+
+            // PR #90 Phase 3 (R3-06b/E3): all pending-intent cleanup moves to
+            // the app IO scope UNDER versionCommitLock — the same serializer as
+            // the blocking binder commits, never the service callback thread.
+            bbcClassificationScope.launch {
+                synchronized(versionCommitLock) {
+                    if (pendingBbcClassification.get() === pendingAtDeath) {
+                        clearPendingBbcClassification()
+                    }
+                }
+                if (bindAttemptInvalidated) {
+                    // E5: the invalidated bind will never refresh; a resync for
+                    // the new generation is the only way out of Initializing.
+                    bbcToggleCoordinator.submitConsentRead()
+                    bbcToggleCoordinator.submitEffectRead()
+                }
+            }
         }
     }
 

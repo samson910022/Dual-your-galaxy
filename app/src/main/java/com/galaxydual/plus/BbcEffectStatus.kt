@@ -21,6 +21,13 @@ package com.galaxydual.plus
  * commit(false)/throw may have polluted the local mMap, so Unknown is never a
  * rollback or a restored value. This is also NOT a Samsung cold-start deletion
  * guard (issue #75).
+ *
+ * PR #90 Phase 3 (R3-06a/E2): [ProvisionalRead] carries a persisted value that
+ * was READ on the app IO lane. It supplies the checkbox value so the row is not
+ * stuck neutral, but it is deliberately NOT [Confirmed]: a read can never claim
+ * that a write was acknowledged, and it renders the same UNVERIFIED presentation
+ * as [Provisional]/[Unknown]. A preference read may observe an optimistically
+ * polluted local mMap, so it is never write-confirmation evidence either.
  */
 internal sealed interface BbcEffectStatus {
     /** A non-stale mark(Confirmed) was applied; [value] is the persisted value. */
@@ -31,6 +38,13 @@ internal sealed interface BbcEffectStatus {
 
     /** Initial seed: no confirmed mark yet in this process; renders UNVERIFIED. */
     data object Provisional : BbcEffectStatus
+
+    /**
+     * A persisted value obtained from an authoritative IO-lane read (never a
+     * write acknowledgement). [value] is a neutral checkbox seed only; the row
+     * still renders UNVERIFIED and a later Confirmed mark always wins.
+     */
+    data class ProvisionalRead(val value: Boolean) : BbcEffectStatus
 }
 
 /** Pure presentation description; the Activity applies it to its own Views. */
@@ -43,15 +57,18 @@ internal data class BbcEffectPresentation(
 /**
  * Map an effect status to the row presentation.
  *
- * A fresh process ([Provisional]) and [Unknown] both render as UNVERIFIED, with
- * the issue-#75 cold-start caveat. Only a later [Confirmed] — a persisted
- * preference acknowledgement, NOT effect proof — switches to the normal
- * caveat-bearing summary. Every presentation keeps the cold-start warning;
- * switching never removes it.
+ * A fresh process ([Provisional]), [Unknown] and an IO-lane [ProvisionalRead]
+ * all render as UNVERIFIED, with the issue-#75 cold-start caveat: a read is not
+ * a write acknowledgement. Only a later [Confirmed] — a persisted preference
+ * acknowledgement, NOT effect proof — switches to the normal caveat-bearing
+ * summary. Every presentation keeps the cold-start warning; switching never
+ * removes it.
  */
 internal fun bbcEffectPresentationFor(status: BbcEffectStatus): BbcEffectPresentation =
     when (status) {
-        BbcEffectStatus.Unknown, BbcEffectStatus.Provisional -> BbcEffectPresentation(
+        BbcEffectStatus.Unknown, BbcEffectStatus.Provisional,
+        is BbcEffectStatus.ProvisionalRead,
+        -> BbcEffectPresentation(
             summaryRes = R.string.settings_bbc_injection_effect_unknown,
             dimmed = true,
             italic = true,

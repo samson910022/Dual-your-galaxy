@@ -941,6 +941,24 @@ class HookPolicyStore(
         BbcConsentDurableSnapshot.failClosed()
     }
 
+    /**
+     * PR #90 Phase 3 (R3-06a/E2): authoritative persisted effect-value read used
+     * by the app IO lane (never on Main). Taken from the SAME coherent snapshot
+     * as the consent keys, with `contains()` semantics and NO default-true
+     * fallback: absent / unreadable / disconnected / torn => `null` (the row
+     * stays neutral). This is a READ, never a write acknowledgement — callers
+     * fold it in as a provisional seed, not as Confirmed.
+     */
+    internal fun readBbcInjectionEnabledAuthoritative(): Boolean? = try {
+        readBbcConsentDurableRaw().let { snapshot ->
+            if (snapshot.coherent) snapshot.legacyRuntimeEnabled else null
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
+    }
+
     // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
     // fail-closed. Direct backends (repairProbe null) delegate to loadResult()
     // (no poison → already authoritative). Remote probe bypasses the poison
