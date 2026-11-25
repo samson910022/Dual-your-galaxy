@@ -15,7 +15,7 @@
 
 ## ⚠️ 風險揭露（必須保留在使用者看得見的地方）
 
-1. **Samsung 可能自動刪除分身與永久資料。** 2026-11-23 的 A/B/C 對照中，BBC 注入 ON、DB 確認 OFF、以及完全沒有本模組 BBC hook 三臂，都出現同一個 system uid (`1000` / `android.uid.system:1000`) 對 `com.openai.chatgpt` user 95 的 `START DELETE PACKAGE`，且都早於任何 BBC callback；Samsung daagent 自己的 DB 記錄 `Delete forbidden package: com.openai.chatgpt from user: 95`。刪除根因**未證實**；此為負向控制關聯、非因果或安全證明（各臂 App build 不同，`pm install-existing` 只還原套件存在、不還原使用者資料）。
+1. **Samsung 可能自動刪除分身與永久資料。** 2026-11-23 的 A/B/C 對照中，BBC 注入 ON、DB 確認 OFF、以及完全沒有本模組 BBC hook 三臂，都出現同一個 system uid (`1000` / `android.uid.system:1000`) 對 `com.openai.chatgpt` user 95 的 `START DELETE PACKAGE`；A/B 臂早於 BBC callback，C 臂無 callback 可比（process-start 代理、低精度 +103 ms）。Samsung daagent 自己的 DB 記錄 `Delete forbidden package: com.openai.chatgpt from user: 95`。刪除根因**未證實**；此為負向控制關聯（ASSOCIATION，非因果；各臂 App build 不同，`pm install-existing` 只還原套件存在、不還原使用者資料），opt-out 不是刪除防護。詳 `docs/ACCEPTANCE.md` §6.0 E-23-ABC。
 2. **這是已揭露、由維護者接受的 experimental limitation，不是 pass、不是已修復、不是安全結論。** 若日後確認本 App 在未授權下直接刪除資料的程式錯誤，仍須重新提升為 blocker。
 3. **opt-out 不是刪除防護。** `BBC_AVAILABLE_APPS_INJECTION=true`、執行期偏好缺席視為啟用；Hook **可能早於首次 App UI 警告生效**。App 的 checkbox／首次對話框**不是**「Hook 生效前取得同意」。
 4. **Root / Shizuku 只是操作路線，不是資料保護。** Shizuku / ADB shell 無法通用備份其他 profile 的私人 App 資料；`pm install-existing` 只還原套件存在，不還原已清除的聊天、登入與私人檔案。即使有 Root，也不等於 Keystore／私有資料可完整還原。
