@@ -187,7 +187,8 @@ class MainActivity : ComponentActivity() {
     // is cleared in onDestroy and consent is session-scoped (never re-bound from
     // a Bundle). The rebuilt final dialog therefore has no live consent action;
     // fail closed by invalidating the orphan pending BEFORE showing it. Consumed
-    // once by syncPolicyWriteDialog so later rebuilds in this instance are normal.
+    // once on the FIRST sync (any phase/pending) so no later fresh WRITE can be
+    // mistaken for an orphan; later rebuilds in this instance are normal.
     private var recreatedFromSavedState = false
     private var serviceBindListener: (() -> Unit)? = null
     // Phase D shared confirm-dialog state machine (Main/Editor共用同一 holder 類型
@@ -482,7 +483,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // PR #89 R3-3: a non-null saved state means this instance was rebuilt;
-        // the orphan gate in syncPolicyWriteDialog consumes the marker once.
+        // syncPolicyWriteDialog consumes the marker on its FIRST sync.
         recreatedFromSavedState = savedInstanceState != null
         // 旋轉恢復：diagExpanded 純 UI 開關，隨 Activity 存活即可。
         // B1：lastWriteBlockText/lastMsgText 為顯示快取（完整文字），View 重建為空時
@@ -4582,6 +4583,13 @@ class MainActivity : ComponentActivity() {
         policySaving: Boolean,
         policyWritePhase: PolicyWritePhase = PolicyWritePhase.IDLE,
     ) {
+        // PR #89 Round-3 R3-4 (P2): consume the rotation marker on the FIRST sync,
+        // regardless of phase/pending (idle + SAVING included). Consuming it only
+        // inside the orphan branch let a leaked `true` survive until a later,
+        // fresh WRITE's confirm (action revoked, VM still QUEUED during pre-read
+        // IO) was spuriously invalidated by a state emission.
+        val rebuilt = recreatedFromSavedState
+        recreatedFromSavedState = false
         // RECONCILING 相位由幀傳入（唯一真相為 state.policyWritePhase）；neutral
         // （稍后刷新）按鈕僅此期可用，判定收斂至 JVM-pinnable 謂詞。
         val policyReconciling = policyWriteSnoozeEnabled(policyWritePhase)
@@ -4617,28 +4625,32 @@ class MainActivity : ComponentActivity() {
         // no-op for the other phases. No Bundle consent/ack restoration, no
         // auto-ack, and NO warning-restart install/deliver/consume here.
         if (shouldInvalidateOrphanPendingOnRebuild(
-                recreatedFromSavedState,
+                rebuilt,
                 policyWritePhase,
                 warningRestartController.isLive(pending.consent?.actionId),
             )
         ) {
-            vm.cancelPolicyWrite(pending)
-            try {
-                policyWriteDialog?.dismiss()
-            } catch (_: Exception) {
-                // Best effort: the window may already be gone.
-            }
-            policyWriteDialog = null
-            policyConfirmState.onPendingCleared()
-            recreatedFromSavedState = false
-            if (!isFinishing && !isDestroyed) {
+            // R3-4: gate the whole invalidation on the REAL VM result. A refused
+            // cancel (phase flipped to SAVING/RECONCILING, app-scoped Tx/handover)
+            // must fall through to the normal busy/Tx rendering below.
+            val cancelled = vm.cancelPolicyWrite(pending)
+            if (cancelled) {
                 try {
-                    Toast.makeText(this, R.string.pre_write_recheck_failed, Toast.LENGTH_LONG).show()
+                    policyWriteDialog?.dismiss()
                 } catch (_: Exception) {
-                    // Best effort: toast failure must not strand the pending.
+                    // Best effort: the window may already be gone.
                 }
+                policyWriteDialog = null
+                policyConfirmState.onPendingCleared()
+                if (!isFinishing && !isDestroyed) {
+                    try {
+                        Toast.makeText(this, R.string.pre_write_recheck_failed, Toast.LENGTH_LONG).show()
+                    } catch (_: Exception) {
+                        // Best effort: toast failure must not strand the pending.
+                    }
+                }
+                return
             }
-            return
         }
         // Stage J4：RECONCILING 期本地抑制（使用者已 Back/取消/稍后刷新主動關閉）：
         // 不重建 dialog，VM fence 保留，reconciler／late-join 照常結清；新世代即清除。

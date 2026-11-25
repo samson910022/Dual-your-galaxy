@@ -1,6 +1,9 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
-// PR #74 R7b-2 (M1)：風險揭露 UI 回歸（instrumentation，手動執行；CI emulator matrix SKIPPED）。
+// PR #74 R7b-2 (M1)：風險揭露 UI 回歸（instrumentation，零真實寫入）。
+// CI 實情：.github/workflows/android.yml 的 locale-instrumentation job 在每個 PR
+// 以 connectedDebugAndroidTest（API 29 x86_64 emulator）執行本套件；API 34 手動
+// emulator 矩陣僅 workflow_dispatch（instrumentation-manual job），非 SKIPPED。
 // mirrors BatchConfirmDialogTest：ActivityScenario + reflection field() + FakeHarnessGateway
 // + MainActivity.testViewModel，全程零真實寫入。鎖定：持續提示可見但不自動彈窗、
 // 詳細風險可重開、一次性 gate 的取消零寫入／不標記、通過後克隆抵達、重進不再彈。

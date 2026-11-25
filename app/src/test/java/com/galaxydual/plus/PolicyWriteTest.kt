@@ -932,6 +932,39 @@ class PolicyWriteTest {
         assertEquals(setOf("com.example.a"), fake.saved)
     }
 
+    // PR #89 Round-3 R3-4 (Editor final confirm): the ack holder is read at
+    // CALLBACK time. A stale holder ack (acknowledged=true but bound to a
+    // different generation — e.g. withdrawn during the revalidation await)
+    // computes ackGen=null, and the VM must refuse RETRYABLE_RETAINED with ZERO
+    // store write. Mirrors MainActivity's live re-read at the confirm seam.
+    @Test
+    fun confirmPolicyWrite_staleEditorHolderAck_refusesEntirely() {
+        val fake = FakePolicyStore()
+        val vm = makeVm(fake.store, userId = 0)
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        // Real holder shape: checked, but bound to a DIFFERENT generation.
+        // This is the exact state Editor reads at callback time.
+        val holder = PolicyConfirmDialogState()
+        holder.onAckChanged(true, pending.generation + 1L)
+        val ackGen = if (holder.acknowledged && holder.ackGeneration == pending.generation) {
+            pending.generation
+        } else null
+        assertNull("stale holder ack must not authorize a write", ackGen)
+
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pending, ackGen),
+        )
+        await(timeoutMs = 5_000L) {
+            vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
+        }
+        assertEquals(0, fake.saveCalls.get())
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
+    }
+
     // 4.1 #3 無 pending：INVALID。
     @Test
     fun confirmPolicyWrite_noPending_reportsInvalid() {

@@ -131,8 +131,9 @@ class PolicyActivity : ComponentActivity() {
     // contract as MainActivity). The retained VM can replay an unsubmitted
     // QUEUED pending while this Activity's WarningRestartController is gone;
     // syncPolicyConfirmDialog invalidates that orphan before rebuilding the
-    // final dialog, then consumes the marker once. Consent/ack are never
-    // restored from a Bundle and are never auto-acknowledged.
+    // final dialog. The marker is consumed on the FIRST sync (any phase/pending)
+    // so a later fresh WRITE cannot be mistaken for an orphan. Consent/ack are
+    // never restored from a Bundle and are never auto-acknowledged.
     private var recreatedFromSavedState = false
     // #78 / #89 D2b：風險揭露對話框與編輯器空集導引對話框的 handle 改由 slot 持有。
     // 共用 RiskNotice helper 回傳 show() 的 handle（失敗為 null），slot 保證 null
@@ -469,7 +470,7 @@ class PolicyActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // PR #89 R3-3: a non-null saved state means this instance was rebuilt;
-        // the orphan gate in syncPolicyConfirmDialog consumes the marker once.
+        // syncPolicyConfirmDialog consumes the marker on its FIRST sync.
         recreatedFromSavedState = savedInstanceState != null
         // Phase D：旋轉保留世代 (expanded/dismissed 世代；pending 本體由 retained VM 重播).
         // consent 為 session-scoped：ack 永不寫入 Bundle，還原強制清除
@@ -1106,7 +1107,14 @@ class PolicyActivity : ComponentActivity() {
                             // PR #89 R3-2: same admission gate as MainActivity.
                             // Other retained-pending refusals (e.g. RECONCILING)
                             // must not revoke the accepted action either.
-                            val admission = vm.confirmPolicyWrite(pending, pending.generation)
+                            // R3-4: the ack CheckBox stays interactive while the
+                            // revalidation suspends, so read the holder AT CALLBACK
+                            // TIME (like Main's live re-read). A withdrawal during
+                            // the await yields ackGen=null -> RETRYABLE_RETAINED.
+                            val ackGen = if (policyConfirmState.acknowledged &&
+                                policyConfirmState.ackGeneration == pending.generation
+                            ) pending.generation else null
+                            val admission = vm.confirmPolicyWrite(pending, ackGen)
                             if (confirmRevocationAccepted(admission)) {
                                 warningRestartController.revoke(actionId)
                             }
@@ -1398,6 +1406,12 @@ class PolicyActivity : ComponentActivity() {
     // dismisses; same-instance showing only refreshes gates; RECONCILING local
     // suppression honored; rotation re-shows from retained VM pending.
     private fun syncPolicyConfirmDialog(pending: PendingPolicyWrite?, phase: PolicyWritePhase) {
+        // PR #89 Round-3 R3-4 (P2): consume the rotation marker on the FIRST sync,
+        // regardless of phase/pending (idle + SAVING included). A marker leaked
+        // past an orphanless first sync could later cancel a fresh WRITE's
+        // pending after its accepted action was revoked on ACCEPTED.
+        val rebuilt = recreatedFromSavedState
+        recreatedFromSavedState = false
         if (isFinishing || isDestroyed) return
         val reconciling = phase == PolicyWritePhase.RECONCILING
         if (pending == null) {
@@ -1417,32 +1431,36 @@ class PolicyActivity : ComponentActivity() {
         // cancel itself is a no-op for those phases). No Bundle consent/ack
         // restoration, no auto-ack, and no warning-restart install/deliver/consume.
         if (shouldInvalidateOrphanPendingOnRebuild(
-                recreatedFromSavedState,
+                rebuilt,
                 phase,
                 warningRestartController.isLive(pending.consent?.actionId),
             )
         ) {
-            vm.cancelPolicyWrite(pending)
-            try {
-                policyConfirmDialog?.dismiss()
-            } catch (_: Exception) {
-                // Best effort: the window may already be gone.
-            }
-            policyConfirmDialog = null
-            policyConfirmState.onPendingCleared()
-            recreatedFromSavedState = false
-            if (!isFinishing && !isDestroyed) {
+            // R3-4: gate the whole invalidation on the REAL VM result. A refused
+            // cancel (phase flipped to SAVING/RECONCILING, app-scoped Tx/handover)
+            // must fall through to the normal busy/Tx rendering below.
+            val cancelled = vm.cancelPolicyWrite(pending)
+            if (cancelled) {
                 try {
-                    android.widget.Toast.makeText(
-                        this,
-                        R.string.pre_write_recheck_failed,
-                        android.widget.Toast.LENGTH_LONG,
-                    ).show()
+                    policyConfirmDialog?.dismiss()
                 } catch (_: Exception) {
-                    // Best effort: toast failure must not strand the pending.
+                    // Best effort: the window may already be gone.
                 }
+                policyConfirmDialog = null
+                policyConfirmState.onPendingCleared()
+                if (!isFinishing && !isDestroyed) {
+                    try {
+                        android.widget.Toast.makeText(
+                            this,
+                            R.string.pre_write_recheck_failed,
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
+                    } catch (_: Exception) {
+                        // Best effort: toast failure must not strand the pending.
+                    }
+                }
+                return
             }
-            return
         }
         if (reconciling && policyConfirmState.shouldSuppressForReconciling(pending, true)) {
             try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }

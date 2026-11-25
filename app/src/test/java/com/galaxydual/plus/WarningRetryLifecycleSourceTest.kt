@@ -638,6 +638,8 @@ class WarningRetryLifecycleSourceTest {
             DialogSeam(
                 "PolicyActivity", editor, "private fun showConfirmDialog(",
                 listOf("setOnCancelListener", "BUTTON_NEGATIVE)?.apply"),
+                // Editor's fail-closed orphan guard lives in syncPolicyConfirmDialog,
+                // not in showConfirmDialog, so this dialog body has no raw cancel.
                 rawCancelInBody = 0,
             ),
         )) {
@@ -722,10 +724,38 @@ class WarningRetryLifecycleSourceTest {
             // Strip comment-only lines so a commented-out revoke cannot satisfy
             // this check: the production call itself must be present in code.
             val helperCode = helper.lines().filterNot { it.trimStart().startsWith("//") }.joinToString("\n")
-            val gateAt = helperCode.indexOf("cancelOwnershipAccepted(")
+            // Require the LITERAL `if (` form. A bare
+            // `cancelOwnershipAccepted(...)` statement followed by an
+            // unconditional revoke would otherwise let the brace matcher below
+            // start at the revoke's own `{ }` and report it as "inside" a gate
+            // that is never actually evaluated as a condition.
+            val gateNeedle = "if (cancelOwnershipAccepted("
+            val gateAt = helperCode.indexOf(gateNeedle)
+            assertTrue(
+                "${seam.name} helper must gate revocation with if (cancelOwnershipAccepted(...))",
+                gateAt >= 0,
+            )
             val revokeAt = helperCode.indexOf("cancelAcceptedWarning(actionId) { }")
             assertTrue("${seam.name} helper must revoke in code, not just in a comment", revokeAt >= 0)
             assertTrue("${seam.name} ownership gate must precede revocation", gateAt in 0 until revokeAt)
+            // R3-4: nesting, not merely membership/order. A gate that is
+            // evaluated but ignored (revoke parked OUTSIDE the block) must fail.
+            assertEquals(
+                "${seam.name} helper must expose exactly one conditional revoke",
+                1,
+                indicesOf(helperCode, "cancelAcceptedWarning(actionId)").size,
+            )
+            // Reuse the whole-lambda brace matcher starting at the `if`: its
+            // first `{` is the gate's own block (the revoke's `{ }` is nested
+            // inside), so an ungated revoke can no longer pose as the block.
+            val gateBlock = cancelLambda(helperCode, gateAt)
+            val gateBlockAt = helperCode.indexOf(gateBlock)
+            assertTrue("${seam.name} ownership gate must open a block", gateBlockAt >= 0)
+            val revokeCallAt = helperCode.indexOf("cancelAcceptedWarning(actionId)")
+            assertTrue(
+                "${seam.name} revoke must be NESTED inside the cancelOwnershipAccepted block",
+                revokeCallAt in gateBlockAt until gateBlockAt + gateBlock.length,
+            )
         }
     }
 
@@ -737,12 +767,30 @@ class WarningRetryLifecycleSourceTest {
     // Positive trips `!isLive(actionId)` and the dialog silently disappears.
     @Test
     fun finalConfirmRevocation_isAdmissionGated() {
-        data class ConfirmSeam(val name: String, val src: String, val ackExpr: String)
+        data class ConfirmSeam(
+            val name: String,
+            val src: String,
+            val ackExpr: String,
+            // Editor-only: the callback-time ack-generation computation. Main
+            // re-reads its live field inline in the confirm call; Editor must
+            // snapshot the holder after the revalidation await instead.
+            val callbackAckComputation: String? = null,
+        )
         for (seam in listOf(
             ConfirmSeam("MainActivity", main, "if (policyAcknowledged) pending.generation else null"),
-            // Editor has no live checkbox, but the VM has OTHER retained-pending
-            // refusal paths (pending!=expected / RECONCILING): same gate required.
-            ConfirmSeam("PolicyActivity", editor, "pending.generation"),
+            // The Editor's ack CheckBox stays interactive while revalidation
+            // suspends, so the holder must be re-read AT CALLBACK TIME. A plain
+            // `pending.generation` there ignores a withdrawal during the await.
+            // The VM has OTHER retained-pending refusals too (RECONCILING etc.),
+            // so the admission gate is required on this host as well.
+            ConfirmSeam(
+                "PolicyActivity", editor, "ackGen",
+                """
+                val ackGen = if (policyConfirmState.acknowledged &&
+                    policyConfirmState.ackGeneration == pending.generation
+                ) pending.generation else null
+                """.trimIndent(),
+            ),
         )) {
             val body = block(seam.src, "private fun confirmWriteWithConsent(")
             val callLine = body.lines().firstOrNull { it.contains("vm.confirmPolicyWrite(") }
@@ -759,6 +807,25 @@ class WarningRetryLifecycleSourceTest {
             // Strip comment-only lines: a documented guard cannot satisfy the
             // ordering check, only executable code can.
             val code = body.lines().filterNot { it.trimStart().startsWith("//") }.joinToString("\n")
+            seam.callbackAckComputation?.let { computation ->
+                // Flatten both sides: a harmless line break before `)` must not
+                // false-fail, but replacing the holder check with a plain
+                // `pending.generation` still does.
+                val normalized = flat(computation).trim()
+                val flatCode = flat(code)
+                assertTrue(
+                    "${seam.name} ack generation must be computed at callback time from the live holder",
+                    flatCode.contains(normalized),
+                )
+                assertTrue(
+                    "${seam.name} ack computation must precede the confirm call",
+                    flatCode.indexOf(normalized) in 0 until flatCode.indexOf("vm.confirmPolicyWrite(pending, ackGen)"),
+                )
+            }
+            assertFalse(
+                "${seam.name} final confirm must not pass a plain pending.generation",
+                callLine.contains("vm.confirmPolicyWrite(pending, pending.generation)"),
+            )
             val guard = "if (confirmRevocationAccepted(admission)) {"
             val guardAt = code.indexOf(guard)
             val revokeAt = code.indexOf("warningRestartController.revoke(actionId)")
@@ -780,6 +847,18 @@ class WarningRetryLifecycleSourceTest {
                 "${seam.name} final confirm must have one ownership revoke",
                 1,
                 indicesOf(code, "warningRestartController.revoke(actionId)").size,
+            )
+            // A second revalidation or dispatch arm would suspend/confirm twice;
+            // pin BOTH seams to exactly one call per host (membership is not enough).
+            assertEquals(
+                "${seam.name} final confirm must revalidate consent exactly once",
+                1,
+                indicesOf(code, "revalidatePolicyWriteConsent(").size,
+            )
+            assertEquals(
+                "${seam.name} final confirm must dispatch consent-gated confirm exactly once",
+                1,
+                indicesOf(code, "dispatchConsentGatedConfirm(").size,
             )
             // Whole-lambda style: the revoke must be INSIDE the guard block,
             // not merely after it on an unguarded line. Match the guard's own
@@ -823,6 +902,13 @@ class WarningRetryLifecycleSourceTest {
     // BEFORE showing an operable final dialog, guide the user to restart, and
     // leave SAVING/RECONCILING + app-scoped Tx/handover alone. No Bundle-based
     // consent/ack restoration and no auto-ack are allowed.
+    //
+    // DEVICE-UNVERIFIED: this test proves ONLY the two Activities' source shape
+    // plus the framework-free predicate truth table
+    // (PolicyWriteAdmissionPredicatesTest.shouldInvalidateOrphanPendingOnRebuild).
+    // The end-to-end Activity/VM/device rotation behavior (real saved state, real
+    // VM replay, real dialog, real cancel result) is NOT executed here and stays
+    // DEVICE-UNVERIFIED; no on-device acceptance is claimed.
     @Test
     fun orphanPendingRebuild_failsClosedBeforeFinalDialogInBothActivities() {
         data class SyncSeam(
@@ -892,25 +978,82 @@ class WarningRetryLifecycleSourceTest {
             )
 
             val sync = block(seam.src, seam.syncFn)
+            // Comment-only lines are NOT executable: a commented-out
+            // `// recreatedFromSavedState = false` must not satisfy the one-shot
+            // marker snapshot/reset/gate ordering checks below.
+            val flatSync = flat(sync.lines().filterNot { it.trimStart().startsWith("//") }.joinToString("\n"))
+            // R3-4 (P2): the rotation marker is a one-shot consumed on the FIRST
+            // sync regardless of phase/pending, and ALWAYS before the gate.
+            // "Reset only inside the orphan branch" leaks it across the Activity
+            // lifetime; pin the snapshot, the reset, and their ordering here.
+            val snapshotAt = flatSync.indexOf("val rebuilt = recreatedFromSavedState")
+            val markerResetAt = flatSync.indexOf("recreatedFromSavedState = false")
+            val syncGateAt = flatSync.indexOf("shouldInvalidateOrphanPendingOnRebuild(")
+            assertTrue("${seam.name}.sync must snapshot the rotation marker", snapshotAt >= 0)
+            assertTrue("${seam.name}.sync must consume the marker on the first sync", markerResetAt >= 0)
+            assertTrue("${seam.name}.sync must expose the orphan gate", syncGateAt >= 0)
+            assertTrue("${seam.name} marker snapshot must precede its reset", snapshotAt in 0 until markerResetAt)
+            assertTrue("${seam.name} marker must be cleared BEFORE the gate", markerResetAt in 0 until syncGateAt)
+
             val branch = orphanBranch(sync)
             assertTrue("${seam.name}.sync must expose the orphan-invalidation branch", branch.isNotEmpty())
             val flatBranch = flat(branch)
+            // Comment-only lines are NOT control flow: a `// if (cancelled) {`
+            // must not open a brace span that swallows the invalidation effects.
+            // Build one code-only view and use it for the cancel-result gate,
+            // its brace match, and the effect scan (and the tail return check
+            // further down).
+            val codeBranch = flat(
+                branch.lines().filterNot { it.trimStart().startsWith("//") }.joinToString(" "),
+            )
+            assertFalse(
+                "${seam.name} orphan branch must NOT hold the marker reset",
+                flatBranch.contains("recreatedFromSavedState = false"),
+            )
             assertTrue(flatBranch.contains("shouldInvalidateOrphanPendingOnRebuild("))
             // Pin the GATE ARGUMENTS, not only the call name: hard-wiring any of
             // rebuilt / phase / live-action to a constant must fail this test.
+            // The rebuilt argument is the captured snapshot, not the mutable flag.
             assertEquals(
                 "${seam.name} orphan gate must pass the live rebuilt/phase/action arguments",
                 listOf(
-                    "recreatedFromSavedState",
+                    "rebuilt",
                     seam.phaseArg,
                     "warningRestartController.isLive(pending.consent?.actionId)",
                 ),
                 callArguments(branch, "shouldInvalidateOrphanPendingOnRebuild("),
             )
-            assertTrue(flatBranch.contains("vm.cancelPolicyWrite(pending)"))
+            // R3-4 (MEDIUM): the invalidation is gated on the REAL VM cancel
+            // result. A refused cancel (SAVING/RECONCILING or app-scoped Tx/
+            // handover) must fall through to normal busy/Tx rendering.
+            val cancelResultAt = codeBranch.indexOf("val cancelled = vm.cancelPolicyWrite(pending)")
+            val resultGateAt = codeBranch.indexOf("if (cancelled)")
+            assertTrue("${seam.name} orphan branch must capture the Boolean VM cancel result", cancelResultAt >= 0)
+            assertEquals(
+                "${seam.name} orphan branch must have exactly one raw VM cancel",
+                1,
+                indicesOf(codeBranch, "vm.cancelPolicyWrite(pending)").size,
+            )
+            assertTrue(
+                "${seam.name} orphan branch must gate invalidation on the captured result",
+                resultGateAt in cancelResultAt until codeBranch.length,
+            )
+            // Nesting, not membership: dismiss / holder clear / toast / early
+            // return must all live INSIDE `if (cancelled) { ... }`, so a
+            // gate-evaluated-but-ignored cancel cannot invalidate the pending.
+            val resultGateBlock = cancelLambda(codeBranch, resultGateAt)
+            val resultGateBlockAt = codeBranch.indexOf(resultGateBlock)
+            assertTrue("${seam.name} cancel-result gate must open a block", resultGateBlockAt >= 0)
+            val resultGateEnd = resultGateBlockAt + resultGateBlock.length
+            for (effect in listOf(seam.handleClear, "onPendingCleared()", "R.string.pre_write_recheck_failed", "return")) {
+                val effectAt = codeBranch.indexOf(effect, resultGateBlockAt)
+                assertTrue(
+                    "${seam.name} '$effect' must be nested inside the cancel-result gate",
+                    effectAt in resultGateBlockAt until resultGateEnd,
+                )
+            }
             assertTrue(flatBranch.contains("onPendingCleared()"))
             assertTrue(flatBranch.contains("R.string.pre_write_recheck_failed"))
-            assertTrue(flatBranch.contains("recreatedFromSavedState = false"))
             assertTrue("${seam.name} orphan branch must clear its dialog handle", flatBranch.contains(seam.handleClear))
             // Gate ordering inside the branch: decide → cancel → clear holder.
             val inBranchGate = flatBranch.indexOf("shouldInvalidateOrphanPendingOnRebuild(")
@@ -935,16 +1078,14 @@ class WarningRetryLifecycleSourceTest {
             // site. Check the branch's LAST statement, so merely burying a
             // `return` earlier in the block cannot satisfy the requirement.
             // Comment-only lines are NOT control flow: a commented-out
-            // `// return }` must fail both checks below. Build the code-only
-            // view from the line-preserving `branch` (flatBranch has already
-            // lost its newlines), and keep `branchStart` from the raw `sync`
-            // so the return index still orders against build sites.
-            val codeBranch = flat(
-                branch.lines().filterNot { it.trimStart().startsWith("//") }.joinToString(" "),
-            )
+            // `// return }` must fail both checks below. Reuse the code-only
+            // `codeBranch` built above, and keep `branchStart` from the raw
+            // `sync` so the return index still orders against build sites.
+            // The early return closes BOTH the `if (cancelled)` gate and the
+            // outer orphan gate, so allow the nested closing braces at the tail.
             assertTrue(
                 "${seam.name} orphan branch must end with an early return",
-                Regex("""return\s*\}\s*$""").containsMatchIn(codeBranch),
+                Regex("""return\s*(\}\s*)+$""").containsMatchIn(codeBranch),
             )
             val branchStart = sync.indexOf(branch)
             assertTrue("${seam.name} orphan branch must be a contiguous slice", branchStart >= 0)
