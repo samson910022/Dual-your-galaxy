@@ -234,6 +234,7 @@ adb shell pm uninstall --user <dualId> com.example.chat
 - 誠實性註記：本節 UI 呈現行為（搜尋／開關／勾選／截斷／批次文案／旋轉回填／重啟恢復）以單元測試＋靜態審查為證；
   TalkBack 朗讀、旋轉重建實機表現、長清單圖示效能、真通道 batch 端到端仍 [待實機驗證]（與 §0／§4 及 PR body 的 Device verification left open 口徑一致），
   不得宣稱為已通過實機驗證。
+- PR #89 Round-3 R3-3 政策寫入 final 對話框旋轉孤兒 fail-closed：ViewModel 在旋轉後仍在，尚未送出的 `QUEUED` pending 會重播，但每個 Activity 的 `WarningRestartController` 於 onDestroy 清除，且 consent／ack 為 session-scoped（永不寫入 Bundle，亦不自動 rebind／auto-ack）。若據 saved state 重建後該 pending 已無 live consent action，則在顯示（或重建）final 對話框**之前**先取消該孤兒 pending、清掉 dialog handle／holder 狀態，並以既有 `pre_write_recheck_failed` 字串提示使用者重新操作；`SAVING`／`RECONCILING` 與 app-scoped Tx／handover 完全不動。純函式真值表（僅 rebuilt＋`QUEUED`＋無 live action 才失效）與兩屏原始碼形狀由 JVM 測試鎖定；**旋轉重建的實機對話框行為仍未驗證（DEVICE-UNVERIFIED）**，不得宣稱已通過實機驗收。
 
 ### 政策寫入流程（Stage2：白名單政策草稿）
 

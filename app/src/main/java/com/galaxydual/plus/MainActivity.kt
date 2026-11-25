@@ -182,6 +182,13 @@ class MainActivity : ComponentActivity() {
     private lateinit var clearPolicyBtn: Button
     private lateinit var refreshPolicyBtn: Button
     private var policyWriteDialog: AlertDialog? = null
+    // PR #89 Round-3 R3-3: rotation rebuild marker. The VM survives rotation with
+    // an unsubmitted QUEUED pending, but each Activity's WarningRestartController
+    // is cleared in onDestroy and consent is session-scoped (never re-bound from
+    // a Bundle). The rebuilt final dialog therefore has no live consent action;
+    // fail closed by invalidating the orphan pending BEFORE showing it. Consumed
+    // once by syncPolicyWriteDialog so later rebuilds in this instance are normal.
+    private var recreatedFromSavedState = false
     private var serviceBindListener: (() -> Unit)? = null
     // Phase D shared confirm-dialog state machine (Main/Editor共用同一 holder 類型
     // PolicyConfirmDialogState；既有欄位名保留為委派屬性，行為不變，rotation/onDestroy
@@ -474,6 +481,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // PR #89 R3-3: a non-null saved state means this instance was rebuilt;
+        // the orphan gate in syncPolicyWriteDialog consumes the marker once.
+        recreatedFromSavedState = savedInstanceState != null
         // 旋轉恢復：diagExpanded 純 UI 開關，隨 Activity 存活即可。
         // B1：lastWriteBlockText/lastMsgText 為顯示快取（完整文字），View 重建為空時
         // 以 View 實際文字為準補寫；lastWriteBlockDedupKey 為播報去重鍵（穩定去時間），亦隨存活。
@@ -4593,6 +4603,41 @@ class MainActivity : ComponentActivity() {
             policyWriteExpandedGeneration = null
             // Stage J4：pending 清除即清除 RECONCILING 本地抑制（終態已到）。
             policyWriteDismissedForReconcilingGen = null
+            return
+        }
+        // PR #89 Round-3 R3-3 (fail-closed orphan): after rotation the retained VM
+        // replays an unsubmitted QUEUED pending, but this Activity's
+        // WarningRestartController was cleared in onDestroy and consent is never
+        // restored from a Bundle. The rebuilt final dialog's Positive arm would
+        // see !isLive(actionId), cancel the pending and vanish, so the user could
+        // never complete it. Drop the orphan pending BEFORE any operable final
+        // dialog is shown/built and guide the user to start over. SAVING /
+        // RECONCILING and app-scoped Tx/handover are untouched: the pure gate only
+        // accepts rebuilt + QUEUED + no live action, and vm.cancelPolicyWrite is a
+        // no-op for the other phases. No Bundle consent/ack restoration, no
+        // auto-ack, and NO warning-restart install/deliver/consume here.
+        if (shouldInvalidateOrphanPendingOnRebuild(
+                recreatedFromSavedState,
+                policyWritePhase,
+                warningRestartController.isLive(pending.consent?.actionId),
+            )
+        ) {
+            vm.cancelPolicyWrite(pending)
+            try {
+                policyWriteDialog?.dismiss()
+            } catch (_: Exception) {
+                // Best effort: the window may already be gone.
+            }
+            policyWriteDialog = null
+            policyConfirmState.onPendingCleared()
+            recreatedFromSavedState = false
+            if (!isFinishing && !isDestroyed) {
+                try {
+                    Toast.makeText(this, R.string.pre_write_recheck_failed, Toast.LENGTH_LONG).show()
+                } catch (_: Exception) {
+                    // Best effort: toast failure must not strand the pending.
+                }
+            }
             return
         }
         // Stage J4：RECONCILING 期本地抑制（使用者已 Back/取消/稍后刷新主動關閉）：

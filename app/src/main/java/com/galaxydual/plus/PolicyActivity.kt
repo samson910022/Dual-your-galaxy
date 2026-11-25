@@ -127,6 +127,13 @@ class PolicyActivity : ComponentActivity() {
     // pending+generation+ack(in-memory session-scoped)+expanded+SAVING/RECONCILING cancel語義+旋轉保留+onDestroy dismiss)。
     // Editor 至少 dialog 欄位化＋onDestroy dismiss＋onSaveInstanceState 世代保留（見下）。
     private var policyConfirmDialog: AlertDialog? = null
+    // PR #89 Round-3 R3-3: rotation rebuild marker (same fail-closed orphan
+    // contract as MainActivity). The retained VM can replay an unsubmitted
+    // QUEUED pending while this Activity's WarningRestartController is gone;
+    // syncPolicyConfirmDialog invalidates that orphan before rebuilding the
+    // final dialog, then consumes the marker once. Consent/ack are never
+    // restored from a Bundle and are never auto-acknowledged.
+    private var recreatedFromSavedState = false
     // #78 / #89 D2b：風險揭露對話框與編輯器空集導引對話框的 handle 改由 slot 持有。
     // 共用 RiskNotice helper 回傳 show() 的 handle（失敗為 null），slot 保證 null
     // 不覆寫有效 handle、單一 flight 不孤兒化、dismiss callback 有 identity guard；
@@ -461,6 +468,9 @@ class PolicyActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // PR #89 R3-3: a non-null saved state means this instance was rebuilt;
+        // the orphan gate in syncPolicyConfirmDialog consumes the marker once.
+        recreatedFromSavedState = savedInstanceState != null
         // Phase D：旋轉保留世代 (expanded/dismissed 世代；pending 本體由 retained VM 重播).
         // consent 為 session-scoped：ack 永不寫入 Bundle，還原強制清除
         // (見 PolicyConfirmDialogState 檔頭；與 Main 同源).
@@ -1394,6 +1404,44 @@ class PolicyActivity : ComponentActivity() {
             try { policyConfirmDialog?.dismiss() } catch (_: Exception) { }
             policyConfirmDialog = null
             policyConfirmState.onPendingCleared()
+            return
+        }
+        // PR #89 Round-3 R3-3 (fail-closed orphan): on rotation the retained VM
+        // replays an unsubmitted QUEUED pending, but this Activity's
+        // WarningRestartController was cleared in onDestroy and consent is never
+        // restored from a Bundle. Rebuilding a final dialog with no live action
+        // would let its Positive arm cancel the pending and disappear, so drop the
+        // orphan BEFORE any showConfirmDialog / dialog build and guide the user to
+        // start over. SAVING / RECONCILING and app-scoped Tx/handover are untouched
+        // (the pure gate only accepts rebuilt + QUEUED + no live action; the VM
+        // cancel itself is a no-op for those phases). No Bundle consent/ack
+        // restoration, no auto-ack, and no warning-restart install/deliver/consume.
+        if (shouldInvalidateOrphanPendingOnRebuild(
+                recreatedFromSavedState,
+                phase,
+                warningRestartController.isLive(pending.consent?.actionId),
+            )
+        ) {
+            vm.cancelPolicyWrite(pending)
+            try {
+                policyConfirmDialog?.dismiss()
+            } catch (_: Exception) {
+                // Best effort: the window may already be gone.
+            }
+            policyConfirmDialog = null
+            policyConfirmState.onPendingCleared()
+            recreatedFromSavedState = false
+            if (!isFinishing && !isDestroyed) {
+                try {
+                    android.widget.Toast.makeText(
+                        this,
+                        R.string.pre_write_recheck_failed,
+                        android.widget.Toast.LENGTH_LONG,
+                    ).show()
+                } catch (_: Exception) {
+                    // Best effort: toast failure must not strand the pending.
+                }
+            }
             return
         }
         if (reconciling && policyConfirmState.shouldSuppressForReconciling(pending, true)) {

@@ -167,6 +167,91 @@ class WarningRetryLifecycleSourceTest {
         return out
     }
 
+    // Collapse whitespace so a harmless reformat of a multi-line call does not
+    // false-fail the gate-argument checks, while hard-wiring an argument to a
+    // constant still does.
+    private fun flat(src: String): String = src.replace(Regex("""\s+"""), " ")
+
+    // Split a call's argument list at TOP-LEVEL commas only: nested calls such
+    // as isLive(pending.consent?.actionId) must stay one argument.
+    private fun callArguments(src: String, callNeedle: String): List<String> {
+        val at = src.indexOf(callNeedle)
+        assertTrue("$callNeedle must exist", at >= 0)
+        val open = src.indexOf('(', at)
+        assertTrue("$callNeedle must open an argument list", open >= 0)
+        val args = mutableListOf<String>()
+        var current = StringBuilder()
+        var depth = 0
+        var close = -1
+        for (i in open + 1 until src.length) {
+            when (val c = src[i]) {
+                '(' -> {
+                    depth++
+                    current.append(c)
+                }
+                ')' -> {
+                    if (depth == 0) {
+                        close = i
+                        break
+                    }
+                    depth--
+                    current.append(c)
+                }
+                ',' -> {
+                    if (depth == 0) {
+                        args.add(flat(current.toString()).trim())
+                        current = StringBuilder()
+                    } else {
+                        current.append(c)
+                    }
+                }
+                else -> current.append(c)
+            }
+        }
+        assertTrue("$callNeedle must close its argument list", close >= 0)
+        val last = flat(current.toString()).trim()
+        if (last.isNotEmpty()) args.add(last)
+        return args
+    }
+
+    // PR #89 R3-3: the fail-closed orphan guard is one `if (...) { ... }` block
+    // in each Activity's sync function. Return the WHOLE block (not just the
+    // gate line) so tests can check both its internals and its position relative
+    // to the final-dialog build site.
+    private fun orphanBranch(body: String): String {
+        val gateAt = body.indexOf("shouldInvalidateOrphanPendingOnRebuild(")
+        if (gateAt < 0) return ""
+        val ifAt = body.lastIndexOf("if (", gateAt)
+        assertTrue("orphan gate must sit inside an if block", ifAt in 0 until gateAt)
+        val open = body.indexOf('{', gateAt)
+        assertTrue("orphan gate block must open", open >= 0)
+        var depth = 0
+        var close = -1
+        for (i in open until body.length) {
+            when (body[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) {
+                        close = i
+                        break
+                    }
+                }
+            }
+        }
+        assertTrue("orphan gate block must close", close >= 0)
+        return body.substring(ifAt, close + 1)
+    }
+
+    // MainActivity.syncPolicyWriteDialog now legitimately calls the raw
+    // vm.cancelPolicyWrite(pending) in that guard BEFORE a dialog is built. It
+    // is a rebuild guard, not a dialog cancel arm, so strip it before asserting
+    // the dialog's own cancel arms stay routed through the ownership helper.
+    private fun withoutOrphanInvalidationBranch(body: String): String {
+        val branch = orphanBranch(body)
+        return if (branch.isEmpty()) body else body.replace(branch, "")
+    }
+
     // G2: an Unknown Retry settle must validate the accepted action id BEFORE
     // it releases the freeze, consumes the retry token, or raises guidance.
     // Membership alone is not enough: the gate must precede EVERY side effect.
@@ -542,20 +627,26 @@ class WarningRetryLifecycleSourceTest {
             val src: String,
             val dialogFn: String,
             val cancelAnchors: List<String>,
+            val rawCancelInBody: Int,
         )
         for (seam in listOf(
             DialogSeam(
                 "MainActivity", main, "private fun syncPolicyWriteDialog(",
                 listOf("setOnCancelListener", "BUTTON_NEGATIVE)?.setOnClickListener"),
+                rawCancelInBody = 1, // the fail-closed orphan guard, not a dialog cancel arm
             ),
             DialogSeam(
                 "PolicyActivity", editor, "private fun showConfirmDialog(",
                 listOf("setOnCancelListener", "BUTTON_NEGATIVE)?.apply"),
+                rawCancelInBody = 0,
             ),
         )) {
             val body = block(seam.src, seam.dialogFn)
-            // Both cancel arms must use the helper with the accepted action id,
-            // and the final dialog body must contain no raw VM cancel at all.
+            // Both cancel arms must use the helper with the accepted action id.
+            // R3-3 exception: MainActivity's fail-closed orphan guard calls the
+            // raw VM cancel before building a dialog; strip that guard so this
+            // assertion still checks ONLY the final dialog's cancel arms.
+            val cancelArmsBody = withoutOrphanInvalidationBranch(body)
             assertEquals(
                 "${seam.name} final dialog must expose exactly two helper cancel arms",
                 2,
@@ -564,8 +655,25 @@ class WarningRetryLifecycleSourceTest {
             assertEquals(
                 "${seam.name} final dialog must not call the raw VM cancel directly",
                 0,
-                indicesOf(body, "vm.cancelPolicyWrite(").size,
+                indicesOf(cancelArmsBody, "vm.cancelPolicyWrite(").size,
             )
+            // Pin the raw-cancel count in the WHOLE body too, so a second raw
+            // cancel cannot hide in an unguarded arm elsewhere in the function.
+            val rawCancels = indicesOf(body, "vm.cancelPolicyWrite(")
+            assertEquals(
+                "${seam.name} raw VM cancel count in the dialog body",
+                seam.rawCancelInBody,
+                rawCancels.size,
+            )
+            if (seam.rawCancelInBody == 1) {
+                val branch = orphanBranch(body)
+                val branchStart = body.indexOf(branch)
+                assertTrue("${seam.name} orphan branch must be present", branchStart >= 0)
+                assertTrue(
+                    "${seam.name} raw VM cancel must be the one inside the orphan branch",
+                    rawCancels[0] in branchStart until branchStart + branch.length,
+                )
+            }
             for (anchor in seam.cancelAnchors) {
                 val at = body.indexOf(anchor)
                 assertTrue("${seam.name} final dialog must expose the $anchor cancel arm", at >= 0)
@@ -704,6 +812,163 @@ class WarningRetryLifecycleSourceTest {
                 "${seam.name} must not have a bare confirm immediately followed by revoke",
                 Regex("""vm\.confirmPolicyWrite\([^\n]*\)\s*\n\s*warningRestartController\.revoke\(""")
                     .containsMatchIn(code),
+            )
+        }
+    }
+
+    // PR #89 Round-3 R3-3: rotation leaves a QUEUED pending in the retained VM
+    // but destroys the Activity's WarningRestartController, so the rebuilt final
+    // dialog has no live consent action and its Positive arm silently cancels the
+    // pending. The accepted strategy is SIMPLE FAIL-CLOSED: invalidate the orphan
+    // BEFORE showing an operable final dialog, guide the user to restart, and
+    // leave SAVING/RECONCILING + app-scoped Tx/handover alone. No Bundle-based
+    // consent/ack restoration and no auto-ack are allowed.
+    @Test
+    fun orphanPendingRebuild_failsClosedBeforeFinalDialogInBothActivities() {
+        data class SyncSeam(
+            val name: String,
+            val src: String,
+            val syncFn: String,
+            val buildNeedle: String,
+            val phaseArg: String,
+            val handleClear: String,
+        )
+        for (seam in listOf(
+            SyncSeam(
+                "MainActivity", main, "private fun syncPolicyWriteDialog(",
+                "AlertDialog.Builder(this)", "policyWritePhase", "policyWriteDialog = null",
+            ),
+            SyncSeam(
+                "PolicyActivity", editor, "private fun syncPolicyConfirmDialog(",
+                "showConfirmDialog(", "phase", "policyConfirmDialog = null",
+            ),
+        )) {
+            val onCreate = block(seam.src, "override fun onCreate(savedInstanceState: Bundle?)")
+            assertTrue(
+                "${seam.name}.onCreate must record a saved-state rebuild",
+                onCreate.contains("recreatedFromSavedState = savedInstanceState != null"),
+            )
+            assertTrue(
+                "${seam.name}.onCreate must route rotation state through the holder",
+                onCreate.contains("policyConfirmState.restoreFromBundle(savedInstanceState)"),
+            )
+            // Policy-write consent / ack are session-scoped and NEVER restored
+            // from a Bundle. Scan the WHOLE onCreate body for ANY getter with a
+            // consent / ack / writeConfirm key, regardless of receiver spelling
+            // (`savedInstanceState[?/!!]`, `arguments`, `intent?.extras`, or `it`
+            // inside `savedInstanceState?.let`) and regardless of getter name
+            // (`get`, `getBoolean`, `getString`, `getLong`, `getInt`, ...).
+            // Comment-only lines are ignored. PolicyActivity legitimately has
+            // NO such getter, so this is a no-ack guard, not a "must find one"
+            // assertion: adding any of these reads in either host must fail.
+            // KEY_REMOVE_ACK / KEY_BATCH_ACK belong to unrelated remove/batch
+            // flows and remain legitimate reads.
+            val onCreateCode = flat(
+                onCreate.lines().filterNot { it.trimStart().startsWith("//") }.joinToString("\n"),
+            )
+            val bundleGet = Regex("""\.get\w*\s*\(([^)]*)\)""")
+            for (match in bundleGet.findAll(onCreateCode)) {
+                val key = match.groupValues[1].trim()
+                val unrelatedFlow = key.contains("KEY_REMOVE_ACK") || key.contains("KEY_BATCH_ACK")
+                val policyKey = key.contains("consent", ignoreCase = true) ||
+                    key.contains("writeConfirm", ignoreCase = true) ||
+                    (key.contains("ack", ignoreCase = true) && !unrelatedFlow)
+                assertFalse(
+                    "${seam.name}.onCreate must not restore policy consent/ack from Bundle (key=$key)",
+                    policyKey,
+                )
+            }
+
+            // The holder itself must force-clear the session-scoped ack on
+            // restore, whether or not a legacy Bundle carried those keys.
+            val holderRestore = block(prodFile("PolicyConfirmDialogState.kt").readText(), "fun restoreFromBundle(")
+            assertTrue(
+                "PolicyConfirmDialogState.restoreFromBundle must clear acknowledged",
+                flat(holderRestore).contains("acknowledged = false"),
+            )
+            assertTrue(
+                "PolicyConfirmDialogState.restoreFromBundle must clear ackGeneration",
+                flat(holderRestore).contains("ackGeneration = null"),
+            )
+
+            val sync = block(seam.src, seam.syncFn)
+            val branch = orphanBranch(sync)
+            assertTrue("${seam.name}.sync must expose the orphan-invalidation branch", branch.isNotEmpty())
+            val flatBranch = flat(branch)
+            assertTrue(flatBranch.contains("shouldInvalidateOrphanPendingOnRebuild("))
+            // Pin the GATE ARGUMENTS, not only the call name: hard-wiring any of
+            // rebuilt / phase / live-action to a constant must fail this test.
+            assertEquals(
+                "${seam.name} orphan gate must pass the live rebuilt/phase/action arguments",
+                listOf(
+                    "recreatedFromSavedState",
+                    seam.phaseArg,
+                    "warningRestartController.isLive(pending.consent?.actionId)",
+                ),
+                callArguments(branch, "shouldInvalidateOrphanPendingOnRebuild("),
+            )
+            assertTrue(flatBranch.contains("vm.cancelPolicyWrite(pending)"))
+            assertTrue(flatBranch.contains("onPendingCleared()"))
+            assertTrue(flatBranch.contains("R.string.pre_write_recheck_failed"))
+            assertTrue(flatBranch.contains("recreatedFromSavedState = false"))
+            assertTrue("${seam.name} orphan branch must clear its dialog handle", flatBranch.contains(seam.handleClear))
+            // Gate ordering inside the branch: decide → cancel → clear holder.
+            val inBranchGate = flatBranch.indexOf("shouldInvalidateOrphanPendingOnRebuild(")
+            val inBranchCancel = flatBranch.indexOf("vm.cancelPolicyWrite(pending)")
+            val inBranchClear = flatBranch.indexOf("onPendingCleared()")
+            assertTrue(inBranchGate in 0 until inBranchCancel)
+            assertTrue(inBranchCancel in 0 until inBranchClear)
+            // NO warning action may be re-bound/re-armed/re-delivered here, and
+            // NO ack may be manufactured: the orphan is invalidated, never
+            // re-authorized from saved state.
+            for (forbidden in listOf(
+                "warningRestartController.install(",
+                "warningRestartController.deliver(",
+                "warningRestartController.consumeRetry(",
+                "policyAcknowledged = true",
+                "onAckChanged(true",
+                "acknowledged = true",
+            )) {
+                assertFalse("$seam.name orphan branch must not call $forbidden", flatBranch.contains(forbidden))
+            }
+            // The orphan branch must return BEFORE every final-dialog build/show
+            // site. Check the branch's LAST statement, so merely burying a
+            // `return` earlier in the block cannot satisfy the requirement.
+            // Comment-only lines are NOT control flow: a commented-out
+            // `// return }` must fail both checks below. Build the code-only
+            // view from the line-preserving `branch` (flatBranch has already
+            // lost its newlines), and keep `branchStart` from the raw `sync`
+            // so the return index still orders against build sites.
+            val codeBranch = flat(
+                branch.lines().filterNot { it.trimStart().startsWith("//") }.joinToString(" "),
+            )
+            assertTrue(
+                "${seam.name} orphan branch must end with an early return",
+                Regex("""return\s*\}\s*$""").containsMatchIn(codeBranch),
+            )
+            val branchStart = sync.indexOf(branch)
+            assertTrue("${seam.name} orphan branch must be a contiguous slice", branchStart >= 0)
+            val returnInCode = codeBranch.lastIndexOf("return")
+            assertTrue("${seam.name} orphan branch must expose a return statement", returnInCode >= 0)
+            val returnAt = branchStart + returnInCode
+            for (buildAt in indicesOf(sync, seam.buildNeedle)) {
+                assertTrue("${seam.name}.sync must expose its final-dialog build site", buildAt >= 0)
+                assertTrue("${seam.name} early return must precede every final-dialog build", returnAt < buildAt)
+            }
+
+            val destroy = block(seam.src, "override fun onDestroy()")
+            assertTrue(
+                "${seam.name}.onDestroy must still clear the warning controller",
+                destroy.contains("warningRestartController.clear()"),
+            )
+            val confirm = block(seam.src, "private fun confirmWriteWithConsent(")
+            assertTrue(
+                "${seam.name} final confirm must still identity-gate the action",
+                confirm.contains("warningRestartController.isLive(actionId)"),
+            )
+            assertTrue(
+                "${seam.name} final confirm must still revalidate consent",
+                confirm.contains("revalidatePolicyWriteConsent("),
             )
         }
     }
