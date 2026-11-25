@@ -194,18 +194,43 @@ internal fun bbcCoherentEffectGateBounded(
     return bbcCoherentEffectDecision(true, snapshot, hybridOpen)
 }
 
-// Entry-clock-distrust decision for the BBC effect gate. When the entry clock
-// sample is untrusted the coherent snapshot cannot be read (its remaining
-// budget is zero), so the raw gate decision would be CLOSED. getBbc() would then
-// short-circuit with Cleared(-1) BEFORE its clock-distrust branch and leave
-// cached/sticky state intact. Reporting the compile-time switch instead keeps
-// main's invariant: switch ON => getBbc() discards sticky / bumps clock epoch;
-// switch OFF => still a zero-read/zero-state gate-closed short-circuit.
-internal fun bbcGateOpenWithEntryClockDistrust(
+// R5-01: BBC policy composition used by bbcPolicy() (and pinned verbatim by the
+// JVM tests). The ENTRY clock sample is taken by the caller BEFORE this helper;
+// getBbc() samples the clock AGAIN inside itself, and those are two different
+// observations. Reporting a fake OPEN gate from the compile-time switch used to
+// let a healthy cache-clock sample serve cached/sticky Good without ever
+// reading the coherent consent/opt-out gate — an authorization bypass. So the
+// entry decision is made HERE, not smuggled through the gate provider:
+//   * entry clock untrusted + switch ON  -> explicit fail-closed path (drop
+//     sticky, bump epoch, invalidate freshness, Unknown(emptySet()), ZERO
+//     coherent reads / policy reads / merge);
+//   * entry clock untrusted + switch OFF -> Cleared(-1) with ZERO cache mutation
+//     (the historic gate-closed zero-touch invariant);
+//   * entry clock healthy                -> getBbc() with the REAL coherent
+//     gate provider, unchanged (one bounded getAll snapshot, one bounded read).
+// No fake-open semantics exist anywhere on this path.
+internal fun bbcPolicyWithEntryClock(
+    cache: EffectivePolicyCache,
     clockOk: Boolean,
     compileTimeGate: Boolean,
     coherentGate: () -> Boolean,
-): Boolean = if (!clockOk) compileTimeGate else coherentGate()
+    seed: Set<String> = DualHook.EXTRA_WHITELIST_PACKAGES,
+    followerGraceMs: Long = EffectivePolicyCache.DEFAULT_FOLLOWER_GRACE_MS,
+    deadlineMs: Long = -1L,
+    reader: () -> Pair<Set<String>?, Long?>,
+): EffectivePolicyCache.BbcPolicy {
+    if (!clockOk) {
+        if (!compileTimeGate) return EffectivePolicyCache.BbcPolicy.Cleared(-1L)
+        return cache.failClosedEntryClockUntrusted()
+    }
+    return cache.getBbc(
+        seed,
+        bbcGateOpen = coherentGate,
+        followerGraceMs = followerGraceMs,
+        deadlineMs = deadlineMs,
+        reader = reader,
+    )
+}
 
 // N06(a): process-local confirmed-OFF timestamp (millis on the injected clock;
 // null = no confirmed OFF in this process). compareAndSet in the gate makes the
@@ -1109,58 +1134,49 @@ class DualHook : XposedModule() {
         } catch (_: Throwable) {
             0L
         }
-        bbcCache.getBbc(
-            EXTRA_WHITELIST_PACKAGES,
-            // N06(b): LAZY provider — getBbc samples now0 first, then calls this
-            // inside the guarded section, so a slow pref read is charged to the
-            // same 50ms deadline budget instead of running outside it.
-            //
-            // Phase B (B3) FINAL BBC EFFECT AND — ONE coherent read, ONE deadline:
-            // bbcCoherentEffectGateBounded checks the compile-time emergency
-            // switch FIRST (false => ZERO executor submissions / ZERO pref reads,
-            // keeping the historic zero-runtime-read pin), then performs exactly
-            // ONE readBbcPreactivationBounded task on the dedicated zero-queue
-            // executor with min(BBC_GATE_MAX_MS, remaining-of-50ms). That task
-            // reads a SINGLE getAll() copy and returns the coherent snapshot;
-            // the pure decision helper evaluates BOTH stages from it:
-            //   1. preactivationOpen = bbcPreactivationGate's READ-ONLY decision
-            //      (optin / durable classification / trusted migration marker);
-            //   2. hybridOpen        = bbcInjectionGateOpen's runtime rule on the
-            //      SAME copy's bbc_injection_enabled value (sticky/CAS/clock
-            //      preserved; runtimeEnabled lambda performs NO second read).
-            // The compile-time constant is NOT ANDed twice (hybrid gets true).
-            // A Binder stall, wrong type or torn generation degrades to CLOSED;
-            // ZERO writes on every path (libxposed API 102 read-only prefs).
-            // ENTRY CLOCK DISTRUST: remainingBudget() is 0 when our clock sample
-            // is untrusted, so the coherent read would return null without a
-            // submission and this provider would report CLOSED. getBbc() would
-            // then short-circuit to Cleared(-1) BEFORE its
-            // failClosedUntrustedClockLocked() branch, leaving cached/sticky
-            // state intact and allowing a later recovery to serve an unverified
-            // snapshot. Report the compile-time switch directly instead: with
-            // the switch ON getBbc() enters its clock-distrust path (sticky
-            // discarded + Unknown(emptySet()) + clock epoch bumped, zero reader
-            // calls); with the switch OFF it still short-circuits with zero
-            // IPC/state changes. Only the healthy-clock path touches prefs.
-            bbcGateOpen = {
-                bbcGateOpenWithEntryClockDistrust(
-                    clockOk = clockOk,
+        // R5-01: the ENTRY clock decision is made by bbcPolicyWithEntryClock(),
+        // never by faking the coherent gate OPEN from the compile-time switch.
+        // When clockOk is false its two fail-closed arms run with ZERO pref /
+        // reader / merge work; only the healthy-clock arm below ever evaluates
+        // the coherent provider. The provider is a real coherent consent/opt-out
+        // read (no fake-open wrapper): N06(b) lazy evaluation inside getBbc
+        // charges a slow pref read to the same bounded 50ms deadline budget.
+        //
+        // Phase B (B3) FINAL BBC EFFECT AND — ONE coherent read, ONE deadline:
+        // bbcCoherentEffectGateBounded checks the compile-time emergency
+        // switch FIRST (false => ZERO executor submissions / ZERO pref reads,
+        // keeping the historic zero-runtime-read pin), then performs exactly
+        // ONE readBbcPreactivationBounded task on the dedicated zero-queue
+        // executor with min(BBC_GATE_MAX_MS, remaining-of-50ms). That task
+        // reads a SINGLE getAll() copy and returns the coherent snapshot;
+        // the pure decision helper evaluates BOTH stages from it:
+        //   1. preactivationOpen = bbcPreactivationGate's READ-ONLY decision
+        //      (optin / durable classification / trusted migration marker);
+        //   2. hybridOpen        = bbcInjectionGateOpen's runtime rule on the
+        //      SAME copy's bbc_injection_enabled value (sticky/CAS/clock
+        //      preserved; runtimeEnabled lambda performs NO second read).
+        // The compile-time constant is NOT ANDed twice (hybrid gets true).
+        // A Binder stall, wrong type or torn generation degrades to CLOSED;
+        // ZERO writes on every path (libxposed API 102 read-only prefs).
+        bbcPolicyWithEntryClock(
+            cache = bbcCache,
+            clockOk = clockOk,
+            compileTimeGate = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
+            coherentGate = {
+                bbcCoherentEffectGateBounded(
                     compileTimeGate = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
-                ) {
-                    bbcCoherentEffectGateBounded(
-                        compileTimeGate = PolicySource.BBC_AVAILABLE_APPS_INJECTION,
-                        readBoundedSnapshot = {
-                            readBbcPreactivationBounded(
-                                bbcPreactivationExecutor,
-                                minOf(BBC_GATE_MAX_MS, remainingBudget()),
-                            ) { bbcCoherentPrefsNow() }
-                        },
-                    )
-                }
+                    readBoundedSnapshot = {
+                        readBbcPreactivationBounded(
+                            bbcPreactivationExecutor,
+                            minOf(BBC_GATE_MAX_MS, remainingBudget()),
+                        ) { bbcCoherentPrefsNow() }
+                    },
+                )
             },
             followerGraceMs = graceAtEntry,
             deadlineMs = deadlineMs,
-        ) { policyReadBbcVersioned() }
+            reader = { policyReadBbcVersioned() },
+        )
     } catch (_: Throwable) {
         EffectivePolicyCache.BbcPolicy.Unknown(emptySet())
     }
