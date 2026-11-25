@@ -833,7 +833,7 @@ class ProfileIdentityTest {
     }
 
     @Test
-    fun r9_cleanDualCloneStillConfirmsWithAbsolutePins() {
+    fun r9_cleanCloneConsensusStillConfirmsWithAbsolutePins() {
         // Positive control with absolute pins: no UNKNOWN/invalid claim means
         // the R9 vetoes are inert and the legitimate target still confirms.
         val candidates = listOf(
