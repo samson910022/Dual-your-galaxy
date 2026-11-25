@@ -49,7 +49,7 @@ Samsung 可能自動刪除分身並永久清除資料；一般既有雙開 App �
 - CI build／locale-instrumentation：**SUCCESS**（PR #74 最終 run #45103347110；main merge 後 #45113206916）；manual emulator matrix **SKIPPED**。
 - JVM：2292 tests（app 1401 / core 395 / hook 496），0 failures / errors / skipped。
 - Android instrumentation：60 tests 全通過（locale-instrumentation，API 29 emulator job）。
-- **本 beta.3 的新 run ID／測試數字：待發布後填入（TBD）。** 送出 Release 前請替換為實際 run ID 與數字，切勿直接沿用上面 beta.1 的數字當作本版驗證。
+- **本 beta.3 的 CI／artifact 錨點（已驗證，見 `docs/ACCEPTANCE.md` §1）**：Android CI run **#45228233599**（PR head `e5c61f51`，tree `33614a81…`：build／locale-instrumentation SUCCESS、manual emulator matrix SKIPPED）與 Release run **#45233459919**（tag push，commit／main HEAD `fc579de3`，tree `33614a81…`：release＋publish SUCCESS、無 manual matrix job）；annotated tag `v0.1.0-beta.3` → `fc579de3`，APK SHA256 `98a3ce205c9a8b5a4f6cc6870c7afa9e93731655cc0a3d0f7f7147335a5a1531`（API metadata，非 tested byte）。**已發布 Release body 已填入本版實際數字**（run #45228233599／#45233459919、JVM 2297 tests〔app 1406／core 395／hook 496〕、locale-instrumentation 60 tests、apksigner cert pin `608e674f…61e3` 等），該 live 內容為既成事實，**不得用本模板的 TBD 或上方 beta.1 數字覆蓋**；rollout 時由 maintainer 同步，且**不得 retag／rebuild／改 APK bytes**。（PR #91 的文件 run #45442918490／#45445622345 為文件審查 run，非 beta.3 驗證錨點。）上方 beta.1 的 2292 tests／run #45103347110／#45113206916 僅屬 beta.1 歷史。JVM／CI 全綠不是 Samsung 端資料安全保證。
 - **不是**裝置零風險驗證；JVM／CI 全綠不等於 Samsung 端資料安全。
 - P0／H00：experiment limitation，UNMEASURED / NOT a pass。
 
