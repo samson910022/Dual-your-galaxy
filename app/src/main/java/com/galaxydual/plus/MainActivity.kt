@@ -2831,10 +2831,10 @@ class MainActivity : ComponentActivity() {
             if (isFinishing || isDestroyed || !consentHolder.isActiveIntent(seq)) return
             // App-scoped: a rebuilt Activity/OFF supersedes this intent, so a
             // late accept from a dead dialog can never write a stale grant.
-            // Legacy test-seam bookkeeping: no production code consumes this
-            // pending-enable record. The CONSUMER that confirms the opt-in owns
-            // the phase-2 durable enable, so this note is NOT part of production
-            // convergence (see BbcActivationConsentHolder's test-only seams).
+            // R5-04: this records the app-scoped GRANT ATTEMPT sequence used by
+            // resync convergence — not an effect write and not an acknowledgement
+            // of the consent commit. A verified durable optin+marker read can
+            // promote it once even when the original grant reply was Unknown.
             val generation = consentHolder.currentGeneration()
             consentHolder.notePendingEnable(seq, generation)
             consentDialogPending = false

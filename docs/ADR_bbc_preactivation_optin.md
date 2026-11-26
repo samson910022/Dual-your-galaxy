@@ -87,12 +87,18 @@ fail-closed，並把 legacy 判定從「目前的草稿 bytes」改為 App 持�
   App 在同一個 atomic forced commit 寫入 `bbc_preactivation_optin=true` 與
   `bbc_enable_pending=true`；其後每一次 runtime 偏好寫入（consumer 的 enable 與使用者的
   OFF 都算）都在同一個 commit 把此標記清除。bind/resync 的 coherent 讀取必須同時看到
-  optin=true 與 marker=true，app IO consumer 才補寫一次 effect enable；已持久化的 OFF
-  已清除標記，背景 resync 因此不會把 OFF 翻回 ON。此標記只給 App 用，Hook gate 永不讀它。
-- **進程死亡殘餘（如實揭露）。** 若 grant 已 `Confirmed`、runtime enable 尚未寫入時進程死亡，
-  marker 仍在，App 下次 bind/resync 會補上該 enable；但若 coherent 讀取讀不到 optin／marker，
-  或該 commit 回報 Unknown，resync 不補寫、效應維持 OFF（fail-closed）。hook 行程的
-  RemotePreferences 快取也可能仍落後，需重啟 hook 行程／開機才觀察到新值。
+  optin=true 與 marker=true，app IO consumer 才補寫**恰好一次** effect enable；即使原始
+  grant 回覆為 Unknown／在 rebind 中遺失，只要較新 session 的權威 coherent 讀取確認兩鍵
+  已落盤，accept 時記錄的 app-scoped grant attempt 就會被提升為有效理由並驅動該次補寫
+  （R5-04）。已持久化的 OFF 已在同一 commit 清除標記，背景 resync 因此不會把 OFF 翻回 ON。
+  較舊的 Confirmed runtime OFF 不再永久否定較新的 verified grant，但真正較新的使用者 OFF
+  （abandon／block／marker-clearing runtime write）仍然優先。此標記只給 App 用，Hook gate 永不讀它。
+- **進程死亡殘餘（如實揭露）。** 若 grant 已 `Confirmed`（或其回覆 Unknown／在 rebind 中
+  遺失但 optin＋marker 已落盤）、runtime enable 尚未寫入時進程死亡，marker 仍在，
+  App 下次 bind/resync 的權威 coherent 讀取會補上該 enable（一次）；但若 coherent 讀取
+  讀不到 optin／marker，或該 commit 回報 Unknown，resync 不補寫、效應維持 OFF
+  （fail-closed）。hook 行程的 RemotePreferences 快取也可能仍落後，需重啟 hook 行程／開機
+  才觀察到新值。
   這不是即時跨行程保證，也不是 #75 防護或資料安全保證。
 - `POLICY_KEY_EXTRA_VERSION`（`extra_whitelist_version`）損毀／讀取失敗會讓整份 coherent
   snapshot fail-closed，效應 OFF 直到修復（C3）；草稿曾非空不能繞過它，也不是 consent 證據。
@@ -136,9 +142,11 @@ fail-closed，並把 legacy 判定從「目前的草稿 bytes」改為 App 持�
 - **已知限制（App opt-in commit Unknown 與冷行程）**：`commit(false)`／拋錯時如實
   回報 Unknown 且不寫 BBC 開關；本地 mMap 可能被樂觀污染，但單調 durable fence 不允許
   同 generation 的讀取或污染值清除 Unknown。有 `bbc_enable_pending=true` 的
-  `Confirmed` grant 在 cold start／rebind 的 coherent resync 會被 app IO consumer 補寫一次
-  effect enable（而不會反轉已清除標記的 durable OFF）；但 grant 已落盤而 runtime 寫入
-  缺席時，若下次讀取讀不到 optin／marker 或 commit 仍為 Unknown，就不補寫，
+  grant（即使原始 grant 回覆 Unknown）在 cold start／rebind 的 coherent resync 會被
+  app IO consumer 補寫一次 effect enable（而不會反轉已清除標記的 durable OFF；較舊的
+  Confirmed OFF 不再永久否定較新的 verified grant，但較新的使用者 OFF 仍優先）；
+  但 grant 已落盤而 runtime 寫入缺席時，若下次讀取讀不到 optin／marker 或 commit 仍為
+  Unknown，就不補寫，
   授權與效應仍可能不一致。因此**不能**宣稱「Hook 一定不提前生效」，也**不能**宣稱
   「App 重啟一定自癒」；重啟只是重新讀取，不保證回到重新詢問，hook 行程的快取亦可能
   落後。這是同意 UX 的可觀測限制，不據此宣稱已修正或資料安全。

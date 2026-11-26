@@ -47,7 +47,10 @@ BBC 注入效應現在是四層 AND：
    可寫入的 **`XposedService.getRemotePreferences`** remote preferences 通道
    （`dual_policy` group）；Hook 端以 `XposedInterface.getRemotePreferences` 取得的
    remote preferences 在 hooked app 中**唯讀**，是另一項獨立限制，不用來完成任何寫入。
-   若寫入結果 Unknown，效應不因此被證明為 OFF 或 ON，請重試／重新核對。
+   若寫入結果 Unknown，效應不因此被證明為 OFF 或 ON，請重試／重新核對；
+   之後若 fresh bind/resync 的權威 coherent 讀取確認 optin 與 `bbc_enable_pending` 確實已落盤，
+   App 可能只補寫一次 effect enable 來完成先前已接受的 ON；若要維持關閉請明確按 OFF
+   （OFF 在同一 commit 清除 pending 標記）。
 5. `bbc_preactivation_optin`、`bbc_legacy_migrated` 與 `install_classification` 是
    breaking-change-sensitive keys，**不得改名**（改名等同放棄同意與遷移狀態）。
 
@@ -59,6 +62,14 @@ BBC 注入效應現在是四層 AND：
   單一 coherent snapshot 整份 fail-closed，BBC 注入維持 OFF，直到該鍵被修復且
   後續讀取成功為止（C3）；非空草稿不能繞過這個 fail-closed。此 fail-closed 不是
   legacy 同意證據，也不是 #75 防護。
+- **opt-in commit 回覆 Unknown 不等於取消，也不等於永遠不會啟用**：app-scoped 狀態機在
+  accept 時記錄 grant attempt；只有較新 session 的權威 coherent 讀取同時驗證
+  `bbc_preactivation_optin=true` 與 `bbc_enable_pending=true` 時，才把該 attempt 提升為
+  有效理由，由 app IO consumer 補寫**恰好一次** effect enable（R5-04），即使原始 grant
+  回覆因 rebind 而遺失。較舊的 Confirmed runtime OFF 不永久否定較新的 verified grant，
+  但真正較新的使用者 OFF（abandon／block／清除標記的 runtime write）仍優先；每一次
+  runtime 偏好寫入（含 OFF）都在同一 commit 清除 pending 標記。這不是即時跨行程保證，
+  也不是 #75 防護或資料安全保證；hook 行程的快取仍可能落後。
 - App 行程 opt-in commit 失敗後，app-scoped 狀態機安裝 durable Unknown fence：
   RemotePreferences 樂觀 `mMap` 可能讓同行程讀到看似 grant 的值，但不能清除 fence；
   只有 `Confirmed` 或較新 service generation 的權威 resync 才能授權。故不宣稱
