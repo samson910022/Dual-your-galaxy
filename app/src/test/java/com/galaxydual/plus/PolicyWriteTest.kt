@@ -7195,7 +7195,14 @@ class PolicyWriteTest {
                 PolicyWriteConfirmAdmission.ACCEPTED,
                 vm.confirmPolicyWrite(pending, pending.generation) { g, o -> settlements.add(g to o) },
             )
-            await { vm.state.value.pendingPolicyWrite == null && fake.saveCalls.get() == savesBefore + 1 }
+            // The attempt-complete callback fires at the END of the launched
+            // coroutine, i.e. AFTER the state/save observation below. Include it
+            // in the barrier so the count assertion cannot race the callback.
+            await {
+                vm.state.value.pendingPolicyWrite == null &&
+                    fake.saveCalls.get() == savesBefore + 1 &&
+                    settlements.size >= 2
+            }
             assertEquals(2, settlements.size)
             assertEquals(PolicyWriteConfirmAttemptOutcome.CONSUMED, settlements[1].second)
             val retire2 = confirmAttemptRetiresAction(

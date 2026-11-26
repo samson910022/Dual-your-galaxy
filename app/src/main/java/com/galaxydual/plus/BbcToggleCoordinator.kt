@@ -366,9 +366,12 @@ internal class BbcToggleCoordinator(
         // #81: pre-commit sequence fence (defense in depth). A write whose
         // sequence is older than the latest issued intent must never reach the
         // non-cancellable commit — state.mark()'s result-only fence is too late
-        // to protect the persisted preference. This is the TOGGLE sequence
-        // domain only; consent writes are fenced by consentHolder. Skipped
-        // writes commit/mark/callback nothing.
+        // to protect the persisted preference. The counter is SHARED with
+        // consentHolder in production, so EVERY mint (including a resync's
+        // bookkeeping) raises this high-water mark: a coordinator path must
+        // never mint without enqueueing, or it would drop an OFF already queued
+        // at a lower sequence. Consent writes are additionally fenced by the
+        // holder. Skipped writes commit/mark/callback nothing.
         if (work.sequence < state.latestSequence()) {
             skippedWrites++
             return
@@ -525,19 +528,24 @@ internal class BbcToggleCoordinator(
         generation: Long,
         session: BbcConsentSessionIdentity? = null,
     ): Boolean {
-        // Mint the effect-axis sequence FIRST, before any authority check. The
-        // holder sequence identifies the AUTHORISATION intent (for OFF
-        // comparison) while the effect state has its own mark fence; in
-        // production both counters are shared, so every OFF recorded from here
-        // on takes a strictly newer number. That OFF either fails the abandon
-        // check below or owns the same-axis slot, so the enable can never
-        // displace it. Burning a number on a rejected attempt is harmless: the
-        // counter is monotonic and gaps have no semantic meaning.
-        val effectSequence = state.nextSequence()
-        effectSequenceMintHook?.invoke(effectSequence)
+        // Authorise BEFORE minting. The counter is SHARED with the holder in
+        // production, so a mint that does not end in an enqueue raises
+        // latestSequence() and lets the #81 fence drop an OFF already queued at
+        // a lower sequence. None of the checks below mints.
         // STRICT ownership: a resync may have claimed a NEWER enable token R.
         // `isEnableHandledBy(S)` would still be true for S<R and would enqueue
         // a second enable; only the exact current owner may drive one.
+        if (!consentHolder.isEnableOwner(reason, generation)) return false
+        if (consentHolder.latestAbandonSequence() > reason) return false
+        if (state.latestIntentProjectedValue() == false) return false
+        // Mint IMMEDIATELY before the committed enqueue: nothing between the
+        // mint and enqueueToggle() mints again, so the enable's sequence equals
+        // the high-water mark and passes the pre-commit fence. An OFF recorded
+        // after the mint takes a strictly newer number and wins via the fence
+        // and the same-axis slot; the post-mint guards below also skip the
+        // enqueue when the test-only hook parked here.
+        val effectSequence = state.nextSequence()
+        effectSequenceMintHook?.invoke(effectSequence)
         if (!consentHolder.isEnableOwner(reason, generation)) return false
         if (consentHolder.latestAbandonSequence() > reason) return false
         if (state.latestIntentProjectedValue() == false) return false
@@ -555,12 +563,6 @@ internal class BbcToggleCoordinator(
         enablePending: Boolean,
         session: BbcConsentSessionIdentity? = null,
     ) {
-        // Mint the effect-axis sequence FIRST for the same OFF-wins reason as
-        // driveConsumerEnable: an OFF recorded afterwards has a newer sequence
-        // and cannot be displaced by this enable. A rejected claim simply burns
-        // a monotonic number, which is harmless.
-        val effectSequence = state.nextSequence()
-        effectSequenceMintHook?.invoke(effectSequence)
         // Cold-start convergence requires the APP-ONLY durable marker from the
         // SAME coherent snapshot as optin=true. optin=true alone is NOT enough:
         // a durable user OFF only writes the effect pref, and the OFF cleared
@@ -589,8 +591,26 @@ internal class BbcToggleCoordinator(
             if (state.appliedSequence() >= reason) return
         }
         if (state.latestIntentProjectedValue() == false) return
-        val claim = consentHolder.nextIntentSequence()
+        // Decide the claim BEFORE minting. The sequence counter is SHARED with
+        // the holder, so a claim rejected after a mint would leave a burned
+        // high-water mark: the #81 fence would then drop an OFF already queued
+        // at a lower sequence. The predicted next number is a fresh ownership
+        // token — strictly newer than every intent issued so far (including a
+        // stale dialog S), so a later Confirmed S cannot regress it into a
+        // second enable. Critically, NO second counter bump happens after the
+        // mint: that used to make latestSequence() > effectSequence and caused
+        // every resync enable to be skipped by the fence.
+        val claim = state.latestSequence() + 1L
         if (!consentHolder.tryClaimResyncEnable(generation, reason, enablePending, claim)) return
+        // Mint IMMEDIATELY before the committed enqueue, after every early
+        // return and after the claim, so no non-enqueueing path raises the
+        // shared fence. An OFF recorded after this mint takes a strictly newer
+        // number and wins via the fence / same-axis slot; the post-mint guards
+        // below also skip the enqueue when the test-only hook parked here.
+        val effectSequence = state.nextSequence()
+        effectSequenceMintHook?.invoke(effectSequence)
+        if (consentHolder.latestAbandonSequence() > reason) return
+        if (state.latestIntentProjectedValue() == false) return
         enqueueToggle(effectSequence, true, {}, {}, session)
     }
 

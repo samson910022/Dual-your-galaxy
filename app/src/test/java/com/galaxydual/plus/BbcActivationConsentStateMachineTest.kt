@@ -1481,12 +1481,12 @@ class BbcActivationConsentStateMachineTest {
     }
 
     /**
-     * FINAL RACE (grant path): the consumer used to run its OFF-authority checks
-     * BEFORE minting the effect-axis sequence. An OFF toggle enqueued with a
-     * sequence X older than the freshly minted enable Y was then silently
-     * replaced by enqueueToggle(Y, true), reversing a durable OFF. The TEST-ONLY
-     * seam parks the consumer after the mint, so Main's OFF is recorded and
-     * enqueued deterministically inside the vulnerable window.
+     * FINAL RACE (grant path): the TEST-ONLY seam parks the consumer right after
+     * the effect-sequence mint. Production's atomic submit mints the OFF at
+     * submission time on the shared counter, so the OFF recorded here is
+     * strictly NEWER than the enable: it must win the slot/fence and be the
+     * only runtime commit. (The original test's older-explicit-sequence premise
+     * is no longer expressible through the production API; see inline comment.)
      */
     @Test
     fun consumerEnableCannotDisplaceOffEnqueuedAfterEffectSequenceMint() = runTest {
@@ -1516,26 +1516,37 @@ class BbcActivationConsentStateMachineTest {
         }
 
         val grant = holder.startConsentIntent() // AUTHORISATION sequence
-        // The OFF toggle's sequence is minted BEFORE the consumer mints its
-        // enable (X > grant but X < Y): exactly the window of the old race.
-        val offSequence = runtime.nextSequence()
         coordinator.submitConsentWrite(grant, 1L) {}
 
         testScheduler.advanceUntilIdle() // consumer parks in the seam
         assertTrue("the consumer must be paused after the mint", minted.isCompleted)
-        assertTrue("enable sequence must be newer than the queued OFF", minted.getCompleted() > offSequence)
 
-        // Main's OFF handler, while the consumer is paused: record app-wide and
-        // enqueue the toggle. The enable must not displace it afterwards.
+        // The old premise ("OFF enqueued with an explicit sequence OLDER than
+        // the enable") is not expressible through the production API: atomic
+        // submit(value, onResult) mints at SUBMISSION time from the shared
+        // counter, so an OFF submitted after the mint is strictly newer. Assert
+        // the reachable invariant instead: the newer OFF wins the slot/fence and
+        // is the ONLY runtime commit; the enable must not displace it.
         holder.supersedeActiveIntent()
         runtime.noteLatestUserIntent(false)
-        coordinator.submit(offSequence, false) {}
+        val offSequence = coordinator.submit(false) {}
+        assertTrue("the OFF must be enqueued after the effect-sequence mint",
+            offSequence > minted.getCompleted())
         release.complete(Unit)
         testScheduler.advanceUntilIdle()
 
         assertEquals("the OFF must be the only runtime commit", listOf(false), commits)
         assertEquals(false, runtime.confirmedOrUnknown)
-        assertEquals(false, runtime.latestIntentProjectedValue())
+        // With the atomic submit the OFF's own Confirmed mark acknowledges its
+        // intent at the SAME sequence, so latestIntentProjectedValue() is null
+        // (the old "newer intent over a stale OFF commit" premise is gone). The
+        // single UI projection still renders UNCHECKED from Confirmed(false).
+        assertNull("a confirmed OFF acknowledges its own atomic intent",
+            runtime.latestIntentProjectedValue())
+        assertEquals(false, bbcToggleUiProjection(
+            holder.currentState(), runtime.effectStatus.value,
+            runtime.latestIntentProjectedValue(),
+        ).checked)
         assertEquals(BbcEffectStatus.Confirmed(false), runtime.effectStatus.value)
     }
 
@@ -1576,22 +1587,83 @@ class BbcActivationConsentStateMachineTest {
             release.await()
         }
 
-        val offSequence = runtime.nextSequence() // newer than grant, older than enable
         coordinator.submitConsentRead {}
 
         testScheduler.advanceUntilIdle()
         assertTrue("the consumer must be paused after the mint", minted.isCompleted)
-        assertTrue("enable sequence must be newer than the queued OFF", minted.getCompleted() > offSequence)
 
+        // Production submits OFF atomically (mint at submission time on the
+        // shared counter), so the old "OFF enqueued with an older explicit
+        // sequence" premise cannot be expressed here. An OFF recorded inside the
+        // mint hook is strictly NEWER than the parked enable: it wins the slot
+        // and the pre-commit fence and is the only runtime commit.
         holder.supersedeActiveIntent() // OFF also blocks this generation's resync
         runtime.noteLatestUserIntent(false)
-        coordinator.submit(offSequence, false) {}
+        val offSequence = coordinator.submit(false) {}
+        assertTrue("the OFF must be enqueued after the effect-sequence mint",
+            offSequence > minted.getCompleted())
         release.complete(Unit)
         testScheduler.advanceUntilIdle()
 
         assertEquals("the OFF must be the only runtime commit", listOf(false), commits)
         assertEquals(false, runtime.confirmedOrUnknown)
-        assertEquals(false, runtime.latestIntentProjectedValue())
+        // Atomic submit pairs the OFF intent with its commit sequence, so a
+        // Confirmed(false) mark clears the pending intent (null, not false).
+        // The one UI projection still resolves to UNCHECKED via Confirmed(false).
+        assertNull("a confirmed OFF acknowledges its own atomic intent",
+            runtime.latestIntentProjectedValue())
+        assertEquals(false, bbcToggleUiProjection(
+            holder.currentState(), runtime.effectStatus.value,
+            runtime.latestIntentProjectedValue(),
+        ).checked)
+        assertEquals(BbcEffectStatus.Confirmed(false), runtime.effectStatus.value)
+    }
+
+    /**
+     * Rebase review counterexample 2: a resync read that returns WITHOUT
+     * enqueueing an enable must not mint from the shared intent counter. The
+     * old mint-above-the-early-returns raised latestSequence() past an OFF that
+     * was already queued at a lower sequence; the #81 pre-commit fence then
+     * dropped that OFF. The OFF is submitted while the authoritative read is
+     * parked and must be the only runtime commit.
+     */
+    @Test
+    fun nonEnqueueingResyncRead_doesNotBurnSequenceOrDropQueuedOff() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false))
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val commits = Collections.synchronizedList(mutableListOf<Boolean>())
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentRead = { gen ->
+                entered.complete(Unit)
+                release.await()
+                read(gen, BbcOptInValue.TRUE, runtime = false, enablePending = false)
+            },
+            consentHolder = holder,
+        )
+
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertTrue("the authoritative read must be parked", entered.isCompleted)
+
+        val offSequence = coordinator.submit(false) {}
+        release.complete(Unit)
+        testScheduler.advanceUntilIdle()
+
+        assertEquals("a no-op resync must not drop the OFF queued during the read",
+            listOf(false), commits)
+        assertEquals("no non-enqueueing bookkeeping mint may advance the fence",
+            offSequence, runtime.latestSequence())
         assertEquals(BbcEffectStatus.Confirmed(false), runtime.effectStatus.value)
     }
 
