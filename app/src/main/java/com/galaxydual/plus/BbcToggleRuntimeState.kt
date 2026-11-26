@@ -18,10 +18,14 @@ import kotlinx.coroutines.flow.asStateFlow
  * be interpreted as "restored to the old value". The value here is only what
  * THIS app process last saw confirmed, not a re-read of the persisted source.
  *
- * This holder is scoped to the Application process, NOT persisted. After an
- * app restart it is reinitialized from the persisted preference (default true
- * on read failure). A dialog/Activity rebuild must reuse the app-scoped
- * instance so [nextSequence] stays monotonic across rebuilds.
+ * This holder is scoped to the Application process, NOT persisted. In
+ * production it is seeded NEUTRAL: no binder read happens in the Application's
+ * lazy initializer (PR #90 Phase 3 R3-06a/E2 — a Main-thread binder read could
+ * block behind the lazy monitor held by the bind IO coroutine). The persisted
+ * value is instead read on the app IO lane by [BbcToggleCoordinator]'s effect
+ * work item and folded in via [seedEffectFromPersistedRead] as a PROVISIONAL
+ * value, never as a Confirmed write acknowledgement. A dialog/Activity rebuild
+ * must reuse the app-scoped instance so [nextSequence] stays monotonic.
  *
  * This is NOT the hook process's `bbcConfirmedOffAtMs`, which governs BBC gate
  * decisions when the hook cannot read the preference. It is also NOT a
@@ -33,28 +37,53 @@ import kotlinx.coroutines.flow.asStateFlow
  * over an immutable state snapshot, so concurrent marks cannot let an older
  * sequence's value win.
  *
- * @param initialConfirmed **Provisional UI seed only** — the value read from
- *   `isBbcInjectionEnabled()` at construction. It is NOT a write confirmation
- *   and must not be treated as acknowledged until the first
- *   `mark(Confirmed(...))` for a submitted intent. A read of the preference
- *   cannot tell whether a prior write was acknowledged (the local mMap may be
- *   optimistically polluted, and the hook may still serve a cached value).
+ * @param initialConfirmed **Provisional UI seed only** — supplied by framework-
+ *   free tests and legacy callers. Production passes no value (NEUTRAL) so no
+ *   binder call is made on the Main thread while acquiring this holder; the
+ *   authoritative value arrives later through [seedEffectFromPersistedRead] on
+ *   the IO lane. It is NOT a write confirmation and must not be treated as
+ *   acknowledged until the first `mark(Confirmed(...))` for a submitted intent.
+ *   A read of the preference cannot tell whether a prior write was acknowledged
+ *   (the local mMap may be optimistically polluted, and the hook may serve a
+ *   cached value).
  */
 internal class BbcToggleRuntimeState(
     initialConfirmed: Boolean? = null,
+    /**
+     * Shared with [BbcActivationConsentHolder] in production so a user OFF and
+     * a pending consent intent are compared in ONE app-scoped sequence domain.
+     * A standalone holder keeps its own counter unless one is supplied.
+     */
+    private val sequence: AtomicLong = AtomicLong(),
 ) {
-    /** Immutable snapshot so the sequence fence and value can move in one CAS. */
-    private data class MarkedState(val sequence: Long, val value: Boolean?)
-
-    /** User intents issued in this process (never reset by a UI rebuild). */
-    private val sequence = AtomicLong(0L)
+    /**
+     * Immutable snapshot so the sequence fence and value can move in one CAS.
+     * [confirmed] distinguishes a real Confirmed effect mark from an Unknown
+     * outcome: only a Confirmed mark may acknowledge the user's latest intent.
+     */
+    private data class MarkedState(
+        val sequence: Long,
+        val value: Boolean?,
+        val confirmed: Boolean,
+    )
 
     /**
      * Highest applied sequence and confirmed/unknown value held together.
      * Keeping both in one [AtomicReference] lets [mark] advance them atomically:
      * a concurrent older mark can never overwrite a newer sequence's value.
      */
-    private val state = AtomicReference(MarkedState(0L, initialConfirmed))
+    private val state = AtomicReference(MarkedState(0L, initialConfirmed, false))
+
+    /**
+     * PR #90 P1-3: the LATEST user effect-toggle intent, recorded app-scoped
+     * when the coordinator accepts submit(sequence, value, ...). A rebuilt View
+     * must not lose it: a per-View local starts at null while the effect axis
+     * replays an older Confirmed value, which used to flip a user's OFF back ON
+     * before the OFF commit had landed.
+     */
+    private data class LatestToggleIntent(val sequence: Long, val value: Boolean)
+
+    private val latestToggleIntent = AtomicReference<LatestToggleIntent?>(null)
 
     /**
      * E04: read-only, app-scoped projection of the last APPLIED mark for the UI.
@@ -63,18 +92,78 @@ internal class BbcToggleRuntimeState(
      * newly subscribed dialog, so a rebuilt dialog learns the outcome of an
      * in-flight app-scoped commit; a live dialog sees every later mark.
      *
-     * Emitted ONLY from [mark] (via [applyOutcome]), never from submit()/tap
-     * paths: D05's global serialization stays the single ordering authority.
+     * Emitted from [mark] (via [applyOutcome]) and from
+     * [seedEffectFromPersistedRead], never from submit()/tap paths: D05's global
+     * serialization stays the single ordering authority. A provisional read is
+     * always a weaker seed than a Confirmed mark.
      */
     private val _effectStatus = MutableStateFlow<BbcEffectStatus>(BbcEffectStatus.Provisional)
     val effectStatus: StateFlow<BbcEffectStatus> = _effectStatus.asStateFlow()
 
     /**
      * `null` means UNKNOWN. The getter reads the value from the latest state
-     * successfully committed by [mark].
+     * successfully committed by [mark]. An IO-lane persisted read does NOT
+     * touch this value: it is strictly a write-outcome record, so a read can
+     * never be mistaken for a write acknowledgement (see
+     * [seedEffectFromPersistedRead]).
      */
     val confirmedOrUnknown: Boolean?
         get() = state.get().value
+
+    /**
+     * R5-04: the sequence of the last APPLIED [mark] outcome (`0` before any
+     * sequence-aware mark). Read-only: it does not change [mark]/[applyOutcome]
+     * semantics or advance the fence. The coordinator compares it with the
+     * verified grant-attempt sequence so an OLD Confirmed(false) from a prior
+     * setting cannot veto a NEWER grant whose enable is still owed after a
+     * rebind. A Confirmed(false) APPLIED after that grant still wins.
+     */
+    fun appliedSequence(): Long = state.get().sequence
+
+    /**
+     * PR #90 Phase 3 (R3-06a/E2): fold an authoritative persisted value that was
+     * read on the app IO lane into the UI projection as a NEUTRAL seed.
+     *
+     * This deliberately does NOT call [mark] and does NOT advance the sequence
+     * fence: a read is not a write outcome. It emits
+     * [BbcEffectStatus.ProvisionalRead] (unverified presentation) instead of
+     * [BbcEffectStatus.Confirmed], so the checkbox shows the persisted value
+     * without claiming the daemon acknowledged a write. A later Confirmed mark
+     * always wins; a confirmed write is never downgraded by a late read.
+     *
+     * `null` (absent / unreadable key) supplies no value — the row stays neutral
+     * rather than fabricating the legacy default-true seed.
+     */
+    @Synchronized // same critical section as [applyOutcome]
+    internal fun seedEffectFromPersistedRead(value: Boolean?) {
+        if (value == null) return // legacy seam: no definite value => no fabricated seed
+        seedEffectFromPersistedRead(
+            if (value) BbcRuntimePrefValue.TRUE else BbcRuntimePrefValue.FALSE,
+        )
+    }
+
+    /**
+     * R5-02: authoritative four-state seed from the app IO lane. Carries the
+     * ABSENT vs UNAVAILABLE reason so an authorized install can seed checked
+     * (unverified) on ABSENT while a failed read stays neutral and never ON.
+     *
+     * Still NEVER calls [mark], NEVER advances the sequence fence and NEVER
+     * emits [BbcEffectStatus.Confirmed]; an existing Confirmed mark wins.
+     */
+    @Synchronized
+    internal fun seedEffectFromPersistedRead(runtime: BbcRuntimePrefValue) {
+        if (_effectStatus.value is BbcEffectStatus.Confirmed) return
+        val definite = when (runtime) {
+            BbcRuntimePrefValue.TRUE -> true
+            BbcRuntimePrefValue.FALSE -> false
+            else -> null
+        }
+        _effectStatus.value = if (definite != null) {
+            BbcEffectStatus.ProvisionalRead(definite)
+        } else {
+            BbcEffectStatus.ProvisionalRuntimeRead(runtime, null)
+        }
+    }
 
     /** Globally monotonic intent sequence for this app process (never resets on UI rebuild). */
     fun nextSequence(): Long = sequence.incrementAndGet()
@@ -88,7 +177,75 @@ internal class BbcToggleRuntimeState(
     fun latestSequence(): Long = sequence.get()
 
     /**
+     * P1-3: record a user toggle intent at submit-accept time. Sequence-aware:
+     * a stale/duplicate submit can never replace a newer intent (the CONFLATED
+     * coordinator slot may hold only the newest one, but the record must also
+     * survive a racing multi-threaded caller).
+     */
+    @Synchronized
+    fun noteToggleIntent(sequence: Long, value: Boolean) {
+        val current = latestToggleIntent.get()
+        if (current == null || sequence >= current.sequence) {
+            latestToggleIntent.set(LatestToggleIntent(sequence, value))
+        }
+    }
+
+    /**
+     * P1-A: record the NEWEST user value at the START of a UI handler, BEFORE
+     * that handler's first render, so the projection can never show an older
+     * app-scoped intent over the tap the user just made. Reserving a sequence
+     * here is harmless bookkeeping: the controller's later submit() assigns a
+     * newer sequence for the same value and supersedes this record.
+     *
+     * Used by the effect-toggle taps and by consent-dialog accept (whose ON
+     * reaches the effect writer only after the consent commit is confirmed).
+     */
+    fun noteLatestUserIntent(value: Boolean): Long {
+        val sequence = nextSequence()
+        noteToggleIntent(sequence, value)
+        return sequence
+    }
+
+    /**
+     * P1-A: cancel/back/show-failure restores the pre-dialog value with ZERO
+     * effect writes. Drop any app-scoped intent left by an older UI or an
+     * in-flight tap so a later render cannot repaint the restored value with
+     * that stale intent; the restored local value stays authoritative until a
+     * real Confirmed effect acknowledges it.
+     */
+    @Synchronized
+    fun abandonLatestUserIntent() {
+        latestToggleIntent.set(null)
+    }
+
+    /**
+     * P1-3 projection seam: the user's latest intent while it is still the
+     * authority for the checkbox, or null once a Confirmed effect mark has
+     * acknowledged it.
+     *
+     * Rule (sequence-aware):
+     *  - an intent whose sequence is NEWER than the applied mark wins (its
+     *    commit has not landed yet — a rebuilt View must keep showing it);
+     *  - an intent at the SAME sequence as an Unknown mark also wins — an
+     *    Unknown outcome is NOT confirmation, so the user's last intent is
+     *    preserved rather than reverting to a stale Confirmed effect;
+     *  - a Confirmed mark at the same sequence, or ANY mark from a NEWER
+     *    sequence, acknowledges/supersedes the intent => null (the confirmed
+     *    effect value then drives the projection).
+     */
+    fun latestIntentProjectedValue(): Boolean? {
+        val intent = latestToggleIntent.get() ?: return null
+        val marked = state.get()
+        return when {
+            marked.sequence < intent.sequence -> intent.value
+            marked.sequence == intent.sequence && !marked.confirmed -> intent.value
+            else -> null
+        }
+    }
+
+    /**
      * Fold a write outcome into the app-scoped state; Unknown clears confirmation.
+     * [BbcWriteOutcome.Skipped] is a true no-op (see [applyOutcome]).
      *
      * Sequence-aware: an outcome whose [sequence] is `<=` the highest sequence
      * already applied is ignored (a stale in-flight commit must not overwrite
@@ -118,26 +275,34 @@ internal class BbcToggleRuntimeState(
      * before publishing, so a late/duplicate failure can never grey out the UI
      * and a late success can never falsely clear it.
      *
+     * [BbcWriteOutcome.Skipped] is handled BEFORE this CAS: it means no durable
+     * key was touched and no pollution evidence exists, so it must not advance
+     * the fence, erase a prior [BbcWriteOutcome.Confirmed] value, or emit an
+     * Unknown status (which would show a false "effect unverified" toast). It
+     * still reports `true` so the coordinator delivers the caller's callback.
+     *
      * @param targetSequence non-null for the sequence-aware overload; `null`
      *   for the legacy overload, which leaves the fence untouched.
      */
     @Synchronized // keep the CAS state and the UI projection in one critical section
     private fun applyOutcome(outcome: BbcWriteOutcome, targetSequence: Long?): Boolean {
+        if (outcome is BbcWriteOutcome.Skipped) return true
         val value = when (outcome) {
             is BbcWriteOutcome.Confirmed -> outcome.value
-            BbcWriteOutcome.Unknown -> null
+            BbcWriteOutcome.Unknown, BbcWriteOutcome.Skipped -> null
         }
         val status = when (outcome) {
             is BbcWriteOutcome.Confirmed -> BbcEffectStatus.Confirmed(outcome.value)
-            BbcWriteOutcome.Unknown -> BbcEffectStatus.Unknown
+            BbcWriteOutcome.Unknown, BbcWriteOutcome.Skipped -> BbcEffectStatus.Unknown
         }
         while (true) {
             val cur = state.get()
+            val confirmed = outcome is BbcWriteOutcome.Confirmed
             val next = if (targetSequence == null) {
-                MarkedState(cur.sequence, value)
+                MarkedState(cur.sequence, value, confirmed)
             } else {
                 if (targetSequence <= cur.sequence) return false
-                MarkedState(targetSequence, value)
+                MarkedState(targetSequence, value, confirmed)
             }
             if (state.compareAndSet(cur, next)) {
                 _effectStatus.value = status

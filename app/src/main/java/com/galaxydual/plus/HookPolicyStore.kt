@@ -63,6 +63,18 @@ internal const val EVIDENCE_MAX_ENTRIES = 128
 internal const val EVIDENCE_GEN_TTL = 32L
 internal const val FALLBACK_CORRUPT_TYPE = "ClassCastException"
 
+/**
+ * PR #90 Phase 2: APP-ONLY durable "enable pending" marker. It lives in the
+ * same remote-prefs group but is deliberately NOT a PolicySource key: the
+ * Hook gate never reads it, so it cannot change Hook authorization semantics.
+ *
+ * Written in the SAME commit as optin=true on a Confirmed consent grant, and
+ * cleared in the SAME commit as every runtime preference write (the consumer's
+ * enable AND any user OFF). That makes cold-start convergence possible without
+ * ever reversing a durable user OFF: an OFF cleared the marker on the daemon.
+ */
+internal const val BBC_ENABLE_PENDING_PREF_KEY = "bbc_enable_pending"
+
 internal val poisonEvictCount = AtomicLong(0L)
 internal val evidenceEvictCount = AtomicLong(0L)
 internal val identityMismatchCount = AtomicLong(0L)
@@ -185,6 +197,9 @@ internal fun logPoisonOverflowOnce(where: String) {
 
 internal fun resetRemotePoisonForTests() {
     remotePoison.set(PoisonState(emptyMap(), 0))
+    // P0: the app-scoped retry intent is process state too; test isolation must
+    // clear it alongside the poison fence (production clears on service death).
+    clearPendingBbcClassification()
     try {
         poisonOverflowOnceLogged.set(false)
     } catch (_: Throwable) {
@@ -675,6 +690,47 @@ class HookPolicyStore(
     // polluted with the new value even though the commit did not persist.
     private val loadBbcEnabledRaw: () -> Boolean? = { null },
     private val saveBbcEnabledRaw: (Boolean) -> Boolean = { false },
+    // PR5 Phase B2 (#80): pre-activation consent (dual_policy/bbc_preactivation_optin).
+    // Deliberately a SEPARATE single-key boolean seam from bbc_injection_enabled:
+    // the hook reads it as the real "new install = OFF until consent" gate.
+    // Absent/failed read => null => NOT opted in (fail-closed, unlike the legacy
+    // default-true BBC opt-out). Failed write => false => BbcWriteOutcome.Unknown;
+    // the optimistic local mMap may be polluted, so a re-read is not authority.
+    // Direct-injected test backends default to absent / failed write.
+    private val loadBbcPreactivationOptinRaw: () -> Boolean? = { null },
+    private val saveBbcPreactivationOptinRaw: (Boolean) -> Boolean = { false },
+    // Phase 2: the "enable pending" marker is written ATOMICALLY with optin=true
+    // on a Confirmed grant. The legacy single-key seam above is left intact for
+    // its existing callers/tests; production grant uses this paired seam.
+    // Direct-injected test backends default to a failed commit (fail closed).
+    private val saveBbcConsentGrantRaw: () -> Boolean = { false },
+    // Phase 2: every runtime preference write also clears the pending marker
+    // in the SAME commit, so a user OFF atomically cancels a pending enable.
+    private val saveBbcRuntimeAndPendingRaw: (Boolean, Boolean) -> Boolean = { _, _ -> false },
+    // PR #90 Phase C (+ final fixer): AUTHORITATIVE durable reads for the app-scoped
+    // consent holder. These are `contains()`-style reads from the CURRENT service
+    // generation's prefs instance, used only on bind/resync. A failed read is
+    // null (never "granted"); the holder additionally fences them by generation
+    // so a polluted local mMap from a failed commit can never clear Unknown.
+    // The migration marker completes the opt-in/classification pair: the app
+    // must not authorize Legacy on PRE_UPGRADE_EXISTING without it.
+    // Direct-injected test backends default to absent / unreadable.
+    private val readBbcInstallClassificationRaw: () -> String? = { null },
+    private val readBbcPreactivationOptinAuthoritativeRaw: () -> Boolean? = { null },
+    // Final fixer: the migration marker is a SECOND durable proof for a genuine
+    // upgrade (PRE_UPGRADE_EXISTING). Like the opt-in key, read it with
+    // contains() so absent is a definite false and a read failure is null.
+    // Direct-injected test backends default to absent / unreadable.
+    private val readBbcLegacyMigratedAuthoritativeRaw: () -> Boolean? = { null },
+    // PR #90 review: ONE coherent snapshot of ALL consent-authoritative keys,
+    // mirroring the Hook-side BbcCoherentPrefsSnapshot. Unlike the per-key seams
+    // above (kept for their existing callers), this reads ONE prefs instance and
+    // maps any failure / wrong type / mismatch to a single fail-closed result so
+    // App and Hook cannot disagree about the same durable bytes. Cancellation
+    // still propagates. Direct-injected test backends default to fail-closed.
+    private val readBbcConsentDurableRaw: () -> BbcConsentDurableSnapshot = {
+        BbcConsentDurableSnapshot.failClosed()
+    },
 ) {
 
     // E07 (PR #74 R4): app-process-local, one-shot signal that a SUCCESSFUL
@@ -754,6 +810,158 @@ class HookPolicyStore(
         throw ce
     } catch (_: Throwable) {
         BbcWriteOutcome.Unknown
+    }
+
+    // PR5 Phase B2 (#80): persisted pre-activation consent. Unlike the legacy
+    // BBC opt-out (default true), an ABSENT key and ANY read failure mean
+    // "NOT opted in" — the hook's new-install effect gate stays closed. A key
+    // explicitly written false is likewise not opted in. CancellationException
+    // stays an interruption (same contract as isBbcInjectionEnabled).
+    fun isBbcPreactivationOptIn(): Boolean = try {
+        loadBbcPreactivationOptinRaw() ?: false
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        false
+    }
+
+    // Best-effort single-key commit of the consent preference. Boolean wrapper
+    // is true ONLY for a Confirmed write; never infer confirmation from a
+    // follow-up read of the optimistic local mMap.
+    @Deprecated(
+        "test compatibility only; use setBbcConsentGrantDetailed / consentCommitAt",
+        ReplaceWith("setBbcConsentGrantDetailed()"),
+    )
+    fun setBbcPreactivationOptIn(enabled: Boolean): Boolean =
+        setBbcPreactivationOptInDetailed(enabled) is BbcWriteOutcome.Confirmed
+
+    // Tri-state write seam mirroring setBbcInjectionEnabledDetailed(): a
+    // commit(false)/throw is Unknown, NOT "the old value survived". No hook
+    // behavior is asserted: Confirmed only means the daemon persisted the key.
+    @Deprecated(
+        "test compatibility only; use setBbcConsentGrantDetailed / consentCommitAt",
+        ReplaceWith("setBbcConsentGrantDetailed()"),
+    )
+    internal fun setBbcPreactivationOptInDetailed(enabled: Boolean): BbcWriteOutcome = try {
+        if (saveBbcPreactivationOptinRaw(enabled)) {
+            BbcWriteOutcome.Confirmed(enabled)
+        } else {
+            BbcWriteOutcome.Unknown
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcWriteOutcome.Unknown
+    }
+
+    /**
+     * Phase 2 cold-start fix: the Confirmed consent write that persists
+     * optin=true ALSO persists the app-only enable-pending marker in the same
+     * atomic commit. Only this seam may set the marker. CancellationException
+     * remains an interruption; any other throwable is Unknown (fail closed).
+     */
+    internal fun setBbcConsentGrantDetailed(): BbcWriteOutcome = try {
+        if (saveBbcConsentGrantRaw()) {
+            BbcWriteOutcome.Confirmed(true)
+        } else {
+            BbcWriteOutcome.Unknown
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcWriteOutcome.Unknown
+    }
+
+    /**
+     * Phase 2 cold-start fix: a runtime preference commit also clears the
+     * enable-pending marker in the SAME commit. This is what makes a durable
+     * user OFF cancel a pending enable across process death. [pending] is
+     * always false in production; the parameter documents the atomic contract.
+     */
+    internal fun setBbcRuntimeAndEnablePendingDetailed(
+        enabled: Boolean,
+        pending: Boolean = false,
+    ): BbcWriteOutcome = try {
+        if (saveBbcRuntimeAndPendingRaw(enabled, pending)) {
+            BbcWriteOutcome.Confirmed(enabled)
+        } else {
+            BbcWriteOutcome.Unknown
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcWriteOutcome.Unknown
+    }
+
+    // PR #90 Phase C: authoritative durable classification read. Null = absent
+    // or unreadable (unresolved); never inferred from current packages/version.
+    internal fun readBbcInstallClassification(): String? = try {
+        readBbcInstallClassificationRaw()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
+    }
+
+    // PR #90 Phase C: authoritative opt-in read. Uses `contains()` so an absent
+    // key is a definite false and a read failure is null. This is NOT used as a
+    // grant source by itself: the holder only accepts it from the current
+    // service generation and never lets it clear a durable Unknown fence.
+    internal fun readBbcPreactivationOptInAuthoritative(): Boolean? = try {
+        readBbcPreactivationOptinAuthoritativeRaw()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
+    }
+
+    // Final fixer: authoritative migration-marker read, mirroring the opt-in
+    // read above. `contains()` => absent is a definite false; a read failure is
+    // null and never authorizes Legacy. Only used by the app consent resync.
+    internal fun readBbcLegacyMigratedAuthoritative(): Boolean? = try {
+        readBbcLegacyMigratedAuthoritativeRaw()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * PR #90 review: the AUTHORITATIVE durable read used for app consent
+     * resolution. All keys come from ONE coherent [BbcConsentDurableSnapshot];
+     * a failed/invalid/torn read masks the WHOLE snapshot (never a hybrid of
+     * two generations, never an inferred default-true runtime value). The
+     * generation is supplied by the caller (the app-scoped holder owns it).
+     */
+    internal fun readBbcConsentAuthoritative(): BbcConsentDurableSnapshot = try {
+        readBbcConsentDurableRaw()
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcConsentDurableSnapshot.failClosed()
+    }
+
+    /**
+     * R5-02: authoritative four-state persisted effect-value read used by the
+     * app IO lane (never on Main). Taken from the SAME coherent snapshot as the
+     * consent keys, with `contains()` semantics and NO default-true fallback:
+     *  * ABSENT = no explicit opt-out (configuration permits ON for an
+     *    authorized install, but not an acknowledgement);
+     *  * FALSE / TRUE = definite persisted values;
+     *  * UNAVAILABLE = wrong type / read failure / binder absence / torn
+     *    snapshot. It must never become TRUE and never render checked.
+     *
+     * This is a READ, never a write acknowledgement — callers fold it in as a
+     * provisional seed, not as Confirmed.
+     */
+    internal fun readBbcInjectionEnabledAuthoritative(): BbcRuntimePrefValue = try {
+        readBbcConsentDurableRaw().let { snapshot ->
+            if (snapshot.coherent) snapshot.runtime else BbcRuntimePrefValue.UNAVAILABLE
+        }
+    } catch (ce: CancellationException) {
+        throw ce
+    } catch (_: Throwable) {
+        BbcRuntimePrefValue.UNAVAILABLE
     }
 
     // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
@@ -1151,6 +1359,21 @@ fun remoteHookPolicyStore(
                     // is deadlock-free because the poison primitives take no lock
                     // (only an AtomicReference CAS, no re-entry into this lock).
                     val ok: Boolean = synchronized(versionCommitLock) {
+                        // P0 (PR #90): decide the durable install classification
+                        // at the VERY START of the write, BEFORE touching any
+                        // packages/version bytes. The resulting key/value (and,
+                        // for a genuine upgrade, the migration marker) go into
+                        // the SAME atomic editor/commit as the draft below —
+                        // no window where a fresh draft exists unclassified.
+                        // A pending intent from a FAILED commit (whose optimistic
+                        // local mMap now reads "known") is re-added here so the
+                        // retry cannot drop classification/marker. The permanent
+                        // overflow latch maps to FailClosed and aborts the whole
+                        // write; CE propagates (save()/clear() promise it).
+                        val classificationPlan = planBbcInstallClassificationForWrite(prefs)
+                        if (classificationPlan is BbcClassificationPlan.FailClosed) {
+                            return@synchronized false
+                        }
                         // Phase A P0 policy_version 同步寫入（與包集合同一 commit
                         // 原子落盤）：每次 save/clear 單調 +1。舊草稿遷移：版本鍵
                         // 缺席視為 0（下次寫入即 1）；非空舊草稿無版本仍被 hook
@@ -1234,6 +1457,15 @@ fun remoteHookPolicyStore(
                         } catch (e: Throwable) {
                             throw e
                         }
+                        // P0: same transaction as packages/version. Only the
+                        // classification key (+ marker for a real upgrade) is
+                        // added — never remove/putStringSet/putLong the old
+                        // draft from this classification write. A pending intent
+                        // is expressed as a Write plan, so it is re-added even
+                        // when classificationValue() reads a polluted local value.
+                        if (classificationPlan is BbcClassificationPlan.Write) {
+                            applyBbcClassificationPlan(ed, classificationPlan)
+                        } // NoWrite: key already durably present, leave unchanged
                         try {
                             ed.putLong(PolicySource.POLICY_KEY_EXTRA_VERSION, newVer)
                         } catch (ce: CancellationException) {
@@ -1247,13 +1479,22 @@ fun remoteHookPolicyStore(
                         // the optimistic mMap update inside commit() is always
                         // fenced by a visible gen bump. No commit => no poison.
                         poisonToken = prePoison(prefs)
-                        try {
+                        val committed = try {
                             ed.commit()
                         } catch (ce: CancellationException) {
                             throw ce
                         } catch (e: Throwable) {
                             throw e
                         }
+                        if (committed) {
+                            // Confirmed daemon persistence: the retry intent (if
+                            // any) is satisfied and must not be re-added to
+                            // future drafts. Inside versionCommitLock, matching
+                            // the documented single-writer invariant with the
+                            // planner that installed the pending intent.
+                            clearPendingBbcClassification()
+                        }
+                        committed
                     }
                     if (ok) {
                         poisonToken?.let { token ->
@@ -1497,6 +1738,284 @@ fun remoteHookPolicyStore(
                     throw ce
                 } catch (_: Throwable) {
                     false
+                }
+            }
+        },
+        // PR5 Phase B2 (#80): pre-activation consent. Same dual_policy group,
+        // SAME process-wide commit lock as the BBC opt-out (defense in depth
+        // against a whole-map commit dropping a concurrent policy draft).
+        // Absent/failed read => null => NOT opted in (fail-closed). Only this
+        // single key is written: packages/version and the hook-side legacy
+        // migration marker are never touched here. CE propagates; other
+        // throwables => null / false => fail-closed / Unknown.
+        loadBbcPreactivationOptinRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    prefs.getBoolean(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN, false)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        saveBbcPreactivationOptinRaw = { enabled ->
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                false
+            } else {
+                try {
+                    synchronized(versionCommitLock) {
+                        prefs.edit()
+                            .putBoolean(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN, enabled)
+                            .commit()
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+        },
+        // Phase 2: ONE atomic edit persists optin=true AND the app-only marker.
+        // The Hook gate ignores the marker; it exists solely so a cold-start
+        // resync can tell "consent granted but effect not yet enabled" from a
+        // durable user OFF (which clears it in the runtime commit below).
+        saveBbcConsentGrantRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                false
+            } else {
+                try {
+                    synchronized(versionCommitLock) {
+                        prefs.edit()
+                            .putBoolean(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN, true)
+                            .putBoolean(BBC_ENABLE_PENDING_PREF_KEY, true)
+                            .commit()
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+        },
+        // Phase 2: every runtime write atomically clears the marker. Used for
+        // the consumer-owned enable AND for the user's OFF toggle.
+        saveBbcRuntimeAndPendingRaw = { enabled, pending ->
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                false
+            } else {
+                try {
+                    synchronized(versionCommitLock) {
+                        prefs.edit()
+                            .putBoolean(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED, enabled)
+                            .putBoolean(BBC_ENABLE_PENDING_PREF_KEY, pending)
+                            .commit()
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    false
+                }
+            }
+        },
+        readBbcInstallClassificationRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    if (!prefs.contains(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION)) {
+                        null
+                    } else {
+                        prefs.getString(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION, null)
+                            ?: throw IllegalStateException("classification key present but unreadable")
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        readBbcPreactivationOptinAuthoritativeRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    if (!prefs.contains(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN)) {
+                        false // definite ABSENT => definitively not granted
+                    } else {
+                        prefs.getBoolean(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN, false)
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        // Final fixer: the one-time migration marker, read with contains() from
+        // the CURRENT service instance. The App writes it in the SAME commit as
+        // PRE_UPGRADE_EXISTING; a failed commit can pollute the local mMap with
+        // both keys, so the holder fences this read by generation as well.
+        readBbcLegacyMigratedAuthoritativeRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                null
+            } else {
+                try {
+                    if (!prefs.contains(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED)) {
+                        false // definite ABSENT => never migrated
+                    } else {
+                        prefs.getBoolean(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED, false)
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+            }
+        },
+        // PR #90 review P2: ONE immutable copy of the CURRENT service
+        // instance's prefs (mirrors the Hook's BbcCoherentPrefsSnapshot:
+        // getAll() exactly once + copy). Every key is read from that SAME copy,
+        // so no live/torn binder view can mix generations and no ~16 paired
+        // contains()/typed-get trips are needed. The Hook's failure detectors
+        // are mirrored exactly: a corrupt version key (wrong type / CCE /
+        // value < 1) and a wrong-typed package set mask the WHOLE snapshot.
+        // An ABSENT key stays a definite ABSENT/null, never default-true.
+        readBbcConsentDurableRaw = {
+            val prefs = resolvePrefs()
+            if (prefs == null) {
+                BbcConsentDurableSnapshot.failClosed()
+            } else {
+                val copy: Map<String, Any?>? = try {
+                    LinkedHashMap<String, Any?>(prefs.all)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    null
+                }
+                if (copy == null) {
+                    BbcConsentDurableSnapshot.failClosed()
+                } else {
+                    var failed = false
+
+                    fun booleanKey(key: String): Boolean? {
+                        if (!copy.containsKey(key)) return null // definite ABSENT
+                        val value = copy[key]
+                        if (value !is Boolean) {
+                            failed = true // present but wrong type => fail closed
+                            return null
+                        }
+                        return value
+                    }
+
+                    fun stringKey(key: String): String? {
+                        if (!copy.containsKey(key)) return null
+                        val value = copy[key]
+                        if (value !is String) {
+                            failed = true
+                            return null
+                        }
+                        return value
+                    }
+
+                    // Version seqlock over the SAME copy, via the shared hook
+                    // probe contract. A corrupt / unreadable version fails the
+                    // whole snapshot, exactly like hook/BbcPreactivationPrefs.
+                    fun probeVersionFromCopy(): VersionProbeResult = try {
+                        probeVersion(object : VersionPrefsView {
+                            override fun containsVersion(): Boolean =
+                                copy.containsKey(PolicySource.POLICY_KEY_EXTRA_VERSION)
+
+                            override fun readVersion(defValue: Long): Long {
+                                val value = copy[PolicySource.POLICY_KEY_EXTRA_VERSION]
+                                    ?: return defValue
+                                if (value !is Long) {
+                                    throw ClassCastException("$value is not a Long")
+                                }
+                                return value
+                            }
+                        })
+                    } catch (_: Throwable) {
+                        VersionProbeResult.Unavailable
+                    }
+                    val versionBefore = probeVersionFromCopy()
+
+                    val optIn = booleanKey(PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN)
+                    val migrated = booleanKey(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED)
+                    val classification = stringKey(PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION)
+                        .also {
+                            if (it != null && it !in PolicySource.INSTALL_CLASSIFICATION_VALUES) {
+                                failed = true
+                            }
+                        }
+                    // Authoritative runtime seed. ABSENT is a definite four-state
+                    // answer ("no explicit opt-out"), NOT a fabricated default-true;
+                    // wrong type masks the snapshot and reports UNAVAILABLE.
+                    fun runtimeKey(): BbcRuntimePrefValue {
+                        val key = PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED
+                        if (!copy.containsKey(key)) return BbcRuntimePrefValue.ABSENT
+                        val value = copy[key]
+                        if (value !is Boolean) {
+                            failed = true
+                            return BbcRuntimePrefValue.UNAVAILABLE
+                        }
+                        return if (value) BbcRuntimePrefValue.TRUE else BbcRuntimePrefValue.FALSE
+                    }
+                    val runtime = runtimeKey()
+                    // APP-ONLY marker, from the SAME copy. It is NOT authorization
+                    // evidence: a wrong-typed value only disables the resync
+                    // enable, it must not mask the durable opt-in/classification.
+                    val enablePending = copy[BBC_ENABLE_PENDING_PREF_KEY] as? Boolean
+
+                    // Failure detector ONLY (never legacy evidence): a hostile
+                    // package-set value must mask the whole snapshot, matching
+                    // the Hook reader's packagesReadable check.
+                    val packagesKey = PolicySource.POLICY_KEY_EXTRA_PACKAGES
+                    if (copy.containsKey(packagesKey) && copy[packagesKey] !is Set<*>) {
+                        failed = true
+                    }
+
+                    val versionAfter = probeVersionFromCopy()
+                    if (versionBefore is VersionProbeResult.Invalid ||
+                        versionBefore is VersionProbeResult.Unavailable ||
+                        versionAfter is VersionProbeResult.Invalid ||
+                        versionAfter is VersionProbeResult.Unavailable ||
+                        versionBefore != versionAfter
+                    ) {
+                        failed = true
+                    }
+
+                    if (failed) {
+                        BbcConsentDurableSnapshot.failClosed()
+                    } else {
+                        BbcConsentDurableSnapshot(
+                            optIn = when (optIn) {
+                                null -> BbcOptInValue.ABSENT
+                                true -> BbcOptInValue.TRUE
+                                false -> BbcOptInValue.FALSE
+                            },
+                            classification = classification,
+                            migrated = migrated,
+                            legacyRuntimeEnabled = when (runtime) {
+                                BbcRuntimePrefValue.TRUE -> true
+                                BbcRuntimePrefValue.FALSE -> false
+                                else -> null
+                            },
+                            coherent = true,
+                            enablePending = enablePending,
+                            runtime = runtime,
+                        )
+                    }
                 }
             }
         },

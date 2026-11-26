@@ -26,6 +26,59 @@ class RiskDisclosureStringTest {
 
     private val maps: Map<String, Map<String, String>> by lazy { locales.associateWith { stringMap(it) } }
 
+    // PR #90 Phase 4: the runtime opt-out key's ABSENCE is not an enabled
+    // preference (it only means "no explicit opt-out") and not a consent proof;
+    // new installs still need opt-in, and read failures fail closed. All three
+    // locales must carry this honest sentence and none may carry the old false
+    // "missing key is no longer treated as enabled" claim.
+    private val honestAbsentKeySentence = mapOf(
+        "values" to "執行期偏好鍵缺席只表示沒有明確 opt-out、不再是「預設開」的依據；新安裝仍須明確 opt-in 才會生效，任何讀取失敗則 fail-closed（關閉）。",
+        "values-b+zh+Hant" to "執行期偏好鍵缺席只表示沒有明確 opt-out、不再是「預設開」的依據；新安裝仍須明確 opt-in 才會生效，任何讀取失敗則 fail-closed（關閉）。",
+        "values-en" to "An absent runtime opt-out key only means there is no explicit opt-out and is no longer a basis for default on; new installs still require an explicit opt-in before the effect applies, and read failures fail closed (OFF).",
+    )
+    private val falseAbsentKeyClaims = listOf(
+        "執行期偏好鍵缺席不再視為啟用",
+        "A missing runtime preference key is no longer treated as enabled",
+    )
+
+    // PR #90 R5-05: the UNKNOWN toast must not read as cancellation or as a
+    // permanent "never will enable". A later authoritative fresh bind/resync
+    // may complete exactly one phase-2 enable even when the grant reply was
+    // Unknown; an explicit OFF (which clears the marker in the same commit)
+    // is how to stop/undo it. Semantically identical in all three locales.
+    private val honestAutoRecoverySentence = mapOf(
+        "values" to "之後若服務重新綁定／重新同步的權威讀取確認同意與待啟用標記確實已持久化，App 可能會自動補寫一次執行期偏好，完成先前已接受的 ON。",
+        "values-b+zh+Hant" to "之後若服務重新綁定／重新同步的權威讀取確認同意與待啟用標記確實已持久化，App 可能會自動補寫一次執行期偏好，完成先前已接受的 ON。",
+        "values-en" to "LATER, if an authoritative fresh bind/resync verifies that the consent and the pending-enable marker were actually persisted, the App MAY automatically complete the previously accepted ON by writing the runtime preference once.",
+    )
+    private val honestOffEscapeSentence = mapOf(
+        "values" to "若你希望保持關閉，請明確點按停用並重新核對結果（停用會在同一筆提交清除待啟用標記）。Unknown 不代表取消，也不代表永遠不會啟用。",
+        "values-b+zh+Hant" to "若你希望保持關閉，請明確點按停用並重新核對結果（停用會在同一筆提交清除待啟用標記）。Unknown 不代表取消，也不代表永遠不會啟用。",
+        "values-en" to "If you want it off, explicitly tap OFF and re-verify the result (OFF clears the pending marker in the same commit). UNKNOWN is not cancellation and does not mean it will never be enabled.",
+    )
+    // The old copy scoped "no further write" to the whole outcome, omitting
+    // the later automatic recovery. The qualified form must replace it; the
+    // substring "no further write was performed" itself stays (pinned in
+    // BbcPreactivationConsentTest) but never as a standalone final sentence.
+    private val oldOmissiveWriteClaims = listOf(
+        "本次未再進行其他寫入。請重試",
+        "no further write was performed. Please retry",
+    )
+    private val nowScopedNoWriteClaim = mapOf(
+        "values" to "本次未再進行其他寫入（僅指此刻）",
+        "values-b+zh+Hant" to "本次未再進行其他寫入（僅指此刻）",
+        "values-en" to "no further write was performed right now",
+    )
+
+    // R5-05: owner first-bind prerequisite for an existing install — the BBC
+    // effect stays OFF until the owner App has been opened at least once and
+    // its bind-time classification/migration commit is Confirmed.
+    private val honestOwnerFirstBindHint = mapOf(
+        "values" to "升級後既有安裝的 BBC 效應維持 OFF，直到 owner App 至少被開啟一次、且其 bind 時的分類／遷移提交為 Confirmed。",
+        "values-b+zh+Hant" to "升級後既有安裝的 BBC 效應維持 OFF，直到 owner App 至少被開啟一次、且其 bind 時的分類／遷移提交為 Confirmed。",
+        "values-en" to "After upgrading, the BBC effect of an existing install stays OFF until the owner App has been opened at least once and its bind-time classification/migration commit is Confirmed.",
+    )
+
     private fun resFile(locale: String): File {
         val candidates = listOf(File("src/main/res/$locale/strings.xml"), File("app/src/main/res/$locale/strings.xml"))
         return candidates.firstOrNull { it.isFile }
@@ -101,7 +154,7 @@ class RiskDisclosureStringTest {
             "已安裝",
             "政策已存",
             "BBC ON/OFF",
-            "不代表 Hook 在生效前已取得你的同意",
+            "仍不是 Hook 生效前同意的證明",
         )
         for (token in required) assertTrue("zh full missing $token", zh.contains(token))
         assertTrue("zh full must name BBC_AVAILABLE_APPS_INJECTION", zh.contains("BBC_AVAILABLE_APPS_INJECTION"))
@@ -118,8 +171,8 @@ class RiskDisclosureStringTest {
             "other profiles",
             "Keystore",
             "BBC ON/OFF",
-            "BEFORE this App",
-            "do NOT mean",
+            "New installs keep the Hook effect OFF",
+            "not proof of hook consent before activation",
             "consent",
         )
         for (token in required) assertTrue("en full missing $token", en.contains(token))
@@ -129,14 +182,77 @@ class RiskDisclosureStringTest {
     }
 
     @Test
+    fun riskDetailsFull_allLocalesPinHonestAbsentRuntimeKeySemantics() {
+        for (locale in locales) {
+            val text = maps.getValue(locale).getValue("risk_details_full")
+            assertTrue(
+                "$locale risk_details_full must state: absent = no explicit opt-out, " +
+                    "new installs still need opt-in, read failures fail closed",
+                text.contains(honestAbsentKeySentence.getValue(locale)),
+            )
+            for (falseClaim in falseAbsentKeyClaims) {
+                assertFalse("$locale must not claim '$falseClaim'", text.contains(falseClaim))
+            }
+            assertTrue("$locale must keep the #75 caveat", text.contains("issue #75"))
+        }
+    }
+
+    @Test
+    fun consentWriteFailureCopy_allLocalesDiscloseLaterAutomaticRecovery() {
+        for (locale in locales) {
+            val copy = maps.getValue(locale).getValue("settings_bbc_preactivation_write_failed")
+            assertTrue(
+                "$locale write-failed copy must disclose that a verified resync MAY " +
+                    "complete the previously accepted ON with one runtime write",
+                copy.contains(honestAutoRecoverySentence.getValue(locale)),
+            )
+            assertTrue(
+                "$locale write-failed copy must give the explicit-OFF escape and reject " +
+                    "the cancellation / never-will-enable reading of UNKNOWN",
+                copy.contains(honestOffEscapeSentence.getValue(locale)),
+            )
+            assertTrue(
+                "$locale write-failed copy must scope 'no further write' to RIGHT NOW",
+                copy.contains(nowScopedNoWriteClaim.getValue(locale)),
+            )
+            for (oldClaim in oldOmissiveWriteClaims) {
+                assertFalse("$locale must not keep the old omissive claim '$oldClaim'", copy.contains(oldClaim))
+            }
+            assertTrue("$locale must keep the #75 caveat", copy.contains("issue #75"))
+            assertTrue(
+                "$locale must keep the cold-start guard disclaimer",
+                if (locale == "values-en") copy.contains("NOT a Samsung cold-start deletion guard")
+                else copy.contains("不是 Samsung 冷啟動刪除防護"),
+            )
+            assertTrue(
+                "$locale must still state the UNKNOWN outcome explicitly",
+                if (locale == "values-en") copy.contains("UNKNOWN") else copy.contains("結果未知"),
+            )
+        }
+    }
+
+    @Test
+    fun riskDetailsFull_allLocalesPinOwnerFirstBindPrerequisite() {
+        for (locale in locales) {
+            val text = maps.getValue(locale).getValue("risk_details_full")
+            assertTrue(
+                "$locale risk_details_full must disclose the owner first-bind prerequisite",
+                text.contains(honestOwnerFirstBindHint.getValue(locale)),
+            )
+            assertTrue("$locale must keep the #75 caveat", text.contains("issue #75"))
+        }
+    }
+
+    @Test
     fun riskDetailsFull_noUnsafeClaimsAndRequiresNegation() {
         val zh = maps.getValue("values").getValue("risk_details_full")
         val en = maps.getValue("values-en").getValue("risk_details_full")
         assertTrue("zh must state 無法保證資料安全", zh.contains("無法保證資料安全"))
         assertTrue("en must state data safety cannot be guaranteed", en.contains("data safety cannot be guaranteed"))
 
-        // 保證資料安全 是 無法保證資料安全 的子字串；先移除強制否定句再查不安全宣稱。
-        val zhWithoutRequiredNegation = zh.replace("無法保證資料安全", "")
+        // 保證資料安全 是 無法保證資料安全／不保證資料安全 的子字串；
+        // 先移除這兩個強制否定句再查不安全宣稱。
+        val zhWithoutRequiredNegation = zh.replace("無法保證資料安全", "").replace("不保證資料安全", "")
         for (claim in listOf("零風險", "保證可還原", "保證資料安全", "完全安全", "絕對安全", "安全無虞")) {
             assertFalse("zh must not claim $claim", zhWithoutRequiredNegation.contains(claim))
         }
@@ -170,5 +286,19 @@ class RiskDisclosureStringTest {
                 }
             }
         }
+    }
+
+    /** R5-02: the consent-free explicit-OFF control needs a label in every locale. */
+    @Test
+    fun explicitDisableLabel_presentAndNonEmptyInAllLocales() {
+        for (locale in locales) {
+            val label = maps.getValue(locale)["settings_bbc_injection_disable"]
+                ?: throw AssertionError("$locale missing settings_bbc_injection_disable")
+            assertTrue("$locale settings_bbc_injection_disable must be non-empty", label.isNotBlank())
+        }
+        assertEquals("Hant and default disable labels must match",
+            maps.getValue("values").getValue("settings_bbc_injection_disable"),
+            maps.getValue("values-b+zh+Hant").getValue("settings_bbc_injection_disable"),
+        )
     }
 }

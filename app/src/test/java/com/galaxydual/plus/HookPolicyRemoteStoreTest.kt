@@ -51,6 +51,8 @@ class HookPolicyRemoteStoreTest {
         private val data = linkedMapOf<String, Any?>()
         var commitCalls = 0
             private set
+        var editCalls = 0
+            private set
         var applyCalls = 0
             private set
         var removeCalls = 0
@@ -130,7 +132,10 @@ class HookPolicyRemoteStoreTest {
             }
             return data.containsKey(key)
         }
-        override fun edit(): SharedPreferences.Editor = RecordingEditor()
+        override fun edit(): SharedPreferences.Editor {
+            editCalls++
+            return RecordingEditor()
+        }
         override fun registerOnSharedPreferenceChangeListener(
             listener: SharedPreferences.OnSharedPreferenceChangeListener?,
         ) = Unit
@@ -737,8 +742,10 @@ class HookPolicyRemoteStoreTest {
                 private var pending: MutableSet<String>? = null
                 private var removed = false
                 private var pendingVersion: Long? = null
+                // P0: every draft write also carries the durable classification
+                // key in the SAME commit, so the stub must accept it.
                 override fun putString(key: String?, value: String?): SharedPreferences.Editor =
-                    throw UnsupportedOperationException()
+                    apply { if (key != null && value != null) data[key] = value }
                 override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor =
                     apply { pending = values?.toMutableSet(); removed = false }
                 override fun putInt(key: String?, value: Int): SharedPreferences.Editor =
@@ -750,8 +757,10 @@ class HookPolicyRemoteStoreTest {
                     apply { pendingVersion = value }
                 override fun putFloat(key: String?, value: Float): SharedPreferences.Editor =
                     throw UnsupportedOperationException()
+                // P0: a genuine upgrade writes the migration marker atomically
+                // with the classification key in this same editor.
                 override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor =
-                    throw UnsupportedOperationException()
+                    apply { if (key != null) data[key] = value }
                 override fun remove(key: String?): SharedPreferences.Editor =
                     apply { removed = true; pending = null }
                 override fun clear(): SharedPreferences.Editor =
@@ -1429,7 +1438,16 @@ class HookPolicyRemoteStoreTest {
                 assertFalse(s.save(setOf("com.example.$i")))
             }
             assertTrue(remotePoison.get().entries.size <= POISON_MAX_ENTRIES)
-            assertTrue(poisonEvictCount.get() - evictBase >= 150 - POISON_MAX_ENTRIES)
+            val state = remotePoison.get()
+            assertTrue("the cap must engage the permanent overflow latch", state.overflow)
+            // P0 (PR #90): once the permanent latch is set, classification is
+            // untrustworthy and EVERY subsequent write is aborted (FailClosed).
+            // Only the single drop-new that engaged the latch is counted; the
+            // remaining instances never reach a commit at all.
+            assertTrue(poisonEvictCount.get() - evictBase >= 1)
+            val afterLatch = RecordingPrefs()
+            assertFalse(remoteHookPolicyStore { afterLatch }.save(setOf("com.example.after-latch")))
+            assertEquals("overflow latch aborts before any editor", 0, afterLatch.editCalls)
         } finally {
             resetRemotePoisonForTests()
         }

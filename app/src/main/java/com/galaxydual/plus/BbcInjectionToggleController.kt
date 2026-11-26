@@ -98,6 +98,13 @@ internal class BbcInjectionToggleController(
     @Volatile
     private var alive: Boolean = true
 
+    // PR #90 Phase C: while the pre-activation consent dialog is pending, an
+    // app-scoped Confirmed from an older/inherited runtime write must NEVER
+    // repaint the CheckBox into a state the user has not settled. Set/cleared
+    // atomically with the dialog lifecycle by MainActivity.
+    @Volatile
+    private var consentPending: Boolean = false
+
     // UI delivery job is local: it is cancelled on dispose so a queued callback
     // cannot touch a dead View. It is a CHILD of the coordinator's app scope,
     // so cancelling it never affects the shared write consumer.
@@ -133,6 +140,7 @@ internal class BbcInjectionToggleController(
                     // Confirmed means "persisted preference acknowledged", NEVER
                     // "hook applied" (the cold-start caveat is unchanged).
                     if (status is BbcEffectStatus.Confirmed &&
+                        !consentPending &&
                         lastSubmittedSequence == 0L &&
                         status.value != lastUiValue
                     ) {
@@ -182,12 +190,40 @@ internal class BbcInjectionToggleController(
                         onUnknown?.invoke()
                         onFailed?.invoke()
                     }
+                    // A superseded effect write never entered a commit: no
+                    // rollback, no Unknown styling, no toast. The newer intent
+                    // already owns the CheckBox. (Consent writes use this
+                    // outcome too; they do not reach this effect callback.)
+                    BbcWriteOutcome.Skipped -> Unit
                 }
             }
         }
         // F03/telemetry only — the result fence above uses myIntent/generation,
         // which is already published before submit() can deliver a result.
         lastSubmittedSequence = seq
+    }
+
+    /**
+     * PR #90 Phase C: gate the inherited-Confirmed CheckBox sync while a
+     * consent dialog is pending. The app-level styling still sees every status;
+     * only the automatic value rewrite is suppressed. No write is involved.
+     */
+    internal fun setConsentPending(pending: Boolean) {
+        consentPending = pending
+    }
+
+    /**
+     * PR #90 Phase C: restore the confirmable pre-dialog CheckBox state after
+     * cancel/back/outside/show-failure with ZERO writes. Generation advances
+     * atomically with lastUiValue so a racing inherited sync cannot restore the
+     * superseded value. [lastGood] is deliberately NOT touched: restoring a
+     * value is a UI action, never a new confirmation or an "effect OFF" claim.
+     */
+    @Synchronized
+    internal fun restoreConsentUi(value: Boolean) {
+        if (!alive) return
+        generation++
+        lastUiValue = value
     }
 
     /**

@@ -387,6 +387,27 @@ class EffectivePolicyCache(
         return BbcPolicy.Unknown(emptySet())
     }
 
+    // R5-01: EXPLICIT entry-clock-untrusted fail-closed route for the caller
+    // that observed an untrusted clock BEFORE entering getBbc(). It makes NO
+    // clock-based DECISION: the cache's own sample is a DIFFERENT observation
+    // (healthy / skewed / throwing) and MUST NOT decide whether this entry
+    // distrust is honored. (The shared locked helper's only nowMs() touch is a
+    // best-effort throttled diagnostic line; it never affects the result.)
+    // In particular it never reaches the
+    // gate-provider / probeCachedLocked() path, so no cached Good, sticky or
+    // policy-reader result can be laundered into a serve without a successful
+    // coherent consent/opt-out read.
+    //
+    // Effects are exactly those of an in-call clock distrust (the same locked
+    // linearization point): drop sticky, invalidate freshness + cooldown, bump
+    // clockEpoch (fence in-flight reads), release the flight claim, wake
+    // followers, and return Unknown(emptySet()) — with zero reader calls, zero
+    // merge and canonical/version evidence retained. getBbc()'s own
+    // mid-call/sampled-clock behavior is deliberately untouched.
+    fun failClosedEntryClockUntrusted(): BbcPolicy = synchronized(lock) {
+        failClosedUntrustedClockLocked()
+    }
+
     // R4: a single under-lock probe for every cached/sticky return decision in
     // getBbc(). Untrusted -> caller routes ONCE through
     // failClosedUntrustedClockLocked(); Hit -> an already-accounted policy to

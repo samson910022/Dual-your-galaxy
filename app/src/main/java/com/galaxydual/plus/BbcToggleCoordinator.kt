@@ -1,59 +1,104 @@
 // MIT License - Original code by Galaxy-Dual-app-Plus contributors. No GPL content.
 //
 // PR #74 round 3 / D05: app-scoped, cross-lifecycle serializer for BBC opt-out
-// writes. Round-2 N05 fixed ordering *inside* one controller, but Main disposed
-// that controller and built a new one on every dialog rebuild / Activity
-// destroy. A synchronous RemotePreferences commit already entered by the old
-// actor is non-cancellable and could land AFTER the new controller's write —
-// overwriting the user's last intent. This coordinator owns the ONLY writer:
-// one conflated channel drained by ONE app-lifetime consumer.
+// writes. Main disposed that controller and built a new one on every dialog
+// rebuild / Activity destroy. A synchronous RemotePreferences commit already
+// entered by the old actor is non-cancellable and could land AFTER the new
+// controller's write — overwriting the user's last intent. This coordinator owns
+// the ONLY writer: one app-lifetime consumer.
+//
+// PR #90 Phase C: the SAME single consumer also owns the consent lane
+// (submitConsentWrite / submitConsentRead), so consent I/O never runs on the
+// Main thread and is serialized against runtime writes by the same consumer.
+//
+// PR #90 Phase 2 (review A1/B3): the lanes are SEPARATE. A background
+// ConsentRead is coalesced with other reads ONLY; it can never replace a queued
+// user Toggle/ConsentWrite. Durable user intents live in per-axis pending slots
+// with explicit sequence supersession (a NEWER same-axis intent wins; an OFF is
+// never dropped by a read or by an older ON handoff). trySend/enqueue success
+// now means the item will be executed — or was explicitly superseded by a newer
+// same-axis intent — and the report is returned to the caller.
 //
 // Framework-free on purpose (only kotlinx.coroutines): JVM tests can drive it
 // without Robolectric.
 package com.galaxydual.plus
 
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/** Result reported to a caller that enqueued work on the app IO lane. */
+internal enum class BbcWorkEnqueue {
+    /** Accepted: the work will run unless a NEWER intent on the SAME axis replaces it. */
+    Accepted,
+    /** Accepted, but an older pending same-axis intent was dropped (its onReplaced fired). */
+    ReplacedOlder,
+    /** Rejected: a NEWER same-axis intent already owns the pending slot. */
+    SupersededByNewer,
+    /** Rejected: the app-lifetime consumer is closed/cancelled, so nothing will run. */
+    Rejected,
+}
+
 /**
- * Process-wide serializer for BBC injection opt-out preference writes.
+ * Result of a generation-aware consent commit.
+ *
+ * [touchedGeneration] is the generation of the prefs instance the commit
+ * ACTUALLY touched — never merely the generation captured when the user
+ * accepted the dialog. A binder death mid-commit may make those differ; the
+ * holder fences [touchedGeneration], so a newer instance can authoritatively
+ * resync while the polluted instance cannot clear its own fence.
+ */
+internal data class BbcConsentWriteResult(
+    val outcome: BbcWriteOutcome,
+    val touchedGeneration: Long,
+    /**
+     * R5-03: identity of the session that ACTUALLY performed the commit. The
+     * holder records it on the pollution fence so a higher generation bound to
+     * the same prefs instance cannot clear the fence with optimistic-local
+     * evidence. `null` keeps legacy callers compiling (generation-only fence).
+     */
+    val sessionIdentity: BbcConsentSessionIdentity? = null,
+)
+
+/**
+ * Process-wide serializer for BBC preference writes and consent reads.
  *
  * **App-process-local.** Constructed ONCE for the Application lifetime and
  * shared by every [BbcInjectionToggleController], including controllers created
- * by later dialog/Activity rebuilds. The single conflated channel + single
- * consumer means every commit that actually entered the queue is serialized
- * GLOBALLY: an old, already-running commit finishes before a newer one starts,
- * so the last user intent is the last value written to storage — across UI
- * lifetimes, not just within one controller.
+ * by later dialog/Activity rebuilds. ONE consumer serializes every commit on
+ * [io]; no binder call ever runs on Main.
  *
  * [submit] assigns its sequence at USER-INTENT time (via
  * [BbcToggleRuntimeState.nextSequence]) AND enqueues inside ONE critical
- * section. Allocation and enqueue MUST be atomic: if a caller could allocate
- * sequence N, be descheduled, and let another caller allocate N+1 and enqueue
- * it first, CONFLATED would keep the LAST SEND — the older sequence — and the
- * stale value could be written to disk last. Sequence numbers stay monotonic
- * across rebuilds. A tap replaced in the CONFLATED slot before it is dequeued
- * never gets a result callback: its outcome is irrelevant because a newer
- * intent superseded it.
+ * section (the 2-arg [submit] overload). Allocation and enqueue MUST be atomic:
+ * a caller that minted sequence N must not be descheduled and let another
+ * caller mint N+1 and enqueue it first, which could let a stale lower sequence
+ * displace the newer intent. The phase-2 per-axis slot additionally rejects any
+ * work whose sequence is not strictly newer than the one it owns, so a minted
+ * sequence and its enqueue stay paired under one lock. The explicit-sequence
+ * [submit] overload is for callers that already minted the intent sequence.
+ * Sequence numbers stay monotonic across rebuilds.
  *
- * #81: the pre-commit sequence fence below remains as defense in depth. It is
- * what makes [submitWithExplicitSequenceForTests] (test-only) safe and it
- * protects any future caller that bypasses the atomic path. A write whose
+ * #81: the pre-commit sequence fence in [executeToggle] remains as defense in
+ * depth. It is what makes [submitWithExplicitSequenceForTests] (test-only) safe
+ * and it protects any future caller that bypasses the atomic path. A write whose
  * sequence is older than the latest issued intent is discarded wholesale (no
  * commit, no mark, no callback), because state.mark()'s result-only fence is
  * too late to protect the persisted preference.
  *
  * Cancellation of a controller's UI must NOT cancel this consumer or an
  * in-flight commit; `dispose()` on the controller only detaches UI callbacks.
- * A [CancellationException] from [commit] is propagated to the app scope (and
- * produces no UI callback), matching the previous controller behavior. Every
- * other throwable maps to [BbcWriteOutcome.Unknown].
+ * A [CancellationException] from a commit maps to [BbcWriteOutcome.Unknown]
+ * while the APP scope is alive: killing the single lifetime consumer would
+ * leave later submits Accepted-but-never-run. It is propagated ONLY when the
+ * whole app scope is terminating. Every other throwable also maps to Unknown.
  *
  * This is a write-ordering guarantee for the persisted preference only. It is
  * NOT the hook process's `bbcConfirmedOffAtMs`, NOT a statement about immediate
@@ -69,16 +114,143 @@ internal class BbcToggleCoordinator(
     private val commit: suspend (Boolean) -> BbcWriteOutcome,
     /** Commit dispatcher; IO in production, an injected scheduler in JVM tests. */
     private val io: CoroutineDispatcher = Dispatchers.IO,
-) {
-    private data class Write(
-        val sequence: Long,
-        val value: Boolean,
-        val onResult: (BbcWriteOutcome) -> Unit,
+    /**
+     * Legacy no-argument consent commit seam. Runs on [io] inside the SAME
+     * app-lifetime consumer as [commit]. Defaults fail closed so a caller that
+     * forgot to wire it can never grant consent. It cannot carry the durable
+     * enable-pending marker, so resync convergence deliberately ignores reads
+     * unless that marker came from the coherent snapshot. Production uses
+     * [consentCommitAt]; kept only for source compatibility with existing
+     * framework-free tests. New code MUST NOT use it.
+     */
+    @Deprecated(
+        "test compatibility only; use setBbcConsentGrantDetailed / consentCommitAt",
+        ReplaceWith("consentCommitAt"),
     )
+    private val consentCommit: suspend () -> BbcWriteOutcome = { BbcWriteOutcome.Unknown },
+    /**
+     * Generation-aware consent commit seam. Receives the generation captured at
+     * user-intent time and MUST report the generation actually touched. Defaults
+     * to the legacy seam, assuming the captured instance was touched (the
+     * conservative fail-closed interpretation for an Unknown legacy outcome).
+     */
+    private val consentCommitAt: suspend (Long) -> BbcConsentWriteResult = { generation ->
+        BbcConsentWriteResult(consentCommit(), generation)
+    },
+    /**
+     * Authoritative durable read seam for bind/resync. Always executes on [io];
+     * the generation argument comes from the app-scoped holder at execution
+     * time so a stale service instance cannot certify consent.
+     */
+    private val consentRead: suspend (Long) -> BbcConsentAuthoritativeRead = { generation ->
+        BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
+    },
+    /** The one app-scoped authorization holder; shared across all UI rebuilds. */
+    internal val consentHolder: BbcActivationConsentHolder = BbcActivationConsentHolder(),
+    /**
+     * R5-02: authoritative four-state persisted effect-value read. Always
+     * executes on [io] inside the SAME app-lifetime consumer, never on Main.
+     * ABSENT means "no explicit opt-out" (configuration permits ON only for an
+     * authorized install); UNAVAILABLE is a failure and must never claim ON.
+     * The value is folded into [BbcToggleRuntimeState] as a PROVISIONAL read,
+     * never as a Confirmed write acknowledgement. Defaults to UNAVAILABLE so a
+     * caller that forgot to wire it leaves the row neutral.
+     */
+    private val effectRead: suspend () -> BbcRuntimePrefValue = { BbcRuntimePrefValue.UNAVAILABLE },
+    /**
+     * R5-03: session-aware runtime commit. [session] is non-null ONLY for
+     * auto-enable work that carries the authorizing session; a rebind between
+     * authorization and the commit must never write ON to a new, unverified
+     * prefs instance. A user OFF passes null and is always written against the
+     * CURRENT session. Defaults to the legacy [commit] seam.
+     */
+    private val commitWithSession: suspend (Boolean, BbcConsentSessionIdentity?) -> BbcWriteOutcome =
+        { value, _ -> commit(value) },
+    /**
+     * R5-03: supplier for the CURRENT immutable I/O session identity. Used at
+     * execution time to reject enable work whose authorizing session was
+     * invalidated by a rebind/death. Defaults to null (legacy tests: no gating).
+     */
+    private val currentSession: () -> BbcConsentSessionIdentity? = { null },
+) {
+    /**
+     * TEST-ONLY seam (mirrors GalaxyApp.bbcClassificationPrefsProvider): invoked
+     * with the freshly minted effect-axis sequence by the two consumer-owned
+     * enable paths, AFTER the mint and BEFORE any OFF-authority check. Production
+     * leaves it null. A test suspends here to force a user OFF to be recorded
+     * and enqueued strictly after the mint; the enable must then lose.
+     */
+    internal var effectSequenceMintHook: (suspend (Long) -> Unit)? = null
 
-    // CONFLATED: a burst keeps just the newest not-yet-dequeued intent. There
-    // is exactly one consumer below, so commits are serialized process-wide.
-    private val writes = Channel<Write>(Channel.CONFLATED)
+    private sealed interface Work {
+        data class Toggle(
+            val sequence: Long,
+            val value: Boolean,
+            val onResult: (BbcWriteOutcome) -> Unit,
+            val onReplaced: () -> Unit,
+            /**
+             * R5-03: the session that AUTHORIZED an automatic enable. Null for
+             * direct user toggles (which always use the current session). At
+             * execution this must still be current or no ON may be written.
+             */
+            val authorizingSession: BbcConsentSessionIdentity? = null,
+        ) : Work
+
+        /** The opt-in grant write. Sequence/generation come from the app holder. */
+        data class ConsentWrite(
+            val sequence: Long,
+            val generation: Long,
+            val onResult: (BbcWriteOutcome) -> Unit,
+            val onReplaced: () -> Unit,
+            /**
+             * R5-03 review R1: identity of the session captured at submit time.
+             * Every outcome path — INCLUDING the CancellationException/Throwable
+             * catches, where the store may already have polluted the local mMap —
+             * must carry it into the holder's fence. Without it a higher bind of
+             * the same prefs could clear the fence with optimistic-local evidence.
+             */
+            val session: BbcConsentSessionIdentity? = null,
+        ) : Work
+
+        /** Bind/resync read. Never called from an OFF toggle path. */
+        data class ConsentRead(
+            val onResult: (BbcConsentAuthoritativeRead) -> Unit,
+            val onCoalesced: () -> Unit,
+        ) : Work
+
+        /**
+         * PR #90 Phase 3: authoritative persisted EFFECT read. Separate from
+         * [ConsentRead] on purpose — a consent resync must not fabricate a
+         * write acknowledgement, and a UI effect read must not disturb the
+         * consent holder's generation/fence resolution.
+         */
+        data class EffectRead(
+            val onResult: (BbcRuntimePrefValue) -> Unit,
+            val onCoalesced: () -> Unit,
+        ) : Work
+    }
+
+    // Per-axis pending slots. A newer intent of the SAME axis may replace the
+    // older one (its onReplaced is invoked, so no caller ever assumes it ran).
+    // No CROSS-axis replacement is possible: a read can never evict an OFF or a
+    // consent grant, and a consent write can never evict a queued toggle.
+    private val slotLock = Any()
+    private val pendingToggle = AtomicReference<Work.Toggle?>(null)
+    private val pendingConsentWrite = AtomicReference<Work.ConsentWrite?>(null)
+    private val pendingRead = AtomicReference<Work.ConsentRead?>(null)
+    private val pendingEffectRead = AtomicReference<Work.EffectRead?>(null)
+
+    // CONFLATED wake-up only: after every signal the consumer drains ALL lanes
+    // (user work first, reads last, then the effect read). A signal arriving
+    // during draining is buffered, so no work is lost.
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+
+    // #81 atomic-submit lane: the 2-arg submit() mints its sequence and enqueues
+    // its Work here INSIDE enqueueLock, so mint+enqueue are one critical section.
+    // The phase-2 per-axis slots below carry the explicit-sequence overloads.
+    // Both paths are drained by the SAME single consumer below, so all commits
+    // remain serialized process-wide.
+    private val writes = Channel<Work.Toggle>(Channel.CONFLATED)
 
     /**
      * Sequence allocation and channel enqueue share ONE critical section.
@@ -102,44 +274,207 @@ internal class BbcToggleCoordinator(
     private var skippedWrites: Int = 0
 
     private val consumer: Job = scope.launch {
-        for (write in writes) {
-            // #81: the sequence belongs to the USER INTENT (assigned before
-            // submit), not to the queue position. A multi-threaded caller can
-            // nextSequence() in one order and submit() in the opposite order,
-            // and CONFLATED keeps the last SEND, which may be the older intent.
-            // Re-check against the latest ISSUED sequence right here, before the
-            // non-cancellable commit — state.mark() below only fences the
-            // result, which is too late to protect the persisted preference.
-            // latestSequence() starts at 0 and nextSequence() increments it, so
-            // the first write (sequence 1) always passes; only strictly older
-            // writes are dropped.
-            if (write.sequence < state.latestSequence()) {
-                skippedWrites++ // test seam; skipped writes commit/mark/callback nothing
+        for (unit in wake) {
+            drainUserWork()
+            drainRead()
+            drainEffectRead()
+        }
+    }
+
+    private suspend fun drainUserWork() {
+        while (true) {
+            // Pop ONE lane at a time: OFF/high-priority toggles run first, but
+            // a consent write that was pending alongside a toggle must still be
+            // executed in this same drain (not lost on `continue`).
+            val toggle = synchronized(slotLock) { pendingToggle.getAndSet(null) }
+            if (toggle != null) {
+                executeToggle(toggle)
                 continue
             }
-
-            val outcome = try {
-                // A synchronous, non-cancellable commit is never abandoned
-                // mid-call by UI disposal: the app scope outlives every UI.
-                withContext(io) { commit(write.value) }
-            } catch (ce: CancellationException) {
-                // App-scope cancellation: no UI callback, let it propagate.
-                throw ce
-            } catch (_: Throwable) {
-                BbcWriteOutcome.Unknown
+            // #81 atomic-submit lane: CONFLATED keeps only the newest minted
+            // intent; the fence in executeToggle drops anything older.
+            val atomicToggle = writes.tryReceive().getOrNull()
+            if (atomicToggle != null) {
+                executeToggle(atomicToggle)
+                continue
             }
+            val consentWrite = synchronized(slotLock) { pendingConsentWrite.getAndSet(null) }
+            if (consentWrite != null) {
+                executeConsentWrite(consentWrite)
+                continue
+            }
+            return
+        }
+    }
 
-            // mark() is sequence-aware: an outcome older than one already
-            // applied is ignored. Defensive — the single consumer already
-            // serializes in submit order — but it also covers a multi-threaded
-            // caller racing nextSequence() against submit().
-            val applied = state.mark(outcome, write.sequence)
-            if (!applied) continue
+    private suspend fun drainRead() {
+        val read = pendingRead.getAndSet(null) ?: return
+        val generation = consentHolder.currentGeneration()
+        val result = try {
+            withContext(io) { consentRead(generation) }
+        } catch (ce: CancellationException) {
+            // Only a terminating APP scope may kill the single lifetime
+            // consumer. A seam-level interruption is not an outcome, but it
+            // must not leave the consumer dead with queued work stranded.
+            if (!scope.isActive) throw ce
+            BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
+        } catch (_: Throwable) {
+            BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
+        }
+        // Resolve on the IO consumer thread: no Main-thread binder read, and a
+        // local mMap value can never clear the fence (the holder enforces the
+        // generation rule).
+        consentHolder.resolve(result)
+        // Phase-2 convergence: a fresh process / rebind with durable opt-in=true
+        // but runtime=false must write the effect enable without waiting for a
+        // UI callback or a state-flow replay. Claimed once per generation.
+        maybeDriveResyncEnable(generation, result.enablePending == true, result.session)
+        try {
+            read.onResult(result)
+        } catch (_: Throwable) {
+            // A UI callback must never kill the process-wide consumer.
+        }
+    }
+
+    /**
+     * PR #90 Phase 3: run the authoritative persisted-effect read on [io].
+     * The result is a PROVISIONAL seed only — [BbcToggleRuntimeState] records it
+     * without advancing the intent fence and without emitting Confirmed, so no
+     * binder read ever happens on Main and no read impersonates a write
+     * acknowledgement. The consent holder is untouched (its own [drainRead]
+     * resolves authorization from the coherent snapshot).
+     */
+    private suspend fun drainEffectRead() {
+        val read = pendingEffectRead.getAndSet(null) ?: return
+        val value = try {
+            withContext(io) { effectRead() }
+        } catch (ce: CancellationException) {
+            if (!scope.isActive) throw ce
+            BbcRuntimePrefValue.UNAVAILABLE
+        } catch (_: Throwable) {
+            BbcRuntimePrefValue.UNAVAILABLE
+        }
+        state.seedEffectFromPersistedRead(value)
+        try {
+            read.onResult(value)
+        } catch (_: Throwable) {
+            // A UI callback must never kill the process-wide consumer.
+        }
+    }
+
+    private suspend fun executeToggle(work: Work.Toggle) {
+        // #81: pre-commit sequence fence (defense in depth). A write whose
+        // sequence is older than the latest issued intent must never reach the
+        // non-cancellable commit — state.mark()'s result-only fence is too late
+        // to protect the persisted preference. The counter is SHARED with
+        // consentHolder in production, so EVERY mint (including a resync's
+        // bookkeeping) raises this high-water mark: a coordinator path must
+        // never mint without enqueueing, or it would drop an OFF already queued
+        // at a lower sequence. Consent writes are additionally fenced by the
+        // holder. Skipped writes commit/mark/callback nothing.
+        if (work.sequence < state.latestSequence()) {
+            skippedWrites++
+            return
+        }
+
+        val outcome = try {
+            // A synchronous, non-cancellable commit is never abandoned
+            // mid-call by UI disposal: the app scope outlives every UI.
+            withContext(io) {
+                val authorizer = work.authorizingSession
+                if (authorizer != null && !(authorizer isSameSession currentSession())) {
+                    // R5-03: the instance that authorized this enable is gone.
+                    // NEVER write ON to a new/unverified prefs instance: the new
+                    // generation's own resync re-verifies durable opt-in+marker
+                    // before claiming the still-owed enable. A user OFF never
+                    // carries an authorizer and is therefore never gated here.
+                    BbcWriteOutcome.Unknown
+                } else {
+                    commitWithSession(work.value, authorizer)
+                }
+            }
+        } catch (ce: CancellationException) {
+            // A commit seam may throw CancellationException without the APP
+            // scope terminating (binder interruption / a caller's scope). Do
+            // NOT kill the single app-lifetime consumer — that would leave
+            // later submits Accepted-but-never-run. Report honest Unknown and
+            // keep draining. Propagate ONLY when the whole app scope is ending.
+            if (!scope.isActive) throw ce
+            BbcWriteOutcome.Unknown
+        } catch (_: Throwable) {
+            BbcWriteOutcome.Unknown
+        }
+
+        // mark() is sequence-aware: an outcome older than one already applied
+        // is ignored. Defensive — the single consumer already serializes in
+        // submit order — but it also covers a multi-threaded caller racing
+        // nextSequence() against submit().
+        val applied = state.mark(outcome, work.sequence)
+        if (!applied) return
+        try {
+            work.onResult(outcome)
+        } catch (_: Throwable) {
+            // A UI callback must never kill the process-wide consumer.
+        }
+    }
+
+    private suspend fun executeConsentWrite(work: Work.ConsentWrite) {
+        // P1-A: authority is checked at EXECUTION time, not only at submit time.
+        // The toggle lane is drained FIRST, so an OFF queued after accept() but
+        // before this drain has already superseded/abandoned the grant. It MUST
+        // not enter the store: the atomic optin=true + marker=true commit would
+        // re-arm a cold-start enable after that OFF cleared the marker.
+        if (!consentHolder.isConsentWriteStillAuthoritative(work.sequence, work.generation)) {
+            // No durability evidence exists — markConsentWriteOutcome treats
+            // Skipped as a no-op — but the caller still gets an honest result.
+            consentHolder.markConsentWriteOutcome(
+                BbcWriteOutcome.Skipped, work.sequence, work.generation,
+                consumerOwnsEnable = true,
+            )
             try {
-                write.onResult(outcome)
+                work.onResult(BbcWriteOutcome.Skipped)
             } catch (_: Throwable) {
                 // A UI callback must never kill the process-wide consumer.
             }
+            return
+        }
+        // R5-03 review R1: the submit-time stamp is authoritative. If prefs were
+        // not resolved at submit time, take the execution-time identity ONLY when
+        // it still targets this generation — a rebind must never let the NEW
+        // session's identity be blamed for the OLD commit's pollution.
+        val attemptedSession = work.session
+            ?: currentSession()?.takeIf { it.generation == work.generation }
+        val result = try {
+            withContext(io) { consentCommitAt(work.generation) }
+        } catch (ce: CancellationException) {
+            // Same rule as the effect lane: only a terminating APP scope may
+            // kill the consumer. Otherwise the interrupted commit is Unknown
+            // and its instance is still fenced (fail closed).
+            if (!scope.isActive) throw ce
+            BbcConsentWriteResult(BbcWriteOutcome.Unknown, work.generation, attemptedSession)
+        } catch (_: Throwable) {
+            // A non-cancellation throw may have polluted the local mMap: fence
+            // the instance the captured intent was addressing (fail closed).
+            BbcConsentWriteResult(BbcWriteOutcome.Unknown, work.generation, attemptedSession)
+        }
+        // The durable fence / grant is recorded HERE, on the app IO lane, before
+        // any UI callback sees the outcome. consumerOwnsEnable=true makes the
+        // holder consume the pending UI handoff and remember that the app
+        // consumer (not an Activity callback) owns the phase-2 effect write.
+        val applied = consentHolder.markConsentWriteOutcome(
+            result.outcome, work.sequence, result.touchedGeneration,
+            consumerOwnsEnable = true, session = result.sessionIdentity,
+        )
+        if (!applied) return
+        try {
+            work.onResult(result.outcome)
+        } catch (_: Throwable) {
+            // A UI callback must never kill the process-wide consumer.
+        }
+        // Phase-2 enable: the SAME consumer that confirmed the opt-in key also
+        // converges the runtime opt-out preference. Exactly-once and OFF-safe.
+        if (result.outcome is BbcWriteOutcome.Confirmed) {
+            driveConsumerEnable(work.sequence, result.touchedGeneration, result.sessionIdentity)
         }
     }
 
@@ -149,25 +484,26 @@ internal class BbcToggleCoordinator(
      * bookkeeping/telemetry. A controller must fence its result callbacks on a
      * token captured BEFORE this call (see BbcInjectionToggleController.onToggle),
      * because an inline consumer can deliver the result before we return.
-     * Never blocks on the consumer; superseded
-     * CONFLATED intents simply never get a callback. This is the ONLY submit
-     * overload production code may call.
+     * Never blocks on the consumer; superseded intents simply never get a
+     * callback. Mint + enqueue under [enqueueLock] is the #81 atomicity
+     * invariant; [enqueueToggle]'s sequence-aware slot is the phase-2 lane rule.
      */
     fun submit(value: Boolean, onResult: (BbcWriteOutcome) -> Unit): Long =
         synchronized(enqueueLock) {
             val seq = state.nextSequence()
             afterBbcSequenceAllocatedForTests?.invoke(seq)
-            writes.trySend(Write(seq, value, onResult))
+            state.noteToggleIntent(seq, value)
+            writes.trySend(Work.Toggle(seq, value, onResult, {}))
+            wake.trySend(Unit) // same single consumer drains the atomic lane
             seq
         }
 
     /**
-     * TEST-ONLY / explicit-sequence overload, kept for back-compat and for the
-     * #81 race test that deliberately allocates in one order and submits in the
-     * opposite order. It does NOT allocate a sequence and does NOT take
-     * [enqueueLock]; the pre-commit fence above is what keeps stale explicit
-     * sequences harmless. Production callers must use [submit] above — the
-     * explicit name makes any accidental production use obvious in review.
+     * TEST-ONLY / explicit-sequence overload, kept for the #81 race test that
+     * deliberately allocates in one order and submits in the opposite order.
+     * It does NOT mint a sequence and does NOT take [enqueueLock]; the
+     * pre-commit fence in [executeToggle] keeps stale explicit sequences
+     * harmless. Production callers must use the atomic [submit] above.
      */
     @androidx.annotation.VisibleForTesting
     fun submitWithExplicitSequenceForTests(
@@ -175,7 +511,280 @@ internal class BbcToggleCoordinator(
         value: Boolean,
         onResult: (BbcWriteOutcome) -> Unit,
     ) {
-        writes.trySend(Write(sequence, value, onResult))
+        enqueueToggle(sequence, value, onResult, {})
+    }
+
+    /**
+     * Enqueue the runtime ENABLE on the consumer's own authority. [reason] is
+     * in the app-scoped intent sequence domain, so a newer OFF (higher sequence,
+     * or an abandon fence) always wins. [generation] is the instance the grant
+     * actually touched: enable ownership is generation-scoped so a rebind can
+     * claim the same still-owed enable once without duplicating it here. The
+     * same-axis slot rule additionally rejects this handoff if a newer toggle
+     * is already pending.
+     */
+    private suspend fun driveConsumerEnable(
+        reason: Long,
+        generation: Long,
+        session: BbcConsentSessionIdentity? = null,
+    ): Boolean {
+        // Authorise BEFORE minting. The counter is SHARED with the holder in
+        // production, so a mint that does not end in an enqueue raises
+        // latestSequence() and lets the #81 fence drop an OFF already queued at
+        // a lower sequence. None of the checks below mints.
+        // STRICT ownership: a resync may have claimed a NEWER enable token R.
+        // `isEnableHandledBy(S)` would still be true for S<R and would enqueue
+        // a second enable; only the exact current owner may drive one.
+        if (!consentHolder.isEnableOwner(reason, generation)) return false
+        if (consentHolder.latestAbandonSequence() > reason) return false
+        if (state.latestIntentProjectedValue() == false) return false
+        // Mint IMMEDIATELY before the committed enqueue: nothing between the
+        // mint and enqueueToggle() mints again, so the enable's sequence equals
+        // the high-water mark and passes the pre-commit fence. An OFF recorded
+        // after the mint takes a strictly newer number and wins via the fence
+        // and the same-axis slot; the post-mint guards below also skip the
+        // enqueue when the test-only hook parked here.
+        val effectSequence = state.nextSequence()
+        effectSequenceMintHook?.invoke(effectSequence)
+        if (!consentHolder.isEnableOwner(reason, generation)) return false
+        if (consentHolder.latestAbandonSequence() > reason) return false
+        if (state.latestIntentProjectedValue() == false) return false
+        // ReplacedOlder is still a committed enable: an older pending ON was
+        // explicitly superseded by this newer, same-axis handoff. Only a newer
+        // intent that already owns the slot rejects the enable.
+        return when (enqueueToggle(effectSequence, true, {}, {}, session)) {
+            BbcWorkEnqueue.Accepted, BbcWorkEnqueue.ReplacedOlder -> true
+            BbcWorkEnqueue.SupersededByNewer, BbcWorkEnqueue.Rejected -> false
+        }
+    }
+
+    private suspend fun maybeDriveResyncEnable(
+        generation: Long,
+        enablePending: Boolean,
+        session: BbcConsentSessionIdentity? = null,
+    ) {
+        // Cold-start convergence requires the APP-ONLY durable marker from the
+        // SAME coherent snapshot as optin=true. optin=true alone is NOT enough:
+        // a durable user OFF only writes the effect pref, and the OFF cleared
+        // this marker in the same commit. Without the marker a cold-start
+        // resync would silently flip the user's OFF back ON.
+        if (!enablePending) return
+        // R5-04: the grant reason must come from the VERIFIED grant attempt,
+        // not only from a Confirmed consent reply. A rebind can lose that reply
+        // after the durable optin+marker commit landed; the fresh authoritative
+        // read verified it and the holder promoted the attempt.
+        // The OFF/cancel comparison uses this GRANT sequence, not the freshly
+        // minted one (which would outrank every recorded abandon). The claim
+        // token is fresh so a later Confirmed S cannot regress a resync-owned R.
+        val reason = consentHolder.effectiveGrantSequence()
+        // SEQUENCE-AWARE effect veto (replaces the old blanket `is Confirmed`):
+        //  * Confirmed(true) is already ON — no second enable, ever.
+        //  * Confirmed(false) APPLIED after the grant is a real newer OFF and
+        //    must veto. Applied BEFORE the grant it is only the prior setting
+        //    and must NOT permanently veto the still-owed enable (that was the
+        //    R5-04 bug: ON never converged until a process restart).
+        //  * A newer projected user intent or abandon is checked below / in the
+        //    holder's claim, so OFF remains highest priority.
+        val effect = state.effectStatus.value
+        if (effect is BbcEffectStatus.Confirmed) {
+            if (effect.value) return
+            if (state.appliedSequence() >= reason) return
+        }
+        if (state.latestIntentProjectedValue() == false) return
+        // Decide the claim BEFORE minting. The sequence counter is SHARED with
+        // the holder, so a claim rejected after a mint would leave a burned
+        // high-water mark: the #81 fence would then drop an OFF already queued
+        // at a lower sequence. The predicted next number is a fresh ownership
+        // token — strictly newer than every intent issued so far (including a
+        // stale dialog S), so a later Confirmed S cannot regress it into a
+        // second enable. Critically, NO second counter bump happens after the
+        // mint: that used to make latestSequence() > effectSequence and caused
+        // every resync enable to be skipped by the fence.
+        val claim = state.latestSequence() + 1L
+        if (!consentHolder.tryClaimResyncEnable(generation, reason, enablePending, claim)) return
+        // Mint IMMEDIATELY before the committed enqueue, after every early
+        // return and after the claim, so no non-enqueueing path raises the
+        // shared fence. An OFF recorded after this mint takes a strictly newer
+        // number and wins via the fence / same-axis slot; the post-mint guards
+        // below also skip the enqueue when the test-only hook parked here.
+        val effectSequence = state.nextSequence()
+        effectSequenceMintHook?.invoke(effectSequence)
+        if (consentHolder.latestAbandonSequence() > reason) return
+        if (state.latestIntentProjectedValue() == false) return
+        enqueueToggle(effectSequence, true, {}, {}, session)
+    }
+
+    private fun enqueueToggle(
+        sequence: Long,
+        value: Boolean,
+        onResult: (BbcWriteOutcome) -> Unit,
+        onReplaced: () -> Unit,
+        authorizingSession: BbcConsentSessionIdentity? = null,
+    ): BbcWorkEnqueue {
+        // Callbacks are invoked AFTER leaving slotLock: they are foreign code
+        // and must never be able to re-enter this serializer while it holds
+        // the slot invariant. Callers must not rely on re-entrant enqueueing
+        // from within onReplaced/onCoalesced.
+        var displaced: (() -> Unit)? = null
+        val result = synchronized(slotLock) {
+            val old = pendingToggle.get()
+            if (old != null && old.sequence >= sequence) {
+                BbcWorkEnqueue.SupersededByNewer
+            } else {
+                val work = Work.Toggle(sequence, value, onResult, onReplaced, authorizingSession)
+                pendingToggle.set(work)
+                // Accepted must mean SOMETHING WILL RUN. A closed channel or a
+                // dead consumer invalidates the promise: restore the slot and
+                // report Rejected. No replaced callback fires (nothing was
+                // displaced). The slotLock guard keeps the consumer from
+                // popping the slot between set and wake.
+                if (!wakeConsumer()) {
+                    pendingToggle.compareAndSet(work, old)
+                    BbcWorkEnqueue.Rejected
+                } else {
+                    state.noteToggleIntent(sequence, value)
+                    if (old == null) BbcWorkEnqueue.Accepted else {
+                        displaced = old.onReplaced
+                        BbcWorkEnqueue.ReplacedOlder
+                    }
+                }
+            }
+        }
+        displaced?.let(::notifyReplaced)
+        return result
+    }
+
+    private fun enqueueConsentWrite(
+        sequence: Long,
+        generation: Long,
+        onResult: (BbcWriteOutcome) -> Unit,
+        onReplaced: () -> Unit,
+    ): BbcWorkEnqueue {
+        var displaced: (() -> Unit)? = null
+        val result = synchronized(slotLock) {
+            val old = pendingConsentWrite.get()
+            if (old != null && old.sequence >= sequence) {
+                BbcWorkEnqueue.SupersededByNewer
+            } else {
+                val work = Work.ConsentWrite(
+                    sequence, generation, onResult, onReplaced, currentSession(),
+                )
+                pendingConsentWrite.set(work)
+                if (!wakeConsumer()) {
+                    pendingConsentWrite.compareAndSet(work, old)
+                    BbcWorkEnqueue.Rejected
+                } else if (old == null) {
+                    BbcWorkEnqueue.Accepted
+                } else {
+                    displaced = old.onReplaced
+                    BbcWorkEnqueue.ReplacedOlder
+                }
+            }
+        }
+        displaced?.let(::notifyReplaced)
+        return result
+    }
+
+    /**
+     * A wake-up is only a promise when the single lifetime consumer is still
+     * running and the CONFLATED channel accepted the signal. Both conditions
+     * are checked before any enqueue reports Accepted/ReplacedOlder.
+     */
+    private fun wakeConsumer(): Boolean =
+        consumer.isActive && wake.trySend(Unit).isSuccess
+
+    private fun notifyReplaced(callback: () -> Unit) {
+        try {
+            callback()
+        } catch (_: Throwable) {
+            // A replaced caller's bookkeeping must never break the writer.
+        }
+    }
+
+    /**
+     * Never blocks. [BbcWorkEnqueue] tells the caller whether this intent will
+     * run, replaced an older same-axis intent, was rejected because a newer
+     * same-axis intent owns the slot, or was rejected because the app-lifetime
+     * consumer is gone. P1-3: the accepted intent is
+     * recorded app-scoped BEFORE enqueueing so a rebuilt View can project it
+     * while the commit is still in flight (or after an Unknown outcome) instead
+     * of replaying a stale Confirmed effect.
+     */
+    fun submit(
+        sequence: Long,
+        value: Boolean,
+        onReplaced: () -> Unit = {},
+        onResult: (BbcWriteOutcome) -> Unit,
+    ): BbcWorkEnqueue = enqueueToggle(sequence, value, onResult, onReplaced)
+
+    /**
+     * Schedule the pre-activation opt-in write on the app-scoped IO lane.
+     * [sequence] is the dialog intent sequence; [generation] the service
+     * generation captured at user-intent time. Both are fenced by the holder.
+     */
+    fun submitConsentWrite(
+        sequence: Long,
+        generation: Long,
+        onReplaced: () -> Unit = {},
+        onResult: (BbcWriteOutcome) -> Unit,
+    ): BbcWorkEnqueue = enqueueConsentWrite(sequence, generation, onResult, onReplaced)
+
+    /**
+     * Schedule an authoritative durable read/resync on the app-scoped IO lane.
+     * Reads coalesce with OTHER READS ONLY: a queued user toggle or consent
+     * write is never touched, and the displaced read's callback is reported via
+     * [onCoalesced] rather than an outcome callback.
+     */
+    fun submitConsentRead(
+        onCoalesced: () -> Unit = {},
+        onResult: (BbcConsentAuthoritativeRead) -> Unit = {},
+    ): BbcWorkEnqueue {
+        var coalesced: (() -> Unit)? = null
+        val result = synchronized(slotLock) {
+            val old = pendingRead.get()
+            val work = Work.ConsentRead(onResult, onCoalesced)
+            pendingRead.set(work)
+            if (!wakeConsumer()) {
+                pendingRead.compareAndSet(work, old)
+                BbcWorkEnqueue.Rejected
+            } else if (old == null) {
+                BbcWorkEnqueue.Accepted
+            } else {
+                coalesced = old.onCoalesced
+                BbcWorkEnqueue.ReplacedOlder
+            }
+        }
+        coalesced?.let(::notifyReplaced)
+        return result
+    }
+
+    /**
+     * PR #90 Phase 3: schedule the authoritative persisted-effect read on the
+     * app IO lane (never a Main-thread binder call). Reads coalesce with OTHER
+     * effect reads only; a displaced read's callback is reported via
+     * [onCoalesced]. User writes are never touched.
+     */
+    fun submitEffectRead(
+        onCoalesced: () -> Unit = {},
+        onResult: (BbcRuntimePrefValue) -> Unit = {},
+    ): BbcWorkEnqueue {
+        var coalesced: (() -> Unit)? = null
+        val result = synchronized(slotLock) {
+            val old = pendingEffectRead.get()
+            val work = Work.EffectRead(onResult, onCoalesced)
+            pendingEffectRead.set(work)
+            if (!wakeConsumer()) {
+                pendingEffectRead.compareAndSet(work, old)
+                BbcWorkEnqueue.Rejected
+            } else if (old == null) {
+                BbcWorkEnqueue.Accepted
+            } else {
+                coalesced = old.onCoalesced
+                BbcWorkEnqueue.ReplacedOlder
+            }
+        }
+        coalesced?.let(::notifyReplaced)
+        return result
     }
 
     /** Last user-intent sequence issued in this app process (for tests/telemetry). */

@@ -262,7 +262,7 @@
     <string name="risk_details_entry">詳細風險 ›</string>
     <string name="risk_details_title">分身資料風險（完整說明）</string>
     <string name="risk_ack_positive">我已了解風險，繼續</string>
-    <string name="risk_details_full">⚠️ 實驗性分身功能：無法保證資料安全。Samsung 可能因開機、原生雙開設定、系統/One UI 更新或未知的內部規則，自動卸載第三方分身並永久刪除分身內資料。這種情形曾在 BBC 非空、注入關閉、甚至未掛載本模組 BBC Hook 的對照中出現；刪除根因仍未完全證實。Root／Shizuku 只提供操作能力，並非防刪保證；重新安裝或 pm install-existing 無法還原已刪除的聊天、登入資訊與私人檔案。不同裝置及 ROM 版本的行為可能不同，今天正常也不代表未來安全。請先透過各 App 的正式方式備份重要資料，不要把唯一重要資料只存在分身。\n\n請特別注意：\n(a) 本 App 主動執行卸載／移除分身，可能直接清除該分身資料；這類操作另有明確確認與目標核對，不會因為你已接受本風險而取消。\n(b) 上述 Samsung 日後自動清理分身，是已觀察到的風險，根因未證實，本 App 無法阻止或保證不會發生。\n(c) Shizuku／ADB shell 無法替其他 Profile 的 App 做通用私人資料備份。\n(d) 即使有 Root，也不等於 Android Keystore／私有資料可完整還原。\n(e) 「已安裝」「政策已存」「BBC ON/OFF」都不等於「資料安全」。\n\n預先 Hook 的現實限制：BBC_AVAILABLE_APPS_INJECTION 預設為 true、執行期偏好缺省視為啟用，因此 Hook 可能早於本 App 首次風險警告或確認生效。本 App 的勾選與首次確認對話框，不代表 Hook 在生效前已取得你的同意；若需要真正的生效前 opt-in，須另行設計新安裝與既有安裝的安全遷移（不可未經確認就縮減舊政策）。</string>
+    <string name="risk_details_full">⚠️ 實驗性分身功能：無法保證資料安全。Samsung 可能因開機、原生雙開設定、系統/One UI 更新或未知的內部規則，自動卸載第三方分身並永久刪除分身內資料。這種情形曾在 BBC 非空、注入關閉、甚至未掛載本模組 BBC Hook 的對照中出現；刪除根因仍未完全證實。Root／Shizuku 只提供操作能力，並非防刪保證；重新安裝或 pm install-existing 無法還原已刪除的聊天、登入資訊與私人檔案。不同裝置及 ROM 版本的行為可能不同，今天正常也不代表未來安全。請先透過各 App 的正式方式備份重要資料，不要把唯一重要資料只存在分身。\n\n請特別注意：\n(a) 本 App 主動執行卸載／移除分身，可能直接清除該分身資料；這類操作另有明確確認與目標核對，不會因為你已接受本風險而取消。\n(b) 上述 Samsung 日後自動清理分身，是已觀察到的風險，根因未證實，本 App 無法阻止或保證不會發生。\n(c) Shizuku／ADB shell 無法替其他 Profile 的 App 做通用私人資料備份。\n(d) 即使有 Root，也不等於 Android Keystore／私有資料可完整還原。\n(e) 「已安裝」「政策已存」「BBC ON/OFF」都不等於「資料安全」。\n\nBBC 生效前同意現況：compile-time 開關 BBC_AVAILABLE_APPS_INJECTION 現在只是緊急 AND（設為 false 即不讀偏好、不合併），不再是「預設開」的依據。新安裝在 App 持久化明確 opt-in 之前，Hook 效應維持關閉；既有安裝由 owner App 在以 XposedService 取得的可寫入 remote prefs 通道分類並以一次性標記完成遷移，舊政策草稿保持原樣、不刪改，Hook 端只讀取、不寫入。升級後既有安裝的 BBC 效應維持 OFF，直到 owner App 至少被開啟一次、且其 bind 時的分類／遷移提交為 Confirmed。執行期偏好鍵缺席只表示沒有明確 opt-out、不再是「預設開」的依據；新安裝仍須明確 opt-in 才會生效，任何讀取失敗則 fail-closed（關閉）。App 勾選與風險確認仍不是 Hook 生效前同意的證明；即使 opt-in 已持久化，仍不保證資料安全，也不防 Samsung 冷啟動刪除（issue #75）。</string>
     <string name="remove_confirm_title">確認移除分身</string>
     <string name="remove_confirm_positive">確認移除</string>
     <string name="remove_confirm_message">警告：將刪除該分身的使用者資料且無法復原；僅影響分身（user %3$s），不影響主 profile。\nPackage：%2$s\n已驗證目標：user %3$s，serial %5$s\n應用：%1$s\nProfile：%4$s  [truncated] 表示標籤已截斷。\n須勾選下方確認框才會啟用「確認移除」。</string>
@@ -400,10 +400,18 @@
     <string name="settings_bbc_injection_label">BBC 注入（雙開可用清單擴充）</string>
     <string name="settings_bbc_injection_summary">關閉後可能需重啟 hook 行程或重新開機才生效（RemotePreferences 快取）；此開關「不是」Samsung 冷啟動刪除的防護——刪除早於 BBC 回調（issue #75）。</string>
     <string name="settings_bbc_injection_write_failed">BBC 注入偏好寫入失敗，請稍後重試。</string>
+    <!-- R5-02: consent-free, always-reachable direct OFF (no true write first). -->
+    <string name="settings_bbc_injection_disable">停用</string>
     <!-- PR #74 R3 D04: honest UNKNOWN state after a failed commit (no placeholders). -->
     <string name="settings_bbc_injection_effect_unknown">生效狀態未知——請重啟 Hook 行程（或開機）後再核對；此開關不是 Samsung 冷啟動刪除防護。</string>
     <!-- PR #74 R7b-3: version-tagged experimental / not-device-verified label for the BBC main effect. -->
     <string name="settings_bbc_injection_experimental_notice">實驗性：BBC 主要效果尚未於此版本（%1$s）實機確認；不保證普遍生效，也不保證資料安全。</string>
+    <!-- PR5 Phase B2 (#80): 首次 BBC 注入 pre-activation opt-in（接受後同意會持久化；但若持久化結果未知或服務重新綁定，可能再次要求確認，並非「從此不再問」）。 -->
+    <string name="settings_bbc_preactivation_dialog_title">首次啟用 BBC 注入前的明確同意</string>
+    <string name="settings_bbc_preactivation_dialog_message">你即將開啟 BBC 注入。新安裝在 App 持久化這份 pre-activation 同意之前，Hook 的 BBC 效應維持關閉；接受時分兩階段：先寫入 consent 鍵到 dual_policy，成功持久化後才寫入你選擇的 BBC 開關設定。兩階段可能只有前半段成功：若同意已持久化但開關寫入結果未知，不能假設已回滾或已生效，請重新核對（可能需重啟 Hook 行程或開機）。\n\n取消、返回鍵或點擊對話框外皆不寫入任何鍵，畫面回到最後已知狀態；這不證明 Hook 效應已關閉。\n\n請注意：這份同意「不是」Samsung 冷啟動刪除的防護——刪除早於 BBC 回調（issue #75）；BBC 主要效果仍屬實驗性，尚未於此版本實機驗證，不保證普遍生效，也不保證資料安全。</string>
+    <string name="settings_bbc_preactivation_dialog_positive">我了解，寫入同意並繼續</string>
+    <string name="settings_bbc_preactivation_dialog_negative">取消，回到最後已知狀態</string>
+    <string name="settings_bbc_preactivation_write_failed">同意寫入結果未知：無法確認是否已持久化，也無法確認 Hook 效應是關閉還是啟用；本次未再進行其他寫入（僅指此刻）。之後若服務重新綁定／重新同步的權威讀取確認同意與待啟用標記確實已持久化，App 可能會自動補寫一次執行期偏好，完成先前已接受的 ON。若你希望保持關閉，請明確點按停用並重新核對結果（停用會在同一筆提交清除待啟用標記）。Unknown 不代表取消，也不代表永遠不會啟用。請重試或重新核對，並可能需重啟 Hook 行程（或開機）後才能觀察到 Hook 效應。此開關不是 Samsung 冷啟動刪除防護（issue #75）。</string>
     <string name="settings_version_unknown">未知</string>
     <string name="badge_number_format">%1$d</string>
     <!-- Phase G (i18n): bullet/count prefixes as format resources (were
