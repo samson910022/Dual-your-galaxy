@@ -1429,7 +1429,7 @@ class BbcActivationConsentStateMachineTest {
     fun rebuildDuringInFlightOff_keepsUserOffAfterReplayAndUnknown() = runTest {
         val holder = BbcActivationConsentHolder()
         holder.onServiceGenerationChanged(1L)
-        holder.resolve(read(1L, optIn = false)) // NotGranted; OFF needs no consent
+        holder.resolve(read(1L, optIn = true)) // Granted; OFF needs no consent
         val runtime = BbcToggleRuntimeState(initialConfirmed = false)
         val inheritedSeq = runtime.nextSequence() // reserve the inherited mark's sequence
         assertTrue("seed the inherited effect ON", runtime.mark(BbcWriteOutcome.Confirmed(true), inheritedSeq))
@@ -1533,7 +1533,10 @@ class BbcActivationConsentStateMachineTest {
     fun acceptRendersChosenOnOverStaleProjectedOff() = runTest {
         val holder = BbcActivationConsentHolder()
         holder.onServiceGenerationChanged(1L)
-        holder.resolve(read(1L, optIn = false)) // NotGranted: ON demands consent
+        // An Unknown fence demands consent on ON but keeps the config gate open
+        // (R5-02 closes it only for NotGranted), so the inherited confirmed ON
+        // is still projectable while the dialog is being tested.
+        holder.markConsentWriteOutcome(BbcWriteOutcome.Unknown, 1L, 1L)
         val runtime = BbcToggleRuntimeState(initialConfirmed = false)
         val inherited = runtime.nextSequence()
         assertTrue(runtime.mark(BbcWriteOutcome.Confirmed(true), inherited))
@@ -1581,7 +1584,9 @@ class BbcActivationConsentStateMachineTest {
     fun cancelRestoreIsNotOverwrittenByStaleAppIntent() = runTest {
         val holder = BbcActivationConsentHolder()
         holder.onServiceGenerationChanged(1L)
-        holder.resolve(read(1L, optIn = false)) // NotGranted
+        // Unknown fence: ON still asks consent, but the config gate stays open
+        // so an inherited Confirmed(true) is a legitimate pre-dialog value.
+        holder.markConsentWriteOutcome(BbcWriteOutcome.Unknown, 1L, 1L)
         val runtime = BbcToggleRuntimeState(initialConfirmed = false)
         val inherited = runtime.nextSequence()
         assertTrue(runtime.mark(BbcWriteOutcome.Confirmed(true), inherited))

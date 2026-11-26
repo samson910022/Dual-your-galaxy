@@ -395,4 +395,31 @@ class BbcPreactivationConsentTest {
             stringMap("values-b+zh+Hant").filterKeys { it in honestCopyKeys },
         )
     }
+
+    // ---- R5-02: an always-reachable, consent-free explicit OFF ----------------
+
+    @Test
+    fun explicitDisableButton_isDirectOffThroughTheSingleWriterWithZeroConsent() {
+        val build = block(main, "private fun buildBbcInjectionToggle()")
+        assertTrue("the button must use the localized label",
+            build.contains("R.string.settings_bbc_injection_disable"))
+        val button = block(main, "disableButton.setOnClickListener")
+        assertTrue("the button must dispatch the direct-OFF action",
+            button.contains("commitExplicitOff()"))
+        val off = block(main, "fun commitExplicitOff()")
+        assertTrue("OFF must supersede the app-scoped dialog intent unconditionally",
+            off.contains("consentHolder.supersedeActiveIntent()"))
+        assertTrue("OFF must abandon any app-scoped user intent",
+            off.contains("abandonLatestUserIntent()"))
+        assertTrue("OFF must go through the ONE checkbox writer",
+            off.contains("setChecked(false)"))
+        assertTrue("OFF must enqueue a direct runtime commit",
+            off.contains("bbcToggleController?.onToggle(false)"))
+        assertFalse("OFF must never demand consent", off.contains("requiresConsentFor"))
+        assertFalse("OFF must never write ON first", off.contains("onToggle(true)"))
+        assertFalse("OFF must never show the consent dialog",
+            off.contains("showBbcPreactivationOptInDialog("))
+        assertFalse("the button must not write the CheckBox outside its one writer",
+            off.contains("toggle.isChecked"))
+    }
 }

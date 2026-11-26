@@ -116,10 +116,11 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
                 // nothing failure flag. The holder still fences by generation.
                 store.readBbcConsentAuthoritative().forGeneration(generation)
             },
-            // PR #90 Phase 3 (R3-06a/E2): the persisted effect value is read on
-            // this SAME app IO lane, never on Main. It comes from the coherent
-            // snapshot (ABSENT/unreadable => null => neutral, no default-true)
-            // and is folded in as a PROVISIONAL value, not a write outcome.
+            // R5-02: the persisted effect value is read on this SAME app IO lane,
+            // never on Main. The four-state read distinguishes ABSENT (no
+            // explicit opt-out: authorized installs may seed checked, UNVERIFIED)
+            // from UNAVAILABLE (failure: never ON), with no default-true. It is
+            // folded in as a PROVISIONAL value, not a write outcome.
             effectRead = {
                 remoteHookPolicyStore {
                     remotePreferences(PolicySource.POLICY_PREFS_NAME)

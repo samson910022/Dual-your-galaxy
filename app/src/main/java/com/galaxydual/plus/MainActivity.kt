@@ -2708,6 +2708,18 @@ class MainActivity : ComponentActivity() {
         initialUi.checked?.let(::setChecked)
         val initialChecked = toggle.isChecked
 
+        // R5-02: an ALWAYS-REACHABLE explicit OFF. A checkbox that seeds checked
+        // from "no explicit opt-out" (authorized install, runtime ABSENT) would
+        // otherwise need TWO taps to turn OFF: the first tap follows the
+        // authorized ON branch and writes runtime=true. This button commits
+        // runtime=false directly, with ZERO consent demand and ZERO true writes.
+        val disableButton = Button(this).apply {
+            text = getString(R.string.settings_bbc_injection_disable)
+            minimumHeight = dp(48)
+            isAllCaps = false
+            textSize = 12f
+        }
+
         val summary = TextView(this).apply {
             text = if (effectUnknownOnOpen || initialUi.neutral) {
                 getString(R.string.settings_bbc_injection_effect_unknown)
@@ -2883,6 +2895,27 @@ class MainActivity : ComponentActivity() {
             bbcToggleController?.restoreConsentUi(lastSettledChecked)
         }
 
+        // R5-02: the explicit OFF control's action. It deliberately does NOT
+        // call requiresConsentFor / showBbcPreactivationOptInDialog and never
+        // calls onToggle(true). Superseding the app-scoped intent also abandons
+        // a pending enable (and blocks a resync from re-arming it); dropping the
+        // latest user intent prevents a replayed ON from repainting the box.
+        fun commitExplicitOff() {
+            if (isFinishing || isDestroyed) return
+            unknownToastShown = false
+            consentHolder.supersedeActiveIntent()
+            consentDialogPending = false
+            bbcToggleController?.setConsentPending(false)
+            dismissBbcConsentDialogSilently()
+            pendingIntentChecked = false
+            app.bbcToggleRuntimeState.abandonLatestUserIntent()
+            app.bbcToggleRuntimeState.noteLatestUserIntent(false)
+            // ONE checkbox writer: the button only calls the shared setter.
+            setChecked(false)
+            renderToggle()
+            bbcToggleController?.onToggle(false)
+        }
+
         bbcToggleController = BbcInjectionToggleController(
             coordinator = app.bbcToggleCoordinator,
             initialValue = initialChecked,
@@ -2904,6 +2937,7 @@ class MainActivity : ComponentActivity() {
                 renderToggle()
             },
         )
+        disableButton.setOnClickListener { commitExplicitOff() }
         toggle.setOnCheckedChangeListener { _, checked ->
             if (restoring) return@setOnCheckedChangeListener
             unknownToastShown = false
@@ -2972,7 +3006,17 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             val side = dp(20)
             setPadding(side, dp(8), side, dp(4))
-            addView(toggle, LinearLayout.LayoutParams(
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(toggle, LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f,
+                ))
+                addView(disableButton, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                ))
+            }, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ))

@@ -126,9 +126,33 @@ internal class BbcToggleRuntimeState(
      */
     @Synchronized // same critical section as [applyOutcome]
     internal fun seedEffectFromPersistedRead(value: Boolean?) {
-        if (value == null) return
+        if (value == null) return // legacy seam: no definite value => no fabricated seed
+        seedEffectFromPersistedRead(
+            if (value) BbcRuntimePrefValue.TRUE else BbcRuntimePrefValue.FALSE,
+        )
+    }
+
+    /**
+     * R5-02: authoritative four-state seed from the app IO lane. Carries the
+     * ABSENT vs UNAVAILABLE reason so an authorized install can seed checked
+     * (unverified) on ABSENT while a failed read stays neutral and never ON.
+     *
+     * Still NEVER calls [mark], NEVER advances the sequence fence and NEVER
+     * emits [BbcEffectStatus.Confirmed]; an existing Confirmed mark wins.
+     */
+    @Synchronized
+    internal fun seedEffectFromPersistedRead(runtime: BbcRuntimePrefValue) {
         if (_effectStatus.value is BbcEffectStatus.Confirmed) return
-        _effectStatus.value = BbcEffectStatus.ProvisionalRead(value)
+        val definite = when (runtime) {
+            BbcRuntimePrefValue.TRUE -> true
+            BbcRuntimePrefValue.FALSE -> false
+            else -> null
+        }
+        _effectStatus.value = if (definite != null) {
+            BbcEffectStatus.ProvisionalRead(definite)
+        } else {
+            BbcEffectStatus.ProvisionalRuntimeRead(runtime, null)
+        }
     }
 
     /** Globally monotonic intent sequence for this app process (never resets on UI rebuild). */

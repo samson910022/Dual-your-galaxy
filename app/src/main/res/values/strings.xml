@@ -400,6 +400,8 @@
     <string name="settings_bbc_injection_label">BBC 注入（雙開可用清單擴充）</string>
     <string name="settings_bbc_injection_summary">關閉後可能需重啟 hook 行程或重新開機才生效（RemotePreferences 快取）；此開關「不是」Samsung 冷啟動刪除的防護——刪除早於 BBC 回調（issue #75）。</string>
     <string name="settings_bbc_injection_write_failed">BBC 注入偏好寫入失敗，請稍後重試。</string>
+    <!-- R5-02: consent-free, always-reachable direct OFF (no true write first). -->
+    <string name="settings_bbc_injection_disable">停用</string>
     <!-- PR #74 R3 D04: honest UNKNOWN state after a failed commit (no placeholders). -->
     <string name="settings_bbc_injection_effect_unknown">生效狀態未知——請重啟 Hook 行程（或開機）後再核對；此開關不是 Samsung 冷啟動刪除防護。</string>
     <!-- PR #74 R7b-3: version-tagged experimental / not-device-verified label for the BBC main effect. -->

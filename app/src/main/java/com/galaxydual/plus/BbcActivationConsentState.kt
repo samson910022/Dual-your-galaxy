@@ -74,6 +74,30 @@ internal sealed interface BbcActivationConsentState {
 enum class BbcOptInValue { ABSENT, FALSE, TRUE, UNAVAILABLE }
 
 /**
+ * Authoritative state of the RUNTIME opt-out preference key. This is a
+ * DIFFERENT axis from [BbcOptInValue] (authorization) and from
+ * [BbcActivationConsentState] (permission to skip the dialog):
+ *  * [ABSENT] — `contains()` was false. The Hook gate reads this as "no
+ *    explicit opt-out", so CONFIGURATION permits ON; it is NOT a write
+ *    acknowledgement and renders UNVERIFIED.
+ *  * [FALSE] / [TRUE] — definite persisted values from the same coherent read.
+ *  * [UNAVAILABLE] — wrong type, read failure or binder absence. It must never
+ *    become TRUE (no default-true fabrication) and never render checked.
+ */
+enum class BbcRuntimePrefValue {
+    ABSENT, FALSE, TRUE, UNAVAILABLE;
+
+    companion object {
+        /** Bridge for legacy `Boolean?` call sites; `null` means ABSENT there. */
+        internal fun fromNullable(value: Boolean?): BbcRuntimePrefValue = when (value) {
+            true -> TRUE
+            false -> FALSE
+            null -> ABSENT
+        }
+    }
+}
+
+/**
  * ALL authoritative durable inputs of a consent resolution, taken from ONE
  * coherent snapshot of the CURRENT service generation's prefs instance on the
  * app's IO lane. Mirrors the Hook's all-or-nothing `BbcCoherentPrefsSnapshot`:
@@ -95,6 +119,17 @@ data class BbcConsentDurableSnapshot(
      * resync-driven enable is allowed. The Hook gate NEVER reads this key.
      */
     val enablePending: Boolean? = null,
+    /**
+     * The same runtime key as a four-state read. This is what the effect-read
+     * seam projects: ABSENT is "configuration permits ON" (unverified), while
+     * UNAVAILABLE is a failure and never claims ON. Defaults keep legacy
+     * Boolean-only callers compiling without fabricating a value.
+     */
+    val runtime: BbcRuntimePrefValue = if (coherent) {
+        BbcRuntimePrefValue.fromNullable(legacyRuntimeEnabled)
+    } else {
+        BbcRuntimePrefValue.UNAVAILABLE
+    },
 ) {
     companion object {
         fun failClosed(): BbcConsentDurableSnapshot = BbcConsentDurableSnapshot(
@@ -104,6 +139,7 @@ data class BbcConsentDurableSnapshot(
             legacyRuntimeEnabled = null,
             coherent = false,
             enablePending = null,
+            runtime = BbcRuntimePrefValue.UNAVAILABLE,
         )
     }
 
@@ -116,6 +152,7 @@ data class BbcConsentDurableSnapshot(
             legacyRuntimeEnabled = legacyRuntimeEnabled,
             coherent = coherent,
             enablePending = enablePending,
+            runtime = runtime,
         )
 }
 
@@ -148,6 +185,11 @@ internal fun bbcConsentAuthoritativeReadLegacyBoolean(
     migrated = migrated,
     legacyRuntimeEnabled = legacyRuntimeEnabled,
     coherent = coherent,
+    runtime = if (coherent) {
+        BbcRuntimePrefValue.fromNullable(legacyRuntimeEnabled)
+    } else {
+        BbcRuntimePrefValue.UNAVAILABLE
+    },
 )
 
 /**
@@ -174,6 +216,12 @@ internal data class BbcConsentAuthoritativeRead(
     val coherent: Boolean = true,
     /** APP-ONLY enable-pending marker; see [BbcConsentDurableSnapshot.enablePending]. */
     val enablePending: Boolean? = null,
+    /** Four-state runtime key read; see [BbcRuntimePrefValue]. */
+    val runtime: BbcRuntimePrefValue = if (coherent) {
+        BbcRuntimePrefValue.fromNullable(legacyRuntimeEnabled)
+    } else {
+        BbcRuntimePrefValue.UNAVAILABLE
+    },
 )
 
 /** Authorization-only seed for a freshly built UI. Never a final value. */
@@ -187,17 +235,23 @@ internal data class BbcActivationToggleUi(
  * effect status). [checked] == null means "leave the CheckBox as-is" — neither
  * authorization nor a provisional read may fabricate a value.
  *
- * Rule, in priority order (PR #90 Phase 3 keeps Phase 2's ordering intact):
+ * Rule, in priority order (R5-02 keeps Phase 3's intent-first ordering):
  *  1. a pending user intent wins (the user's latest, still-unverified choice);
- *  2. [BbcEffectStatus.Confirmed] supplies the acknowledged effect value;
- *  3. [BbcEffectStatus.ProvisionalRead] supplies the persisted value read on the
- *     IO lane (a neutral seed, NOT a write acknowledgement);
- *  4. Provisional/Unknown supplies NO value and renders neutral/unverified.
+ *  2. [NotGranted] (including an explicit opt-in FALSE) CLOSES the config gate:
+ *     no confirmed/provisional persisted value may render checked=true;
+ *  3. [BbcEffectStatus.Confirmed] supplies the acknowledged effect value;
+ *  4. [BbcEffectStatus.ProvisionalRead] supplies a definite persisted value;
+ *  5. [BbcEffectStatus.ProvisionalRuntimeRead] supplies the four-state reason:
+ *     ABSENT means "configuration permits ON" for an AUTHORIZED install
+ *     (checked=true, UNVERIFIED), UNAVAILABLE never claims ON, and TRUE/FALSE
+ *     are definite values;
+ *  6. Provisional/Unknown supplies NO value and renders neutral/unverified.
  *
- * Authorization does not decide the checkbox value: [Granted] is permission
- * to skip the consent dialog, NOT proof that the effect is on. It only affects
- * the "unresolved" neutral styling and, via [requiresConsentFor], whether an
- * ON tap asks for consent.
+ * Authorization is a separate axis from the runtime read: [Granted] is
+ * permission to skip the consent dialog, NOT proof that the effect is on. It
+ * only decides whether an ABSENT key permits the checked seed, plus the
+ * "unresolved" neutral styling and, via [requiresConsentFor], whether an ON
+ * tap asks for consent. An explicit always-reachable OFF never asks consent.
  */
 internal data class BbcToggleUiProjection(
     val checked: Boolean?,
@@ -209,13 +263,39 @@ internal fun bbcToggleUiProjection(
     effect: BbcEffectStatus,
     pendingIntent: Boolean?,
 ): BbcToggleUiProjection {
+    val configGateOff = authorization is BbcActivationConsentState.NotGranted
+    // A config gate closes the checkbox only when a runtime value exists. With
+    // no value (Provisional/Unknown/UNAVAILABLE) it supplies NOTHING, so the
+    // single writer leaves the box untouched instead of fabricating an OFF.
+    val hasRuntimeValue = effect is BbcEffectStatus.Confirmed ||
+        effect is BbcEffectStatus.ProvisionalRead ||
+        (effect is BbcEffectStatus.ProvisionalRuntimeRead &&
+            effect.runtime != BbcRuntimePrefValue.UNAVAILABLE)
     val checked = when {
         pendingIntent != null -> pendingIntent
+        configGateOff -> if (hasRuntimeValue) false else null
         effect is BbcEffectStatus.Confirmed -> effect.value
         effect is BbcEffectStatus.ProvisionalRead -> effect.value
+        effect is BbcEffectStatus.ProvisionalRuntimeRead -> when (effect.runtime) {
+            BbcRuntimePrefValue.TRUE -> true
+            BbcRuntimePrefValue.FALSE -> false
+            // "No explicit opt-out" permits ON ONLY for an install the app has
+            // actually authorized. An unresolved (Initializing/Unknown) state
+            // stays fail-closed and supplies no checkbox value.
+            BbcRuntimePrefValue.ABSENT ->
+                if (authorization is BbcActivationConsentState.Granted ||
+                    authorization is BbcActivationConsentState.Legacy
+                ) true else null
+            BbcRuntimePrefValue.UNAVAILABLE -> null
+        }
         else -> null
     }
-    val neutral = checked == null ||
+    // A provisional read is UNVERIFIED even when it supplies a checked value:
+    // the absence of an explicit opt-out is configuration permission, not an
+    // acknowledgement and not effect proof (issue #75 caveat is unchanged).
+    val unverifiedRead = effect is BbcEffectStatus.ProvisionalRead ||
+        effect is BbcEffectStatus.ProvisionalRuntimeRead
+    val neutral = checked == null || unverifiedRead ||
         authorization is BbcActivationConsentState.Initializing ||
         authorization is BbcActivationConsentState.Unknown
     return BbcToggleUiProjection(checked, neutral)

@@ -203,4 +203,18 @@ class RiskDisclosureStringTest {
             }
         }
     }
+
+    /** R5-02: the consent-free explicit-OFF control needs a label in every locale. */
+    @Test
+    fun explicitDisableLabel_presentAndNonEmptyInAllLocales() {
+        for (locale in locales) {
+            val label = maps.getValue(locale)["settings_bbc_injection_disable"]
+                ?: throw AssertionError("$locale missing settings_bbc_injection_disable")
+            assertTrue("$locale settings_bbc_injection_disable must be non-empty", label.isNotBlank())
+        }
+        assertEquals("Hant and default disable labels must match",
+            maps.getValue("values").getValue("settings_bbc_injection_disable"),
+            maps.getValue("values-b+zh+Hant").getValue("settings_bbc_injection_disable"),
+        )
+    }
 }

@@ -942,21 +942,26 @@ class HookPolicyStore(
     }
 
     /**
-     * PR #90 Phase 3 (R3-06a/E2): authoritative persisted effect-value read used
-     * by the app IO lane (never on Main). Taken from the SAME coherent snapshot
-     * as the consent keys, with `contains()` semantics and NO default-true
-     * fallback: absent / unreadable / disconnected / torn => `null` (the row
-     * stays neutral). This is a READ, never a write acknowledgement — callers
-     * fold it in as a provisional seed, not as Confirmed.
+     * R5-02: authoritative four-state persisted effect-value read used by the
+     * app IO lane (never on Main). Taken from the SAME coherent snapshot as the
+     * consent keys, with `contains()` semantics and NO default-true fallback:
+     *  * ABSENT = no explicit opt-out (configuration permits ON for an
+     *    authorized install, but not an acknowledgement);
+     *  * FALSE / TRUE = definite persisted values;
+     *  * UNAVAILABLE = wrong type / read failure / binder absence / torn
+     *    snapshot. It must never become TRUE and never render checked.
+     *
+     * This is a READ, never a write acknowledgement — callers fold it in as a
+     * provisional seed, not as Confirmed.
      */
-    internal fun readBbcInjectionEnabledAuthoritative(): Boolean? = try {
+    internal fun readBbcInjectionEnabledAuthoritative(): BbcRuntimePrefValue = try {
         readBbcConsentDurableRaw().let { snapshot ->
-            if (snapshot.coherent) snapshot.legacyRuntimeEnabled else null
+            if (snapshot.coherent) snapshot.runtime else BbcRuntimePrefValue.UNAVAILABLE
         }
     } catch (ce: CancellationException) {
         throw ce
     } catch (_: Throwable) {
-        null
+        BbcRuntimePrefValue.UNAVAILABLE
     }
 
     // Stage N1 P1 repair-aware read: Corrupt evidence retained while value stays
@@ -1953,9 +1958,20 @@ fun remoteHookPolicyStore(
                                 failed = true
                             }
                         }
-                    // Authoritative runtime seed for Legacy. ABSENT => null; a
-                    // default-true fallback here would fabricate a checked state.
-                    val runtime = booleanKey(PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED)
+                    // Authoritative runtime seed. ABSENT is a definite four-state
+                    // answer ("no explicit opt-out"), NOT a fabricated default-true;
+                    // wrong type masks the snapshot and reports UNAVAILABLE.
+                    fun runtimeKey(): BbcRuntimePrefValue {
+                        val key = PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED
+                        if (!copy.containsKey(key)) return BbcRuntimePrefValue.ABSENT
+                        val value = copy[key]
+                        if (value !is Boolean) {
+                            failed = true
+                            return BbcRuntimePrefValue.UNAVAILABLE
+                        }
+                        return if (value) BbcRuntimePrefValue.TRUE else BbcRuntimePrefValue.FALSE
+                    }
+                    val runtime = runtimeKey()
                     // APP-ONLY marker, from the SAME copy. It is NOT authorization
                     // evidence: a wrong-typed value only disables the resync
                     // enable, it must not mask the durable opt-in/classification.
@@ -1990,9 +2006,14 @@ fun remoteHookPolicyStore(
                             },
                             classification = classification,
                             migrated = migrated,
-                            legacyRuntimeEnabled = runtime,
+                            legacyRuntimeEnabled = when (runtime) {
+                                BbcRuntimePrefValue.TRUE -> true
+                                BbcRuntimePrefValue.FALSE -> false
+                                else -> null
+                            },
                             coherent = true,
                             enablePending = enablePending,
+                            runtime = runtime,
                         )
                     }
                 }

@@ -45,6 +45,20 @@ internal sealed interface BbcEffectStatus {
      * still renders UNVERIFIED and a later Confirmed mark always wins.
      */
     data class ProvisionalRead(val value: Boolean) : BbcEffectStatus
+
+    /**
+     * R5-02: a PROVISIONAL read that carries WHY there is no persisted value.
+     * [runtime] is the four-state authoritative key read (ABSENT/FALSE/TRUE/
+     * UNAVAILABLE); [value] is the definite value when there is one, otherwise
+     * null. ABSENT is "no explicit opt-out" — for an AUTHORIZED install the
+     * projection may seed checked=true, still UNVERIFIED. UNAVAILABLE must
+     * never render checked=true. This is NEVER emitted by mark(): no write is
+     * acknowledged, no sequence fence is advanced, and it never claims effect.
+     */
+    data class ProvisionalRuntimeRead(
+        val runtime: BbcRuntimePrefValue,
+        val value: Boolean?,
+    ) : BbcEffectStatus
 }
 
 /** Pure presentation description; the Activity applies it to its own Views. */
@@ -67,7 +81,7 @@ internal data class BbcEffectPresentation(
 internal fun bbcEffectPresentationFor(status: BbcEffectStatus): BbcEffectPresentation =
     when (status) {
         BbcEffectStatus.Unknown, BbcEffectStatus.Provisional,
-        is BbcEffectStatus.ProvisionalRead,
+        is BbcEffectStatus.ProvisionalRead, is BbcEffectStatus.ProvisionalRuntimeRead,
         -> BbcEffectPresentation(
             summaryRes = R.string.settings_bbc_injection_effect_unknown,
             dimmed = true,

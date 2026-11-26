@@ -182,8 +182,28 @@ class BbcAppHookParityTest {
         val snapshot = appRead(prefs, 7L)
         assertEquals(BbcOptInValue.TRUE, snapshot.optIn)
         assertNull("absent runtime key must stay null, not default-true", snapshot.legacyRuntimeEnabled)
+        assertEquals(BbcRuntimePrefValue.ABSENT, snapshot.runtime)
         val state = assertParity(prefs, confirmedClassification = false, expectedOpen = true)
         assertEquals(BbcActivationConsentState.Granted, state)
+    }
+
+    /** R5-02: the effect-read seam must report WHY there is no value. */
+    @Test
+    fun runtimeKeyState_distinguishesAbsentFalseTrueAndUnavailable() {
+        fun runtimeOf(prefs: SharedPreferences?): BbcRuntimePrefValue =
+            remoteHookPolicyStore { prefs }.readBbcInjectionEnabledAuthoritative()
+
+        assertEquals(BbcRuntimePrefValue.ABSENT,
+            runtimeOf(MapPrefs(mapOf(optinKey to true, classKey to newGeneration))))
+        assertEquals(BbcRuntimePrefValue.FALSE,
+            runtimeOf(MapPrefs(mapOf(runtimeKey to false))))
+        assertEquals(BbcRuntimePrefValue.TRUE,
+            runtimeOf(MapPrefs(mapOf(runtimeKey to true))))
+        // Present-but-wrong-type and an absent binder are failures, never ABSENT
+        // and certainly never TRUE (no default-true fabrication).
+        assertEquals(BbcRuntimePrefValue.UNAVAILABLE,
+            runtimeOf(MapPrefs(mapOf(runtimeKey to "not-a-boolean"))))
+        assertEquals(BbcRuntimePrefValue.UNAVAILABLE, runtimeOf(null))
     }
 
     @Test

@@ -141,14 +141,15 @@ internal class BbcToggleCoordinator(
     /** The one app-scoped authorization holder; shared across all UI rebuilds. */
     internal val consentHolder: BbcActivationConsentHolder = BbcActivationConsentHolder(),
     /**
-     * PR #90 Phase 3 (R3-06a/E2): authoritative persisted effect-value read.
-     * Always executes on [io] inside the SAME app-lifetime consumer, never on
-     * Main. Returns `null` for ABSENT / unreadable / disconnected (no fabricated
-     * default-true seed). The value is folded into [BbcToggleRuntimeState] as a
-     * PROVISIONAL read, never as a Confirmed write acknowledgement. Defaults to
-     * fail closed so a caller that forgot to wire it leaves the row neutral.
+     * R5-02: authoritative four-state persisted effect-value read. Always
+     * executes on [io] inside the SAME app-lifetime consumer, never on Main.
+     * ABSENT means "no explicit opt-out" (configuration permits ON only for an
+     * authorized install); UNAVAILABLE is a failure and must never claim ON.
+     * The value is folded into [BbcToggleRuntimeState] as a PROVISIONAL read,
+     * never as a Confirmed write acknowledgement. Defaults to UNAVAILABLE so a
+     * caller that forgot to wire it leaves the row neutral.
      */
-    private val effectRead: suspend () -> Boolean? = { null },
+    private val effectRead: suspend () -> BbcRuntimePrefValue = { BbcRuntimePrefValue.UNAVAILABLE },
 ) {
     /**
      * TEST-ONLY seam (mirrors GalaxyApp.bbcClassificationPrefsProvider): invoked
@@ -188,7 +189,7 @@ internal class BbcToggleCoordinator(
          * consent holder's generation/fence resolution.
          */
         data class EffectRead(
-            val onResult: (Boolean?) -> Unit,
+            val onResult: (BbcRuntimePrefValue) -> Unit,
             val onCoalesced: () -> Unit,
         ) : Work
     }
@@ -313,9 +314,9 @@ internal class BbcToggleCoordinator(
             withContext(io) { effectRead() }
         } catch (ce: CancellationException) {
             if (!scope.isActive) throw ce
-            null
+            BbcRuntimePrefValue.UNAVAILABLE
         } catch (_: Throwable) {
-            null
+            BbcRuntimePrefValue.UNAVAILABLE
         }
         state.seedEffectFromPersistedRead(value)
         try {
@@ -668,7 +669,7 @@ internal class BbcToggleCoordinator(
      */
     fun submitEffectRead(
         onCoalesced: () -> Unit = {},
-        onResult: (Boolean?) -> Unit = {},
+        onResult: (BbcRuntimePrefValue) -> Unit = {},
     ): BbcWorkEnqueue {
         var coalesced: (() -> Unit)? = null
         val result = synchronized(slotLock) {

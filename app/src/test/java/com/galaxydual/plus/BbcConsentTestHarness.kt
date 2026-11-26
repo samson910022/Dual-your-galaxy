@@ -65,6 +65,11 @@ internal class BbcConsentTestHarness(
     var lastSettledChecked: Boolean = holder.currentState().toggleUi().checked ?: false
         private set
 
+    /** R5-02: whether the latest projection rendered the row UNVERIFIED/neutral. */
+    @Volatile
+    var lastProjectionNeutral: Boolean = false
+        private set
+
     // Shared axes fed by BOTH collectors; neither writes the checkbox directly.
     @Volatile
     private var currentAuthorization: BbcActivationConsentState = holder.currentState()
@@ -92,7 +97,13 @@ internal class BbcConsentTestHarness(
         // effect axis replays an older Confirmed(true).
         val pendingIntent = coordinator.state.latestIntentProjectedValue() ?: pendingIntentChecked
         val projection = bbcToggleUiProjection(currentAuthorization, currentEffect, pendingIntent)
+        lastProjectionNeutral = projection.neutral
         if (!dialogPending) projection.checked?.let(::setToggleChecked)
+    }
+
+    /** Mirrors MainActivity's renderToggle() call after recording a user intent. */
+    fun render() {
+        if (alive) renderToggle()
     }
 
     val controller = BbcInjectionToggleController(
@@ -237,6 +248,24 @@ internal class BbcConsentTestHarness(
         coordinator.state.abandonLatestUserIntent()
         setToggleChecked(lastSettledChecked)
         controller.restoreConsentUi(lastSettledChecked)
+    }
+
+    /**
+     * R5-02: the always-reachable explicit-OFF control, mirroring MainActivity's
+     * disableButton action exactly. ZERO consent demand, ZERO onToggle(true),
+     * app-scoped intent/enable abandoned, and ONE checkbox writer path.
+     */
+    fun explicitOff() {
+        if (!alive) return
+        activeSeq = holder.supersedeActiveIntent()
+        dialogPending = false
+        controller.setConsentPending(false)
+        pendingIntentChecked = false
+        coordinator.state.abandonLatestUserIntent()
+        coordinator.state.noteLatestUserIntent(false)
+        renderToggle()
+        controller.onToggle(false)
+        toggleCalls.add(false)
     }
 
     /** Activity/UI teardown: late callbacks and emissions after this are no-ops. */

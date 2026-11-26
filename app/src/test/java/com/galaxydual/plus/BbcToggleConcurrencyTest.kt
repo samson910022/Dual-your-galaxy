@@ -837,7 +837,7 @@ class BbcToggleConcurrencyTest {
             BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
         },
         state: BbcToggleRuntimeState = BbcToggleRuntimeState(initialConfirmed = false),
-        effectRead: suspend () -> Boolean? = { null },
+        effectRead: suspend () -> BbcRuntimePrefValue = { BbcRuntimePrefValue.UNAVAILABLE },
     ): BbcToggleCoordinator {
         val dispatcher = StandardTestDispatcher(testScheduler)
         val appScope = CoroutineScope(SupervisorJob() + dispatcher)
@@ -1072,7 +1072,7 @@ class BbcToggleConcurrencyTest {
         val state = BbcToggleRuntimeState() // production-neutral seed
         var reads = 0
         val coordinator = splitLaneCoordinator(
-            sink, holder, state = state, effectRead = { reads++; false },
+            sink, holder, state = state, effectRead = { reads++; BbcRuntimePrefValue.FALSE },
         )
 
         assertEquals(BbcWorkEnqueue.Accepted, coordinator.submitEffectRead())
