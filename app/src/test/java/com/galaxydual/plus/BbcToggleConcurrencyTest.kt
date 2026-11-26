@@ -1680,4 +1680,74 @@ class BbcToggleConcurrencyTest {
         assertTrue("allocation must be inside the lock",
             critical.contains("state.nextSequence()"))
     }
+
+    /**
+     * R5-03 (P1): a rebind between the consent grant and the phase-2 enable must
+     * not let the OLD session's result certify the NEW session or write ON to
+     * the new prefs. The enable carries its authorizing session and is rejected
+     * at execution time. A user OFF has no authorizer and is still committed
+     * against the CURRENT session (highest priority).
+     */
+    @Test
+    fun rebindBeforeEnable_oldSessionCannotWriteOn_newSessionStillAcceptsOff() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val oldPrefs = Any()
+        val newPrefs = Any()
+        val s1 = BbcConsentSessionIdentity(1L, Any(), oldPrefs)
+        val s2 = BbcConsentSessionIdentity(2L, Any(), newPrefs)
+        var current: BbcConsentSessionIdentity = s1
+        val commits = Collections.synchronizedList(
+            mutableListOf<Pair<Boolean, BbcConsentSessionIdentity?>>(),
+        )
+        val sink = Sink(initial = false)
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val minted = CompletableDeferred<Long>()
+        val release = CompletableDeferred<Unit>()
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { sink.commit(it) }, io = dispatcher,
+            consentCommitAt = { generation ->
+                BbcConsentWriteResult(BbcWriteOutcome.Confirmed(true), generation, s1)
+            },
+            commitWithSession = { value, session ->
+                commits.add(value to session)
+                sink.commit(value)
+            },
+            currentSession = { current },
+            consentHolder = holder,
+        )
+        coordinator.effectSequenceMintHook = { seq ->
+            minted.complete(seq)
+            release.await()
+        }
+
+        val grant = holder.startConsentIntent()
+        holder.notePendingEnable(grant, 1L)
+        coordinator.submitConsentWrite(grant, 1L, onResult = {})
+        testScheduler.advanceUntilIdle()
+        assertTrue("the enable must be parked after its sequence mint", minted.isCompleted)
+
+        // Rebind BEFORE the enable commit executes. Its authorizing session S1
+        // is no longer current; S2's prefs must never receive the stale ON.
+        current = s2
+        holder.onServiceGenerationChanged(2L)
+        release.complete(Unit)
+        testScheduler.advanceUntilIdle()
+        assertTrue("a stale authorizing session must never write ON",
+            commits.none { it.first })
+        assertFalse("the new prefs instance received no ON", sink.persisted)
+
+        // User OFF is highest priority: no authorizer, always on the CURRENT
+        // session, even though the grant's session was invalidated.
+        coordinator.submit(holder.nextIntentSequence(), false, onResult = {})
+        testScheduler.advanceUntilIdle()
+        assertEquals("only the user OFF reached the store", listOf(false), commits.map { it.first })
+        assertNull("OFF must not carry a stale authorizing session", commits.single().second)
+        assertEquals(false, sink.persisted)
+        assertFalse("the stale grant must never have been certified on S2",
+            holder.currentState() is BbcActivationConsentState.Granted)
+    }
 }

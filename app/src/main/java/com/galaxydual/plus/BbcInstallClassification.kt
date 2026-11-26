@@ -22,7 +22,11 @@
 //  2. [confirmBbcInstallClassificationDurable] (GalaxyApp.onServiceBind): the
 //     ONLY bind-time trust path. It forces a real commit even when the key
 //     appears present, because a NoWrite inferred from the local mMap is not
-//     durable proof. Only a successful commit authorizes confirmation.
+//     durable proof. Only a successful commit authorizes confirmation. Its
+//     [BbcClassificationConfirmation] tri-state separates a FAILED COMMIT (the
+//     only case with a possibly polluted local map) from a NO-COMMIT fail-closed
+//     plan (unknown/unreadable value, poison latch, Unavailable version, read
+//     error), which must leave the holder neutral instead of fenced.
 //
 // [ensureBbcInstallClassification] is retained as a TEST-ONLY idempotent-writer
 // helper: it commits the classification (+ marker for a genuine upgrade) in
@@ -70,6 +74,23 @@ internal sealed interface BbcClassificationPlan {
     data object NoWrite : BbcClassificationPlan
     data class Write(val value: String, val marker: Boolean) : BbcClassificationPlan
     data object FailClosed : BbcClassificationPlan
+}
+
+// Bind-time confirmation is TRI-STATE: `false` alone cannot distinguish "a
+// commit entered and may have polluted this prefs instance's optimistic local
+// mMap" from "no editor was ever created and nothing was written". Fencing the
+// latter installs a same-prefs Unknown fence that no later bind of the cached
+// instance can clear (a permanent in-process lockout). CE still propagates as
+// an interruption, never as one of these outcomes.
+internal sealed interface BbcClassificationConfirmation {
+    /** A real successful `commit()` (including a forced NoWrite re-put). */
+    data object Confirmed : BbcClassificationConfirmation
+
+    /** An `edit()`/`commit()` was attempted and returned false or threw. */
+    data object CommitFailedPollution : BbcClassificationConfirmation
+
+    /** Fail-closed plan / unreadable value / poison latch / resolver error: no editor, no write. */
+    data object NoCommitFailClosed : BbcClassificationConfirmation
 }
 
 // PR #90 P0 retry safety: the optimistic-local-mMap trap.
@@ -291,58 +312,77 @@ internal fun ensureBbcInstallClassification(provider: () -> SharedPreferences?):
  *    as the draft-write path does (a pending intent for this instance wins).
  *  - [BbcClassificationPlan.NoWrite]: re-put the ALREADY-KNOWN value and
  *    marker in a fresh editor and commit. A successful commit restores parity
- *    (durable map now matches local) and authorizes confirmation; a failed
- *    one returns false so the caller installs the Unknown fence instead.
- *  - [BbcClassificationPlan.FailClosed] / unknown / unreadable value: no
- *    commit, no confirmation — an unknown value is NEVER overwritten.
+ *    (durable map now matches local) and returns
+ *    [BbcClassificationConfirmation.Confirmed]; a failed one returns
+ *    [BbcClassificationConfirmation.CommitFailedPollution] so the caller fences
+ *    the prefs instance that may be polluted.
+ *  - [BbcClassificationPlan.FailClosed] / unknown / unreadable value / poison
+ *    latch / Unavailable version / resolver error: no editor is created and
+ *    nothing is written, so [BbcClassificationConfirmation.NoCommitFailClosed]
+ *    is returned and the caller must leave the holder NEUTRAL. An unknown value
+ *    is NEVER overwritten.
  *
  * The pending intent is set for the forced re-put too, so a failed bind-time
  * commit still forces later draft writes to re-add the same keys.
  */
-internal fun confirmBbcInstallClassificationDurable(provider: () -> SharedPreferences?): Boolean {
+internal fun confirmBbcInstallClassificationDurable(
+    provider: () -> SharedPreferences?,
+): BbcClassificationConfirmation {
     val prefs: SharedPreferences = try {
         provider()
     } catch (ce: CancellationException) {
         throw ce
     } catch (_: Throwable) {
         null
-    } ?: return false
+    } ?: return BbcClassificationConfirmation.NoCommitFailClosed
 
     return synchronized(versionCommitLock) {
-        try {
-            when (val plan = planBbcInstallClassificationForWrite(prefs)) {
-                BbcClassificationPlan.FailClosed -> false
-                is BbcClassificationPlan.Write -> commitClassificationDurable(prefs, plan)
-                BbcClassificationPlan.NoWrite -> {
-                    // Trust only a KNOWN value; a present-but-unreadable /
-                    // unknown value is fail-closed and is never overwritten.
-                    val reads = classificationReads(prefs)
-                    val value = reads.classificationValue()
-                    if (value == null || value !in BbcInstallClassificationValues) {
-                        false
-                    } else {
-                        val marker = try {
-                            if (prefs.contains(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED)) {
-                                prefs.getBoolean(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED, false)
-                            } else false
-                        } catch (ce: CancellationException) {
-                            throw ce
-                        } catch (_: Throwable) {
-                            // Present but unreadable marker: never invent a
-                            // durable migration proof.
-                            null
-                        }
-                        if (marker == null) false else commitClassificationDurable(
-                            prefs,
-                            BbcClassificationPlan.Write(value, marker),
-                        )
-                    }
-                }
-            }
+        // Resolving the write creates NO editor. A fail-closed plan (poison
+        // latch, unknown/unreadable value, Unavailable version, read throw) is
+        // therefore provably not pollution and must never be fenced.
+        val plan = try {
+            resolveDurableClassificationWrite(prefs)
         } catch (ce: CancellationException) {
             throw ce
         } catch (_: Throwable) {
-            false
+            null
+        }
+        if (plan == null) {
+            BbcClassificationConfirmation.NoCommitFailClosed
+        } else {
+            commitClassificationDurable(prefs, plan)
+        }
+    }
+}
+
+/**
+ * Resolve the value/marker to force-commit WITHOUT creating an editor.
+ * `null` means fail closed: no write of any kind is justified.
+ */
+private fun resolveDurableClassificationWrite(
+    prefs: SharedPreferences,
+): BbcClassificationPlan.Write? = when (val plan = planBbcInstallClassificationForWrite(prefs)) {
+    BbcClassificationPlan.FailClosed -> null
+    is BbcClassificationPlan.Write -> plan
+    BbcClassificationPlan.NoWrite -> {
+        // Trust only a KNOWN value; a present-but-unreadable / unknown value is
+        // fail-closed and is never overwritten.
+        val reads = classificationReads(prefs)
+        val value = reads.classificationValue()
+        if (value == null || value !in BbcInstallClassificationValues) {
+            null
+        } else {
+            val marker = try {
+                if (prefs.contains(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED)) {
+                    prefs.getBoolean(PolicySource.POLICY_KEY_BBC_LEGACY_MIGRATED, false)
+                } else false
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                // Present but unreadable marker: never invent a durable proof.
+                null
+            }
+            if (marker == null) null else BbcClassificationPlan.Write(value, marker)
         }
     }
 }
@@ -351,7 +391,7 @@ internal fun confirmBbcInstallClassificationDurable(provider: () -> SharedPrefer
 private fun commitClassificationDurable(
     prefs: SharedPreferences,
     plan: BbcClassificationPlan.Write,
-): Boolean {
+): BbcClassificationConfirmation {
     // Keep the pending intent until the daemon CONFIRMS persistence: a failed
     // commit must still be re-added by every later draft write.
     pendingBbcClassification.set(PendingBbcClassification.of(prefs, plan))
@@ -359,11 +399,17 @@ private fun commitClassificationDurable(
         val editor = prefs.edit()
         applyBbcClassificationPlan(editor, plan)
         val committed = editor.commit()
-        if (committed) clearPendingBbcClassification()
-        committed
+        if (committed) {
+            clearPendingBbcClassification()
+            BbcClassificationConfirmation.Confirmed
+        } else {
+            BbcClassificationConfirmation.CommitFailedPollution
+        }
     } catch (ce: CancellationException) {
         throw ce
     } catch (_: Throwable) {
-        false
+        // An edit()/commit() that entered may have polluted the optimistic
+        // local mMap even though the daemon persisted nothing: conservative.
+        BbcClassificationConfirmation.CommitFailedPollution
     }
 }

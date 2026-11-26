@@ -18,10 +18,61 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+
+/**
+ * PR #90 R5-03: one immutable app-side I/O session. It is created and published
+ * atomically at `onServiceBind` and binds a generation to the service instance
+ * captured at that bind. [prefs] is resolved once SUCCESSFULLY (a failed
+ * resolution is retried), FROM THAT CAPTURED SERVICE, on the app's IO lane —
+ * never by re-sampling the global serviceRef at execution time.
+ *
+ * A generation NUMBER is not an I/O identity: a repeated bind of the same
+ * service / same cached SharedPreferences with a higher generation is a
+ * DIFFERENT session but NOT fresh, clean evidence. The session object identity
+ * (and its generation + service + prefs triple) is what every read/write stamp
+ * and every currency check uses.
+ */
+internal class BbcIoSession(
+    val generation: Long,
+    val service: XposedService,
+    private val resolver: (XposedService) -> SharedPreferences?,
+) {
+    /** Resolved on IO; a failed resolution is retried, a success is kept. */
+    @Volatile
+    var prefs: SharedPreferences? = null
+        private set
+
+    fun resolvePrefs(): SharedPreferences? {
+        prefs?.let { return it }
+        val resolved = try {
+            resolver(service)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            null
+        }
+        if (resolved != null) prefs = resolved
+        return resolved
+    }
+
+    /** Non-null only once prefs have been resolved from the captured service. */
+    fun identity(): BbcConsentSessionIdentity? = prefs?.let {
+        BbcConsentSessionIdentity(generation, service, it)
+    }
+
+    /**
+     * Same session INSTANCE (which fixes generation and service) and the same
+     * prefs identity. An unresolved prefs (`null === null`) is still the same
+     * session: a failed bind must be allowed to fence its own generation.
+     */
+    fun isCurrent(current: BbcIoSession?): Boolean =
+        current === this && prefs === current.prefs
+}
 
 class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
 
@@ -83,51 +134,136 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     // commit uses the SAME remote store seam MainActivity uses. NOT a Samsung
     // cold-start deletion guard (issue #75).
     internal val bbcToggleCoordinator: BbcToggleCoordinator by lazy {
-        BbcToggleCoordinator(
-            scope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
-            state = bbcToggleRuntimeState,
-            commit = { enabled ->
-                // Phase 2 cold-start fix: EVERY runtime commit clears the
-                // app-only enable-pending marker in the SAME atomic edit. This
-                // is what makes a durable user OFF cancel a pending enable.
-                remoteHookPolicyStore {
-                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
-                }.setBbcRuntimeAndEnablePendingDetailed(enabled, pending = false)
-            },
-            // PR #90 Phase C: consent grant + authoritative resync share the
-            // SAME app-lifetime consumer / IO lane as the runtime opt-out. No
-            // binder or versionCommitLock wait ever happens on the Main thread.
-            // Phase 2 (B3): generation-aware. The snapshot captured at bind
-            // entry pairs (generation, service, provider); prefs are resolved
-            // on this IO lane and the identity is verified BEFORE and AFTER the
-            // commit. A reply from a dead generation can never grant, and the
-            // fence is attributed to the instance actually touched.
-            consentCommitAt = { capturedGeneration ->
-                performBbcConsentWrite(capturedGeneration)
-            },
-            consentRead = { generation ->
-                val store = remoteHookPolicyStore {
-                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
-                }
-                // ONE coherent snapshot of every consent-authoritative key,
-                // mirroring the Hook reader: distinct explicit-FALSE / ABSENT /
-                // UNAVAILABLE opt-in states, a contains()-based runtime seed
-                // (never the default-true legacy read), and a single all-or-
-                // nothing failure flag. The holder still fences by generation.
-                store.readBbcConsentAuthoritative().forGeneration(generation)
-            },
-            // R5-02: the persisted effect value is read on this SAME app IO lane,
-            // never on Main. The four-state read distinguishes ABSENT (no
-            // explicit opt-out: authorized installs may seed checked, UNVERIFIED)
-            // from UNAVAILABLE (failure: never ON), with no default-true. It is
-            // folded in as a PROVISIONAL value, not a write outcome.
-            effectRead = {
-                remoteHookPolicyStore {
-                    remotePreferences(PolicySource.POLICY_PREFS_NAME)
-                }.readBbcInjectionEnabledAuthoritative()
-            },
-            consentHolder = bbcActivationConsentHolder,
-        )
+        buildBbcToggleCoordinator(CoroutineScope(SupervisorJob() + Dispatchers.IO))
+    }
+
+    /**
+     * R5-03: every BBC app I/O seam is bound to the CURRENT immutable session.
+     * No consent/effect/classification/enable path re-samples the global
+     * serviceRef at execution time. Extracted from the lazy so JVM tests can
+     * build the SAME production seams on a virtual dispatcher.
+     */
+    internal fun buildBbcToggleCoordinator(
+        scope: CoroutineScope,
+        io: CoroutineDispatcher = Dispatchers.IO,
+    ): BbcToggleCoordinator = BbcToggleCoordinator(
+        scope = scope,
+        io = io,
+        state = bbcToggleRuntimeState,
+        commit = { enabled -> performBbcRuntimeCommit(enabled, null) },
+        commitWithSession = { enabled, authorizer ->
+            performBbcRuntimeCommit(enabled, authorizer)
+        },
+        // PR #90 Phase C: consent grant + authoritative resync share the
+        // SAME app-lifetime consumer / IO lane as the runtime opt-out. No
+        // binder or versionCommitLock wait ever happens on the Main thread.
+        // R5-03: the generation-aware write is now SESSION-aware — prefs are
+        // resolved from the service captured at bind and verified before and
+        // after the blocking commit.
+        consentCommitAt = { capturedGeneration ->
+            performBbcConsentWrite(capturedGeneration)
+        },
+        consentRead = { generation -> performBbcConsentRead(generation) },
+        // R5-02: the persisted effect value is read on this SAME app IO lane,
+        // never on Main. R5-03: from the current session's prefs instance.
+        effectRead = { performBbcEffectRead() },
+        currentSession = { currentBbcSessionIdentity() },
+        consentHolder = bbcActivationConsentHolder,
+    )
+
+    /** Current session identity, or null before prefs are resolved / after death. */
+    private fun currentBbcSessionIdentity(): BbcConsentSessionIdentity? =
+        bbcIoSession.get()?.identity()
+
+    /** Every runtime write clears the app-only enable-pending marker atomically. */
+    private fun commitBbcRuntime(prefs: SharedPreferences, enabled: Boolean): BbcWriteOutcome =
+        try {
+            remoteHookPolicyStore { prefs }
+                .setBbcRuntimeAndEnablePendingDetailed(enabled, pending = false)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            BbcWriteOutcome.Unknown
+        }
+
+    /**
+     * Phase 2 cold-start fix: EVERY runtime commit clears the app-only
+     * enable-pending marker in the SAME atomic edit. R5-03: the write targets
+     * the CURRENT session's prefs; an auto-enable [authorizer] may only write
+     * when that session is still current and is NEVER retried after a failed
+     * currency check (fail-closed rejection is correct there).
+     *
+     * R5-03 review R2: a USER OFF (null authorizer) is highest priority. If a
+     * rebind landed inside its commit, the old prefs may now hold the OFF while
+     * the new session still carries a durable enablePending marker. On the
+     * failed currency check we re-read the session and retry the SAME OFF write
+     * ONCE against the genuinely current prefs. A second rebind, an absent
+     * session or an unresolvable prefs instance reports Unknown honestly.
+     */
+    private fun performBbcRuntimeCommit(
+        enabled: Boolean,
+        authorizer: BbcConsentSessionIdentity?,
+    ): BbcWriteOutcome {
+        val session = bbcIoSession.get() ?: return BbcWriteOutcome.Unknown
+        val prefs = session.resolvePrefs() ?: return BbcWriteOutcome.Unknown
+        if (authorizer != null && !(authorizer isSameSession session.identity())) {
+            return BbcWriteOutcome.Unknown
+        }
+        val outcome = commitBbcRuntime(prefs, enabled)
+        if (session.isCurrent(bbcIoSession.get())) return outcome
+        if (authorizer != null) return BbcWriteOutcome.Unknown // never retry an enabled grant
+
+        val current = bbcIoSession.get() ?: return BbcWriteOutcome.Unknown
+        if (current === session) return BbcWriteOutcome.Unknown
+        val currentPrefs = current.resolvePrefs() ?: return BbcWriteOutcome.Unknown
+        val retry = commitBbcRuntime(currentPrefs, enabled)
+        return if (current.isCurrent(bbcIoSession.get())) retry else BbcWriteOutcome.Unknown
+    }
+
+    /**
+     * R5-03: authoritative consent read from the CURRENT session's prefs. The
+     * full session identity is stamped on the result; a rebind before/after the
+     * coherent read forces fail-closed and never certifies the new session.
+     */
+    private fun performBbcConsentRead(generation: Long): BbcConsentAuthoritativeRead {
+        val session = bbcIoSession.get()
+        if (session == null || session.generation != generation) {
+            return BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
+        }
+        val prefs = session.resolvePrefs()
+        val identity = session.identity()
+        if (prefs == null || identity == null || !session.isCurrent(bbcIoSession.get())) {
+            return BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
+        }
+        // ONE coherent snapshot of every consent-authoritative key, mirroring
+        // the Hook reader: explicit-FALSE / ABSENT / UNAVAILABLE, contains()-based
+        // runtime seed (never default-true) and one all-or-nothing failure flag.
+        val snapshot = try {
+            remoteHookPolicyStore { prefs }.readBbcConsentAuthoritative()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            BbcConsentDurableSnapshot.failClosed()
+        }
+        if (!session.isCurrent(bbcIoSession.get())) {
+            return BbcConsentDurableSnapshot.failClosed().forGeneration(generation)
+        }
+        return snapshot.forSession(identity)
+    }
+
+    /** R5-03: authoritative four-state effect read from the session's prefs. */
+    private fun performBbcEffectRead(): BbcRuntimePrefValue {
+        val session = bbcIoSession.get() ?: return BbcRuntimePrefValue.UNAVAILABLE
+        val prefs = session.resolvePrefs() ?: return BbcRuntimePrefValue.UNAVAILABLE
+        if (!session.isCurrent(bbcIoSession.get())) return BbcRuntimePrefValue.UNAVAILABLE
+        val value = try {
+            remoteHookPolicyStore { prefs }.readBbcInjectionEnabledAuthoritative()
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            BbcRuntimePrefValue.UNAVAILABLE
+        }
+        return if (session.isCurrent(bbcIoSession.get())) value else BbcRuntimePrefValue.UNAVAILABLE
     }
 
     // PR #90 Phase C: monotonic service-instance generation for consent trust.
@@ -142,133 +278,33 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     }
 
     /**
-     * P1-B: ONE atomic bind snapshot. Generation, bound service identity and
-     * the prefs provider are captured TOGETHER on Main at bind entry (no binder
-     * call here). The IO coroutine uses this snapshot and NEVER re-samples the
-     * generation after resolving prefs: a stale attempt that outlives a rebind
-     * must skip ALL state effects (confirm AND Unknown fence), leaving them to
-     * the newer bind's own attempt.
-     *
-     * [resolvedPrefs] is filled in on the IO lane and participates in the
-     * pre-apply check, so a failed commit made against a prefs instance that
-     * is no longer the bound one cannot fence the new generation.
+     * R5-03: the ONE published immutable I/O session. Created and atomically
+     * replaced at bind entry; invalidated on death only for its owning service.
+     * Every BBC consent/effect/classification/enable path reads sessions from
+     * here instead of re-sampling the global serviceRef at execution time.
      */
-    private class BbcClassificationAttempt(
-        val generation: Long,
-        val service: XposedService?,
-        val provider: () -> SharedPreferences?,
-    ) {
-        @Volatile
-        var resolvedPrefs: SharedPreferences? = null
-    }
-
-    /** Guards snapshot publication so a stale attempt cannot clobber it. */
-    private val bbcClassificationSnapshotLock = Any()
-
-    /** The current bind's snapshot; replaced atomically by every new bind. */
-    private val bbcClassificationAttempt = AtomicReference<BbcClassificationAttempt?>(null)
-
-    /** The prefs instance the CURRENT attempt resolved on the IO lane. */
-    private val bbcClassificationBoundPrefs = AtomicReference<SharedPreferences?>(null)
+    private val bbcIoSession = AtomicReference<BbcIoSession?>(null)
 
     /**
-     * True only while the captured generation, service/provider identity AND
-     * the resolved prefs instance are all still the ones bound for this
-     * attempt. Called twice in the IO coroutine: before committing and before
-     * applying ANY outcome.
-     */
-    private fun isBindSnapshotCurrent(attempt: BbcClassificationAttempt): Boolean {
-        val current = bbcClassificationAttempt.get() ?: return false
-        return current === attempt &&
-            bbcConsentServiceGeneration.get() == attempt.generation &&
-            serviceRef.get() === attempt.service &&
-            bbcClassificationPrefsProvider === attempt.provider
-    }
-
-    /** Full check, including the prefs identity resolved by this attempt. */
-    private fun isBbcClassificationAttemptCurrent(attempt: BbcClassificationAttempt): Boolean =
-        isBindSnapshotCurrent(attempt) &&
-            bbcClassificationBoundPrefs.get() === attempt.resolvedPrefs
-
-    // PR #90 Phase 2 (B3): the same atomic bind-snapshot discipline for the
-    // consent OPT-IN commit. A user accepts at generation N; the commit may run
-    // after binder death/rebind. Capturing `serviceRef` at execution time would
-    // pair gen N with gen N+1 prefs, report a false grant, and let a gen N+1
-    // resync clear the fence at gen N (minOf(current, captured)). Instead the
-    // (generation, service, provider) triple is published atomically at bind
-    // entry, checked before AND after the blocking commit, and the touched
-    // generation is what the holder fences.
-    private class BbcConsentWriteAttempt(
-        val generation: Long,
-        val service: XposedService?,
-        val provider: () -> SharedPreferences?,
-    ) {
-        @Volatile
-        var resolvedPrefs: SharedPreferences? = null
-    }
-
-    private val bbcConsentWriteSnapshotLock = Any()
-    private val bbcConsentWriteAttempt = AtomicReference<BbcConsentWriteAttempt?>(null)
-    private val bbcConsentWriteBoundPrefs = AtomicReference<SharedPreferences?>(null)
-
-    private fun isBbcConsentWriteSnapshotCurrent(attempt: BbcConsentWriteAttempt): Boolean {
-        val current = bbcConsentWriteAttempt.get() ?: return false
-        return current === attempt &&
-            bbcConsentServiceGeneration.get() == attempt.generation &&
-            serviceRef.get() === attempt.service &&
-            bbcClassificationPrefsProvider === attempt.provider
-    }
-
-    private fun isBbcConsentWriteAttemptCurrent(attempt: BbcConsentWriteAttempt): Boolean =
-        isBbcConsentWriteSnapshotCurrent(attempt) &&
-            bbcConsentWriteBoundPrefs.get() === attempt.resolvedPrefs
-
-    /**
-     * The generation-aware consent commit seam, executed on the app IO lane.
-     * The generation comes from the user-intent snapshot; prefs are resolved
-     * from that SAME snapshot. On any mismatch the outcome is forced to Unknown:
-     *  - if NO commit entered (stale snapshot / prefs null / failed pre-check),
-     *    the NO-GENERATION sentinel 0L is reported — no local pollution exists,
-     *    so no fence (especially not a spurious CURRENT-generation one) is
-     *    installed;
-     *  - if the commit did enter and only the REPLY is stale, the holder fences
-     *    the instance actually touched, never a re-sampled current generation.
+     * R5-03: the session-aware consent commit seam, executed on the app IO lane.
+     * The prefs instance is resolved FROM THE SERVICE CAPTURED AT BIND inside
+     * [session]; the whole (generation, service, prefs) identity is verified
+     * BEFORE and AFTER the blocking commit and stamped on the result:
+     *  - no session / wrong generation / prefs absent / stale before-check: the
+     *    NO-GENERATION sentinel 0L — no local pollution exists, so no spurious
+     *    CURRENT-generation fence is installed;
+     *  - commit entered but the REPLY is stale: outcome forced to Unknown, yet
+     *    the fence is attributed to the instance ACTUALLY touched (its session
+     *    identity), never to the new generation.
      */
     private fun performBbcConsentWrite(capturedGeneration: Long): BbcConsentWriteResult {
-        val attempt = bbcConsentWriteAttempt.get()
-        if (attempt == null ||
-            attempt.generation != capturedGeneration ||
-            !isBbcConsentWriteSnapshotCurrent(attempt)
-        ) {
-            // NO-GENERATION sentinel (0L): no commit entered, so NO local mMap
-            // was polluted and there is nothing to fence. Reporting the current
-            // generation here used to install a spurious current-gen Unknown
-            // fence that blocked that very generation's authoritative resync
-            // until gen 3. `fenceForTouchedGeneration` keeps the old fence on <=0.
+        val session = bbcIoSession.get()
+        if (session == null || session.generation != capturedGeneration) {
             return BbcConsentWriteResult(BbcWriteOutcome.Unknown, NO_CONSENT_COMMIT_GENERATION)
         }
-        val prefs = try {
-            attempt.provider()
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (_: Throwable) {
-            null
-        }
-        if (prefs == null) {
-            // Still no commit: no pollution, no fence (see above).
-            return BbcConsentWriteResult(BbcWriteOutcome.Unknown, NO_CONSENT_COMMIT_GENERATION)
-        }
-        attempt.resolvedPrefs = prefs
-        val safeToCommit = synchronized(bbcConsentWriteSnapshotLock) {
-            if (!isBbcConsentWriteSnapshotCurrent(attempt)) false else {
-                bbcConsentWriteBoundPrefs.set(prefs)
-                isBbcConsentWriteAttemptCurrent(attempt)
-            }
-        }
-        if (!safeToCommit) {
-            // A rebind won the race BEFORE the write: never commit against a
-            // serviceRef whose generation differs from the captured one, and
-            // never fence the NEW generation with an outcome that never ran.
+        val prefs = session.resolvePrefs()
+        val identity = session.identity()
+        if (prefs == null || identity == null || !session.isCurrent(bbcIoSession.get())) {
             return BbcConsentWriteResult(BbcWriteOutcome.Unknown, NO_CONSENT_COMMIT_GENERATION)
         }
         // ONE commit persists optin=true AND the app-only enable-pending marker.
@@ -281,13 +317,13 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         } catch (_: Throwable) {
             BbcWriteOutcome.Unknown
         }
-        // Verify AFTER the blocking commit. The write really landed on the
-        // captured generation's prefs instance; a rebind in between only
-        // invalidates the reply (Unknown), it does not re-label the fence.
-        val stillCurrent = isBbcConsentWriteAttemptCurrent(attempt)
+        // Verify AFTER the blocking commit. A rebind in between only invalidates
+        // the REPLY; the fence still belongs to the instance actually touched.
+        val stillCurrent = session.isCurrent(bbcIoSession.get())
         return BbcConsentWriteResult(
             if (stillCurrent) outcome else BbcWriteOutcome.Unknown,
-            attempt.generation,
+            session.generation,
+            identity,
         )
     }
 
@@ -336,14 +372,29 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     }
 
     /**
-     * PR #90 P1-1 test seam: the writable remote-prefs provider used by the
-     * bind-time durable-classification confirmation. Production always uses
-     * the app's XposedService channel; JVM tests inject an in-memory prefs
-     * because `Process.myUid()` is an Android stub there (so [remotePreferences]
-     * always fails closed). Defaults to the production channel.
+     * PR #90 P1-1 / R5-03 test seam: resolves the writable remote prefs FROM
+     * THE SERVICE CAPTURED AT BIND. The argument is the bound service — never
+     * the global serviceRef at execution time — so a stale I/O attempt cannot
+     * pair its generation with a newer binder's prefs. Production uses the
+     * app's XposedService channel; JVM tests inject an in-memory resolver
+     * because `Process.myUid()` is an Android stub there (so the production
+     * channel always fails closed). The returned instance is bound into the
+     * [BbcIoSession] and its identity is stamped on every later read/write.
      */
-    internal var bbcClassificationPrefsProvider: () -> SharedPreferences? = {
-        remotePreferences(PolicySource.POLICY_PREFS_NAME)
+    internal var bbcClassificationPrefsProvider: (XposedService) -> SharedPreferences? = { service ->
+        val owner = try {
+            userIdFromUid(Process.myUid()) == 0
+        } catch (_: Throwable) {
+            false
+        }
+        if (!owner) null
+        else try {
+            service.getRemotePreferences(PolicySource.POLICY_PREFS_NAME)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     override fun onServiceBind(service: XposedService) {
@@ -352,88 +403,82 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
         // cached Granted/Legacy trust (but keep the durable Unknown fence) and
         // resolve again from durable keys once classification is in place.
         val generation = bumpBbcConsentServiceGeneration()
-        // P1-B: capture generation + bound service + provider identity in ONE
-        // atomic snapshot at bind entry. These are in-memory reads on Main —
-        // no binder call. The IO coroutine uses ONLY this snapshot; its prefs
-        // resolution can no longer be paired with a newer generation.
-        val attempt = BbcClassificationAttempt(
-            generation = generation,
-            service = serviceRef.get(),
-            provider = bbcClassificationPrefsProvider,
-        )
-        bbcClassificationAttempt.set(attempt)
-        // Phase 2 B3: publish the consent-write snapshot atomically with the
-        // same bind entry. Generation, service identity and provider are fixed
-        // before any IO coroutine can capture them.
-        synchronized(bbcConsentWriteSnapshotLock) {
-            bbcConsentWriteAttempt.set(
-                BbcConsentWriteAttempt(
-                    generation = generation,
-                    service = serviceRef.get(),
-                    provider = bbcClassificationPrefsProvider,
-                ),
-            )
-            bbcConsentWriteBoundPrefs.set(null)
-        }
+        // R5-03: publish ONE immutable session atomically at bind entry. It
+        // captures the ACTUAL service (not the global serviceRef) together with
+        // the generation and the resolver; prefs are resolved FROM THAT SERVICE
+        // on the IO lane below. No BBC I/O re-samples the global at execution.
+        val session = BbcIoSession(generation, service, bbcClassificationPrefsProvider)
+        bbcIoSession.set(session)
         // PR #90 P1-1: confirm classification on EVERY bind, including a rebind
         // that arrives without a death callback (or whose stale death callback
-        // lost the CAS). A rebind bumps the consent generation, which resets
-        // classificationConfirmedGeneration; short-circuiting on a one-shot flag
-        // left legacy installs stuck at Initializing (App demanding consent
-        // while the Hook gate was open). Confirmation therefore always runs for
-        // the current bind's generation; a failed attempt is retried on a later
-        // bind.
+        // lost the CAS). A rebind bumps the generation, which resets
+        // classificationConfirmedGeneration; a one-shot flag used to leave
+        // legacy installs stuck at Initializing. Confirmation always runs for
+        // the current bind's generation; a failed attempt is retried later.
         bbcClassificationScope.launch {
-            // Resolve prefs on IO with the CAPTURED provider. The generation is
-            // deliberately NOT re-sampled here: the earlier code paired prefs1
-            // with gen2 after a rebind and let that stale failure fence gen2.
-            // CancellationException always propagates; every other throwable
-            // fails closed as binder-absent.
+            // Resolve prefs on IO FROM THE CAPTURED SERVICE. CancellationException
+            // always propagates; every other throwable fails closed.
             val prefs = try {
-                attempt.provider()
+                session.resolvePrefs()
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Throwable) {
                 null
             }
-            attempt.resolvedPrefs = prefs
-            // P1-B: a newer bind already owns this state — skip EVERYTHING.
-            // Publishing the prefs identity is atomic with the snapshot check
-            // so a stale attempt can never clobber the new bind's identity.
-            synchronized(bbcClassificationSnapshotLock) {
-                if (!isBindSnapshotCurrent(attempt)) return@launch
-                bbcClassificationBoundPrefs.set(prefs)
-            }
+            // R5-03: a newer bind already published a different session — skip
+            // EVERYTHING, leaving confirm/fence to the newer bind's own attempt.
+            if (!session.isCurrent(bbcIoSession.get())) return@launch
             // P1-2: only a SUCCESSFUL durable commit may confirm classification.
             // A NoWrite inferred from a polluted local mMap is never enough.
-            val ok = if (prefs == null) false else try {
+            // R5 Phase 3a: a fail-closed plan (unknown/unreadable value, poison
+            // latch, Unavailable version, resolver error) creates NO editor and
+            // writes NOTHING — it is NOT pollution and must leave the holder
+            // neutral for a later bind's authoritative resync.
+            val confirmation = if (prefs == null) {
+                BbcClassificationConfirmation.NoCommitFailClosed
+            } else try {
                 confirmBbcInstallClassificationDurable { prefs }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Throwable) {
-                false
+                BbcClassificationConfirmation.NoCommitFailClosed
             }
-            // P1-B: verify the snapshot AGAIN before applying ANY outcome. A
-            // rebind during the blocking commit must leave both confirmation
-            // and the Unknown fence to the newer bind's own attempt.
-            if (!isBbcClassificationAttemptCurrent(attempt)) return@launch
-            if (ok) {
-                // Review A6: record the CONFIRMED fact BEFORE enqueuing the
-                // resync. A queued read can otherwise observe an optimistic
-                // local mMap polluted by a failed classification commit and
-                // resolve Legacy before the failure fence is installed.
-                bbcActivationConsentHolder.markInstallClassificationConfirmed(attempt.generation)
-                // Phase C: resolve authorization from durable keys only after
-                // the classification is confirmed durable, on the app IO lane
-                // (never on Main, never from a cached local mMap).
-                refreshBbcActivationConsent()
-            } else {
-                // A FAILED bind-time classification may have left
-                // PRE_UPGRADE_EXISTING + marker in THIS instance's local mMap
-                // while the daemon persisted NOTHING. Do NOT resync from that
-                // read: fence this generation as Unknown so no legacy checkbox
-                // or consent skip can be authorized by optimistic pollution.
-                bbcActivationConsentHolder.markInstallClassificationFailed(attempt.generation)
+            // R5-03: verify the FULL session identity AGAIN before applying ANY
+            // outcome. A rebind during the blocking commit must leave both
+            // confirmation and the Unknown fence to the newer bind's attempt.
+            if (!session.isCurrent(bbcIoSession.get())) return@launch
+            when (confirmation) {
+                BbcClassificationConfirmation.Confirmed -> {
+                    // Review A6: record the CONFIRMED fact BEFORE enqueuing the
+                    // resync. A queued read can otherwise observe an optimistic
+                    // local mMap polluted by a failed classification commit and
+                    // resolve Legacy before the failure fence is installed.
+                    bbcActivationConsentHolder.markInstallClassificationConfirmed(generation)
+                    // Phase C: resolve authorization from durable keys only after
+                    // the classification is confirmed durable, on the app IO lane.
+                    refreshBbcActivationConsent()
+                }
+                BbcClassificationConfirmation.CommitFailedPollution -> {
+                    // Only a commit that ACTUALLY ENTERED can pollute an
+                    // optimistic local mMap. This outcome means an edit()/commit()
+                    // was attempted and failed, possibly leaving PRE_UPGRADE_*
+                    // + marker in THIS instance's local mMap while the daemon
+                    // persisted NOTHING. Do NOT resync from that read: fence this
+                    // generation as Unknown, attributed to the exact prefs
+                    // instance actually touched (R5-03).
+                    bbcActivationConsentHolder.markInstallClassificationFailed(
+                        generation, session.identity(),
+                    )
+                }
+                BbcClassificationConfirmation.NoCommitFailClosed -> {
+                    // No editor was created: prefs unresolved, or the planner
+                    // failed closed without writing. There is no optimistic map
+                    // to fence. Stay Initializing/neutral and let the next
+                    // bind's authoritative resync decide from durable keys.
+                    // A same-prefs stamped fence here can NEVER be cleared
+                    // (only a Confirmed grant or a process restart), which
+                    // would lock out the user until a manual re-grant.
+                }
             }
         }
         // 5.1.5:通知所有綁定監聽者 (例如刷新政策草稿)。
@@ -452,25 +497,18 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
             // Initializing immediately; a durable Unknown fence is preserved.
             val newGeneration = bumpBbcConsentServiceGeneration()
 
-            // E5: a bind may have captured an attempt for an older generation
-            // between this CAS and the bump. That attempt will now deliberately
-            // skip its own refresh, so record that a resync for THIS generation
-            // is required. No loop: a read never bumps the generation.
-            val bindAttemptInvalidated = synchronized(bbcClassificationSnapshotLock) {
-                val attempt = bbcClassificationAttempt.get()
-                val invalidated = attempt != null && attempt.generation != newGeneration
-                // P1-B: invalidate the dead bind's snapshot; its in-flight
-                // attempt must not apply a confirm/fence to the new instance.
-                bbcClassificationAttempt.set(null)
-                bbcClassificationBoundPrefs.set(null)
-                invalidated
-            }
-            // Phase 2 B3: invalidate the consent-write snapshot too. An in-flight
-            // write must see the mismatch both before and after its commit.
-            synchronized(bbcConsentWriteSnapshotLock) {
-                bbcConsentWriteAttempt.set(null)
-                bbcConsentWriteBoundPrefs.set(null)
-            }
+            // R5-03: invalidate the session ONLY for the owning service identity.
+            // A stale death callback for an old binder never clears a newer
+            // bind's session (the serviceRef CAS above already guarantees this,
+            // but the session CAS makes the invariant explicit). An in-flight
+            // I/O attempt on this session then fails every currency check.
+            val deadSession = bbcIoSession.get()
+            val bindAttemptInvalidated = deadSession != null &&
+                deadSession.service === service &&
+                bbcIoSession.compareAndSet(deadSession, null)
+            // A bind may have published a session older than this bump; its IO
+            // coroutine will skip its own refresh, so this generation needs a
+            // resync. No loop: a read never bumps the generation.
             // Capture the pending classification intent identity WITHOUT a lock.
             // The deferred clear below must never drop a NEWER bind's retry
             // intent; a stale pending entry is keyed by prefs identity and is

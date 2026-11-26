@@ -98,6 +98,39 @@ enum class BbcRuntimePrefValue {
 }
 
 /**
+ * PR #90 R5-03: immutable identity of the app-side I/O session that performed a
+ * durable read or write. A generation NUMBER is not an I/O identity: a repeated
+ * bind of the SAME service / SAME cached SharedPreferences with a HIGHER
+ * generation is a different session but NOT fresh, clean evidence. The three
+ * identities are captured together and never change for the lifetime of the
+ * session.
+ *
+ * [serviceIdentity] and [prefsIdentity] are compared by reference (identity),
+ * never by equals(): two instances with equal contents are still different I/O
+ * sessions. This is what stops an optimistic local mMap from clearing its own
+ * Unknown fence merely because the bind generation advanced.
+ */
+internal class BbcConsentSessionIdentity(
+    val generation: Long,
+    val serviceIdentity: Any,
+    val prefsIdentity: Any,
+) {
+    /** Same bound instance in every dimension — used to gate auto-enable work. */
+    infix fun isSameSession(other: BbcConsentSessionIdentity?): Boolean =
+        other != null && generation == other.generation &&
+            serviceIdentity === other.serviceIdentity &&
+            prefsIdentity === other.prefsIdentity
+
+    /**
+     * Same prefs map regardless of generation. A read from the SAME prefs
+     * instance may be an optimistic local map polluted by a failed commit, so
+     * it can never clear a fence raised on that instance.
+     */
+    infix fun isSamePrefs(other: BbcConsentSessionIdentity?): Boolean =
+        other != null && prefsIdentity === other.prefsIdentity
+}
+
+/**
  * ALL authoritative durable inputs of a consent resolution, taken from ONE
  * coherent snapshot of the CURRENT service generation's prefs instance on the
  * app's IO lane. Mirrors the Hook's all-or-nothing `BbcCoherentPrefsSnapshot`:
@@ -153,6 +186,25 @@ data class BbcConsentDurableSnapshot(
             coherent = coherent,
             enablePending = enablePending,
             runtime = runtime,
+        )
+
+    /**
+     * R5-03: stamp the snapshot with the FULL session identity (generation +
+     * service + prefs), not just a number. Production reads use this so the
+     * holder can tell a genuinely different, clean prefs instance from a
+     * higher generation bound to the same polluted instance.
+     */
+    internal fun forSession(session: BbcConsentSessionIdentity): BbcConsentAuthoritativeRead =
+        BbcConsentAuthoritativeRead(
+            serviceGeneration = session.generation,
+            optIn = optIn,
+            classification = classification,
+            migrated = migrated,
+            legacyRuntimeEnabled = legacyRuntimeEnabled,
+            coherent = coherent,
+            enablePending = enablePending,
+            runtime = runtime,
+            session = session,
         )
 }
 
@@ -222,6 +274,12 @@ internal data class BbcConsentAuthoritativeRead(
     } else {
         BbcRuntimePrefValue.UNAVAILABLE
     },
+    /**
+     * R5-03: the session that ACTUALLY produced this read. `null` keeps the
+     * legacy generation-only behavior for framework-free callers; production
+     * always stamps it so a same-prefs higher generation cannot clear a fence.
+     */
+    val session: BbcConsentSessionIdentity? = null,
 )
 
 /** Authorization-only seed for a freshly built UI. Never a final value. */
@@ -345,12 +403,25 @@ private val LEGACY_CLASSIFICATIONS = setOf(
  *  - Only [markConsentWriteOutcome] with Confirmed (and matching generation)
  *    or [resolve] with `BbcOptInValue.TRUE` from the *current* service
  *    generation may produce [Granted].
- *  - A same-generation read can NEVER upgrade [Unknown] — the local mMap may
- *    have been optimistically polluted by a failed commit. Only a read from a
- *    newer service generation (after [onServiceGenerationChanged]) may, via
- *    [resolve], clear the fence. A failed bind-time classification commit
- *    ([markInstallClassificationFailed]) installs that fence so a polluted
- *    PRE_UPGRADE + marker local read can never be mistaken for [Legacy].
+ *  - A read from the SAME prefs instance can NEVER upgrade [Unknown] — even at a
+ *    higher generation the local mMap may have been optimistically polluted by
+ *    a failed commit. Only a stamped read from a genuinely DIFFERENT prefs
+ *    instance may, via [resolve], clear a stamped fence; a stamped read meeting
+ *    a sessionless fence fails closed too (generation alone never clears it).
+ *    A FAILED bind-time classification COMMIT ([markInstallClassificationFailed])
+ *    installs that fence so a polluted PRE_UPGRADE + marker local read can never
+ *    be mistaken for [Legacy]. A NO-COMMIT bind failure (prefs unresolvable OR a
+ *    fail-closed classification plan that creates no editor) installs NO fence
+ *    at all: the holder stays neutral/Initializing for the next bind's
+ *    authoritative resync. A NO-COMMIT consent-write outcome (the 0L sentinel,
+ *    no commit entered) is treated the SAME way: it never installs the
+ *    sessionless fence that would permanently fail closed for stamped reads.
+ *  - A stamped fence is PERMANENT for stamped resyncs. Recovery requires a
+ *    DIFFERENT prefs instance (a stamped authoritative read) OR a fresh
+ *    [markConsentWriteOutcome] with Confirmed on the current generation: the
+ *    latter clears fenceGeneration/fenceSession and grants, owning the phase-2
+ *    enable. Unstamped (framework-free) reads keep the older generation-only
+ *    rule, but production always stamps and is held to the stricter one.
  *  - [Legacy] mirrors the Hook gate: PRE_UPGRADE_EXISTING needs the durable
  *    migration marker too; only MIGRATED/EXPLICITLY_GRANTED open without it.
  *  - A generation change drops Granted/Legacy to [Initializing] (must resync)
@@ -389,9 +460,9 @@ internal class BbcActivationConsentHolder(
         val appliedIntentSequence: Long,
         /**
          * Service generation that installed the current Unknown fence. A read
-         * from this same generation may be the polluted local mMap and can
-         * NEVER clear it; a read from a NEWER generation is an authoritative
-         * resync from a different prefs instance and may.
+         * from the SAME prefs instance is optimistic-local evidence and can NEVER
+         * clear it, even at a higher generation; only a genuinely different
+         * prefs instance may (see [fenceSession]).
          */
         val fenceGeneration: Long,
         /**
@@ -404,10 +475,24 @@ internal class BbcActivationConsentHolder(
          * [markInstallClassificationFailed] fences it.
          */
         val classificationConfirmedGeneration: Long,
+        /**
+         * R5-03: identity of the session whose failed durable COMMIT installed
+         * the current Unknown fence. A stamped read from the SAME prefs instance
+         * (even at a higher generation) is optimistic-local evidence and can
+         * never clear it; clearing requires a genuinely DIFFERENT prefs instance
+         * or a fresh Confirmed consent write. A stamped read meeting a
+         * sessionless fence ALSO fails closed — a generation number alone may
+         * never lift it. `null` is the legacy generation-only case for unstamped
+         * callers only: production stamps the identity whenever a commit
+         * actually entered, and a no-commit bind failure (unresolved prefs or a
+         * fail-closed plan) never installs a fence at all (there is nothing
+         * optimistic to fence).
+         */
+        val fenceSession: BbcConsentSessionIdentity? = null,
     )
 
     private val fenced = AtomicReference(
-        Fenced(BbcActivationConsentState.Initializing, 0L, 0L, -1L, -1L),
+        Fenced(BbcActivationConsentState.Initializing, 0L, 0L, -1L, -1L, null),
     )
 
     /**
@@ -603,6 +688,9 @@ internal class BbcActivationConsentHolder(
     /** Test/telemetry seam: the generation owning the current (Unknown) fence. */
     internal fun currentFenceGeneration(): Long = fenced.get().fenceGeneration
 
+    /** R5-03 test/telemetry seam: the session that owns the current fence. */
+    internal fun currentFenceSession(): BbcConsentSessionIdentity? = fenced.get().fenceSession
+
     /**
      * Atomic, once-per-generation claim for a resync-driven enable.
      *
@@ -722,16 +810,27 @@ internal class BbcActivationConsentHolder(
         }
         // The confirmation belongs to a prefs instance, not to the app process:
         // a rebind must re-confirm classification for the new generation.
-        fenced.set(Fenced(next, generation, cur.appliedIntentSequence, cur.fenceGeneration, -1L))
+        fenced.set(
+            Fenced(
+                next, generation, cur.appliedIntentSequence, cur.fenceGeneration, -1L,
+                cur.fenceSession,
+            ),
+        )
         _state.value = next
     }
 
     /**
      * Authoritative resolution from durable keys. A read from an older service
-     * generation is ignored outright (never trust a stale instance). A
-     * same-generation read cannot clear [Unknown]: that is exactly the polluted
-     * local-mMap case the durable fence exists for. Only a read from a NEWER
-     * generation (a genuinely different prefs instance) may clear the fence.
+     * generation is ignored outright (never trust a stale instance). A stamped
+     * read from the SAME prefs instance cannot clear [Unknown], even at a higher
+     * generation: that is exactly the polluted local-mMap case the fence exists
+     * for. A stamped read may clear a stamped fence ONLY from a genuinely
+     * DIFFERENT prefs instance; meeting a sessionless fence it fails closed too
+     * (generation alone never clears it). The other explicit recovery is a fresh
+     * Confirmed consent write ([markConsentWriteOutcome]) on the current
+     * generation. No-commit bind failures install no fence, so the next bind's
+     * authoritative resync decides freely from durable keys. Unstamped
+     * (framework-free) reads keep the older generation-only rule.
      *
      * Decision order mirrors the read-only Hook gate: explicit opt-out wins
      * over every legacy fallback, an unreadable snapshot authorizes nothing,
@@ -742,9 +841,23 @@ internal class BbcActivationConsentHolder(
     fun resolve(read: BbcConsentAuthoritativeRead) {
         val cur = fenced.get()
         if (read.serviceGeneration != cur.generation) return
-        val fenceIsCurrent =
-            cur.state is BbcActivationConsentState.Unknown &&
-                read.serviceGeneration <= cur.fenceGeneration
+        // R5-03: a generation number alone is NOT proof of fresh evidence. When
+        // the READ is stamped, the fence may be lifted ONLY by a genuinely
+        // DIFFERENT prefs instance. A repeated bind of the same prefs with a
+        // higher generation reads the same optimistic local mMap and must stay
+        // fenced. A stamped read meeting an Unknown fence with NO session stamp
+        // fails closed too: generation alone may never clear such a fence.
+        // Legacy callers (unstamped reads) keep the old generation rule.
+        val stampedRead = read.session
+        val stampedFence = cur.fenceSession
+        val fenceIsCurrent = when {
+            cur.state !is BbcActivationConsentState.Unknown -> false
+            stampedRead != null ->
+                stampedFence == null ||
+                    stampedRead isSamePrefs stampedFence ||
+                    stampedRead.generation <= cur.fenceGeneration
+            else -> read.serviceGeneration <= cur.fenceGeneration
+        }
         val classificationConfirmed =
             isInstallClassificationConfirmed(read.serviceGeneration)
         val legacy = when {
@@ -766,11 +879,13 @@ internal class BbcActivationConsentHolder(
             else -> cur.state // unresolved: stay neutral rather than invent a state
         }
         if (next === cur.state) return
-        val fenceGeneration = if (next is BbcActivationConsentState.Unknown) read.serviceGeneration else -1L
+        val becomesUnknown = next is BbcActivationConsentState.Unknown
+        val fenceGeneration = if (becomesUnknown) read.serviceGeneration else -1L
+        val fenceSession = if (becomesUnknown) read.session else null
         fenced.set(
             Fenced(
                 next, cur.generation, cur.appliedIntentSequence,
-                fenceGeneration, cur.classificationConfirmedGeneration,
+                fenceGeneration, cur.classificationConfirmedGeneration, fenceSession,
             ),
         )
         _state.value = next
@@ -782,10 +897,16 @@ internal class BbcActivationConsentHolder(
      * migration marker while the daemon persisted neither; feeding that read
      * into [resolve] would falsely authorize [BbcActivationConsentState.Legacy].
      *
-     * Install a same-generation Unknown fence instead: no local read from this
-     * generation can lift it, and no consent is skipped. Only an authoritative
-     * resync from a NEWER service instance (after a successful retry) may
-     * clear it. An already-authorized [BbcActivationConsentState.Granted] /
+     * Install an Unknown fence attributed to this prefs instance instead: no read
+     * from the same prefs can lift it, and no consent is skipped. Only a stamped
+     * authoritative resync from a DIFFERENT prefs instance may clear it; a fresh
+     * Confirmed consent write on the current generation is the explicit recovery.
+     * Callers MUST invoke this only when an edit()/commit() actually ENTERED and
+     * failed. A no-commit bind failure (prefs unresolvable, or a fail-closed
+     * classification plan that creates no editor) has no optimistic map to fence
+     * and must leave the holder neutral; calling here with a null [session] would
+     * install a sessionless fence that no stamped resync can ever clear.
+     * An already-authorized [BbcActivationConsentState.Granted] /
      * [BbcActivationConsentState.Legacy] is left untouched: a late bind-time
      * failure must not regress a confirmed grant or a durable Legacy resync.
      * This does NOT touch the user-intent sequence — a bind-time bookkeeping
@@ -793,7 +914,10 @@ internal class BbcActivationConsentHolder(
      * user intent.
      */
     @Synchronized
-    fun markInstallClassificationFailed(generation: Long) {
+    fun markInstallClassificationFailed(
+        generation: Long,
+        session: BbcConsentSessionIdentity? = null,
+    ) {
         val cur = fenced.get()
         if (generation != cur.generation) return // a dead instance cannot pollute this one
         // A late async failure (e.g. an older bind's commit completing after a
@@ -809,7 +933,7 @@ internal class BbcActivationConsentHolder(
         fenced.set(
             Fenced(
                 BbcActivationConsentState.Unknown, cur.generation, cur.appliedIntentSequence,
-                generation, cur.classificationConfirmedGeneration,
+                generation, cur.classificationConfirmedGeneration, session,
             ),
         )
         _state.value = BbcActivationConsentState.Unknown
@@ -833,11 +957,22 @@ internal class BbcActivationConsentHolder(
      *  2. UI-intent outcome: a stale sequence still gets no grant and no
      *     callback; it must never advance the applied-intent fence either.
      *
+     * A NO-COMMIT reply (`touchedGeneration <= 0`, outcome not Confirmed) is
+     * NEITHER concern: no commit entered, so there is no pollution evidence and
+     * no reason to claim Unknown. It only invalidates the pending UI handoff and
+     * resolves the intent sequence; state, fence generation and fence session
+     * are left exactly as they were (an existing stronger fence is preserved).
+     * This keeps stamped authoritative resyncs from failing closed forever on
+     * a sessionless fence installed by a failed grant that never wrote anything.
+     *
      * @param consumerOwnsEnable when true (the app coordinator consumer), a
      *   Confirmed grant consumes the pending UI handoff and records that the
      *   effect enable is driven by the consumer, BEFORE Granted is published.
      *   Direct holder callers keep the legacy exactly-once UI handoff.
      * @return false for an older/already-applied intent; its callback is stale.
+     *   A fresh no-commit outcome returns true so the caller receives an honest
+     *   Unknown result (never a grant), without any holder mutation beyond the
+     *   intent sequence and pending-handoff invalidation.
      */
     @Synchronized
     fun markConsentWriteOutcome(
@@ -845,6 +980,7 @@ internal class BbcActivationConsentHolder(
         intentSequence: Long,
         touchedGeneration: Long,
         consumerOwnsEnable: Boolean = false,
+        session: BbcConsentSessionIdentity? = null,
     ): Boolean {
         // A skipped/superseded write NEVER entered a store commit: no pollution
         // evidence, no fence, no state claim and no enable ownership. Reporting
@@ -854,6 +990,25 @@ internal class BbcActivationConsentHolder(
         val stale = intentSequence <= cur.appliedIntentSequence
         val grants = !stale && outcome is BbcWriteOutcome.Confirmed &&
             touchedGeneration == cur.generation
+
+        // A NO-COMMIT reply (GalaxyApp's 0L sentinel) means NO edit()/commit()
+        // entered: there is no optimistic local mMap to fence. Letting it fall
+        // through to the Unknown transition below would install a SESSIONLESS
+        // fence (touchedGeneration <= 0 keeps fenceGeneration/fenceSession at
+        // their prior values) that EVERY stamped production read fails closed
+        // against — permanently, across rebinds, even with durable optin=true.
+        // Instead: invalidate the pending UI handoff so a failed grant cannot
+        // drive phase2, resolve the intent in the sequence domain, and leave
+        // the state AND any existing (stronger) fence completely untouched.
+        // A fresh no-commit outcome is still reported to its caller (an honest
+        // Unknown callback, never a grant); a stale one gets no callback.
+        if (touchedGeneration <= 0L && outcome !is BbcWriteOutcome.Confirmed) {
+            val pending = pendingEnable
+            if (pending != null && pending.sequence <= intentSequence) pendingEnable = null
+            if (stale) return false
+            fenced.set(cur.copy(appliedIntentSequence = intentSequence))
+            return true
+        }
         // Only a Confirmed grant on the CURRENT generation keeps the enable
         // intent alive for the UI handoff/replay. Unknown, a stale intent, or a
         // reply from a dead service drops it — that is OFF-wins / fail-closed.
@@ -880,6 +1035,7 @@ internal class BbcActivationConsentHolder(
                     Fenced(
                         evidenceState, cur.generation, cur.appliedIntentSequence,
                         fence, cur.classificationConfirmedGeneration,
+                        fenceSessionFor(cur, touchedGeneration, session),
                     ),
                 )
                 if (evidenceState !== cur.state) _state.value = evidenceState
@@ -890,6 +1046,7 @@ internal class BbcActivationConsentHolder(
         if (stale) return false
         val next = if (grants) BbcActivationConsentState.Granted else BbcActivationConsentState.Unknown
         val fenceGeneration = if (grants) -1L else fenceForTouchedGeneration(cur, touchedGeneration)
+        val fenceSession = if (grants) null else fenceSessionFor(cur, touchedGeneration, session)
         if (grants) confirmedGrantSequence = intentSequence
         if (grants && consumerOwnsEnable) {
             // Record app-consumer ownership before publishing Granted: a rebuilt
@@ -903,7 +1060,7 @@ internal class BbcActivationConsentHolder(
         fenced.set(
             Fenced(
                 next, cur.generation, intentSequence, fenceGeneration,
-                cur.classificationConfirmedGeneration,
+                cur.classificationConfirmedGeneration, fenceSession,
             ),
         )
         _state.value = next
@@ -929,6 +1086,21 @@ internal class BbcActivationConsentHolder(
     }
 
     /**
+     * R5-03: the fence's SESSION identity moves with the (monotonic) fence
+     * generation. A no-commit reply or a reply from a DEAD generation must keep
+     * the identity of the instance that actually owns the fence.
+     */
+    private fun fenceSessionFor(
+        cur: Fenced,
+        touchedGeneration: Long,
+        session: BbcConsentSessionIdentity?,
+    ): BbcConsentSessionIdentity? {
+        if (touchedGeneration <= 0L || session == null) return cur.fenceSession
+        if (cur.fenceSession != null && cur.fenceGeneration > touchedGeneration) return cur.fenceSession
+        return session
+    }
+
+    /**
      * Cancel / OFF / dialog-show-failure: invalidate one intent with ZERO
      * writes and no state claim. A late commit result for that sequence (or any
      * older one) is dropped; newer intents still advance normally.
@@ -950,7 +1122,7 @@ internal class BbcActivationConsentHolder(
         fenced.set(
             Fenced(
                 cur.state, cur.generation, intentSequence, cur.fenceGeneration,
-                cur.classificationConfirmedGeneration,
+                cur.classificationConfirmedGeneration, cur.fenceSession,
             ),
         )
     }

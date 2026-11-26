@@ -13,6 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -129,34 +130,47 @@ class GalaxyAppTest {
     }
 
     @Test
-    fun consentWriteBindSnapshot_isPublishedAtomicallyAndInvalidatedOnDeath() {
-        // Phase 2 B3: the generation-aware consent commit must not re-sample
-        // serviceRef at execution time. Its (generation, service, provider)
-        // snapshot is published at bind entry and cleared on the owning death.
+    fun bbcIoSession_isPublishedAtomicallyAndInvalidatedOnDeath() {
+        // R5-03: the (generation, service, prefs) session is published atomically
+        // at bind entry and invalidated on death ONLY for the owning identity.
+        // A generation number alone is not an I/O identity.
         fun snapshot(): Any? = (GalaxyApp::class.java
-            .getDeclaredField("bbcConsentWriteAttempt").apply { isAccessible = true }
+            .getDeclaredField("bbcIoSession").apply { isAccessible = true }
             .get(app) as java.util.concurrent.atomic.AtomicReference<*>).get()
+
+        fun generationOf(session: Any): Long {
+            val f = session.javaClass.getDeclaredField("generation").apply { isAccessible = true }
+            return f.get(session) as Long
+        }
+        fun serviceOf(session: Any): Any? {
+            val f = session.javaClass.getDeclaredField("service").apply { isAccessible = true }
+            return f.get(session)
+        }
 
         val service1 = createFakeXposedService()
         val service2 = createFakeXposedService()
-        assertNull("no snapshot before bind", snapshot())
+        assertNull("no session before bind", snapshot())
 
         app.onServiceBind(service1)
         val first = snapshot()
-        assertNotNull("bind must publish the consent-write snapshot", first)
+        assertNotNull("bind must publish the I/O session", first)
+        assertEquals(1L, generationOf(first!!))
+        assertSame("the session captures the actual bound service", service1, serviceOf(first))
         assertEquals(1L, app.bbcActivationConsentHolder.currentGeneration())
 
         app.onServiceBind(service2) // rebind without a death callback
         val second = snapshot()
         assertNotNull(second)
-        assertNotSame("a new bind must replace the snapshot atomically", first, second)
+        assertNotSame("a new bind must replace the session atomically", first, second)
+        assertEquals(2L, generationOf(second!!))
+        assertSame("the new session captures the new service", service2, serviceOf(second))
         assertEquals(2L, app.bbcActivationConsentHolder.currentGeneration())
 
-        app.onServiceDied(service1) // stale death must not clobber the new snapshot
-        assertNotNull("stale death must keep service2's snapshot", snapshot())
+        app.onServiceDied(service1) // stale death must not clobber service2's session
+        assertSame("stale death must keep service2's session", second, snapshot())
 
         app.onServiceDied(service2)
-        assertNull("the owning death must invalidate the snapshot", snapshot())
+        assertNull("the owning death must invalidate the session", snapshot())
     }
 
     @Test
@@ -267,11 +281,88 @@ class GalaxyAppTest {
         ) = Unit
     }
 
+    /**
+     * R5-03: a fake with SEPARATE optimistic-local and durable-daemon maps. A
+     * failed commit pollutes only [local]; a genuinely fresh service instance
+     * rebuilds local from [durable] only. [commits] records the keys of every
+     * accepted editor commit so a test can prove no runtime enable ran.
+     */
+    private class DualPrefs(initial: Map<String, Any> = emptyMap()) : SharedPreferences {
+        val local = LinkedHashMap<String, Any>(initial)
+        val durable = LinkedHashMap<String, Any>(initial)
+        var commitOk = true
+        /** Throw AFTER the optimistic local write, before the durable daemon write. */
+        var throwCancellationOnCommit = false
+        val commits = Collections.synchronizedList(mutableListOf<Set<String>>())
+
+        override fun getAll(): MutableMap<String, *> = LinkedHashMap(local)
+        override fun getString(key: String?, defValue: String?): String? =
+            local[key] as? String ?: defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? =
+            (local[key] as? Set<*>)?.mapNotNull { it as? String }?.toMutableSet() ?: defValues
+        override fun getInt(key: String?, defValue: Int): Int = local[key] as? Int ?: defValue
+        override fun getLong(key: String?, defValue: Long): Long = local[key] as? Long ?: defValue
+        override fun getFloat(key: String?, defValue: Float): Float = local[key] as? Float ?: defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean =
+            local[key] as? Boolean ?: defValue
+        override fun contains(key: String?): Boolean = local.containsKey(key)
+        override fun edit(): SharedPreferences.Editor = object : SharedPreferences.Editor {
+            private val pending = LinkedHashMap<String, Any>()
+            private fun put(key: String?, value: Any?): SharedPreferences.Editor {
+                if (key != null && value != null) pending[key] = value
+                return this
+            }
+            override fun putString(key: String?, value: String?) = put(key, value)
+            override fun putStringSet(key: String?, values: MutableSet<String>?) =
+                put(key, values?.toSet())
+            override fun putInt(key: String?, value: Int) = put(key, value)
+            override fun putLong(key: String?, value: Long) = put(key, value)
+            override fun putFloat(key: String?, value: Float) = put(key, value)
+            override fun putBoolean(key: String?, value: Boolean) = put(key, value)
+            override fun remove(key: String?): SharedPreferences.Editor {
+                pending.remove(key); return this
+            }
+            override fun clear(): SharedPreferences.Editor { pending.clear(); return this }
+            override fun commit(): Boolean {
+                commits.add(pending.keys.toSet())
+                local.putAll(pending) // optimistic local write happens either way
+                if (throwCancellationOnCommit) throw CancellationException("interrupted mid-commit")
+                if (!commitOk) return false
+                durable.putAll(pending)
+                return true
+            }
+            override fun apply() { local.putAll(pending); durable.putAll(pending) }
+        }
+        override fun registerOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+        override fun unregisterOnSharedPreferenceChangeListener(
+            listener: SharedPreferences.OnSharedPreferenceChangeListener?,
+        ) = Unit
+    }
+
     private fun generationCounter(): AtomicLong {
         val field = GalaxyApp::class.java.getDeclaredField("bbcConsentServiceGeneration")
         field.isAccessible = true
         return field.get(app) as AtomicLong
     }
+
+    /** R5-03: the current session, read reflectively for identity assertions. */
+    private fun currentSession(): Any? = (GalaxyApp::class.java
+        .getDeclaredField("bbcIoSession").apply { isAccessible = true }
+        .get(app) as java.util.concurrent.atomic.AtomicReference<*>).get()
+
+    private fun sessionGeneration(session: Any): Long =
+        (session.javaClass.getDeclaredField("generation").apply { isAccessible = true }
+            .get(session) as Long)
+
+    private fun sessionService(session: Any): Any? =
+        session.javaClass.getDeclaredField("service").apply { isAccessible = true }
+            .get(session)
+
+    private fun sessionPrefs(session: Any): Any? =
+        session.javaClass.getDeclaredField("prefs").apply { isAccessible = true }
+            .get(session)
 
     private fun invokeConsentWrite(capturedGeneration: Long): BbcConsentWriteResult {
         val method = GalaxyApp::class.java.getDeclaredMethod(
@@ -461,12 +552,26 @@ class GalaxyAppTest {
         clearPendingBbcClassification()
         resetRemotePoisonForTests()
 
+        // A SAME-GENERATION fence requires a commit that ACTUALLY ENTERED:
+        // resolve a prefs instance whose durable commit fails (and pollutes its
+        // optimistic local map). A null provider is a NO-COMMIT failure and must
+        // NOT fence at all — that case is covered by
+        // noCommitBindFailure_installsNoPermanentFence_nextCleanBindGrantsAndEnablesOnce.
+        val failingPrefs = MemPrefs(emptyMap()).apply {
+            commitSucceeds = false
+            flushOnFailedCommit = true
+        }
+        app.bbcClassificationPrefsProvider = { failingPrefs }
         val service1 = createFakeXposedService()
         try {
             app.onServiceBind(service1)
             val counter = generationCounter()
             assertEquals(1L, counter.get())
             assertEquals(1L, app.bbcActivationConsentHolder.currentGeneration())
+            val session = currentSession()
+            assertNotNull("bind must publish a session", session)
+            assertEquals(1L, sessionGeneration(session!!))
+            assertSame(service1, sessionService(session))
             assertTrue("the first bind's classification attempt must be queued",
                 dispatcher.hasQueued())
 
@@ -491,6 +596,7 @@ class GalaxyAppTest {
         } finally {
             scope.cancel()
             scopeField.set(app, previousScope)
+            app.bbcClassificationPrefsProvider = { null }
             clearPendingBbcClassification()
             resetRemotePoisonForTests()
         }
@@ -630,11 +736,20 @@ class GalaxyAppTest {
         try {
             app.onServiceBind(service1) // step 1: gen1, A queued
             assertEquals(1L, generationCounter().get())
+            val sessionA = currentSession()
+            assertNotNull("gen1 must publish a session", sessionA)
+            assertEquals(1L, sessionGeneration(sessionA!!))
+            assertSame(service1, sessionService(sessionA))
             attemptAThread.start()
             check(attemptAParked.await(10, TimeUnit.SECONDS)) { "attempt A did not resolve prefs1" }
 
             app.onServiceBind(service2) // step 2: rebind, NO death callback
             assertEquals(2L, holder.currentGeneration())
+            val sessionB = currentSession()
+            assertNotNull("gen2 must publish a new session", sessionB)
+            assertNotSame(sessionA, sessionB)
+            assertEquals(2L, sessionGeneration(sessionB!!))
+            assertSame(service2, sessionService(sessionB))
             dispatcher.drainQueued() // B completes on the test thread
             assertTrue("the new bind must confirm classification for gen2",
                 holder.isInstallClassificationConfirmed(2L))
@@ -642,6 +757,8 @@ class GalaxyAppTest {
             releaseAttemptA.countDown() // step 3: A resumes holding prefs1
             attemptAThread.join(10_000)
             check(!attemptAThread.isAlive) { "attempt A never finished" }
+            assertSame("the stale session resolved prefs from the CAPTURED service",
+                prefs1, sessionPrefs(sessionA))
 
             // step 5: B's authoritative durable resync from prefs2.
             holder.resolve(
@@ -726,6 +843,10 @@ class GalaxyAppTest {
         try {
             app.onServiceBind(service1) // gen1, A queued
             assertEquals(1L, generationCounter().get())
+            val sessionA = currentSession()
+            assertNotNull(sessionA)
+            assertEquals(1L, sessionGeneration(sessionA!!))
+            assertSame(service1, sessionService(sessionA))
             attemptAThread.start()
             check(commitEntered.await(10, TimeUnit.SECONDS)) {
                 "attempt A never reached its blocking commit"
@@ -736,6 +857,11 @@ class GalaxyAppTest {
             // attempt-current guard can stop its outcome from touching gen2.
             app.onServiceBind(service2) // NO death callback; B queued
             assertEquals(2L, holder.currentGeneration())
+            val sessionB = currentSession()
+            assertNotNull(sessionB)
+            assertNotSame(sessionA, sessionB)
+            assertEquals(2L, sessionGeneration(sessionB!!))
+            assertSame(service2, sessionService(sessionB))
 
             releaseCommit.countDown()
             attemptAThread.join(10_000)
@@ -976,4 +1102,514 @@ class GalaxyAppTest {
             resetRemotePoisonForTests()
         }
     }
+
+    // --- R5-03: session identity is not just a generation number ---------------
+
+    /**
+     * R5-03 (P1): a failed grant pollutes the optimistic local map of prefs P.
+     * A repeated bind of the SAME prefs instance at a higher generation must NOT
+     * let a forced-classification-success + resync read that polluted map as
+     * fresh evidence: no Granted, no auto-enable, Unknown fence holds. Only a
+     * genuinely FRESH prefs instance with a durable grant may clear it.
+     */
+    @Test
+    fun samePrefsIdentityHigherGeneration_cannotClearPollutionFence_freshPrefsCan() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+
+        val scheduler = TestCoroutineScheduler()
+        val coordinatorDispatcher = StandardTestDispatcher(scheduler)
+        val coordinatorScope = CoroutineScope(SupervisorJob() + coordinatorDispatcher)
+        // The REAL GalaxyApp seams (including the session-aware consent read),
+        // only the dispatcher is virtual so ordering is deterministic.
+        val coordinator = app.buildBbcToggleCoordinator(coordinatorScope, coordinatorDispatcher)
+        val coordinatorField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcToggleCoordinator") }
+        coordinatorField.isAccessible = true
+        val previousCoordinator = coordinatorField.get(app)
+        coordinatorField.set(app, lazy { coordinator })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val optinKey = PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN
+        val classKey = PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION
+        val runtimeKey = PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED
+        val pendingKey = BBC_ENABLE_PENDING_PREF_KEY
+        val newGeneration = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED
+
+        val polluted = DualPrefs()
+        polluted.commitOk = false // grant commit fails; optimistic local is polluted
+        var currentPrefs: SharedPreferences = polluted
+        app.bbcClassificationPrefsProvider = { currentPrefs }
+        val holder = app.bbcActivationConsentHolder
+        val service1 = createFakeXposedService()
+        val service2 = createFakeXposedService()
+        val service3 = createFakeXposedService()
+        try {
+            // gen1: bind classification fails and installs an Unknown fence whose
+            // identity is the exact prefs instance actually touched.
+            app.onServiceBind(service1)
+            assertEquals(1L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+            val fenceSession = holder.currentFenceSession()
+            assertNotNull("a failed bind must record the touched session", fenceSession)
+            assertSame("the fence is attributed to the polluted prefs instance",
+                polluted, (fenceSession as BbcConsentSessionIdentity).prefsIdentity)
+
+            // A failed consent grant pollutes local optin=true + marker=true;
+            // the daemon persisted nothing.
+            val seq = holder.startConsentIntent()
+            holder.notePendingEnable(seq, 1L)
+            coordinator.submitConsentWrite(seq, 1L, onResult = {})
+            scheduler.advanceUntilIdle()
+            assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+            assertEquals(true, polluted.local[optinKey])
+            assertFalse("no durable opt-in was persisted by the failed grant",
+                polluted.durable.containsKey(optinKey))
+
+            // gen2: SAME prefs identity, higher generation. The forced
+            // classification commit now succeeds (classification + marker ONLY).
+            polluted.commitOk = true
+            polluted.commits.clear()
+            app.onServiceBind(service2)
+            assertEquals(2L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            scheduler.advanceUntilIdle()
+            assertTrue("classification is confirmed for gen2",
+                holder.isInstallClassificationConfirmed(2L))
+            assertEquals("a same-prefs higher generation must NOT clear the fence",
+                BbcActivationConsentState.Unknown, holder.currentState())
+            assertFalse("no Granted from an optimistic local map",
+                holder.currentState() is BbcActivationConsentState.Granted)
+            assertFalse("forced classification must not write the consent key",
+                polluted.commits.any { optinKey in it })
+            assertFalse("no auto-enable may be driven from the polluted instance",
+                polluted.commits.any { runtimeKey in it })
+
+            // gen3: a genuinely FRESH prefs instance with a durable grant.
+            val fresh = DualPrefs(
+                mapOf(
+                    optinKey to true,
+                    pendingKey to true,
+                    classKey to newGeneration,
+                    runtimeKey to false,
+                ),
+            )
+            currentPrefs = fresh
+            app.onServiceBind(service3)
+            assertEquals(3L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            scheduler.advanceUntilIdle()
+            assertEquals("a different clean prefs instance may clear the fence",
+                BbcActivationConsentState.Granted, holder.currentState())
+            assertTrue("the fresh durable grant may converge the effect enable",
+                fresh.commits.any { runtimeKey in it })
+        } finally {
+            coordinatorScope.cancel()
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            coordinatorField.set(app, previousCoordinator)
+            app.bbcClassificationPrefsProvider = { null }
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
+    }
+
+    /**
+     * R5-03 review R1: a CancellationException thrown by the consent store AFTER
+     * it polluted the optimistic local map must still stamp the pollution fence
+     * with the session identity of the commit. A dropped identity would let a
+     * rebind of the SAME prefs at a higher generation clear the fence by
+     * reading that polluted map again (generation-only rule).
+     */
+    @Test
+    fun consentCommitCancellationAfterPollution_samePrefsRebindStaysFenced_freshPrefsGrants() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+
+        val scheduler = TestCoroutineScheduler()
+        val coordinatorDispatcher = StandardTestDispatcher(scheduler)
+        val coordinatorScope = CoroutineScope(SupervisorJob() + coordinatorDispatcher)
+        val coordinator = app.buildBbcToggleCoordinator(coordinatorScope, coordinatorDispatcher)
+        val coordinatorField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcToggleCoordinator") }
+        coordinatorField.isAccessible = true
+        val previousCoordinator = coordinatorField.get(app)
+        coordinatorField.set(app, lazy { coordinator })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val optinKey = PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN
+        val classKey = PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION
+        val runtimeKey = PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED
+        val pendingKey = BBC_ENABLE_PENDING_PREF_KEY
+        val newGeneration = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED
+
+        val polluted = DualPrefs()
+        var currentPrefs: SharedPreferences = polluted
+        app.bbcClassificationPrefsProvider = { currentPrefs }
+        val holder = app.bbcActivationConsentHolder
+        val service1 = createFakeXposedService()
+        val service2 = createFakeXposedService()
+        val service3 = createFakeXposedService()
+        try {
+            app.onServiceBind(service1)
+            dispatcher.drainQueued()
+            assertEquals(1L, holder.currentGeneration())
+
+            // The store interrupts AFTER putting optin=true + marker=true into
+            // the optimistic local map; the daemon persisted nothing.
+            polluted.throwCancellationOnCommit = true
+            val seq = holder.startConsentIntent()
+            holder.notePendingEnable(seq, 1L)
+            assertEquals(
+                BbcWorkEnqueue.Accepted,
+                coordinator.submitConsentWrite(seq, 1L, onResult = {}),
+            )
+            scheduler.advanceUntilIdle()
+
+            assertEquals(true, polluted.local[optinKey])
+            assertFalse("the interrupted commit persisted no durable opt-in",
+                polluted.durable.containsKey(optinKey))
+            assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+            val fence = holder.currentFenceSession()
+            assertNotNull("the CANCELLED commit must still stamp its session", fence)
+            assertSame("the fence owns the polluted prefs instance",
+                polluted, (fence as BbcConsentSessionIdentity).prefsIdentity)
+
+            // gen2: SAME prefs instance at a higher generation. A forced
+            // classification success must not let its optimistic read clear the
+            // fence left by the interrupted commit.
+            polluted.throwCancellationOnCommit = false
+            polluted.commitOk = true
+            polluted.commits.clear()
+            app.onServiceBind(service2)
+            assertEquals(2L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            scheduler.advanceUntilIdle()
+            assertTrue("classification is confirmed for gen2",
+                holder.isInstallClassificationConfirmed(2L))
+            assertEquals("a same-prefs higher generation must stay fenced",
+                BbcActivationConsentState.Unknown, holder.currentState())
+            assertFalse("no Granted from the polluted local map",
+                holder.currentState() is BbcActivationConsentState.Granted)
+            assertFalse("no auto-enable may be driven from the polluted instance",
+                polluted.commits.any { runtimeKey in it })
+
+            // gen3: a genuinely fresh prefs instance with a durable grant.
+            val fresh = DualPrefs(
+                mapOf(
+                    optinKey to true,
+                    pendingKey to true,
+                    classKey to newGeneration,
+                    runtimeKey to false,
+                ),
+            )
+            currentPrefs = fresh
+            app.onServiceBind(service3)
+            assertEquals(3L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            scheduler.advanceUntilIdle()
+            assertEquals("a clean prefs identity may clear the fence",
+                BbcActivationConsentState.Granted, holder.currentState())
+            assertTrue("the durable grant may converge the effect enable",
+                fresh.commits.any { runtimeKey in it })
+        } finally {
+            coordinatorScope.cancel()
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            coordinatorField.set(app, previousCoordinator)
+            app.bbcClassificationPrefsProvider = { null }
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
+    }
+
+    /**
+     * R5-03 review R2: a user OFF racing a rebind must not be dropped. The first
+     * commit may land on the old prefs; on the failed post-commit currency check
+     * the OFF must be retried ONCE against the genuinely current session so its
+     * durable enable-pending marker is cleared. Otherwise a cold resync of the
+     * new prefs re-enables the effect the user just turned off.
+     */
+    @Test
+    fun userOffRebindDuringCommit_retriesOnNewSession_coldResyncStaysOff() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+
+        val scheduler = TestCoroutineScheduler()
+        val coordinatorDispatcher = StandardTestDispatcher(scheduler)
+        val coordinatorScope = CoroutineScope(SupervisorJob() + coordinatorDispatcher)
+        val coordinator = app.buildBbcToggleCoordinator(coordinatorScope, coordinatorDispatcher)
+        val coordinatorField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcToggleCoordinator") }
+        coordinatorField.isAccessible = true
+        val previousCoordinator = coordinatorField.get(app)
+        coordinatorField.set(app, lazy { coordinator })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val optinKey = PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN
+        val classKey = PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION
+        val runtimeKey = PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED
+        val pendingKey = BBC_ENABLE_PENDING_PREF_KEY
+        val durable = linkedMapOf<String, Any>(
+            optinKey to true,
+            pendingKey to true, // an enable is still owed before the OFF
+            runtimeKey to false,
+            classKey to PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
+        )
+        val prefs1 = MemPrefs(durable)
+        val prefs2 = MemPrefs(durable)
+        var currentPrefs: SharedPreferences = prefs1
+        app.bbcClassificationPrefsProvider = { currentPrefs }
+        val holder = app.bbcActivationConsentHolder
+        val service1 = createFakeXposedService()
+        val service2 = createFakeXposedService()
+        val service3 = createFakeXposedService()
+        try {
+            app.onServiceBind(service1)
+            assertEquals(1L, holder.currentGeneration())
+
+            // The rebind lands INSIDE the OFF commit, before MemPrefs applies
+            // the edit. The old session's reply is invalid; the write itself
+            // already touched prefs1.
+            prefs1.beforeCommit = {
+                currentPrefs = prefs2
+                app.onServiceBind(service2)
+            }
+            assertEquals(BbcWorkEnqueue.Accepted,
+                coordinator.submit(holder.nextIntentSequence(), false, onResult = {}))
+            scheduler.advanceUntilIdle()
+
+            assertEquals("a rebind happened during the OFF commit", 2L, holder.currentGeneration())
+            assertEquals("the new session received the OFF", false, prefs2.data[runtimeKey])
+            assertEquals("the new session must have its marker cleared by the retry",
+                false, prefs2.data[pendingKey])
+
+            // Cold resync: a brand-new prefs instance rebuilt from what the
+            // daemon actually persisted must not re-enable the effect.
+            val coldPrefs = MemPrefs(prefs2.data)
+            currentPrefs = coldPrefs
+            app.onServiceBind(service3)
+            assertEquals(3L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            scheduler.advanceUntilIdle()
+            assertEquals("cold resync must not re-enable after a durable OFF",
+                false, coldPrefs.data[runtimeKey])
+            val coldRead = remoteHookPolicyStore { coldPrefs }.readBbcConsentAuthoritative()
+            assertFalse("the durable marker stays clear across the cold start",
+                coldRead.enablePending == true)
+        } finally {
+            prefs1.beforeCommit = null
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            coordinatorField.set(app, previousCoordinator)
+            app.bbcClassificationPrefsProvider = { null }
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
+    }
+
+    /**
+     * R5 Phase 3a (BLOCKING): a no-commit bind failure must NOT install an
+     * Unknown fence. When prefs cannot be resolved (non-owner UID / transient
+     * binder throwable) NO commit ever entered, so there is no optimistic local
+     * map to fence. Installing a sessionless fence here (`fenceSession == null`)
+     * is permanent: every later stamped resync meets `fenceIsCurrent == true`
+     * and no prefs instance can clear it, so a genuinely clean bind with a
+     * durable opt-in stays Unknown forever and needs a manual re-grant.
+     *
+     * gen1: provider -> null => no commit, neutral state, no fence.
+     * gen2: a clean prefs with durable optin=true + enablePending marker must
+     *       resync to Granted and write exactly ONE effect enable.
+     */
+    @Test
+    fun noCommitBindFailure_installsNoPermanentFence_nextCleanBindGrantsAndEnablesOnce() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+
+        val scheduler = TestCoroutineScheduler()
+        val coordinatorDispatcher = StandardTestDispatcher(scheduler)
+        val coordinatorScope = CoroutineScope(SupervisorJob() + coordinatorDispatcher)
+        val coordinator = app.buildBbcToggleCoordinator(coordinatorScope, coordinatorDispatcher)
+        val coordinatorField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcToggleCoordinator") }
+        coordinatorField.isAccessible = true
+        val previousCoordinator = coordinatorField.get(app)
+        coordinatorField.set(app, lazy { coordinator })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val optinKey = PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN
+        val classKey = PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION
+        val runtimeKey = PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED
+        val pendingKey = BBC_ENABLE_PENDING_PREF_KEY
+        val newGeneration = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED
+        val holder = app.bbcActivationConsentHolder
+        val service1 = createFakeXposedService()
+        val service2 = createFakeXposedService()
+        try {
+            // gen1: no prefs instance can be resolved -> no commit at all.
+            app.bbcClassificationPrefsProvider = { null }
+            app.onServiceBind(service1)
+            assertEquals(1L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            scheduler.advanceUntilIdle()
+
+            assertFalse("a no-commit bind failure must NOT be fenced Unknown",
+                holder.currentState() is BbcActivationConsentState.Unknown)
+            assertEquals("no commit -> no fence generation sentinel",
+                -1L, holder.currentFenceGeneration())
+            assertNull("no sessionless fence may be installed without a commit",
+                holder.currentFenceSession())
+
+            // gen2: genuinely clean prefs with a durable opt-in and marker.
+            val clean = DualPrefs(
+                mapOf(
+                    optinKey to true,
+                    pendingKey to true,
+                    classKey to newGeneration,
+                    runtimeKey to false,
+                ),
+            )
+            app.bbcClassificationPrefsProvider = { clean }
+            app.onServiceBind(service2)
+            assertEquals(2L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            scheduler.advanceUntilIdle()
+
+            assertEquals("a clean authoritative resync must converge to Granted",
+                BbcActivationConsentState.Granted, holder.currentState())
+            assertNull("no stale sessionless fence may remain after a clean bind",
+                holder.currentFenceSession())
+            assertEquals("exactly one durable effect enable must be written",
+                1, clean.commits.count { runtimeKey in it })
+        } finally {
+            coordinatorScope.cancel()
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            coordinatorField.set(app, previousCoordinator)
+            app.bbcClassificationPrefsProvider = { null }
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
+    }
+
+    /**
+     * R5 Phase 3a (BLOCKING C1): a RESOLVED prefs instance whose classification
+     * planning FAILS CLOSED creates NO editor and commits NOTHING. There is no
+     * optimistic local map to fence, so treating this as a pollution failure
+     * installs a stamped Unknown fence that a later bind of the SAME cached
+     * prefs instance can never clear (only a Confirmed grant, a genuinely fresh
+     * prefs instance, or a process restart can). That is a permanent in-process
+     * lockout requiring a manual re-grant — contrary to the recovery contract.
+     *
+     * gen1: resolved prefs carrying an UNKNOWN classification value => planner
+     *       FailClosed, zero commits, holder must stay neutral/Initializing.
+     * gen2: the SAME cached instance now carries a durable opt-in + enable
+     *       marker + a valid classification => bind/resync must reach Granted
+     *       and write exactly one effect enable.
+     */
+    @Test
+    fun noCommitFailClosedClassification_installsNoFence_sameCachedPrefsNextBindGrantsOnce() {
+        val dispatcher = GateDispatcher()
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val scopeField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcClassificationScope") }
+        scopeField.isAccessible = true
+        val previousScope = scopeField.get(app)
+        scopeField.set(app, lazy { scope })
+
+        val scheduler = TestCoroutineScheduler()
+        val coordinatorDispatcher = StandardTestDispatcher(scheduler)
+        val coordinatorScope = CoroutineScope(SupervisorJob() + coordinatorDispatcher)
+        val coordinator = app.buildBbcToggleCoordinator(coordinatorScope, coordinatorDispatcher)
+        val coordinatorField = GalaxyApp::class.java.declaredFields
+            .first { it.name.startsWith("bbcToggleCoordinator") }
+        coordinatorField.isAccessible = true
+        val previousCoordinator = coordinatorField.get(app)
+        coordinatorField.set(app, lazy { coordinator })
+        clearPendingBbcClassification()
+        resetRemotePoisonForTests()
+
+        val optinKey = PolicySource.POLICY_KEY_BBC_PREACTIVATION_OPTIN
+        val classKey = PolicySource.POLICY_KEY_INSTALL_CLASSIFICATION
+        val runtimeKey = PolicySource.POLICY_KEY_BBC_INJECTION_ENABLED
+        val pendingKey = BBC_ENABLE_PENDING_PREF_KEY
+        val newGeneration = PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED
+        val holder = app.bbcActivationConsentHolder
+        val service1 = createFakeXposedService()
+        val service2 = createFakeXposedService()
+
+        // The SAME cached instance is returned by both binds. An unknown value
+        // makes planning fail closed without ever calling prefs.edit().
+        val cached = DualPrefs(mapOf(classKey to "FUTURE_SCHEMA_UNKNOWN"))
+        app.bbcClassificationPrefsProvider = { cached }
+        try {
+            app.onServiceBind(service1)
+            assertEquals(1L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            scheduler.advanceUntilIdle()
+
+            assertEquals("a fail-closed plan must create no editor/commit",
+                0, cached.commits.size)
+            assertEquals("a no-commit fail-closed bind must stay neutral",
+                BbcActivationConsentState.Initializing, holder.currentState())
+            assertEquals("no fence generation without a commit",
+                -1L, holder.currentFenceGeneration())
+            assertNull("no stamped fence without a commit", holder.currentFenceSession())
+
+            // gen2: the same cached instance now carries durable evidence. No
+            // permanent same-prefs lockout may block this authoritative resync.
+            for (map in listOf(cached.local, cached.durable)) {
+                map[classKey] = newGeneration
+                map[optinKey] = true
+                map[pendingKey] = true
+                map[runtimeKey] = false
+            }
+            app.onServiceBind(service2)
+            assertEquals(2L, holder.currentGeneration())
+            dispatcher.drainQueued()
+            scheduler.advanceUntilIdle()
+
+            assertTrue("classification must be confirmed for gen2",
+                holder.isInstallClassificationConfirmed(2L))
+            assertEquals("a resolved no-commit failure must not lock out the next bind",
+                BbcActivationConsentState.Granted, holder.currentState())
+            assertNull("no stale same-prefs fence may remain", holder.currentFenceSession())
+            assertEquals("exactly one durable effect enable must be written",
+                1, cached.commits.count { runtimeKey in it })
+        } finally {
+            coordinatorScope.cancel()
+            scope.cancel()
+            scopeField.set(app, previousScope)
+            coordinatorField.set(app, previousCoordinator)
+            app.bbcClassificationPrefsProvider = { null }
+            clearPendingBbcClassification()
+            resetRemotePoisonForTests()
+        }
+    }
+
 }

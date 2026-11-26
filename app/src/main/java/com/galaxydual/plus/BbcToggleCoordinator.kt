@@ -58,6 +58,13 @@ internal enum class BbcWorkEnqueue {
 internal data class BbcConsentWriteResult(
     val outcome: BbcWriteOutcome,
     val touchedGeneration: Long,
+    /**
+     * R5-03: identity of the session that ACTUALLY performed the commit. The
+     * holder records it on the pollution fence so a higher generation bound to
+     * the same prefs instance cannot clear the fence with optimistic-local
+     * evidence. `null` keeps legacy callers compiling (generation-only fence).
+     */
+    val sessionIdentity: BbcConsentSessionIdentity? = null,
 )
 
 /**
@@ -150,6 +157,21 @@ internal class BbcToggleCoordinator(
      * caller that forgot to wire it leaves the row neutral.
      */
     private val effectRead: suspend () -> BbcRuntimePrefValue = { BbcRuntimePrefValue.UNAVAILABLE },
+    /**
+     * R5-03: session-aware runtime commit. [session] is non-null ONLY for
+     * auto-enable work that carries the authorizing session; a rebind between
+     * authorization and the commit must never write ON to a new, unverified
+     * prefs instance. A user OFF passes null and is always written against the
+     * CURRENT session. Defaults to the legacy [commit] seam.
+     */
+    private val commitWithSession: suspend (Boolean, BbcConsentSessionIdentity?) -> BbcWriteOutcome =
+        { value, _ -> commit(value) },
+    /**
+     * R5-03: supplier for the CURRENT immutable I/O session identity. Used at
+     * execution time to reject enable work whose authorizing session was
+     * invalidated by a rebind/death. Defaults to null (legacy tests: no gating).
+     */
+    private val currentSession: () -> BbcConsentSessionIdentity? = { null },
 ) {
     /**
      * TEST-ONLY seam (mirrors GalaxyApp.bbcClassificationPrefsProvider): invoked
@@ -166,6 +188,12 @@ internal class BbcToggleCoordinator(
             val value: Boolean,
             val onResult: (BbcWriteOutcome) -> Unit,
             val onReplaced: () -> Unit,
+            /**
+             * R5-03: the session that AUTHORIZED an automatic enable. Null for
+             * direct user toggles (which always use the current session). At
+             * execution this must still be current or no ON may be written.
+             */
+            val authorizingSession: BbcConsentSessionIdentity? = null,
         ) : Work
 
         /** The opt-in grant write. Sequence/generation come from the app holder. */
@@ -174,6 +202,14 @@ internal class BbcToggleCoordinator(
             val generation: Long,
             val onResult: (BbcWriteOutcome) -> Unit,
             val onReplaced: () -> Unit,
+            /**
+             * R5-03 review R1: identity of the session captured at submit time.
+             * Every outcome path — INCLUDING the CancellationException/Throwable
+             * catches, where the store may already have polluted the local mMap —
+             * must carry it into the holder's fence. Without it a higher bind of
+             * the same prefs could clear the fence with optimistic-local evidence.
+             */
+            val session: BbcConsentSessionIdentity? = null,
         ) : Work
 
         /** Bind/resync read. Never called from an OFF toggle path. */
@@ -292,7 +328,7 @@ internal class BbcToggleCoordinator(
         // Phase-2 convergence: a fresh process / rebind with durable opt-in=true
         // but runtime=false must write the effect enable without waiting for a
         // UI callback or a state-flow replay. Claimed once per generation.
-        maybeDriveResyncEnable(generation, result.enablePending == true)
+        maybeDriveResyncEnable(generation, result.enablePending == true, result.session)
         try {
             read.onResult(result)
         } catch (_: Throwable) {
@@ -341,7 +377,19 @@ internal class BbcToggleCoordinator(
         val outcome = try {
             // A synchronous, non-cancellable commit is never abandoned
             // mid-call by UI disposal: the app scope outlives every UI.
-            withContext(io) { commit(work.value) }
+            withContext(io) {
+                val authorizer = work.authorizingSession
+                if (authorizer != null && !(authorizer isSameSession currentSession())) {
+                    // R5-03: the instance that authorized this enable is gone.
+                    // NEVER write ON to a new/unverified prefs instance: the new
+                    // generation's own resync re-verifies durable opt-in+marker
+                    // before claiming the still-owed enable. A user OFF never
+                    // carries an authorizer and is therefore never gated here.
+                    BbcWriteOutcome.Unknown
+                } else {
+                    commitWithSession(work.value, authorizer)
+                }
+            }
         } catch (ce: CancellationException) {
             // A commit seam may throw CancellationException without the APP
             // scope terminating (binder interruption / a caller's scope). Do
@@ -387,6 +435,12 @@ internal class BbcToggleCoordinator(
             }
             return
         }
+        // R5-03 review R1: the submit-time stamp is authoritative. If prefs were
+        // not resolved at submit time, take the execution-time identity ONLY when
+        // it still targets this generation — a rebind must never let the NEW
+        // session's identity be blamed for the OLD commit's pollution.
+        val attemptedSession = work.session
+            ?: currentSession()?.takeIf { it.generation == work.generation }
         val result = try {
             withContext(io) { consentCommitAt(work.generation) }
         } catch (ce: CancellationException) {
@@ -394,11 +448,11 @@ internal class BbcToggleCoordinator(
             // kill the consumer. Otherwise the interrupted commit is Unknown
             // and its instance is still fenced (fail closed).
             if (!scope.isActive) throw ce
-            BbcConsentWriteResult(BbcWriteOutcome.Unknown, work.generation)
+            BbcConsentWriteResult(BbcWriteOutcome.Unknown, work.generation, attemptedSession)
         } catch (_: Throwable) {
             // A non-cancellation throw may have polluted the local mMap: fence
             // the instance the captured intent was addressing (fail closed).
-            BbcConsentWriteResult(BbcWriteOutcome.Unknown, work.generation)
+            BbcConsentWriteResult(BbcWriteOutcome.Unknown, work.generation, attemptedSession)
         }
         // The durable fence / grant is recorded HERE, on the app IO lane, before
         // any UI callback sees the outcome. consumerOwnsEnable=true makes the
@@ -406,7 +460,7 @@ internal class BbcToggleCoordinator(
         // consumer (not an Activity callback) owns the phase-2 effect write.
         val applied = consentHolder.markConsentWriteOutcome(
             result.outcome, work.sequence, result.touchedGeneration,
-            consumerOwnsEnable = true,
+            consumerOwnsEnable = true, session = result.sessionIdentity,
         )
         if (!applied) return
         try {
@@ -417,7 +471,7 @@ internal class BbcToggleCoordinator(
         // Phase-2 enable: the SAME consumer that confirmed the opt-in key also
         // converges the runtime opt-out preference. Exactly-once and OFF-safe.
         if (result.outcome is BbcWriteOutcome.Confirmed) {
-            driveConsumerEnable(work.sequence, result.touchedGeneration)
+            driveConsumerEnable(work.sequence, result.touchedGeneration, result.sessionIdentity)
         }
     }
 
@@ -466,7 +520,11 @@ internal class BbcToggleCoordinator(
      * same-axis slot rule additionally rejects this handoff if a newer toggle
      * is already pending.
      */
-    private suspend fun driveConsumerEnable(reason: Long, generation: Long): Boolean {
+    private suspend fun driveConsumerEnable(
+        reason: Long,
+        generation: Long,
+        session: BbcConsentSessionIdentity? = null,
+    ): Boolean {
         // Mint the effect-axis sequence FIRST, before any authority check. The
         // holder sequence identifies the AUTHORISATION intent (for OFF
         // comparison) while the effect state has its own mark fence; in
@@ -486,13 +544,17 @@ internal class BbcToggleCoordinator(
         // ReplacedOlder is still a committed enable: an older pending ON was
         // explicitly superseded by this newer, same-axis handoff. Only a newer
         // intent that already owns the slot rejects the enable.
-        return when (enqueueToggle(effectSequence, true, {}, {})) {
+        return when (enqueueToggle(effectSequence, true, {}, {}, session)) {
             BbcWorkEnqueue.Accepted, BbcWorkEnqueue.ReplacedOlder -> true
             BbcWorkEnqueue.SupersededByNewer, BbcWorkEnqueue.Rejected -> false
         }
     }
 
-    private suspend fun maybeDriveResyncEnable(generation: Long, enablePending: Boolean) {
+    private suspend fun maybeDriveResyncEnable(
+        generation: Long,
+        enablePending: Boolean,
+        session: BbcConsentSessionIdentity? = null,
+    ) {
         // Mint the effect-axis sequence FIRST for the same OFF-wins reason as
         // driveConsumerEnable: an OFF recorded afterwards has a newer sequence
         // and cannot be displaced by this enable. A rejected claim simply burns
@@ -517,7 +579,7 @@ internal class BbcToggleCoordinator(
         val reason = consentHolder.confirmedGrantSequence()
         val claim = consentHolder.nextIntentSequence()
         if (!consentHolder.tryClaimResyncEnable(generation, reason, enablePending, claim)) return
-        enqueueToggle(effectSequence, true, {}, {})
+        enqueueToggle(effectSequence, true, {}, {}, session)
     }
 
     private fun enqueueToggle(
@@ -525,6 +587,7 @@ internal class BbcToggleCoordinator(
         value: Boolean,
         onResult: (BbcWriteOutcome) -> Unit,
         onReplaced: () -> Unit,
+        authorizingSession: BbcConsentSessionIdentity? = null,
     ): BbcWorkEnqueue {
         // Callbacks are invoked AFTER leaving slotLock: they are foreign code
         // and must never be able to re-enter this serializer while it holds
@@ -536,7 +599,7 @@ internal class BbcToggleCoordinator(
             if (old != null && old.sequence >= sequence) {
                 BbcWorkEnqueue.SupersededByNewer
             } else {
-                val work = Work.Toggle(sequence, value, onResult, onReplaced)
+                val work = Work.Toggle(sequence, value, onResult, onReplaced, authorizingSession)
                 pendingToggle.set(work)
                 // Accepted must mean SOMETHING WILL RUN. A closed channel or a
                 // dead consumer invalidates the promise: restore the slot and
@@ -571,7 +634,9 @@ internal class BbcToggleCoordinator(
             if (old != null && old.sequence >= sequence) {
                 BbcWorkEnqueue.SupersededByNewer
             } else {
-                val work = Work.ConsentWrite(sequence, generation, onResult, onReplaced)
+                val work = Work.ConsentWrite(
+                    sequence, generation, onResult, onReplaced, currentSession(),
+                )
                 pendingConsentWrite.set(work)
                 if (!wakeConsumer()) {
                     pendingConsentWrite.compareAndSet(work, old)

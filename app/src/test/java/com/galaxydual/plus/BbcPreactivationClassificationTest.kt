@@ -514,7 +514,9 @@ class BbcPreactivationClassificationTest {
         }
         val before = LinkedHashMap(prefs.data)
 
-        assertFalse(confirmBbcInstallClassificationDurable { prefs })
+        assertEquals("an unknown value is a no-commit fail-closed plan",
+            BbcClassificationConfirmation.NoCommitFailClosed,
+            confirmBbcInstallClassificationDurable { prefs })
         assertFalse(ensureBbcInstallClassification { prefs })
 
         assertEquals("an unknown classification value must be preserved verbatim",
@@ -522,6 +524,38 @@ class BbcPreactivationClassificationTest {
         assertEquals("no durable commit may be attempted for an unknown value",
             0, prefs.commitCalls)
         assertTrue("no key may be rewritten for an unknown value", prefs.writtenKeys.isEmpty())
+    }
+
+    @Test
+    fun noCommitFailClosedOutcomes_poisonLatchAndUnreadableValue_createNoEditor() {
+        try {
+            // The permanent process-level overflow latch forces fail closed even
+            // when the prefs would otherwise plan a classification Write.
+            remotePoison.set(PoisonState(emptyMap(), 0, overflow = true))
+            val poisoned = PersistedPrefs().apply {
+                data[packagesKey] = setOf("com.example.old")
+                data[versionKey] = 7L
+            }
+            assertEquals("poison overflow is a no-commit fail-closed plan",
+                BbcClassificationConfirmation.NoCommitFailClosed,
+                confirmBbcInstallClassificationDurable { poisoned })
+            assertEquals("no editor may be created under the overflow latch", 0, poisoned.editCalls)
+            assertEquals("no commit may be attempted under the overflow latch",
+                0, poisoned.commitCalls)
+        } finally {
+            resetRemotePoisonForTests()
+        }
+
+        // A present-but-unreadable value is never overwritten and is NOT
+        // commit pollution: no editor, no commit, value preserved verbatim.
+        val unreadable = PersistedPrefs().apply { data[classificationKey] = 42 }
+        assertEquals("unreadable classification value is no-commit fail-closed",
+            BbcClassificationConfirmation.NoCommitFailClosed,
+            confirmBbcInstallClassificationDurable { unreadable })
+        assertEquals("no editor for an unreadable value", 0, unreadable.editCalls)
+        assertEquals("no commit for an unreadable value", 0, unreadable.commitCalls)
+        assertEquals("an unreadable value must be preserved verbatim",
+            42, unreadable.data[classificationKey])
     }
 
     /**
@@ -541,7 +575,9 @@ class BbcPreactivationClassificationTest {
         val prefs = OptimisticPrefs(mapOf(packagesKey to setOf("com.example.old"), versionKey to 7L))
 
         prefs.commitSucceeds = false
-        assertFalse("gen1 bind-time commit fails", confirmBbcInstallClassificationDurable { prefs })
+        assertEquals("gen1 bind-time commit fails (pollution evidence)",
+            BbcClassificationConfirmation.CommitFailedPollution,
+            confirmBbcInstallClassificationDurable { prefs })
         assertNull("daemon persisted no classification", prefs.durable[classificationKey])
         assertNull("daemon persisted no marker", prefs.durable[markerKey])
         assertEquals(preUpgrade, prefs.local[classificationKey])
@@ -553,7 +589,9 @@ class BbcPreactivationClassificationTest {
         // the SAME prefs instance (local map still polluted).
         clearPendingBbcClassification()
         holder.onServiceGenerationChanged(2L)
-        assertFalse("retry commit still fails", confirmBbcInstallClassificationDurable { prefs })
+        assertEquals("retry commit still fails (pollution evidence)",
+            BbcClassificationConfirmation.CommitFailedPollution,
+            confirmBbcInstallClassificationDurable { prefs })
         assertNull(prefs.durable[classificationKey])
         assertNull(prefs.durable[markerKey])
         holder.markInstallClassificationFailed(2L)
@@ -577,7 +615,9 @@ class BbcPreactivationClassificationTest {
         // opens the Hook gate (on a newer service generation, so the old
         // Unknown fence no longer applies).
         prefs.commitSucceeds = true
-        assertTrue("a real commit confirms", confirmBbcInstallClassificationDurable { prefs })
+        assertEquals("a real commit confirms",
+            BbcClassificationConfirmation.Confirmed,
+            confirmBbcInstallClassificationDurable { prefs })
         assertEquals(preUpgrade, prefs.durable[classificationKey])
         assertEquals(true, prefs.durable[markerKey])
         holder.onServiceGenerationChanged(3L)

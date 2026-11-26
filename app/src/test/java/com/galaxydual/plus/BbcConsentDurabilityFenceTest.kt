@@ -8,6 +8,7 @@
 package com.galaxydual.plus
 
 import com.galaxydual.hook.PolicySource
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -19,6 +20,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -638,5 +640,292 @@ class BbcConsentDurabilityFenceTest {
         assertEquals(false, h.lastSettledChecked)
         assertEquals(BbcActivationConsentState.NotGranted, holder.currentState())
         h.dispose()
+    }
+
+    /**
+     * R5-03: a late failure from a DEAD session records pollution evidence on
+     * that session's prefs WITHOUT downgrading an already Granted/Legacy state.
+     * The evidence must survive later reads — including a same-prefs read at a
+     * higher generation — because the optimistic local map cannot clear it.
+     */
+    @Test
+    fun staleFailureEvidenceSurvivesGrantedAndSamePrefsReadCannotClearIt() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(newService().authoritativeRead(1L))
+        assertEquals(BbcActivationConsentState.NotGranted, holder.currentState())
+
+        val oldPrefs = Any()
+        val s1 = BbcConsentSessionIdentity(1L, Any(), oldPrefs)
+        holder.markConsentWriteOutcome(Unknown(), 1L, 1L, session = s1)
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+        assertSame(s1, holder.currentFenceSession())
+
+        // A Confirmed grant from a genuinely different session clears the fence.
+        holder.onServiceGenerationChanged(2L)
+        val newPrefs = Any()
+        val s2 = BbcConsentSessionIdentity(2L, Any(), newPrefs)
+        holder.markConsentWriteOutcome(Confirmed(), 2L, 2L, session = s2)
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+
+        // Late failure reply from the dead session: evidence is preserved on
+        // S1's prefs, but the confirmed grant is NOT downgraded.
+        holder.markConsentWriteOutcome(Unknown(), 2L, 1L, session = s1)
+        assertEquals("a stale failure must not downgrade a confirmed grant",
+            BbcActivationConsentState.Granted, holder.currentState())
+        assertEquals(1L, holder.currentFenceGeneration())
+        assertSame("stale evidence stays attributed to its own prefs instance",
+            s1, holder.currentFenceSession())
+
+        // A DIFFERENT-prefs read while Granted must leave the evidence intact.
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 2L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+                session = s2,
+            ),
+        )
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+        assertSame(s1, holder.currentFenceSession())
+
+        // The same-prefs rule must be exercised while the state is still UNKNOWN:
+        // resolving while already Granted returns early and proves nothing.
+        val fenced = BbcActivationConsentHolder()
+        fenced.onServiceGenerationChanged(1L)
+        val f1 = BbcConsentSessionIdentity(1L, Any(), oldPrefs)
+        fenced.markConsentWriteOutcome(Unknown(), 1L, 1L, session = f1)
+        assertEquals(BbcActivationConsentState.Unknown, fenced.currentState())
+        fenced.onServiceGenerationChanged(2L)
+        fenced.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 2L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+                session = BbcConsentSessionIdentity(2L, Any(), oldPrefs),
+            ),
+        )
+        assertEquals("a same-prefs higher-generation read must not clear the fence",
+            BbcActivationConsentState.Unknown, fenced.currentState())
+        assertSame("the evidence stays attributed to its own prefs instance",
+            f1, fenced.currentFenceSession())
+    }
+
+    /**
+     * R5-03 review R1: a stamped read must never lift an Unknown fence whose
+     * session identity was not recorded. Falling back to the generation number
+     * here re-opens the generation-only fence the session stamp was added to close.
+     */
+    @Test
+    fun stampedReadCannotClearSessionlessUnknownFence() {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        // A legacy/sessionless writer installed a generation-only fence.
+        holder.markConsentWriteOutcome(Unknown(), 1L, 1L)
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+        assertNull(holder.currentFenceSession())
+
+        holder.onServiceGenerationChanged(2L)
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 2L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+                session = BbcConsentSessionIdentity(2L, Any(), Any()),
+            ),
+        )
+        assertEquals("a stamped read cannot clear a sessionless fence by generation",
+            BbcActivationConsentState.Unknown, holder.currentState())
+        assertNull(holder.currentFenceSession())
+    }
+
+    /**
+     * R5-03 review R3: a SAME-prefs fence is deliberately permanent for resync.
+     * The only recovery is a fresh Confirmed consent write on the current
+     * generation — it clears the fence and drives exactly one app-consumer enable.
+     */
+    @Test
+    fun confirmedGrantOnCurrentGeneration_recoversFromSamePrefsFenceOnce() = runTest {
+        val holder = BbcActivationConsentHolder()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val oldPrefs = Any()
+        val s1 = BbcConsentSessionIdentity(1L, Any(), oldPrefs)
+
+        holder.onServiceGenerationChanged(1L)
+        holder.markConsentWriteOutcome(Unknown(), holder.nextIntentSequence(), 1L, session = s1)
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+        assertSame(s1, holder.currentFenceSession())
+
+        holder.onServiceGenerationChanged(2L)
+        val s2 = BbcConsentSessionIdentity(2L, s1.serviceIdentity, oldPrefs)
+        holder.resolve(
+            BbcConsentAuthoritativeRead(
+                serviceGeneration = 2L, optIn = BbcOptInValue.TRUE,
+                classification = null, migrated = null, legacyRuntimeEnabled = true,
+                session = s2,
+            ),
+        )
+        assertEquals("resync from the same prefs instance must stay fenced",
+            BbcActivationConsentState.Unknown, holder.currentState())
+        assertSame(s1, holder.currentFenceSession())
+
+        val enableWrites = mutableListOf<Boolean>()
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, io = dispatcher,
+            state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { value -> enableWrites.add(value); Confirmed() },
+            consentCommitAt = { generation -> BbcConsentWriteResult(Confirmed(), generation, s2) },
+            currentSession = { s2 },
+            consentHolder = holder,
+        )
+        val grant = holder.startConsentIntent()
+        holder.notePendingEnable(grant, 2L)
+        assertEquals(
+            BbcWorkEnqueue.Accepted,
+            coordinator.submitConsentWrite(grant, 2L, onResult = {}),
+        )
+        testScheduler.advanceUntilIdle()
+
+        assertEquals("a fresh Confirmed grant is the explicit recovery",
+            BbcActivationConsentState.Granted, holder.currentState())
+        assertNull("the recovery clears the fence", holder.currentFenceSession())
+        assertEquals(-1L, holder.currentFenceGeneration())
+        assertEquals("exactly one enable is driven by the recovery", listOf(true), enableWrites)
+        appScope.cancel()
+    }
+
+    /**
+     * R5 Phase 3a: a NO-COMMIT consent outcome (GalaxyApp's 0L sentinel) must
+     * leave the holder's state AND fence untouched. A sessionless Unknown fence
+     * would fail closed for EVERY production-stamped authoritative read, across
+     * rebinds, until a manual re-grant — even though no local mMap was polluted.
+     * This drives the FULL coordinator executeConsentWrite path with the real
+     * holder, then a stamped (forSession) durable resync.
+     */
+    @Test
+    fun noCommitConsentOutcome_neverBlocksStampedResync() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+
+        val s1 = BbcConsentSessionIdentity(1L, Any(), Any())
+        val s2 = BbcConsentSessionIdentity(2L, Any(), Any())
+        var currentSession: BbcConsentSessionIdentity = s1
+        val outcomes = mutableListOf<BbcWriteOutcome>()
+        val enableWrites = mutableListOf<Boolean>()
+
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, io = dispatcher,
+            state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { value -> enableWrites.add(value); Confirmed() },
+            consentCommitAt = { _ ->
+                // A rebind lands AFTER the coordinator's authority check but
+                // BEFORE the commit's session pre-check. performBbcConsentWrite
+                // sees a stale session and returns the NO-GENERATION sentinel:
+                // no edit()/commit() entered, so no pollution evidence exists.
+                holder.onServiceGenerationChanged(2L)
+                currentSession = s2
+                BbcConsentWriteResult(
+                    BbcWriteOutcome.Unknown,
+                    GalaxyApp.NO_CONSENT_COMMIT_GENERATION,
+                    sessionIdentity = null,
+                )
+            },
+            currentSession = { currentSession },
+            consentRead = { generation ->
+                assertEquals(2L, generation)
+                // PRODUCTION shape: stamped via BbcConsentDurableSnapshot.forSession,
+                // NOT an unstamped legacy read.
+                BbcConsentDurableSnapshot(
+                    optIn = BbcOptInValue.TRUE,
+                    classification = null,
+                    migrated = null,
+                    legacyRuntimeEnabled = true,
+                    enablePending = null,
+                ).forSession(s2)
+            },
+            consentHolder = holder,
+        )
+
+        val seq = holder.startConsentIntent()
+        holder.notePendingEnable(seq, 1L)
+        assertEquals(
+            BbcWorkEnqueue.Accepted,
+            coordinator.submitConsentWrite(seq, 1L, onResult = { outcomes.add(it) }),
+        )
+        testScheduler.advanceUntilIdle()
+
+        assertEquals(listOf(BbcWriteOutcome.Unknown), outcomes)
+        assertTrue("no commit entered -> no enable may be driven by the failed grant",
+            enableWrites.isEmpty())
+
+        // The production-stamped resync on the NEW instance must reach the
+        // durable grant. Pre-fix, the sessionless Unknown fence fails closed.
+        assertEquals(BbcWorkEnqueue.Accepted, coordinator.submitConsentRead {})
+        testScheduler.advanceUntilIdle()
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+        assertNull("a no-commit outcome must not install any fence",
+            holder.currentFenceSession())
+        assertEquals(-1L, holder.currentFenceGeneration())
+        assertTrue("the marker-less resync drives no enable either", enableWrites.isEmpty())
+        appScope.cancel()
+    }
+
+    /**
+     * R5 Phase 3a hardening: the queued-write recovery boundary with PRODUCTION-
+     * STAMPED reads (`forSession`, not the unstamped legacy shape). A genuinely
+     * failed commit stamps its fence with the session it touched; only a
+     * DIFFERENT prefs instance may clear it — a higher bind generation on the
+     * SAME optimistic map may not.
+     */
+    @Test
+    fun stampedFenceFromFailedCommit_recoversOnlyFromDifferentPrefs() = runTest {
+        val holder = BbcActivationConsentHolder()
+        holder.onServiceGenerationChanged(1L)
+        val s2 = BbcConsentSessionIdentity(2L, Any(), Any())
+        val outcomes = mutableListOf<BbcWriteOutcome>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        var readSession = s2 // same prefs, gen 2
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = BbcToggleRuntimeState(initialConfirmed = false),
+            commit = { Confirmed() }, io = dispatcher,
+            consentCommitAt = { BbcConsentWriteResult(Unknown(), 2L, s2) },
+            consentRead = { _ ->
+                BbcConsentDurableSnapshot(
+                    optIn = BbcOptInValue.TRUE,
+                    classification = null,
+                    migrated = null,
+                    legacyRuntimeEnabled = true,
+                ).forSession(readSession)
+            },
+            consentHolder = holder,
+        )
+
+        coordinator.submitConsentWrite(
+            holder.nextIntentSequence(), 1L, onResult = { outcomes.add(it) },
+        )
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(BbcWriteOutcome.Unknown), outcomes)
+        assertSame(s2, holder.currentFenceSession())
+        assertEquals(BbcActivationConsentState.Unknown, holder.currentState())
+
+        holder.onServiceGenerationChanged(2L)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("a same-prefs stamped read must not clear the fence",
+            BbcActivationConsentState.Unknown, holder.currentState())
+        assertSame(s2, holder.currentFenceSession())
+
+        holder.onServiceGenerationChanged(3L)
+        readSession = BbcConsentSessionIdentity(3L, Any(), Any()) // genuinely fresh prefs
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("a different-prefs stamped read is the recovery",
+            BbcActivationConsentState.Granted, holder.currentState())
+        assertNull(holder.currentFenceSession())
+        appScope.cancel()
     }
 }
