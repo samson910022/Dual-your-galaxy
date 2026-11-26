@@ -29,14 +29,18 @@ class GalaxyApp : Application(), XposedServiceHelper.OnServiceListener {
     // attachBaseContext(), so getSharedPreferences() here would crash on device.
     // The repair-hint marker lives in app-private prefs (NOT dual_policy remote
     // prefs) and is seeded into the coordinator at construction, so a restarted
-    // app process immediately warns again until explicit acknowledgement. Any
-    // failure to obtain the prefs degrades to in-memory-only (fail-safe: a missed
-    // warning is preferable to crashing app startup; live hint still works).
+    // app process immediately warns again until explicit acknowledgement.
+    // PR #89 Phase B (B3): failure to ACQUIRE the prefs must NOT degrade to a null
+    // store — that would make persistRepairHint early-return and silently drop the
+    // hint on every restart (fail-open). Inject the fail-closed stub instead: it
+    // warns, reports unconfirmed saves, and never touches disk. A genuinely null
+    // store remains only the explicit JVM/in-memory no-store mode.
     val policyTxCoordinator: PolicyTxCoordinator by lazy {
-        val hintStore = try {
+        // Single source of truth for the fail-closed acquisition decision
+        // (JVM-testable in RepairHintStore.kt): null/throw -> fail-closed stub,
+        // never a null store / in-memory-only coordinator.
+        val hintStore = repairHintStoreOrFailClosed {
             getSharedPreferences(REPAIR_HINT_PREFS_NAME, Context.MODE_PRIVATE).repairHintStore()
-        } catch (_: Throwable) {
-            null
         }
         PolicyTxCoordinator(repairHintStore = hintStore)
     }

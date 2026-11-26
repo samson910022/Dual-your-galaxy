@@ -79,7 +79,12 @@ internal class BbcToggleRuntimeState(
     /** Globally monotonic intent sequence for this app process (never resets on UI rebuild). */
     fun nextSequence(): Long = sequence.incrementAndGet()
 
-    /** The last sequence issued by [nextSequence]; used for cross-rebuild assertions. */
+    /**
+     * The last sequence ISSUED by [nextSequence] (0 before the first intent),
+     * not the last one applied by [mark]. The coordinator reads this before
+     * committing (#81) to drop a write whose user intent was superseded while
+     * it waited in the CONFLATED channel; [mark] separately fences the result.
+     */
     fun latestSequence(): Long = sequence.get()
 
     /**

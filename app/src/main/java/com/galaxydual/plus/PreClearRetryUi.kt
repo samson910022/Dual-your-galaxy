@@ -10,6 +10,7 @@
 // configuration that both Activities hand to the dialog.
 package com.galaxydual.plus
 
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -141,3 +142,398 @@ internal class WarningRetryOneShot {
     /** Test accessor: the generation advances once per installed warning. */
     val currentGeneration: Int get() = ref.get().generation
 }
+
+/**
+ * #77 (H02): arm the per-warning one-shot ONLY when a new warning request is
+ * actually accepted by the re-entry guard (`consentResetAllowedForNewWarning`,
+ * i.e. `!pendingClearConfirm`). The old code called [WarningRetryOneShot.onWarningInstalled]
+ * unconditionally at every `start*Warning` entry, including stale auto-restarts
+ * that the guard then rejected. Such a rejected restart burned the generation,
+ * so the live Retry tap's captured token no longer matched and its legitimate
+ * re-entry was silently dropped. Gating the re-arm on the same accept decision
+ * keeps one retry per *installed* warning without weakening the duplicate guard.
+ *
+ * Framework-free (no android.* import) so the rejected-restart contract is
+ * directly JVM-testable; both Activities call this at their accept sites.
+ */
+internal fun tryAcceptWarning(
+    oneShot: WarningRetryOneShot,
+    newWarningAllowed: Boolean,
+): Boolean {
+    if (!newWarningAllowed) return false
+    oneShot.onWarningInstalled()
+    return true
+}
+
+// ---------------------------------------------------------------------------
+// Follow-up A (PR #89): identity-bound warning restart / retry controller.
+// ---------------------------------------------------------------------------
+//
+// The old Activities kept ONE mutable `pendingWarningRestart: (() -> Unit)?`
+// slot, written at `start*Warning` ENTRY (before the re-entry guard) and read
+// later at Handler delivery and from Retry callbacks. That made a late settle
+// for an old action invoke a NEW action's callback: tap WRITE -> Unknown
+// warning (gen G) -> Retry refresh in flight -> tap CLEAR (entry overwrites the
+// slot, guard rejects) -> refresh settles Known -> the consumed token invokes
+// the CLEAR callback, i.e. a destructive clear during a write retry.
+//
+// This controller removes the slot entirely. Every live restart is a
+// [WarningRestartRequest] with a MONOTONIC id, installed ONLY at the accept
+// seam (after `tryAcceptWarning` succeeds). Installing a new request bumps the
+// token id and clears the scheduled state, so an already-posted restart token
+// from the previous action can never deliver again. Both auto restarts and
+// Retry taps are bound to the captured request id + a live host.
+//
+// IMPORTANT: [WarningRequestIdentity.generation] is the generation of the
+// WarningRetryOneShot at the moment the warning was ACCEPTED. It is NOT the
+// WarningRetryOneShot generation itself: that one advances once per installed
+// warning and guards the one retry token per warning, whereas this generation
+// is copied into the immutable request identity for correlation/diagnostics.
+// No android.* import on purpose (fully JVM-testable).
+
+/** Which destructive entry installed the request (used only for correlation). */
+internal enum class WarningRestartAction { WRITE, CLEAR, EDITOR_WRITE }
+
+internal data class WarningRequestIdentity(
+    val id: Long,
+    val action: WarningRestartAction,
+    val candidateKey: String?,
+    val generation: Int,
+)
+
+internal data class WarningRestartRequest(
+    val identity: WarningRequestIdentity,
+    val callback: () -> Unit,
+)
+
+internal class WarningRestartController {
+    private data class State(
+        val request: WarningRestartRequest? = null,
+        /** Bumped on every install/clear so an older token is stale by construction. */
+        val tokenId: Long = 0L,
+        val scheduledTokenId: Long? = null,
+        val scheduledRequestId: Long? = null,
+        val autoRestartsUsed: Int = 0,
+        val consumedRetryRequestId: Long? = null,
+    )
+
+    private val nextRequestId = AtomicLong(0L)
+    private val state = AtomicReference(State())
+
+    /** Test/telemetry accessor: the currently live request identity, if any. */
+    val currentIdentity: WarningRequestIdentity? get() = state.get().request?.identity
+
+    /** Test/telemetry accessor: the currently scheduled token, if any. */
+    val scheduledTokenId: Long? get() = state.get().scheduledTokenId
+
+    /**
+     * Install a new live request. MUST be called only at an accept seam — a
+     * request rejected by `consentResetAllowedForNewWarning` must not call
+     * this, otherwise it would steal the previous action's restart identity.
+     * Any previously queued token is invalidated (token id bumped, scheduled
+     * state cleared) and the new request gets a fresh Retry token.
+     *
+     * [resetBudget] is `true` ONLY for a genuine user entry tap. Auto-restart
+     * delivery and Retry re-entry pass `false`: they still install a NEW
+     * identity (so a settled token from the old request cannot be reused), but
+     * they CARRY OVER the consumed auto-restart budget. Without that carry-over
+     * an auto-restart would re-install with a fresh budget and defeat
+     * [MAX_AUTO_WARNING_RESTARTS], producing an unbounded re-prompt loop.
+     *
+     * FAST-PATH CALLERS: an accepted destructive action can settle with NO
+     * warning at all (a Known snapshot / empty removal set, i.e. a no-op). Such
+     * a call still goes through this seam, and `resetBudget` mirrors
+     * `fromUserTap`: `true` for a genuine tap, `false` for an auto/Retry re-entry
+     * (which carries over the consumed auto-restart budget). It passes
+     * `generation = WarningRetryOneShot.currentGeneration` for CORRELATION ONLY.
+     * This method NEVER touches [WarningRetryOneShot] (it never did): the
+     * one-shot generation advances only for warnings actually shown, via
+     * [tryAcceptWarning]. A no-warning fast path must therefore pass through
+     * here without calling [WarningRetryOneShot.onWarningInstalled].
+     *
+     * CANCELLED REQUESTS: a cancel/no-op must call [revoke] with the captured
+     * request id, NOT [clear], so a newer accepted action is never dropped.
+     */
+    fun install(
+        action: WarningRestartAction,
+        candidateKey: String?,
+        generation: Int,
+        callback: () -> Unit,
+        resetBudget: Boolean,
+    ): WarningRestartRequest {
+        val request = WarningRestartRequest(
+            identity = WarningRequestIdentity(
+                id = nextRequestId.incrementAndGet(),
+                action = action,
+                candidateKey = candidateKey,
+                generation = generation,
+            ),
+            callback = callback,
+        )
+        while (true) {
+            val current = state.get()
+            val next = State(
+                request = request,
+                tokenId = current.tokenId + 1L,
+                autoRestartsUsed = if (resetBudget) 0 else current.autoRestartsUsed,
+            )
+            if (state.compareAndSet(current, next)) return request
+        }
+    }
+
+    /**
+     * Capture the current request + a fresh token and hand an invokable body to
+     * [post]. Fails (without posting) when there is no live request, the host is
+     * dying, or this request has already used its auto-restart budget. The
+     * budget is consumed here, at schedule time, so repeated aborts for the
+     * same warning cannot loop forever; a new accepted request resets it.
+     *
+     * The posted [body] closes over the host-liveness snapshot taken here; the
+     * Activity also re-checks `isFinishing/isDestroyed` immediately before
+     * invoking it, so a host that dies in between never delivers.
+     *
+     * [expectedRequestId] is the identity whose abort/WRITE is being handled.
+     * When non-null, this method fails WITHOUT posting or consuming budget if
+     * the live request is a different one — this is what stops a stale abort
+     * (e.g. a cancelled CLEAR) from scheduling a new restart for a live WRITE.
+     * Passing `null` keeps the original behavior for pre-existing callers.
+     *
+     * COMPATIBILITY: the 3-parameter overload keeps the [post] lambda LAST, so
+     * every existing `schedule(...) { tokenId, requestId, body -> ... }` trailing
+     * lambda call still compiles unchanged. Only callers that need identity
+     * binding pass the 4th [expectedRequestId] argument.
+     */
+    fun schedule(
+        hostAlive: Boolean,
+        maxRestarts: Int,
+        post: (tokenId: Long, requestId: Long, body: () -> Unit) -> Unit,
+    ): Boolean = schedule(hostAlive, maxRestarts, post, expectedRequestId = null)
+
+    fun schedule(
+        hostAlive: Boolean,
+        maxRestarts: Int,
+        post: (tokenId: Long, requestId: Long, body: () -> Unit) -> Unit,
+        expectedRequestId: Long? = null,
+    ): Boolean {
+        if (!hostAlive || maxRestarts <= 0) return false
+        var capturedRequest: WarningRestartRequest
+        var tokenId: Long
+        while (true) {
+            val current = state.get()
+            val request = current.request ?: return false
+            // Identity-bound abort: a stale caller must not touch a newer
+            // request's token, budget or scheduled state (checked inside the
+            // CAS so a concurrent install cannot be raced past it).
+            if (expectedRequestId != null && request.identity.id != expectedRequestId) return false
+            // Same semantics as canAutoRestart(previousCount): one auto restart
+            // per accepted request; ONLY a genuine entry tap re-arms via
+            // install(resetBudget = true). Re-entry from a posted restart or a
+            // Retry tap installs with resetBudget = false and carries this count.
+            if (current.autoRestartsUsed >= maxRestarts) return false
+            tokenId = current.tokenId + 1L
+            capturedRequest = request
+            val next = current.copy(
+                tokenId = tokenId,
+                scheduledTokenId = tokenId,
+                scheduledRequestId = request.identity.id,
+                autoRestartsUsed = current.autoRestartsUsed + 1,
+            )
+            if (state.compareAndSet(current, next)) break
+        }
+        val aliveAtSchedule = hostAlive
+        post(tokenId, capturedRequest.identity.id) {
+            deliver(tokenId, capturedRequest.identity.id, aliveAtSchedule)
+        }
+        return true
+    }
+
+    /**
+     * Deliver a posted auto restart. The callback runs ONLY when the token is
+     * the currently scheduled one, the request id still matches the live
+     * request, and the host is alive. A new user tap (install) or [clear]
+     * invalidates the token, so a stale post is a silent no-op.
+     */
+    fun deliver(tokenId: Long, requestId: Long, hostAlive: Boolean): Boolean {
+        var callback: () -> Unit
+        while (true) {
+            val current = state.get()
+            val request = current.request
+            if (request == null || request.identity.id != requestId) return false
+            if (current.scheduledTokenId != tokenId || current.scheduledRequestId != requestId) return false
+            callback = request.callback
+            // Consume the token even when the host is gone: a dead-host
+            // delivery must not remain resumable by a later call.
+            val next = current.copy(scheduledTokenId = null, scheduledRequestId = null)
+            if (state.compareAndSet(current, next)) break
+        }
+        if (!hostAlive) return false
+        callback()
+        return true
+    }
+
+    /**
+     * Legacy/test accessor for the live request id. Production captures the
+     * accept-time `actionId` (threaded into install/schedule/consumeRetry and
+     * the dialog identity gates) instead; do not use this to correlate a settle.
+     */
+    fun retryRequestId(): Long? = state.get().request?.identity?.id
+
+    /** Test/telemetry accessor: the live request id, if any. */
+    fun currentRequestId(): Long? = state.get().request?.identity?.id
+
+    /** True only for a non-null id that is still the live request identity. */
+    fun isLive(requestId: Long?): Boolean {
+        if (requestId == null) return false
+        val live = state.get().request ?: return false
+        return live.identity.id == requestId
+    }
+
+    /**
+     * Identity-bound equivalent of [deliver] for Retry taps: the captured id
+     * must still be the live request, no Retry for this request may have been
+     * consumed yet, and the host must be alive. Re-installing a new warning
+     * (e.g. the accepted auto-restart) gives the next cycle a fresh id.
+     */
+    fun consumeRetry(requestId: Long, hostAlive: Boolean): Boolean {
+        if (!hostAlive) return false
+        var callback: () -> Unit
+        while (true) {
+            val current = state.get()
+            val request = current.request
+            if (request == null || request.identity.id != requestId) return false
+            if (current.consumedRetryRequestId == requestId) return false
+            callback = request.callback
+            val next = current.copy(consumedRetryRequestId = requestId)
+            if (state.compareAndSet(current, next)) break
+        }
+        callback()
+        return true
+    }
+
+    /**
+     * CANCEL / NO-OP seam: conditionally drop ONLY [requestId]'s request.
+     *
+     * Unlike [clear], this never globally drops state: a stale or null id is a
+     * no-op that returns `false` with ZERO state mutation, so a cancel arriving
+     * late can never revoke a newer accepted action. On success the request is
+     * cleared, the token id is bumped (so any already-posted restart token is
+     * stale), the scheduled token/request ids and the consumed-Retry mark are
+     * cleared. [autoRestartsUsed] is deliberately RETAINED — a cancel is not a
+     * genuine entry tap and must not hand a fresh auto-restart budget to the
+     * next action.
+     */
+    fun revoke(requestId: Long?): Boolean {
+        if (requestId == null) return false
+        while (true) {
+            val current = state.get()
+            val live = current.request ?: return false
+            if (live.identity.id != requestId) return false
+            val next = current.copy(
+                request = null,
+                tokenId = current.tokenId + 1L,
+                scheduledTokenId = null,
+                scheduledRequestId = null,
+                consumedRetryRequestId = null,
+                // autoRestartsUsed intentionally carried, NOT reset.
+            )
+            if (state.compareAndSet(current, next)) return true
+        }
+    }
+
+    /** onDestroy: drop the live request and invalidate any queued token. */
+    fun clear() {
+        while (true) {
+            val current = state.get()
+            if (state.compareAndSet(current, State(tokenId = current.tokenId + 1L))) return
+        }
+    }
+}
+
+// PR #89 Round-3 R3-1: revoke the accepted warning action ONLY when the VM
+// actually cleared the pending (QUEUED cancel) AND that action is still live.
+// A refused cancel (SAVING/RECONCILING/in-flight/stale) must keep the action.
+internal fun cancelOwnershipAccepted(vmCancelled: Boolean, actionLive: Boolean): Boolean =
+    vmCancelled && actionLive
+
+// PR #89 Round-3 R3-2: this is the SYNCHRONOUS verdict gate only — a
+// RETRYABLE_RETAINED refusal keeps the accepted action live, and a terminal
+// no-write path retires it. R4-1: ACCEPTED is NOT passed here; the Activity
+// hands that case to the VM's async outcome gate (`confirmAttemptRetiresAction`,
+// fed by `onAttemptComplete`). Keeping this gate's truth table unchanged avoids
+// an interim regression where a dispatched write had no retirement producer.
+internal fun confirmRevocationAccepted(admission: PolicyWriteConfirmAdmission): Boolean =
+    admission != PolicyWriteConfirmAdmission.RETRYABLE_RETAINED
+
+// PR #89 Round-4 R4-1: the ACTUAL async outcome of a dispatched confirm write.
+// ACCEPTED (dispatch) alone never retires an accepted warning action; only a
+// proven CONSUMED/HANDED_OFF outcome may do so, and only for the generation and
+// attempt that produced it. Framework-free and JVM-testable.
+public enum class PolicyWriteConfirmAttemptOutcome {
+    CONSUMED,           // pending settled/cleared; no retryable pending remains
+    HANDED_OFF,         // proven Tx ownership transition; cannot return to retryable QUEUED
+    RETRYABLE_RETAINED, // same expected pending still QUEUED with zero save; keep action
+    SUPERSEDED,         // a different generation now owns the pending; never retire a newer action
+}
+
+internal fun confirmAttemptMayRetire(o: PolicyWriteConfirmAttemptOutcome): Boolean =
+    o == PolicyWriteConfirmAttemptOutcome.CONSUMED ||
+    o == PolicyWriteConfirmAttemptOutcome.HANDED_OFF
+
+/**
+ * Settlement-time gate for retiring the accepted warning action after an async
+ * confirm attempt. Signature and truth semantics are unchanged from Phase 1.
+ *
+ * IMPORTANT (TOCTOU): [attemptActive] MUST be the result of the ATOMIC
+ * [PolicyWriteAttemptTracker.exit] call performed AT settlement time with the
+ * captured (generation, attemptId). A pre-check via
+ * [PolicyWriteAttemptTracker.isActive] and a later exit is a race: another
+ * settle can consume the attempt in between. Likewise [actionLive] and
+ * [hostAlive] MUST be RE-READ at settlement time, and the caller MUST hold a
+ * live action id so that a true result is applied to the very action that was
+ * checked here (not to whatever the controller happens to hold later).
+ */
+internal fun confirmAttemptRetiresAction(
+    outcome: PolicyWriteConfirmAttemptOutcome,
+    callbackGeneration: Long,
+    expectedGeneration: Long,
+    attemptActive: Boolean,
+    actionLive: Boolean,
+    hostAlive: Boolean,
+): Boolean =
+    hostAlive && actionLive && attemptActive &&
+        callbackGeneration == expectedGeneration &&
+        confirmAttemptMayRetire(outcome)
+
+// PR #89 Round-4 R4-1: tokenized per-pending attempt guard. No global
+// AtomicBoolean: a stale settle for an old attempt on the SAME retained pending
+// cannot release a newer attempt, and unrelated generations never block each
+// other. The tracker GENERATES its own monotonic attempt ids — callers cannot
+// choose or forge a token, so a stale settle cannot replay an old id.
+// Framework-free and JVM-testable.
+internal class PolicyWriteAttemptTracker {
+    private val active = java.util.concurrent.ConcurrentHashMap<Long, Long>()
+    private val nextAttemptId = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** null => duplicate attempt for this generation; caller must ignore the tap. */
+    fun tryEnter(generation: Long): Long? {
+        val id = nextAttemptId.incrementAndGet()
+        return if (active.putIfAbsent(generation, id) == null) id else null
+    }
+    /** Atomic consume: returns true ONLY if [attemptId] still owned this generation. */
+    fun exit(generation: Long, attemptId: Long): Boolean = active.remove(generation, attemptId)
+    fun isActive(generation: Long, attemptId: Long): Boolean = active[generation] == attemptId
+    fun isAnyActive(generation: Long): Boolean = active.containsKey(generation)
+    /** Lifecycle-only escape hatch (Activity onDestroy); late callbacks then no-op. */
+    fun clear() { active.clear() }
+}
+
+// PR #89 Round-3 R3-3: after rotation, an orphan QUEUED pending that was rebuilt
+// from saved state and has no live consent action must be invalidated. SAVING /
+// RECONCILING / IDLE and any live action are never invalidated here.
+// PolicyWritePhase is a framework-free enum in this same package, so this
+// predicate stays JVM-testable (no android.* dependency).
+internal fun shouldInvalidateOrphanPendingOnRebuild(
+    rebuiltFromSavedState: Boolean,
+    phase: PolicyWritePhase,
+    consentActionIdLive: Boolean,
+): Boolean = rebuiltFromSavedState && phase == PolicyWritePhase.QUEUED && !consentActionIdLive

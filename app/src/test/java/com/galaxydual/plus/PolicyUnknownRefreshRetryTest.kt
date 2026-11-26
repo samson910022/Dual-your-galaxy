@@ -336,15 +336,21 @@ class PolicyUnknownRefreshRetryTest {
         assertEquals(0, oneShot.currentGeneration)
 
         // Warning #1 installed at the entry tap and consumed by its settle.
-        oneShot.onWarningInstalled()
+        assertTrue(tryAcceptWarning(oneShot, newWarningAllowed = true))
         val t1 = oneShot.capture()
         assertEquals(1, t1.generation)
         assertFalse(t1.consumed)
         assertTrue(oneShot.tryConsume(t1))
         assertFalse(oneShot.tryConsume(t1)) // duplicate settle for warning #1
 
-        // Auto re-entry installs warning #2: generation advances and re-arms.
-        oneShot.onWarningInstalled()
+        // #77: a stale auto-restart REJECTED by the guard must not burn the
+        // generation — the old contract (call onWarningInstalled unconditionally
+        // at every start*Warning) dropped the live Retry's token here.
+        assertFalse(tryAcceptWarning(oneShot, newWarningAllowed = false))
+        assertEquals("rejected restart must not advance generation", 1, oneShot.currentGeneration)
+
+        // An ACCEPTED re-entry installs warning #2: generation advances and re-arms.
+        assertTrue(tryAcceptWarning(oneShot, newWarningAllowed = true))
         val t2 = oneShot.capture()
         assertEquals(2, oneShot.currentGeneration)
         assertTrue("new token must differ from the consumed one", t2 != t1)
@@ -371,9 +377,14 @@ class PolicyUnknownRefreshRetryTest {
         val releases = AtomicInteger(0)
         val restarts = AtomicInteger(0)
 
-        // Initial Unknown warning installed at the entry tap (generation 1).
-        oneShot.onWarningInstalled()
+        // Initial Unknown warning installed at the accepted entry tap (generation 1).
+        assertTrue(tryAcceptWarning(oneShot, newWarningAllowed = true))
         val tA = oneShot.capture()
+
+        // #77: a stale restart rejected by the guard leaves the live token alone.
+        assertFalse(tryAcceptWarning(oneShot, newWarningAllowed = false))
+        assertEquals(1, oneShot.currentGeneration)
+        assertEquals(tA, oneShot.capture())
 
         // Cycle A: store becomes Known, settle consumes tA, then the proceed's
         // pendingWarningRestart installs a NEW warning (generation 2).
@@ -386,7 +397,8 @@ class PolicyUnknownRefreshRetryTest {
                     if (oneShot.tryConsume(tA)) {
                         releases.incrementAndGet()
                         restarts.incrementAndGet()
-                        oneShot.onWarningInstalled() // pendingWarningRestart -> startWarning
+                        // accepted pendingWarningRestart -> startWarning (guard passed)
+                        assertTrue(tryAcceptWarning(oneShot, newWarningAllowed = true))
                     }
                 },
                 onCorrupt = { },
@@ -418,7 +430,8 @@ class PolicyUnknownRefreshRetryTest {
                     if (oneShot.tryConsume(tB)) {
                         releases.incrementAndGet()
                         restarts.incrementAndGet()
-                        oneShot.onWarningInstalled() // pendingWarningRestart -> startWarning
+                        // accepted pendingWarningRestart -> startWarning (guard passed)
+                        assertTrue(tryAcceptWarning(oneShot, newWarningAllowed = true))
                     }
                 },
                 onCorrupt = { },

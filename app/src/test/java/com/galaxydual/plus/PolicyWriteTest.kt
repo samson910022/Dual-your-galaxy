@@ -332,7 +332,10 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.ACCEPTED,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await { vm.state.value.pendingPolicyWrite == null }
 
         assertEquals(setOf("com.ok.app"), vm.state.value.policyDraft)
@@ -371,7 +374,10 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.TERMINAL,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(0, fake.saveCalls.get())
 
@@ -488,7 +494,7 @@ class PolicyWriteTest {
         )
         setPendingPolicyWrite(vm, pending)
 
-        vm.cancelPolicyWrite(pending)
+        assertTrue("QUEUED cancel must report actual ownership transfer", vm.cancelPolicyWrite(pending))
         assertNull(vm.state.value.pendingPolicyWrite)
 
         vm.confirmPolicyWrite(pending, pending.generation)
@@ -645,7 +651,7 @@ class PolicyWriteTest {
         assertTrue(vm.policyWriteCommitInProgress)
 
         // 5.1.1:寫入進行中取消被拒絕 (pending 保留,不產生「已取消」訊息)。
-        vm.cancelPolicyWrite(pending)
+        assertFalse("SAVING cancel must report refusal", vm.cancelPolicyWrite(pending))
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertFalse(vm.state.value.msg.contains("已取消寫入政策"))
         assertTrue(vm.state.value.loading)
@@ -848,7 +854,10 @@ class PolicyWriteTest {
         val pendingB = PendingPolicyWrite(setOf("com.example.b"), System.currentTimeMillis())
         setPendingPolicyWrite(vm, pendingB)
 
-        vm.confirmPolicyWrite(pendingA, pendingA.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pendingA, pendingA.generation),
+        )
 
         assertEquals(0, fake.saveCalls.get())
         assertEquals(pendingB, vm.state.value.pendingPolicyWrite)
@@ -868,7 +877,10 @@ class PolicyWriteTest {
         setPendingPolicyWrite(vm, pending)
 
         // 未勾選確認框：VM 不得寫入，pending 保留。
-        vm.confirmPolicyWrite(pending, null)
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pending, null),
+        )
         await(timeoutMs = 5_000L) {
             vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
         }
@@ -877,7 +889,10 @@ class PolicyWriteTest {
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
 
         // 勾選後重試（帶出勾選時綁定的世代：ack 綁定到本 pending）：正常寫入。
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.ACCEPTED,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(1, fake.saveCalls.get())
         assertEquals(setOf("com.example.a"), fake.saved)
@@ -896,7 +911,10 @@ class PolicyWriteTest {
         setPendingPolicyWrite(vm, pending)
 
         // 世代不符：不寫 store、不清 pending、POLICY_NOT_ACKNOWLEDGED。
-        vm.confirmPolicyWrite(pending, pending.generation + 1L)
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pending, pending.generation + 1L),
+        )
         await(timeoutMs = 5_000L) {
             vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
         }
@@ -905,10 +923,46 @@ class PolicyWriteTest {
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
 
         // 正確世代：正常寫入。
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.ACCEPTED,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await { vm.state.value.pendingPolicyWrite == null }
         assertEquals(1, fake.saveCalls.get())
         assertEquals(setOf("com.example.a"), fake.saved)
+    }
+
+    // PR #89 Round-3 R3-4 (Editor final confirm): the ack holder is read at
+    // CALLBACK time. A stale holder ack (acknowledged=true but bound to a
+    // different generation — e.g. withdrawn during the revalidation await)
+    // computes ackGen=null, and the VM must refuse RETRYABLE_RETAINED with ZERO
+    // store write. Mirrors MainActivity's live re-read at the confirm seam.
+    @Test
+    fun confirmPolicyWrite_staleEditorHolderAck_refusesEntirely() {
+        val fake = FakePolicyStore()
+        val vm = makeVm(fake.store, userId = 0)
+        val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+        setPendingPolicyWrite(vm, pending)
+
+        // Real holder shape: checked, but bound to a DIFFERENT generation.
+        // This is the exact state Editor reads at callback time.
+        val holder = PolicyConfirmDialogState()
+        holder.onAckChanged(true, pending.generation + 1L)
+        val ackGen = if (holder.acknowledged && holder.ackGeneration == pending.generation) {
+            pending.generation
+        } else null
+        assertNull("stale holder ack must not authorize a write", ackGen)
+
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pending, ackGen),
+        )
+        await(timeoutMs = 5_000L) {
+            vm.state.value.msg == PolicyText(PolicyTextKind.POLICY_NOT_ACKNOWLEDGED).defaultText()
+        }
+        assertEquals(0, fake.saveCalls.get())
+        assertEquals(pending, vm.state.value.pendingPolicyWrite)
+        assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
     }
 
     // 4.1 #3 無 pending：INVALID。
@@ -918,7 +972,7 @@ class PolicyWriteTest {
         val vm = makeVm(fake.store, userId = 0)
 
         val dummy = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
-        vm.confirmPolicyWrite(dummy, dummy.generation)
+        assertEquals(PolicyWriteConfirmAdmission.TERMINAL, vm.confirmPolicyWrite(dummy, dummy.generation))
 
         assertEquals("沒有待確認的政策寫入", vm.state.value.msg)
         assertEquals(MsgKind.INVALID, vm.state.value.msgKind)
@@ -1172,7 +1226,10 @@ class PolicyWriteTest {
         )
 
         // 重複維：核對中重複 confirm 不耗第二次 save。
-        vm.confirmPolicyWrite(pending, pending.generation)
+        assertEquals(
+            PolicyWriteConfirmAdmission.RETRYABLE_RETAINED,
+            vm.confirmPolicyWrite(pending, pending.generation),
+        )
         await(timeoutMs = 5_000L) { vm.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText() }
         assertEquals(PolicyText(PolicyTextKind.IN_PROGRESS).defaultText(), vm.state.value.msg)
         // IN_PROGRESS 覆寫 TIMEOUT 後，pending/相位仍保留（僅 msg 變化）。
@@ -1188,7 +1245,7 @@ class PolicyWriteTest {
         vm.clearPolicyDraft()
         assertEquals(PolicyText(PolicyTextKind.BUSY).defaultText(), vm.state.value.msg)
         val msgBeforeCancel = vm.state.value.msg
-        vm.cancelPolicyWrite(pending)
+        assertFalse("RECONCILING cancel must report refusal", vm.cancelPolicyWrite(pending))
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(msgBeforeCancel, vm.state.value.msg)
 
@@ -1451,7 +1508,10 @@ class PolicyWriteTest {
         setPendingPolicyWrite(vm, pending)
         val beforeMsg = vm.state.value.msg
 
-        vm.cancelPolicyWrite(pending.copy(generation = pending.generation + 1))
+        assertFalse(
+            "stale/mismatched expected must report refusal",
+            vm.cancelPolicyWrite(pending.copy(generation = pending.generation + 1)),
+        )
 
         assertEquals(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(beforeMsg, vm.state.value.msg)
@@ -3167,7 +3227,7 @@ class PolicyWriteTest {
         assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
         assertTrue(vm.state.value.policyEpoch > epochBefore)
 
-        vm.cancelPolicyWrite(pending!!)
+        assertTrue("QUEUED cancel must report actual clearance", vm.cancelPolicyWrite(pending!!))
 
         assertNull(vm.state.value.pendingPolicyWrite)
         assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
@@ -3205,7 +3265,7 @@ class PolicyWriteTest {
 
         // saving 中取消/Back 一律禁用：cancel 為 no-op，pending 同一實例保留。
         assertFalse(policyDialogShouldBeCancelable(policySaving = true))
-        vm.cancelPolicyWrite(pending)
+        assertFalse(vm.cancelPolicyWrite(pending))
         assertSame(pending, vm.state.value.pendingPolicyWrite)
         assertEquals(PolicyWritePhase.SAVING, vm.state.value.policyWritePhase)
 
@@ -6855,6 +6915,416 @@ class PolicyWriteTest {
                 coord.close()
             } catch (_: Exception) {
             }
+        }
+    }
+
+    // PR #89 Round-4 R4-1 (counterexample A): a BUSY/in-progress async refusal
+    // must report RETRYABLE_RETAINED exactly once and keep the accepted action
+    // live. The verdict is observed from real VM end state, not a prechosen enum.
+    @Test
+    fun confirmHeldMutexRetention_reportsRetryableRetainedExactlyOnce() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            assertTrue(coord.writeMutex.tryLock())
+            try {
+                val controller = WarningRestartController()
+                val action = controller.install(
+                    action = WarningRestartAction.WRITE,
+                    candidateKey = "com.example.a",
+                    generation = 1,
+                    callback = { },
+                    resetBudget = true,
+                )
+                val actionId = action.identity.id
+                val settlements = java.util.Collections.synchronizedList(
+                    mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+                )
+                val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+                setPendingPolicyWrite(vm, pending)
+                assertFalse(revisionStaleOf(vm))
+                val savesBefore = fake.saveCalls.get()
+
+                val admission = vm.confirmPolicyWrite(pending, pending.generation) { gen, outcome ->
+                    settlements.add(gen to outcome)
+                }
+                assertEquals(PolicyWriteConfirmAdmission.ACCEPTED, admission)
+                await { settlements.isNotEmpty() }
+                await { vm.state.value.msg == PolicyText(PolicyTextKind.IN_PROGRESS).defaultText() }
+
+                assertEquals(1, settlements.size)
+                assertEquals(pending.generation, settlements[0].first)
+                assertEquals(PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED, settlements[0].second)
+                assertEquals(pending, vm.state.value.pendingPolicyWrite)
+                assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+                assertEquals(savesBefore, fake.saveCalls.get())
+                assertNull(activeTxOf(vm))
+                assertNull(coordinatorTxOf(coord))
+
+                // Compose the observed outcome with the PRODUCTION ownership seam.
+                val tracker = PolicyWriteAttemptTracker()
+                val token = checkNotNull(tracker.tryEnter(pending.generation))
+                val retired = confirmAttemptRetiresAction(
+                    outcome = settlements[0].second,
+                    callbackGeneration = settlements[0].first,
+                    expectedGeneration = pending.generation,
+                    attemptActive = tracker.exit(pending.generation, token),
+                    actionLive = controller.isLive(actionId),
+                    hostAlive = true,
+                )
+                assertFalse("BUSY retention must NOT retire the accepted action", retired)
+                assertTrue("action must stay live for a fresh retry", controller.isLive(actionId))
+                assertEquals(actionId, controller.currentRequestId())
+            } finally {
+                try {
+                    coord.writeMutex.unlock()
+                } catch (_: Exception) {
+                }
+            }
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // R4-1: the `inFlightWrites.add` failure path is BEFORE the inner try at
+    // opMutex. It must still emit exactly one settlement from the outer finally.
+    @Test
+    fun confirmDuplicateInFlight_secondAttemptReportsRetainedOnce() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            assertTrue(coord.writeMutex.tryLock())
+            try {
+                val settlements = java.util.Collections.synchronizedList(
+                    mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+                )
+                val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+                setPendingPolicyWrite(vm, pending)
+                val savesBefore = fake.saveCalls.get()
+
+                val sink: (Long, PolicyWriteConfirmAttemptOutcome) -> Unit = { gen, outcome ->
+                    settlements.add(gen to outcome)
+                }
+                assertEquals(
+                    PolicyWriteConfirmAdmission.ACCEPTED,
+                    vm.confirmPolicyWrite(pending, pending.generation, sink),
+                )
+                assertEquals(
+                    PolicyWriteConfirmAdmission.ACCEPTED,
+                    vm.confirmPolicyWrite(pending, pending.generation, sink),
+                )
+                await { settlements.size == 2 }
+                assertTrue(
+                    "both attempts must report retained, not dispatched-success",
+                    settlements.all {
+                        it.first == pending.generation &&
+                            it.second == PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED
+                    },
+                )
+                assertEquals(pending, vm.state.value.pendingPolicyWrite)
+                assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+                assertEquals(savesBefore, fake.saveCalls.get())
+            } finally {
+                try {
+                    coord.writeMutex.unlock()
+                } catch (_: Exception) {
+                }
+            }
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // R4-1: the `pending != pendingAtCall` return@launch sits BEFORE the inner
+    // try. Pause Main so the coroutine runs only after the pending is swapped,
+    // then assert the settlement still fires exactly once (SUPERSEDED).
+    @Test
+    fun confirmPreLaunchBail_invokesCallbackOnce() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            val paused = kotlinx.coroutines.test.StandardTestDispatcher()
+            val settlements = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+            )
+            try {
+                Dispatchers.setMain(paused)
+                val a = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+                setPendingPolicyWrite(vm, a)
+                vm.confirmPolicyWrite(a, a.generation) { gen, outcome -> settlements.add(gen to outcome) }
+                val b = PendingPolicyWrite(setOf("com.example.b"), System.currentTimeMillis() + 1L)
+                setPendingPolicyWrite(vm, b)
+                assertNotEquals(a.generation, b.generation)
+                paused.scheduler.runCurrent()
+
+                assertEquals(1, settlements.size)
+                assertEquals(a.generation, settlements[0].first)
+                assertEquals(PolicyWriteConfirmAttemptOutcome.SUPERSEDED, settlements[0].second)
+                assertEquals(0, fake.saveCalls.get())
+                assertEquals(b, vm.state.value.pendingPolicyWrite)
+            } finally {
+                // Drain and cancel every queued VM job while the paused
+                // dispatcher is STILL installed. Otherwise tearDown's
+                // drainBeforeResetMain cannot converge after resetMain().
+                vm.viewModelScope.cancel()
+                val scopeJob = vm.viewModelScope.coroutineContext[kotlinx.coroutines.Job]
+                val drainDeadline = System.currentTimeMillis() + 2_000L
+                while (scopeJob != null && !scopeJob.isCompleted &&
+                    System.currentTimeMillis() < drainDeadline
+                ) {
+                    paused.scheduler.advanceUntilIdle()
+                    Thread.sleep(20L)
+                }
+                Dispatchers.resetMain()
+            }
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // R4-1: an abort that CLEARS the pending must report CONSUMED exactly once,
+    // so the caller retires the action. Uses the existing no-store fail-closed
+    // path (zero IO) to make the end state deterministic.
+    @Test
+    fun confirmNoStoreAbort_reportsConsumedOnce() {
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(null, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            val settlements = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+            )
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            setPendingPolicyWrite(vm, pending)
+
+            val admission = vm.confirmPolicyWrite(pending, pending.generation) { gen, outcome ->
+                settlements.add(gen to outcome)
+            }
+            assertEquals(PolicyWriteConfirmAdmission.ACCEPTED, admission)
+            await { settlements.isNotEmpty() }
+            assertEquals(1, settlements.size)
+            assertEquals(pending.generation, settlements[0].first)
+            assertEquals(PolicyWriteConfirmAttemptOutcome.CONSUMED, settlements[0].second)
+            assertNull(vm.state.value.pendingPolicyWrite)
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // PR #89 Round-4 R4-1 counterexample A (full lifecycle): a BUSY retention
+    // keeps the action live; releasing the mutex and retrying with FRESH
+    // validation must commit exactly once and then retire the action.
+    @Test
+    fun retryAfterBusyRetention_commitsOnceThenRetiresAction() {
+        val fake = FakePolicyStore()
+        val coord = PolicyTxCoordinator()
+        try {
+            val vm = makeVm(fake.store, userId = 0, policyIoTimeoutMs = 5_000, policyTxCoordinator = coord)
+            await { vm.state.value.policyDraftKnown }
+            val controller = WarningRestartController()
+            val hits = mutableListOf<String>()
+            val action = controller.install(
+                action = WarningRestartAction.WRITE,
+                candidateKey = "com.example.a",
+                generation = 1,
+                callback = { hits.add("write") },
+                resetBudget = true,
+            )
+            val actionId = action.identity.id
+            val tracker = PolicyWriteAttemptTracker()
+            val settlements = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+            )
+            val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
+            val savesBefore = fake.saveCalls.get()
+
+            assertTrue(coord.writeMutex.tryLock())
+            try {
+                setPendingPolicyWrite(vm, pending)
+                val token1 = checkNotNull(tracker.tryEnter(pending.generation))
+                assertEquals(
+                    PolicyWriteConfirmAdmission.ACCEPTED,
+                    vm.confirmPolicyWrite(pending, pending.generation) { g, o -> settlements.add(g to o) },
+                )
+                await { settlements.isNotEmpty() }
+                assertEquals(1, settlements.size)
+                assertEquals(PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED, settlements[0].second)
+                val retire1 = confirmAttemptRetiresAction(
+                    outcome = settlements[0].second,
+                    callbackGeneration = settlements[0].first,
+                    expectedGeneration = pending.generation,
+                    attemptActive = tracker.exit(pending.generation, token1),
+                    actionLive = controller.isLive(actionId),
+                    hostAlive = true,
+                )
+                assertFalse("BUSY retryable retention must NOT retire", retire1)
+                assertTrue("action must survive a BUSY retention", controller.isLive(actionId))
+            } finally {
+                try {
+                    coord.writeMutex.unlock()
+                } catch (_: Exception) {
+                }
+            }
+
+            // Fresh retry: the VM re-runs all pre-read / consent / revision gates.
+            assertTrue("retry requires a live action", controller.isLive(actionId))
+            val token2 = checkNotNull(tracker.tryEnter(pending.generation))
+            assertEquals(
+                PolicyWriteConfirmAdmission.ACCEPTED,
+                vm.confirmPolicyWrite(pending, pending.generation) { g, o -> settlements.add(g to o) },
+            )
+            await { vm.state.value.pendingPolicyWrite == null && fake.saveCalls.get() == savesBefore + 1 }
+            assertEquals(2, settlements.size)
+            assertEquals(PolicyWriteConfirmAttemptOutcome.CONSUMED, settlements[1].second)
+            val retire2 = confirmAttemptRetiresAction(
+                outcome = settlements[1].second,
+                callbackGeneration = settlements[1].first,
+                expectedGeneration = pending.generation,
+                attemptActive = tracker.exit(pending.generation, token2),
+                actionLive = controller.isLive(actionId),
+                hostAlive = true,
+            )
+            assertTrue("CONSUMED must retire", retire2)
+            if (retire2) assertTrue(controller.revoke(actionId))
+            assertFalse("action dead after commit", controller.isLive(actionId))
+            assertEquals(setOf("com.example.a"), fake.saved)
+            assertEquals(PolicyWritePhase.IDLE, vm.state.value.policyWritePhase)
+            assertFalse(vm.state.value.loading)
+            assertNull(activeTxOf(vm))
+            assertNull(coordinatorTxOf(coord))
+            assertTrue(inFlightKeysOf(vm).isEmpty())
+            assertTrue(savingKeysOf(vm).isEmpty())
+            assertTrue(reconcilingKeysOf(vm).isEmpty())
+            assertTrue("revoke alone must not fire the restart callback", hits.isEmpty())
+
+            // A stale replay of the FIRST (retained) settlement cannot retire
+            // a NEWER action installed for a subsequent pending.
+            val newer = controller.install(
+                action = WarningRestartAction.WRITE,
+                candidateKey = "com.example.b",
+                generation = 2,
+                callback = { hits.add("write:newer") },
+                resetBudget = true,
+            )
+            val staleRetires = confirmAttemptRetiresAction(
+                outcome = settlements[0].second,
+                callbackGeneration = settlements[0].first,
+                expectedGeneration = pending.generation + 9L,
+                attemptActive = true,
+                actionLive = controller.isLive(newer.identity.id),
+                hostAlive = true,
+            )
+            assertFalse("stale settlement must not retire a newer action", staleRetires)
+            assertTrue(controller.isLive(newer.identity.id))
+        } finally {
+            try {
+                coord.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // PR #89 Round-4 R4-1 counterexample B: a second Positive while the first
+    // attempt is queued behind a slow unrelated op must be IGNORED, not mapped
+    // to cancelPolicyWrite, and must not start a second write.
+    @Test
+    fun duplicatePositiveInQueuedWindow_doesNotCancelOrDoubleWrite() {
+        val fake = FakePolicyStore()
+        val blockerEntered = java.util.concurrent.CountDownLatch(1)
+        val blockerRelease = java.util.concurrent.atomic.AtomicBoolean(false)
+        val blockingSelectionStore = SelectionStore(
+            loadRaw = { null },
+            saveRaw = { _ ->
+                blockerEntered.countDown()
+                while (!blockerRelease.get()) {
+                    try {
+                        Thread.sleep(10)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+                true
+            },
+        )
+        try {
+            val vm = makeVm(fake.store, userId = 0, selectionStore = blockingSelectionStore)
+            seedSelection(vm)
+            vm.requestPolicyWrite()
+            val pending = checkNotNull(vm.state.value.pendingPolicyWrite)
+            val controller = WarningRestartController()
+            val action = controller.install(
+                action = WarningRestartAction.WRITE,
+                candidateKey = "com.example.a",
+                generation = 1,
+                callback = { },
+                resetBudget = true,
+            )
+            val actionId = action.identity.id
+            val tracker = PolicyWriteAttemptTracker()
+            val settlements = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<Long, PolicyWriteConfirmAttemptOutcome>>(),
+            )
+            val savesBefore = fake.saveCalls.get()
+            vm.cancelSavedSelection()
+            assertTrue(blockerEntered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            try {
+                val loadsBefore = fake.loadCalls.get()
+
+                // First Positive: guard entered, VM attempt dispatched/queued.
+                val token = checkNotNull(tracker.tryEnter(pending.generation))
+                assertEquals(
+                    PolicyWriteConfirmAdmission.ACCEPTED,
+                    vm.confirmPolicyWrite(pending, pending.generation) { g, o -> settlements.add(g to o) },
+                )
+                await { vm.policyOperationInProgress }
+                assertEquals(PolicyWritePhase.QUEUED, vm.state.value.policyWritePhase)
+                assertTrue("dispatch alone must not retire", controller.isLive(actionId))
+                assertTrue("no settlement before claim", settlements.isEmpty())
+
+                // Second Positive: production click peek sees the live attempt
+                // and returns without calling confirm OR cancel.
+                assertTrue("second Positive must be ignored", tracker.isAnyActive(pending.generation))
+                assertEquals(pending, vm.state.value.pendingPolicyWrite)
+                assertEquals(savesBefore, fake.saveCalls.get())
+                assertEquals(loadsBefore, fake.loadCalls.get())
+                assertTrue(controller.isLive(actionId))
+
+                // Explicit Negative in the SAME window must still cancel.
+                val cancelled = vm.cancelPolicyWrite(pending)
+                assertTrue(cancelled)
+                val owned = cancelOwnershipAccepted(cancelled, controller.isLive(actionId))
+                assertTrue(owned)
+                if (owned) assertTrue(controller.revoke(actionId))
+                assertNull(vm.state.value.pendingPolicyWrite)
+                assertFalse(controller.isLive(actionId))
+                assertEquals(savesBefore, fake.saveCalls.get())
+
+                // A stale token cannot release the newer action's guard.
+                assertFalse(tracker.exit(pending.generation, token + 7L))
+            } finally {
+                blockerRelease.set(true)
+            }
+            await { !vm.policyOperationInProgress }
+            assertEquals(savesBefore, fake.saveCalls.get())
+            assertEquals(setOf("com.seed"), fake.saved)
+            assertNull(vm.state.value.pendingPolicyWrite)
+        } finally {
+            blockerRelease.set(true)
         }
     }
 
@@ -11170,7 +11640,10 @@ class PolicyWriteTest {
             // stale 生效：後續 confirm 被強制重讀擋住（UNKNOWN_REFRESH、零寫入）。
             val pending = PendingPolicyWrite(setOf("com.example.a"), System.currentTimeMillis())
             setPendingPolicyWrite(vm, pending)
-            vm.confirmPolicyWrite(pending, pending.generation)
+            assertEquals(
+                PolicyWriteConfirmAdmission.TERMINAL,
+                vm.confirmPolicyWrite(pending, pending.generation),
+            )
             await { vm.state.value.pendingPolicyWrite == null }
             assertEquals(PolicyText(PolicyTextKind.UNKNOWN_REFRESH).defaultText(), vm.state.value.msg)
             assertEquals(0, fake.saveCalls.get())

@@ -34,10 +34,14 @@ class BatchConfirmDialogTest {
 
     private fun setRiskAckTrue() {
         riskPrefs().edit().putBoolean(RISK_ACK_KEY, true).commit()
+        // D1: 直接改 prefs 不會經過 riskAckStore() 的 latched seed；同步 owner，
+        // 讓 gate 讀到的狀態與剛寫入的 durable 值一致。
+        ProcessRiskAckState.reseedForTests(true)
     }
 
     private fun clearRiskAck() {
         riskPrefs().edit().clear().commit()
+        ProcessRiskAckState.reseedForTests(false)
     }
 
     private fun checkbox(view: View): CheckBox? {

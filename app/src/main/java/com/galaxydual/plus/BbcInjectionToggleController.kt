@@ -7,7 +7,7 @@
 // the serializer to the app-scoped [BbcToggleCoordinator]: the sequence is
 // assigned at user-intent time from the shared state, and the single global
 // consumer serializes commits across controller lifetimes. This controller now
-// only owns UI state (lastGood / persistedValue / a local sequence fence) and
+// only owns UI state (lastGood / persistedValue / a local generation fence) and
 // detaches its callbacks on dispose; it never cancels an in-flight write.
 // D04: a failed commit is UNKNOWN, not a rollback. Neither the local mMap nor
 // persistedValue is an authority after commit(false)/throw, so the CheckBox is
@@ -20,7 +20,7 @@
 // 中文：連點曾經每次點擊都起一條 IO coroutine；round-2 的單一 actor 又會在對話框
 // 重建時被銷毀。D05 把序列化器提升為 app 層級的 BbcToggleCoordinator：序號在使用者
 // 意圖產生時由共享 state 指派，全域唯一 consumer 負責跨 controller 生命週期的寫入
-// 順序。本控制器只保留 UI 狀態（lastGood / persistedValue / 本地序號柵欄），dispose
+// 順序。本控制器只保留 UI 狀態（lastGood / persistedValue / 本地 generation 柵欄），dispose
 // 只切斷 UI 回呼，不再取消進行中的提交。D04：提交失敗即 UNKNOWN，不得謊稱回滾；
 // 本地 mMap 與 persistedValue 都不可作為失敗後的權威，CheckBox 保持使用者最後意圖，
 // 由 onUnknown() 標示未驗證。F03：重建且本身沒有點擊的對話框收到 app 層級 Confirmed(value)
@@ -152,11 +152,17 @@ internal class BbcInjectionToggleController(
         // F03: the CheckBox now shows the user's latest intent; the inherited
         // Confirmed sync below must not overwrite it once a tap exists.
         lastUiValue = checked
-        // Sequence is assigned at USER-INTENT time from app-scoped state, so it
-        // keeps increasing even when this controller is rebuilt.
-        val seq = coordinator.state.nextSequence()
-        lastSubmittedSequence = seq
-        coordinator.submit(seq, checked) { outcome ->
+        // The coordinator now allocates the app-scoped sequence AND enqueues in
+        // ONE critical section, so no other caller can slip a higher sequence
+        // into the CONFLATED slot in between (that would let a stale lower
+        // sequence overwrite the newest intent on disk, #81 follow-up B).
+        // The per-intent fence is the generation captured BEFORE enqueue:
+        // generation++ already ran at the top of this method. Under the
+        // Unconfined test seam the consumer can invoke onResult INLINE inside
+        // submit(), so a token published only AFTER submit() returns would
+        // mistake this very intent for a stale one and drop its result.
+        val myIntent = generation
+        val seq = coordinator.submit(checked) { outcome ->
             // Coordinator consumer thread: bookkeeping advances on EVERY
             // successful commit, BEFORE the fence below — a stale commit really
             // did write to storage. D04: this value is NEVER consulted for a
@@ -166,7 +172,7 @@ internal class BbcInjectionToggleController(
                 if (!alive) return@launch
                 // Per-controller fence: a result superseded by a newer tap on
                 // this UI must not move the CheckBox or fire a toast.
-                if (seq != lastSubmittedSequence) return@launch
+                if (myIntent != generation) return@launch
                 when (outcome) {
                     is BbcWriteOutcome.Confirmed -> lastGood = outcome.value
                     BbcWriteOutcome.Unknown -> {
@@ -179,6 +185,9 @@ internal class BbcInjectionToggleController(
                 }
             }
         }
+        // F03/telemetry only — the result fence above uses myIntent/generation,
+        // which is already published before submit() can deliver a result.
+        lastSubmittedSequence = seq
     }
 
     /**

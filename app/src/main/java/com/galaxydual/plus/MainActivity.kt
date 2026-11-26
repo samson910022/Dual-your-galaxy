@@ -103,7 +103,6 @@ import com.galaxydual.hook.PolicySource
 import java.io.File
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -183,6 +182,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var clearPolicyBtn: Button
     private lateinit var refreshPolicyBtn: Button
     private var policyWriteDialog: AlertDialog? = null
+    // PR #89 Round-3 R3-3: rotation rebuild marker. The VM survives rotation with
+    // an unsubmitted QUEUED pending, but each Activity's WarningRestartController
+    // is cleared in onDestroy and consent is session-scoped (never re-bound from
+    // a Bundle). The rebuilt final dialog therefore has no live consent action;
+    // fail closed by invalidating the orphan pending BEFORE showing it. Consumed
+    // once on the FIRST sync (any phase/pending) so no later fresh WRITE can be
+    // mistaken for an orphan; later rebuilds in this instance are normal.
+    private var recreatedFromSavedState = false
     private var serviceBindListener: (() -> Unit)? = null
     // Phase D shared confirm-dialog state machine (Main/Editor共用同一 holder 類型
     // PolicyConfirmDialogState；既有欄位名保留為委派屬性，行為不變，rotation/onDestroy
@@ -359,8 +366,10 @@ class MainActivity : ComponentActivity() {
     private val riskAckStore: RiskAckStore by lazy {
         getSharedPreferences(RISK_ACK_PREFS_NAME, MODE_PRIVATE).riskAckStore()
     }
-    // 風險對話框 handle：onDestroy best-effort dismiss，避免舊 Activity window 洩漏／BadToken。
-    private var riskDialog: AlertDialog? = null
+    // PR #89 D2b (#78)：風險對話框 handle 由 slot 統一持有。show() 失敗回 null 時
+    // 不覆寫既有 handle；single-flight 擋下第二個對話框；dismiss callback 由 slot
+    // 以 identity 守護綁定。onDestroy 透過 slot best-effort dismiss。
+    private val riskDialogSlot = DialogSlot<AlertDialog>()
 
     private lateinit var statusPillText: TextView
     private lateinit var statusPillDot: ImageView
@@ -473,6 +482,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // PR #89 R3-3: a non-null saved state means this instance was rebuilt;
+        // syncPolicyWriteDialog consumes the marker on its FIRST sync.
+        recreatedFromSavedState = savedInstanceState != null
         // 旋轉恢復：diagExpanded 純 UI 開關，隨 Activity 存活即可。
         // B1：lastWriteBlockText/lastMsgText 為顯示快取（完整文字），View 重建為空時
         // 以 View 實際文字為準補寫；lastWriteBlockDedupKey 為播報去重鍵（穩定去時間），亦隨存活。
@@ -554,9 +566,15 @@ class MainActivity : ComponentActivity() {
         // R5-1 (F02): a repair committed by the OTHER Activity's VM marks the
         // App-scoped coordinator (no new UiState emission reaches this VM), so
         // observe that flow too and re-render the last known state on change.
+        // P3 device-risk: the flow can be emitted from repair-hint-io or an IO
+        // dispatcher, so hop to Main (no-op when already there) before touching Views.
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                vm.repairHintFromApp.collect { lastState?.let { s -> render(s) } ?: render(vm.state.value) }
+                vm.repairHintFromApp.collect {
+                    withContext(Dispatchers.Main.immediate) {
+                        lastState?.let { s -> render(s) } ?: render(vm.state.value)
+                    }
+                }
             }
         }
         refreshShizukuPresenceCache()
@@ -675,14 +693,10 @@ class MainActivity : ComponentActivity() {
             // Best effort: the window is going away anyway.
         }
         settingsDialog = null
-        // PR #74 R7b-2 (M1)：風險 gate／詳細說明對話框 handle best-effort 釋放
-        // （舊 Activity window 洩漏／BadToken 防護；與上面既有 dialog 同一語義）。
-        try {
-            riskDialog?.dismiss()
-        } catch (_: Exception) {
-            // Best effort: the window is going away anyway.
-        }
-        riskDialog = null
+        // PR #74 R7b-2 (M1) / #89 D2b：風險 gate／詳細說明對話框 handle best-effort
+        // 釋放（舊 Activity window 洩漏／BadToken 防護；slot 先清空再 dismiss()，
+        // 不用 cancel()，見 DialogSlot.clear）。
+        riskDialogSlot.clear { it.dismiss() }
         // PR #74 R2 N05：終止 BBC 開關係統的單一 consumer，避免它在 Activity
         // 銷毀後仍回呼 onRestored/onFailed（舊 CheckBox / Toast 已無效）。
         bbcToggleController?.dispose()
@@ -691,6 +705,20 @@ class MainActivity : ComponentActivity() {
         // （含 probe-failed；單一 handle 失敗不阻斷後續。用 dismiss() 而非 cancel()，
         // 避免快銷毀中的 Activity 仍觸發對話框的 onCancel 回呼）。
         dismissAllDestructiveHandles(destructiveDialogHandles) { it.dismiss() }
+        // Follow-up A: invalidate the live request/queued token AND remove the
+        // posted restart Runnable specifically; keep the blanket removal below
+        // for the other Handler callbacks.
+        warningRestartController.clear()
+        // R4-1: release every in-flight write attempt so a late settlement on
+        // a destroyed Activity is a harmless no-op.
+        policyWriteAttempts.clear()
+        pendingWarningRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingWarningRestartRunnable = null
+        // G2: drop the session-scoped consent and the owned Runnable's request id.
+        pendingWarningConsent = null
+        pendingWarningRestartActionId = null
+        // P2: cancel pending warning restarts posted on the Activity-owned Handler.
+        mainHandler.removeCallbacksAndMessages(null)
         try {
             catalogJob?.cancel()
         } catch (_: Exception) {
@@ -757,10 +785,11 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---- PR #74 R7b-2 (M1)：風險揭露 gate 與對話框 ----
-    // R7b-1 的共用 helper（showRiskDetailsDialog / showRiskAckGate）回傳 Unit，無法取得
-    // 對話框 handle。為在 onDestroy 釋放 handle 並讓 instrumentation 可觀測，於此以
-    // 完全相同的資源／語意建立對話框；決策仍走共用 shouldShowRiskGate + riskAckStore
-    // （單一來源、JVM 可測），取消（含返回鍵）恆為零寫入、零 ack。
+    // 共用 helper（showRiskDetailsDialog / showRiskAckGate，#78）已回傳 show() 的
+    // handle；Main 保留同語意 private wrapper 以維持既有 source-shape 契約
+    // （RiskDisclosureSourceShapeTest 檢查這些 entry 呼叫同名的 private wrapper）。
+    // 決策仍走共用 shouldShowRiskGate + riskAckStore（單一來源、JVM 可測），取消
+    // （含返回鍵）恆為零寫入、零 ack。
 
     private fun showRiskDetailsDialog(activity: Activity) {
         if (activity.isFinishing || activity.isDestroyed) return
@@ -771,8 +800,12 @@ class MainActivity : ComponentActivity() {
                 .setPositiveButton(R.string.dialog_close, null)
                 .setCancelable(true)
                 .show()
-            riskDialog = dlg
-            dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
+            riskDialogSlot.install(
+                dlg,
+                isShowing = { it.isShowing },
+                bindDismiss = { d, cb -> d.setOnDismissListener { cb() } },
+                discard = { it.dismiss() },
+            )
         } catch (_: Exception) {
             // fail-safe：不改變任何狀態。
         }
@@ -785,14 +818,22 @@ class MainActivity : ComponentActivity() {
                 .setTitle(R.string.risk_details_title)
                 .setMessage(R.string.risk_details_full)
                 .setPositiveButton(R.string.risk_ack_positive) { _, _ ->
-                    store.markAcknowledged()
-                    onContinue()
+                    // D2a:非阻塞提交；durability 未證實時由 ProcessRiskAckState
+                    // 保持 gate 開啟，consent 仍舊進行。R4:繼續前確認 host alive。
+                    store.markAcknowledgedAsync()
+                    if (!activity.isFinishing && !activity.isDestroyed) {
+                        onContinue()
+                    }
                 }
                 .setNegativeButton(R.string.dialog_cancel, null)
                 .setCancelable(true)
                 .show()
-            riskDialog = dlg
-            dlg.setOnDismissListener { if (riskDialog === dlg) riskDialog = null }
+            riskDialogSlot.install(
+                dlg,
+                isShowing = { it.isShowing },
+                bindDismiss = { d, cb -> d.setOnDismissListener { cb() } },
+                discard = { it.dismiss() },
+            )
         } catch (_: Exception) {
             // fail-closed：show 失敗即不標記、不繼續。
         }
@@ -822,9 +863,9 @@ class MainActivity : ComponentActivity() {
 
     private fun onWritePolicyEntryClicked() {
         if (shouldShowRiskGate(riskAckStore.isAcknowledged())) {
-            showRiskAckGate(this, riskAckStore) { startWriteWarning() }
+            showRiskAckGate(this, riskAckStore) { startWriteWarning(fromUserTap = true) }
         } else {
-            startWriteWarning()
+            startWriteWarning(fromUserTap = true)
         }
     }
 
@@ -1181,7 +1222,7 @@ class MainActivity : ComponentActivity() {
             // VM 內部決策 helper／JVM 可測，不在此重複分發，避免雙路由器漂移）。
             // Phase C：清除候選為空集，delta=old 全量；proceed 攜綁定進 VM
             // （第二參數為凍結候選，clear 路徑固定空集，VM 清除入口忽略它）。
-            setOnClickListener { startClearWarning() }
+            setOnClickListener { startClearWarning(fromUserTap = true) }
         }
         // Phase 2：手動重新整理草稿（唯讀，不觸發寫入；Unknown 時計數行保留
         // 未知提示，不改 dialog 主流程）。
@@ -4545,6 +4586,13 @@ class MainActivity : ComponentActivity() {
         policySaving: Boolean,
         policyWritePhase: PolicyWritePhase = PolicyWritePhase.IDLE,
     ) {
+        // PR #89 Round-3 R3-4 (P2): consume the rotation marker on the FIRST sync,
+        // regardless of phase/pending (idle + SAVING included). Consuming it only
+        // inside the orphan branch let a leaked `true` survive until a later,
+        // fresh WRITE's confirm (action revoked, VM still QUEUED during pre-read
+        // IO) was spuriously invalidated by a state emission.
+        val rebuilt = recreatedFromSavedState
+        recreatedFromSavedState = false
         // RECONCILING 相位由幀傳入（唯一真相為 state.policyWritePhase）；neutral
         // （稍后刷新）按鈕僅此期可用，判定收斂至 JVM-pinnable 謂詞。
         val policyReconciling = policyWriteSnoozeEnabled(policyWritePhase)
@@ -4567,6 +4615,45 @@ class MainActivity : ComponentActivity() {
             // Stage J4：pending 清除即清除 RECONCILING 本地抑制（終態已到）。
             policyWriteDismissedForReconcilingGen = null
             return
+        }
+        // PR #89 Round-3 R3-3 (fail-closed orphan): after rotation the retained VM
+        // replays an unsubmitted QUEUED pending, but this Activity's
+        // WarningRestartController was cleared in onDestroy and consent is never
+        // restored from a Bundle. The rebuilt final dialog's Positive arm would
+        // see !isLive(actionId), cancel the pending and vanish, so the user could
+        // never complete it. Drop the orphan pending BEFORE any operable final
+        // dialog is shown/built and guide the user to start over. SAVING /
+        // RECONCILING and app-scoped Tx/handover are untouched: the pure gate only
+        // accepts rebuilt + QUEUED + no live action, and vm.cancelPolicyWrite is a
+        // no-op for the other phases. No Bundle consent/ack restoration, no
+        // auto-ack, and NO warning-restart install/deliver/consume here.
+        if (shouldInvalidateOrphanPendingOnRebuild(
+                rebuilt,
+                policyWritePhase,
+                warningRestartController.isLive(pending.consent?.actionId),
+            )
+        ) {
+            // R3-4: gate the whole invalidation on the REAL VM result. A refused
+            // cancel (phase flipped to SAVING/RECONCILING, app-scoped Tx/handover)
+            // must fall through to the normal busy/Tx rendering below.
+            val cancelled = vm.cancelPolicyWrite(pending)
+            if (cancelled) {
+                try {
+                    policyWriteDialog?.dismiss()
+                } catch (_: Exception) {
+                    // Best effort: the window may already be gone.
+                }
+                policyWriteDialog = null
+                policyConfirmState.onPendingCleared()
+                if (!isFinishing && !isDestroyed) {
+                    try {
+                        Toast.makeText(this, R.string.pre_write_recheck_failed, Toast.LENGTH_LONG).show()
+                    } catch (_: Exception) {
+                        // Best effort: toast failure must not strand the pending.
+                    }
+                }
+                return
+            }
         }
         // Stage J4：RECONCILING 期本地抑制（使用者已 Back/取消/稍后刷新主動關閉）：
         // 不重建 dialog，VM fence 保留，reconciler／late-join 照常結清；新世代即清除。
@@ -4788,7 +4875,7 @@ class MainActivity : ComponentActivity() {
                         shownPolicyWrite = null
                         shownPolicyWriteSaving = false
                     } else {
-                        vm.cancelPolicyWrite(pending)
+                        cancelWritePendingAndRevoke(pending, pending.consent?.actionId)
                     }
                 }
                 .show()
@@ -4822,6 +4909,11 @@ class MainActivity : ComponentActivity() {
             }
             // D03b：最終 confirm 經 consent fence（警告↔confirm 期間的 clone TOCTOU）；
             // ProceedOk 且 host 存活才真正寫入，其餘一律 revoke pending＋強制新警告。
+            // R4-1: a second Positive while this pending's attempt is in flight
+            // is ignored — never converted into a cancel of the first write.
+            if (policyWriteAttempts.isAnyActive(pending.generation)) {
+                return@setOnClickListener
+            }
             if (policyWriteCanConfirmInspectable(pending.packages.size, policyAcknowledged, curPolicySaving)) {
                 confirmWriteWithConsent(pending)
             }
@@ -4857,7 +4949,7 @@ class MainActivity : ComponentActivity() {
                 shownPolicyWrite = null
                 shownPolicyWriteSaving = false
             } else {
-                vm.cancelPolicyWrite(pending)
+                cancelWritePendingAndRevoke(pending, pending.consent?.actionId)
             }
         }
         // Stage J4：稍后刷新（RECONCILING 期手動恢復入口）：觸發一次顯式重讀
@@ -6297,25 +6389,39 @@ class MainActivity : ComponentActivity() {
     // TRUE throughout the refresh (consent-reset guard); only a settled Known
     // snapshot may release it and re-enter ONE fresh warning. Corrupt/still-
     // Unknown settles show non-recursive guidance with NO restart.
-    private fun retryUnknownWarning() {
+    private fun retryUnknownWarning(actionId: Long) {
         // R6-1 (G01): capture the token at the Retry tap, BEFORE the refresh.
+        // G2: the request id is the action id accepted for THIS warning; the
+        // settle must validate it BEFORE any side effect (guidance/flag/retry).
         val token = warningRetryOneShot.capture()
         vm.refreshPolicyDraftForWarningRetry { settled ->
             applyWarningRetryDecision(
                 decision = policyWarningRetryDecision(settled),
                 hostAlive = !isFinishing && !isDestroyed,
                 onContinue = {
-                    if (warningRetryOneShot.tryConsume(token)) {
+                    if (!warningRestartController.isLive(actionId)) {
+                        preClearLog("unknown retry request stale; dropping")
+                    } else if (warningRetryOneShot.tryConsume(token)) {
                         setPendingClearConfirm(false)
-                        pendingWarningRestart?.invoke()
+                        if (!warningRestartController.consumeRetry(actionId, !isFinishing && !isDestroyed)) {
+                            preClearLog("unknown retry request stale; dropping")
+                        }
                     } else {
                         // LOG-ONLY: a benign duplicate/late settle is not a
                         // guidance event — do not toast here.
                         preClearLog("unknown retry re-entry already consumed; dropping")
                     }
                 },
-                onCorrupt = { showWarningRetryGuidance(R.string.policy_corrupt_detected) },
-                onUnavailable = { showWarningRetryGuidance(R.string.policy_refresh_failed) },
+                onCorrupt = {
+                    if (warningRestartController.isLive(actionId)) {
+                        showWarningRetryGuidance(R.string.policy_corrupt_detected)
+                    }
+                },
+                onUnavailable = {
+                    if (warningRestartController.isLive(actionId)) {
+                        showWarningRetryGuidance(R.string.policy_refresh_failed)
+                    }
+                },
             )
         }
     }
@@ -6332,14 +6438,48 @@ class MainActivity : ComponentActivity() {
         return false
     }
 
-    // D03b：最近一次警告要求的 re-trigger。fail-closed abort 後呼叫以強制一次
-    // 全新警告（新 probe／新 consent）；Activity 重建後為 null（使用者須再點入口）。
-    // R4-1 (E01) 驗證：Failed-probe／Unknown 的 onRetry 先清 pendingClearConfirm，
-    // 再 invoke 此 seam ⇒ re-entry 通過 consentResetAllowedForNewWarning（=!pending）,
-    // 不會被 guard 擋住。此 seam 以 fromUserTap=false 重入，故 autoRestartCount
-    // 既不重置也不遞增（只由 scheduleWarningRestart 遞增）——重試是使用者主動點，
-    // 不是自動重啟，不應消耗／重置可用性上限。真正的入口點擊才會重置（fromUserTap=true）。
-    private var pendingWarningRestart: (() -> Unit)? = null
+    // Follow-up A: re-trigger is now an immutable, identity-bound request in a
+    // controller — there is NO mutable pendingWarningRestart callback slot.
+    // A rejected entry cannot overwrite the live request, and installing a new
+    // accepted request invalidates any already-posted restart token.
+    private val warningRestartController = WarningRestartController()
+    /** Posted restart Runnable, removable individually on destroy/cancel. */
+    private var pendingWarningRestartRunnable: Runnable? = null
+    /** Request id that owns [pendingWarningRestartRunnable]; removal is identity-gated. */
+    private var pendingWarningRestartActionId: Long? = null
+
+    // G2: the two ACCEPT seams are the ONLY places that install request identities.
+    // A warning that actually shows a dialog advances the retry generation; a
+    // Known/no-op fast path installs the SAME kind of identity but MUST NOT touch
+    // WarningRetryOneShot (its generation is used for correlation only).
+    private fun installAcceptedWarning(
+        action: WarningRestartAction,
+        candidateKey: String?,
+        fromUserTap: Boolean,
+        callback: () -> Unit,
+    ): Long? {
+        if (!tryAcceptWarning(warningRetryOneShot, consentResetAllowedForNewWarning(pendingClearConfirm))) return null
+        return warningRestartController.install(
+            action = action,
+            candidateKey = candidateKey,
+            generation = warningRetryOneShot.currentGeneration,
+            callback = callback,
+            resetBudget = fromUserTap,
+        ).identity.id
+    }
+
+    private fun installAcceptedAction(
+        action: WarningRestartAction,
+        candidateKey: String?,
+        fromUserTap: Boolean,
+        callback: () -> Unit,
+    ): Long = warningRestartController.install(
+        action = action,
+        candidateKey = candidateKey,
+        generation = warningRetryOneShot.currentGeneration,
+        callback = callback,
+        resetBudget = fromUserTap,
+    ).identity.id
 
     // R6-1 (G01): one re-entry per INSTALLED WARNING (not per Activity). The
     // token is captured at the Retry tap and consumed only by that warning's
@@ -6350,16 +6490,52 @@ class MainActivity : ComponentActivity() {
 
     // D03b fixer M5：confirm 重入防護（double-tap）——第一段 enter 成功才 launch。
     private val consentConfirmInFlight = InFlightGuard()
-    // D03b fixer M3：abort 後重啟警告的 one-shot 排程 guard（打破同步遞迴）。
-    private val warningRestartGuard = OneShotRestartGuard()
-    // D03b fixer (availability)：每次使用者真正點入口重置；自動重啟最多 MAX 次。
-    private val autoRestartCount = AtomicInteger(0)
+    // R4-1: per-pending, tokenized attempt guard spanning the VM's async
+    // pre-read/claim window. Distinct from the short global revalidation guard.
+    private val policyWriteAttempts = PolicyWriteAttemptTracker()
+
+    // G2: every dialog CANCEL is identity-bound. A stale cancel (e.g. a late
+    // onCancel from a superseded CLEAR) must NOT touch pendingClearConfirm or
+    // pendingWarningConsent — a newer action may own both.
+    private fun cancelAcceptedWarning(actionId: Long?, onCancel: () -> Unit) {
+        if (!warningRestartController.isLive(actionId)) {
+            preClearLog("warning cancel dropped: request no longer live")
+            return
+        }
+        warningRestartController.revoke(actionId)
+        if (pendingWarningRestartActionId == actionId) {
+            pendingWarningRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+            pendingWarningRestartRunnable = null
+            pendingWarningRestartActionId = null
+        }
+        if (pendingWarningConsent?.actionId == actionId) pendingWarningConsent = null
+        setPendingClearConfirm(false)
+        onCancel()
+    }
+
+    // PR #89 Round-3 R3-1: FINAL policy-write confirmation dialog cancel.
+    // A cancel that really clears the QUEUED pending must ALSO revoke the
+    // accepted warning action, otherwise the suspended revalidation coroutine's
+    // later abort schedules a restart for an already-cancelled WRITE. A refused
+    // cancel (SAVING/RECONCILING/in-flight/stale) keeps the action live.
+    private fun cancelWritePendingAndRevoke(pending: PendingPolicyWrite, actionId: Long?) {
+        val vmCancelled = try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { false }
+        if (cancelOwnershipAccepted(vmCancelled, warningRestartController.isLive(actionId))) {
+            cancelAcceptedWarning(actionId) { }   // isLive→revoke→remove owned Runnable→clear own consent; NO onCancel side effect
+        }
+    }
 
     // D03b fixer M3：abort 後共用清理——清 consent、顯示既有 recheck 訊息，
-    // 並以 main Handler.post + one-shot guard 排程新警告（不再同步 invoke 造成遞迴／死路）。
+    // 並以 main Handler.post + request-scoped 一次性上限排程新警告（不再同步 invoke 造成遞迴／死路）。
     // R4-1 (E01)：寫入路徑的 abort 必須說「寫入已取消」，不能沿用清除文案；
     // 清除路徑沿用既有 pre_clear_continue_recheck_failed（default）。
-    private fun consentAbortCleanup(msgRes: Int = R.string.pre_clear_continue_recheck_failed) {
+    // G2: a stale abort has NO side effect at all; only the request that failed
+    // may clear consent / toast / schedule its own restart.
+    private fun consentAbortCleanup(msgRes: Int = R.string.pre_clear_continue_recheck_failed, actionId: Long?) {
+        if (!warningRestartController.isLive(actionId)) {
+            preClearLog("consent abort dropped: request no longer live")
+            return
+        }
         pendingWarningConsent = null
         if (!isFinishing && !isDestroyed) {
             try {
@@ -6367,32 +6543,56 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {
             }
         }
-        scheduleWarningRestart()
+        scheduleWarningRestart(actionId)
     }
 
-    // D03b fixer M3 + availability cap：one-shot + post 打破同步遞迴，並以 autoRestartCount
-    // 限制「連續 post」次數（結構性 fail-closed 原因否則會無限重警）。用罷只顯示既有
-    // recheck 訊息（consentAbortCleanup 已顯示），不再排程——使用者必須重新點入口。
+    // D03b fixer M3 + availability cap, Follow-up A: post through the
+    // Activity-owned Handler and let the controller own the request-scoped
+    // one-shot budget. No global guard/counter: a new accepted request resets
+    // the budget; a stale token cannot deliver after a different action's tap.
+    // G2: the schedule is bound to [actionId], so a stale abort cannot post a
+    // restart for the current request; the owned Runnable is tracked with its id.
     // fail-closed 寫入不變：abort 依然零寫入。
-    private fun scheduleWarningRestart() {
-        if (!warningRestartGuard.trySchedule()) {
-            preClearLog("warning restart already scheduled; dropping re-entrant request")
+    private fun scheduleWarningRestart(actionId: Long?) {
+        if (isFinishing || isDestroyed) {
+            preClearLog("warning restart dropped: host dying")
             return
         }
-        val previous = autoRestartCount.getAndIncrement()
-        if (!canAutoRestart(previous)) {
-            preClearLog("warning restart cap reached; user must re-tap entry")
-            warningRestartGuard.reset() // 未 post，必須歸還 guard
-            return
-        }
-        Handler(Looper.getMainLooper()).post {
-            try {
-                pendingWarningRestart?.invoke()
-            } catch (_: Exception) {
-                preClearLog("warning restart failed status=exception")
-            } finally {
-                warningRestartGuard.reset()
-            }
+        val scheduled = warningRestartController.schedule(
+            hostAlive = !isFinishing && !isDestroyed,
+            maxRestarts = MAX_AUTO_WARNING_RESTARTS,
+            post = { tokenId, requestId, body ->
+                // P2: post on the Activity-owned Handler so onDestroy can cancel
+                // this specific callback; a per-call Handler would leak the Activity.
+                if (pendingWarningRestartActionId == requestId) {
+                    pendingWarningRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+                }
+                val runnable = Runnable {
+                    // A superseded request's Runnable must not clear the tracking
+                    // fields owned by a newer scheduled request.
+                    if (pendingWarningRestartActionId == requestId) {
+                        pendingWarningRestartRunnable = null
+                        pendingWarningRestartActionId = null
+                    }
+                    // Host may have been destroyed between schedule and delivery.
+                    if (isFinishing || isDestroyed) {
+                        preClearLog("warning restart dropped at delivery: host dying token=$tokenId request=$requestId")
+                        return@Runnable
+                    }
+                    try {
+                        body()
+                    } catch (_: Exception) {
+                        preClearLog("warning restart failed status=exception")
+                    }
+                }
+                pendingWarningRestartRunnable = runnable
+                pendingWarningRestartActionId = requestId
+                mainHandler.post(runnable)
+            },
+            expectedRequestId = actionId,
+        )
+        if (!scheduled) {
+            preClearLog("warning restart not scheduled: no live request, host dying or cap reached")
         }
     }
 
@@ -6403,6 +6603,7 @@ class MainActivity : ComponentActivity() {
     private fun buildRealConsentThen(
         delta: Set<String>,
         noRemovalKnown: Boolean = false,
+        actionId: Long,
         action: (PolicyWriteConsent) -> Unit,
     ) {
         lifecycleScope.launch {
@@ -6411,8 +6612,11 @@ class MainActivity : ComponentActivity() {
                 resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
                 reprobe = { pkgs, uid -> probeDualApps(pkgs, uid) },
                 noRemovalKnown = noRemovalKnown,
+                actionId = actionId,
             )
-            if (isFinishing || isDestroyed) return@launch
+            // G2: the suspend build may settle after a newer action installed its
+            // own request; never overwrite that action's consent.
+            if (!warningRestartController.isLive(actionId) || isFinishing || isDestroyed) return@launch
             pendingWarningConsent = consent
             action(consent)
         }
@@ -6421,42 +6625,58 @@ class MainActivity : ComponentActivity() {
     // D03b fixer M2：ROOT 驗證對話框的兩個「繼續」回呼才會把 rootVerifiedEmpty
     // 蓋到 consent — onClearVerified（已驗證空）與 onForceClear（使用者在 Residual/
     // ProbeFailed 後明確自擔風險覆寫，NOT 驗證成功）。非 ROOT Positive 不經此回呼。
-    private val markRootVerifiedEmpty: () -> Unit = {
-        pendingWarningConsent = pendingWarningConsent?.copy(rootVerifiedEmpty = true)
+    // G2: only the consent owned by a still-live request may be mutated.
+    private val markRootVerifiedEmpty: (Long) -> Unit = { actionId ->
+        if (pendingWarningConsent?.actionId == actionId && warningRestartController.isLive(actionId)) {
+            pendingWarningConsent = pendingWarningConsent?.copy(rootVerifiedEmpty = true)
+        }
     }
 
-    // D03b：Main 寫入入口 —— 記錄 restart callback 後發出警告（consent 由警告捕獲）。
-    // fromUserTap=false 表示由 scheduleWarningRestart 的 post 呼叫：不得重置自動重啟上限。
-    private fun startWriteWarning(fromUserTap: Boolean = true) {
-        if (fromUserTap) {
-            autoRestartCount.set(0)
+    // D03b：Main 寫入入口 —— 發出警告（consent 由警告捕獲）。
+    // Follow-up A: this entry NEVER mutates restart state. Both the retry token
+    // (#77) and the identity-bound restart request are installed only at the
+    // ACCEPT seam inside requestPreWriteWarning, after the re-entry guard.
+    // [fromUserTap] is provenance ONLY: a genuine entry click passes true and
+    // re-arms the auto-restart budget; the installed callback (auto restart AND
+    // Retry settle) re-enters with false and carries the budget forward.
+    private fun startWriteWarning(fromUserTap: Boolean) {
+        // G2: proceed is bound to the accepted request id; a stale settle must
+        // not read/forward a consent owned by a newer action.
+        val proceed: (PolicyWarningBinding, Set<String>, Long) -> Unit = { binding, frozen, actionId ->
+            if (!warningRestartController.isLive(actionId) || pendingWarningConsent?.actionId != actionId) {
+                preClearLog("policy write proceed dropped: request no longer live")
+            } else {
+                vm.requestPolicyWriteForWarning(frozen, binding, consent = pendingWarningConsent)
+            }
         }
-        // R6-1 (G01): re-arm on EVERY installed warning, including auto re-entry.
-        warningRetryOneShot.onWarningInstalled()
-        val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, frozen ->
-            vm.requestPolicyWriteForWarning(frozen, binding, consent = pendingWarningConsent)
-        }
-        pendingWarningRestart = { startWriteWarning(fromUserTap = false) }
-        requestPreWriteWarning(proceed = proceed, onRootVerified = markRootVerifiedEmpty)
+        requestPreWriteWarning(
+            proceed = proceed,
+            onRootVerified = markRootVerifiedEmpty,
+            fromUserTap = fromUserTap,
+        )
     }
 
     // D03b：Main 清除入口 —— 清除沒有 PendingPolicyWrite carrier，consent 由 Activity
     // 欄位攜帶，在真正清除確認前由 confirmClearWithConsent 做同一道 fail-closed fence。
-    private fun startClearWarning(fromUserTap: Boolean = true) {
-        if (fromUserTap) {
-            autoRestartCount.set(0)
+    // Same entry invariant as startWriteWarning: no restart mutation here.
+    private fun startClearWarning(fromUserTap: Boolean) {
+        // G2: carry the accepted request id all the way into the final fence.
+        val proceed: (PolicyWarningBinding, Set<String>, Long) -> Unit = { binding, _, actionId ->
+            confirmClearWithConsent(binding, actionId)
         }
-        // R6-1 (G01): re-arm on EVERY installed warning, including auto re-entry.
-        warningRetryOneShot.onWarningInstalled()
-        val proceed: (PolicyWarningBinding, Set<String>) -> Unit = { binding, _ ->
-            confirmClearWithConsent(binding)
-        }
-        pendingWarningRestart = { startClearWarning(fromUserTap = false) }
-        requestPreClearWarning(proceed = proceed, onRootVerified = markRootVerifiedEmpty)
+        requestPreClearWarning(
+            proceed = proceed,
+            onRootVerified = markRootVerifiedEmpty,
+            fromUserTap = fromUserTap,
+        )
     }
 
     // D03b fixer：fence + 派遣共用主體（suspend；不自行取得 in-flight guard）。
-    private suspend fun dispatchClearFence(binding: PolicyWarningBinding, consent: PolicyWriteConsent) {
+    private suspend fun dispatchClearFence(
+        binding: PolicyWarningBinding,
+        consent: PolicyWriteConsent,
+        actionId: Long,
+    ) {
         val outcome: PreClearContinueOutcome = try {
             revalidatePolicyWriteConsent(
                 consent = consent,
@@ -6469,16 +6689,29 @@ class MainActivity : ComponentActivity() {
         }
         dispatchConsentGatedConfirm(
             outcome = outcome,
-            confirm = { vm.onClearPolicyButtonTap(binding, consent = consent) },
+            confirm = {
+                // G2: re-check identity after the async revalidation; only the
+                // request that accepted this consent may perform the clear.
+                if (!warningRestartController.isLive(actionId) || consent.actionId != actionId) {
+                    preClearLog("clear confirm dropped: request no longer live")
+                } else {
+                    vm.onClearPolicyButtonTap(binding, consent = consent)
+                    warningRestartController.revoke(actionId)
+                }
+            },
             revoke = { /* 清除未建 pending：不放行即已 rollback，無需額外 revoke */ },
-            notify = { consentAbortCleanup() },
+            notify = { consentAbortCleanup(actionId = actionId) },
             hostAlive = { !isFinishing && !isDestroyed },
         )
     }
 
     // D03b：清除路徑 final-confirm fence。清除未建 pending，無可 revoke；
     // 任何失配／缺 consent／host 消失即「不執行清除 + consentAbortCleanup（含強制新警告）」。
-    private fun confirmClearWithConsent(binding: PolicyWarningBinding) {
+    private fun confirmClearWithConsent(binding: PolicyWarningBinding, actionId: Long) {
+        if (!warningRestartController.isLive(actionId)) {
+            preClearLog("policy-write consent aborted: clear confirm request no longer live")
+            return
+        }
         if (!consentConfirmInFlight.tryEnter()) {
             preClearLog("consent confirm dropped: clear already in flight")
             return
@@ -6498,17 +6731,24 @@ class MainActivity : ComponentActivity() {
                             resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
                             reprobe = { p, uid -> probeDualApps(p, uid) },
                             noRemovalKnown = noRemovalAllowed(snapKnown = snap.known, delta = emptySet()),
+                            actionId = actionId,
                         )
+                        if (!warningRestartController.isLive(actionId)) return@launch
                         pendingWarningConsent = real
-                        dispatchClearFence(binding, real)
+                        dispatchClearFence(binding, real, actionId)
                     } else {
                         // carry-forward #4：Activity 重建／consent 缺失 ⇒ fail closed，零清除。
                         preClearLog("policy-write consent aborted: clear confirm has no consent")
-                        consentAbortCleanup()
+                        consentAbortCleanup(actionId = actionId)
                     }
                     return@launch
                 }
-                dispatchClearFence(binding, consent)
+                if (consent.actionId != actionId || !warningRestartController.isLive(actionId)) {
+                    preClearLog("policy-write consent aborted: clear consent owned by another request")
+                    consentAbortCleanup(actionId = actionId)
+                    return@launch
+                }
+                dispatchClearFence(binding, consent, actionId)
             } finally {
                 consentConfirmInFlight.exit()
             }
@@ -6518,11 +6758,32 @@ class MainActivity : ComponentActivity() {
     // D03b：寫入路徑 final-confirm fence（由 policyWriteDialog Positive 觸發）。
     // 四道關卡是唯一新鮮度權威；generation 只作 pending 身份比對（binding-only）。
     private fun confirmWriteWithConsent(pending: PendingPolicyWrite) {
+        // G2: the consent carries the id of the request that accepted this write.
+        val actionId = pending.consent?.actionId
+        val generation = pending.generation
+        // R4-1: per-pending tokenized guard spans BOTH the Activity revalidation
+        // window and the VM's async pre-read/claim window; the global guard
+        // below stays short so unrelated operations are never blocked.
+        val attemptId = policyWriteAttempts.tryEnter(generation)
+        if (attemptId == null) {
+            preClearLog("policy-write confirm dropped: attempt already in flight for this pending")
+            return
+        }
+        if (!warningRestartController.isLive(actionId)) {
+            policyWriteAttempts.exit(generation, attemptId)
+            preClearLog("policy-write consent aborted: no live request id")
+            try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
+            return
+        }
         if (!consentConfirmInFlight.tryEnter()) {
+            policyWriteAttempts.exit(generation, attemptId)
             preClearLog("consent confirm dropped: write already in flight")
             return
         }
         lifecycleScope.launch {
+            // R4-1: only the VM's real settlement releases the guard after a
+            // dispatched attempt; all abort paths release it in the finally.
+            var handedOff = false
             try {
                 val livePending = try {
                     vm.state.value.pendingPolicyWrite
@@ -6532,7 +6793,7 @@ class MainActivity : ComponentActivity() {
                 if (livePending == null || livePending.generation != pending.generation) {
                     preClearLog("policy-write consent aborted: pending gone/changed at confirm")
                     try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
-                    consentAbortCleanup(R.string.pre_write_recheck_failed)
+                    consentAbortCleanup(R.string.pre_write_recheck_failed, actionId)
                     return@launch
                 }
                 val consent = livePending.consent
@@ -6540,7 +6801,7 @@ class MainActivity : ComponentActivity() {
                     // carry-forward #4：Activity 重建／legacy 注入 ⇒ fail closed，零寫入。
                     preClearLog("policy-write consent aborted: missing at confirm")
                     try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
-                    consentAbortCleanup(R.string.pre_write_recheck_failed)
+                    consentAbortCleanup(R.string.pre_write_recheck_failed, actionId)
                     return@launch
                 }
                 val outcome: PreClearContinueOutcome = try {
@@ -6559,36 +6820,100 @@ class MainActivity : ComponentActivity() {
                 } catch (_: Exception) {
                     null
                 }
-                if (afterPending == null || afterPending.generation != pending.generation) {
+                if (afterPending == null || afterPending.generation != pending.generation ||
+                    !warningRestartController.isLive(actionId)
+                ) {
                     preClearLog("policy-write consent aborted: pending changed after revalidation")
                     try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { }
-                    consentAbortCleanup(R.string.pre_write_recheck_failed)
+                    consentAbortCleanup(R.string.pre_write_recheck_failed, actionId)
                     return@launch
                 }
                 dispatchConsentGatedConfirm(
                     outcome = outcome,
-                    confirm = { vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null) },
+                    confirm = {
+                        // G2: re-check identity inside confirm after the await.
+                        if (!warningRestartController.isLive(actionId)) {
+                            preClearLog("policy-write confirm dropped: request no longer live")
+                        } else {
+                            // PR #89 R3-2: the ack is read LIVE at callback time.
+                            // R4-1: ACCEPTED only DISPATCHES the VM attempt — the
+                            // action stays live until the real settlement reports
+                            // CONSUMED/HANDED_OFF (or a synchronous TERMINAL).
+                            val admission = vm.confirmPolicyWrite(pending, if (policyAcknowledged) pending.generation else null) { cbGen, outcome ->
+                                onPolicyWriteAttemptComplete(actionId, generation, attemptId, cbGen, outcome)
+                            }
+                            if (admission == PolicyWriteConfirmAdmission.ACCEPTED) {
+                                // Async callback now owns the per-pending guard.
+                                handedOff = true
+                            } else {
+                                // Synchronous refusal launched no coroutine, so
+                                // no settlement callback will release the guard.
+                                policyWriteAttempts.exit(generation, attemptId)
+                                if (confirmRevocationAccepted(admission)) {
+                                    warningRestartController.revoke(actionId)
+                                }
+                            }
+                        }
+                    },
                     revoke = { try { vm.cancelPolicyWrite(pending) } catch (_: Exception) { } },
-                    notify = { consentAbortCleanup(R.string.pre_write_recheck_failed) },
+                    notify = { consentAbortCleanup(R.string.pre_write_recheck_failed, actionId) },
                     hostAlive = { !isFinishing && !isDestroyed },
                 )
             } finally {
                 consentConfirmInFlight.exit()
+                // R4-1: a dispatched attempt is released by the callback only;
+                // every abort path releases here.
+                if (!handedOff) {
+                    policyWriteAttempts.exit(generation, attemptId)
+                }
             }
         }
     }
 
+    // R4-1: consume the VM's async settlement. The per-pending token is
+    // consumed ATOMICALLY by exit(), so a late settle for an older attempt on
+    // the same retained generation can never retire a newer action.
+    private fun onPolicyWriteAttemptComplete(
+        actionId: Long?,
+        generation: Long,
+        attemptId: Long,
+        callbackGeneration: Long,
+        outcome: PolicyWriteConfirmAttemptOutcome,
+    ) {
+        val attemptActive = policyWriteAttempts.exit(generation, attemptId)
+        if (!attemptActive || callbackGeneration != generation) return
+        val hostAlive = !isFinishing && !isDestroyed
+        val actionLive = warningRestartController.isLive(actionId)
+        if (confirmAttemptRetiresAction(
+                outcome = outcome,
+                callbackGeneration = callbackGeneration,
+                expectedGeneration = generation,
+                attemptActive = attemptActive,
+                actionLive = actionLive,
+                hostAlive = hostAlive,
+            )
+        ) {
+            warningRestartController.revoke(actionId)
+        }
+    }
+
     private fun requestPreClearWarning(
-        proceed: (PolicyWarningBinding, Set<String>) -> Unit,
+        proceed: (PolicyWarningBinding, Set<String>, Long) -> Unit,
+        // Provenance of THIS entry: true only for a genuine user click. The
+        // installed restart callback (auto restart + Retry settle) passes false.
+        fromUserTap: Boolean,
         onCancel: () -> Unit = {},
         // D03b fixer M2：ROOT 驗證對話框的兩個繼續回呼（已驗證空／自擔風險覆寫）
         // 由 showPreClearWarning 回呼，把 rootVerifiedEmpty 蓋到 consent（只跳 membership）。
-        onRootVerified: () -> Unit = {},
+        onRootVerified: (Long) -> Unit = {},
     ) {
         // D03b carry-forward #2：re-entrant 要求（probe／警告對話框存活期）直接返回，
         // 不清空活躍警告捕獲的 consent。只有真正的新警告才清空（consentResetAllowed...）。
         if (!consentResetAllowedForNewWarning(pendingClearConfirm)) return
         pendingWarningConsent = null
+        // G2: one restart callback per request function, reused by every accept
+        // branch (Unknown warning, no-warning fast paths, probe warning).
+        val clearRestart = { startClearWarning(fromUserTap = false) }
         // Phase C：快照 old＋Known＋綁定（單一來源，避免 TOCTOU 借用）。
         val snap: PolicyWarningSnapshot = try {
             vm.snapshotPolicyForWarning()
@@ -6607,14 +6932,19 @@ class MainActivity : ComponentActivity() {
         // 只提供「重新整理 snapshot + 取消」。若日後要在此建 consent，必須傳
         // noRemovalKnown=false（Unknown 的 delta=∅ 是偽空，D03 fail-open）。
         if (!snap.known) {
-            if (pendingClearConfirm) return
+            val actionId = installAcceptedWarning(
+                action = WarningRestartAction.CLEAR,
+                candidateKey = null,
+                fromUserTap = fromUserTap,
+                callback = clearRestart,
+            ) ?: return
             setPendingClearConfirm(true)
             pendingWarningConsent = null
             showPreClearProbeFailedWarning(
                 this@MainActivity,
                 config = probeFailedDialogConfig(write = false, unknown = true),
-                onRetry = { retryUnknownWarning() },
-                onCancel = { setPendingClearConfirm(false); onCancel() },
+                onRetry = { retryUnknownWarning(actionId) },
+                onCancel = { cancelAcceptedWarning(actionId) { onCancel() } },
                 dialogHandles = destructiveDialogHandles,
             )
             return
@@ -6625,18 +6955,35 @@ class MainActivity : ComponentActivity() {
         // M3：真 no-op 清除——建真實 consent 後直走 VM，不重觸發警告。
         // R4-1 (E02)：snap.known 已驗證且 delta==old==∅ ⇒ 可證明不移除。
         if (old.isEmpty()) {
-            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta)) {
-                proceed(warnedBinding, emptySet())
+            val actionId = installAcceptedAction(
+                action = WarningRestartAction.CLEAR,
+                candidateKey = null,
+                fromUserTap = fromUserTap,
+                callback = clearRestart,
+            )
+            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta), actionId = actionId) {
+                proceed(warnedBinding, emptySet(), actionId)
             }
             return
         }
         if (delta.isEmpty()) {
-            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta)) {
-                proceed(warnedBinding, emptySet())
+            val actionId = installAcceptedAction(
+                action = WarningRestartAction.CLEAR,
+                candidateKey = null,
+                fromUserTap = fromUserTap,
+                callback = clearRestart,
+            )
+            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta), actionId = actionId) {
+                proceed(warnedBinding, emptySet(), actionId)
             }
             return
         }
-        if (pendingClearConfirm) return
+        val actionId = installAcceptedWarning(
+            action = WarningRestartAction.CLEAR,
+            candidateKey = null,
+            fromUserTap = fromUserTap,
+            callback = clearRestart,
+        ) ?: return
         setPendingClearConfirm(true)
         lifecycleScope.launch {
             // Phase B：probe 回傳 DualProbeResult（Ok/Failed），不再以空清單吞失敗。
@@ -6649,14 +6996,20 @@ class MainActivity : ComponentActivity() {
             val probe = try {
                 probeDualApps(delta, verifiedTarget?.userId)
             } catch (e: CancellationException) {
-                setPendingClearConfirm(false)
+                if (warningRestartController.isLive(actionId)) setPendingClearConfirm(false)
                 throw e
             } catch (e: Exception) {
                 preClearLog("pre-clear dual-profile probe failed", e)
                 DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
             }
             if (isFinishing || isDestroyed) {
-                setPendingClearConfirm(false)
+                if (warningRestartController.isLive(actionId)) setPendingClearConfirm(false)
+                return@launch
+            }
+            // G2: gate the WHOLE settle on the accepted request identity. A late
+            // settle for a superseded CLEAR may not write consent/open dialogs.
+            if (!warningRestartController.isLive(actionId)) {
+                preClearLog("pre-clear probe settle dropped: request no longer live")
                 return@launch
             }
             // R4-1 (E01)：consent 只在 probe Ok 時凍結。Failed 一律 pending=null ＋
@@ -6669,10 +7022,14 @@ class MainActivity : ComponentActivity() {
                         this@MainActivity,
                         config = probeFailedDialogConfig(write = false, unknown = false),
                         onRetry = {
-                            setPendingClearConfirm(false)
-                            pendingWarningRestart?.invoke()
+                            if (warningRestartController.isLive(actionId)) {
+                                setPendingClearConfirm(false)
+                                if (!warningRestartController.consumeRetry(actionId, !isFinishing && !isDestroyed)) {
+                                    preClearLog("clear probe-failed retry request stale; dropping")
+                                }
+                            }
                         },
-                        onCancel = { setPendingClearConfirm(false); onCancel() },
+                        onCancel = { cancelAcceptedWarning(actionId) { onCancel() } },
                         dialogHandles = destructiveDialogHandles,
                     )
                     return@launch
@@ -6684,17 +7041,26 @@ class MainActivity : ComponentActivity() {
                         installed = probe.installed,
                         // 只有 Ok 才到這裡，故永遠不是 failed-probe consent。
                         fromFailedProbe = false,
+                        actionId = actionId,
                     )
                     if (!shouldWarnForDelta(probe.installed)) {
+                        if (!warningRestartController.isLive(actionId) || pendingWarningConsent?.actionId != actionId) return@launch
                         setPendingClearConfirm(false)
-                        proceed(warnedBinding, emptySet())
+                        proceed(warnedBinding, emptySet(), actionId)
                         return@launch
                     }
                     showPreClearWarning(
                         this@MainActivity,
                         probe.installed,
-                        onProceed = { setPendingClearConfirm(false); proceed(warnedBinding, emptySet()) },
-                        onCancel = { setPendingClearConfirm(false); onCancel() },
+                        onProceed = {
+                            if (!warningRestartController.isLive(actionId) || pendingWarningConsent?.actionId != actionId) {
+                                preClearLog("pre-clear proceed dropped: request no longer live")
+                            } else {
+                                setPendingClearConfirm(false)
+                                proceed(warnedBinding, emptySet(), actionId)
+                            }
+                        },
+                        onCancel = { cancelAcceptedWarning(actionId) { onCancel() } },
                         resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
                         fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
                         dialogHandles = destructiveDialogHandles,
@@ -6704,7 +7070,8 @@ class MainActivity : ComponentActivity() {
                         // revalidatePreClearContinue 先與 live/fresh 比對過。
                         reprobe = { probeDualApps(delta, verifiedTarget?.userId) },
                         rootUninstallAllowed = verifiedTarget != null,
-                        onRootVerified = onRootVerified,
+                        onRootVerified = { onRootVerified(actionId) },
+                        actionAlive = { warningRestartController.isLive(actionId) },
                     )
                 }
             }
@@ -6718,14 +7085,19 @@ class MainActivity : ComponentActivity() {
     // R03：proceed 攜「綁定＋probe 前凍結候選」進 VM（vm.requestPolicyWriteForWarning），
     // 不再於 proceed 時重導當下勾選；候選漂移／綁定失配皆作廢要求重探。
     private fun requestPreWriteWarning(
-        proceed: (PolicyWarningBinding, Set<String>) -> Unit,
+        proceed: (PolicyWarningBinding, Set<String>, Long) -> Unit,
+        // Provenance of THIS entry: true only for a genuine user click. The
+        // installed restart callback (auto restart + Retry settle) passes false.
+        fromUserTap: Boolean,
         onCancel: () -> Unit = {},
         // D03b fixer M2：ROOT 驗證對話框兩個繼續回呼（只跳 membership 比對）。
-        onRootVerified: () -> Unit = {},
+        onRootVerified: (Long) -> Unit = {},
     ) {
         // D03b carry-forward #2：同上——re-entrant 要求不得清空活躍警告的 consent。
         if (!consentResetAllowedForNewWarning(pendingClearConfirm)) return
         pendingWarningConsent = null
+        // G2: one restart callback per request function, reused by all branches.
+        val writeRestart = { startWriteWarning(fromUserTap = false) }
         val snap: PolicyWarningSnapshot = try {
             vm.snapshotPolicyForWarning()
         } catch (_: Exception) {
@@ -6745,14 +7117,21 @@ class MainActivity : ComponentActivity() {
         // R4-1 (E01/E02)：Unknown 只提供「重新整理 + 取消」，不建造 consent／pending。
         // 舊 force-proceed 若重建 consent，必須傳 noRemovalKnown=false（delta=∅ 為偽空）。
         if (!snap.known) {
-            if (pendingClearConfirm) return
+            // The frozen write candidate is part of the request identity, so a
+            // changed selection is a different request.
+            val actionId = installAcceptedWarning(
+                action = WarningRestartAction.WRITE,
+                candidateKey = candidate.sorted().joinToString(),
+                fromUserTap = fromUserTap,
+                callback = writeRestart,
+            ) ?: return
             setPendingClearConfirm(true)
             pendingWarningConsent = null
             showPreClearProbeFailedWarning(
                 this@MainActivity,
                 config = probeFailedDialogConfig(write = true, unknown = true),
-                onRetry = { retryUnknownWarning() },
-                onCancel = { setPendingClearConfirm(false); onCancel() },
+                onRetry = { retryUnknownWarning(actionId) },
+                onCancel = { cancelAcceptedWarning(actionId) { onCancel() } },
                 dialogHandles = destructiveDialogHandles,
             )
             return
@@ -6763,18 +7142,35 @@ class MainActivity : ComponentActivity() {
         // R4-1 (E02)：候選為空時 delta==old，**不可**因 candidate.isEmpty() 就無條件
         // 設 noRemovalKnown=true；old 非空仍為破壞性，只有 delta 為空才可證明不移除。
         if (candidate.isEmpty()) {
-            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta)) {
-                if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+            val actionId = installAcceptedAction(
+                action = WarningRestartAction.WRITE,
+                candidateKey = candidate.sorted().joinToString(),
+                fromUserTap = fromUserTap,
+                callback = writeRestart,
+            )
+            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta), actionId = actionId) {
+                if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate, actionId)
             }
             return
         }
         if (delta.isEmpty()) {
-            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta)) {
-                if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+            val actionId = installAcceptedAction(
+                action = WarningRestartAction.WRITE,
+                candidateKey = candidate.sorted().joinToString(),
+                fromUserTap = fromUserTap,
+                callback = writeRestart,
+            )
+            buildRealConsentThen(delta, noRemovalKnown = noRemovalAllowed(snap.known, delta), actionId = actionId) {
+                if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate, actionId)
             }
             return
         }
-        if (pendingClearConfirm) return
+        val actionId = installAcceptedWarning(
+            action = WarningRestartAction.WRITE,
+            candidateKey = candidate.sorted().joinToString(),
+            fromUserTap = fromUserTap,
+            callback = writeRestart,
+        ) ?: return
         setPendingClearConfirm(true)
         lifecycleScope.launch {
             // R05/NEW-1：同 requestPreClearWarning，uid 來自 verified target。
@@ -6782,14 +7178,19 @@ class MainActivity : ComponentActivity() {
             val probe = try {
                 probeDualApps(delta, verifiedTarget?.userId)
             } catch (e: CancellationException) {
-                setPendingClearConfirm(false)
+                if (warningRestartController.isLive(actionId)) setPendingClearConfirm(false)
                 throw e
             } catch (e: Exception) {
                 preClearLog("pre-clear dual-profile probe failed", e)
                 DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
             }
             if (isFinishing || isDestroyed) {
-                setPendingClearConfirm(false)
+                if (warningRestartController.isLive(actionId)) setPendingClearConfirm(false)
+                return@launch
+            }
+            // G2: gate the WHOLE settle on the accepted request identity.
+            if (!warningRestartController.isLive(actionId)) {
+                preClearLog("pre-write probe settle dropped: request no longer live")
                 return@launch
             }
             // R4-1 (E01)：同上——Failed 不作廢任何 consent 以外的事情；不建 pending，
@@ -6801,10 +7202,14 @@ class MainActivity : ComponentActivity() {
                         this@MainActivity,
                         config = probeFailedDialogConfig(write = true, unknown = false),
                         onRetry = {
-                            setPendingClearConfirm(false)
-                            pendingWarningRestart?.invoke()
+                            if (warningRestartController.isLive(actionId)) {
+                                setPendingClearConfirm(false)
+                                if (!warningRestartController.consumeRetry(actionId, !isFinishing && !isDestroyed)) {
+                                    preClearLog("write probe-failed retry request stale; dropping")
+                                }
+                            }
                         },
-                        onCancel = { setPendingClearConfirm(false); onCancel() },
+                        onCancel = { cancelAcceptedWarning(actionId) { onCancel() } },
                         dialogHandles = destructiveDialogHandles,
                     )
                     return@launch
@@ -6816,20 +7221,26 @@ class MainActivity : ComponentActivity() {
                         installed = probe.installed,
                         // 只有 Ok 才到這裡，故永遠不是 failed-probe consent。
                         fromFailedProbe = false,
+                        actionId = actionId,
                     )
                     if (!shouldWarnForDelta(probe.installed)) {
+                        if (!warningRestartController.isLive(actionId) || pendingWarningConsent?.actionId != actionId) return@launch
                         setPendingClearConfirm(false)
-                        if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                        if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate, actionId)
                         return@launch
                     }
                     showPreClearWarning(
                         this@MainActivity,
                         probe.installed,
                         onProceed = {
-                            setPendingClearConfirm(false)
-                            if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate)
+                            if (!warningRestartController.isLive(actionId) || pendingWarningConsent?.actionId != actionId) {
+                                preClearLog("pre-write proceed dropped: request no longer live")
+                            } else {
+                                setPendingClearConfirm(false)
+                                if (mainWarningCandidateFresh(warnedBinding)) proceed(warnedBinding, candidate, actionId)
+                            }
                         },
-                        onCancel = { setPendingClearConfirm(false); onCancel() },
+                        onCancel = { cancelAcceptedWarning(actionId) { onCancel() } },
                         resolveLiveTarget = { resolvePreClearDualTarget(vm.state.value) },
                         fetchFreshVerifiedTarget = { vm.fetchFreshVerifiedTarget() },
                         dialogHandles = destructiveDialogHandles,
@@ -6838,7 +7249,8 @@ class MainActivity : ComponentActivity() {
                         // R2-5 (N10)：同 requestPreClearWarning，重探同一 delta。
                         reprobe = { probeDualApps(delta, verifiedTarget?.userId) },
                         rootUninstallAllowed = verifiedTarget != null,
-                        onRootVerified = onRootVerified,
+                        onRootVerified = { onRootVerified(actionId) },
+                        actionAlive = { warningRestartController.isLive(actionId) },
                     )
                 }
             }
@@ -8409,6 +8821,10 @@ internal suspend fun rootUninstallIfTargetStillValid(
     resolveLiveTarget: () -> PreClearDualTarget?,
     fetchFreshVerifiedTarget: suspend () -> VerifiedTarget?,
     uninstall: suspend (List<String>, Int) -> Boolean,
+    // G4: the originating action may be revoked/superseded while the fresh
+    // fetch above suspends. Re-check identity immediately before the
+    // irreversible uninstall; the default keeps all JVM callers compiling.
+    actionAlive: () -> Boolean = { true },
 ): Int? {
     val live: PreClearDualTarget? = try {
         resolveLiveTarget()
@@ -8439,6 +8855,13 @@ internal suspend fun rootUninstallIfTargetStillValid(
     // uninstall 本身的失敗沿用既有「只記 log、仍讓後續驗證決定」語意（成敗回傳值
     // 不影響 fence 結論），只有 cancellation 透傳。
     val effectiveUid = captured!!.userId
+    // G4: the fresh fetch is a suspend point — a newer action (or a cancel)
+    // can supersede this confirm while we await it. Fail closed with ZERO
+    // uninstall when the originating action is no longer live.
+    if (!actionAlive()) {
+        preClearLog("root-uninstall aborted: originating action no longer live")
+        return null
+    }
     try {
         uninstall(installed, effectiveUid)
     } catch (e: CancellationException) {
@@ -8551,6 +8974,7 @@ internal fun buildPolicyWriteConsent(
     installed: List<String>,
     fromFailedProbe: Boolean = false,
     rootVerifiedEmpty: Boolean = false,
+    actionId: Long? = null,
 ): PolicyWriteConsent = PolicyWriteConsent(
     generation = -1L,
     delta = HashSet(delta),
@@ -8559,6 +8983,7 @@ internal fun buildPolicyWriteConsent(
     capturedInstalled = HashSet(installed),
     fromFailedProbe = fromFailedProbe,
     rootVerifiedEmpty = rootVerifiedEmpty,
+    actionId = actionId,
 )
 
 // D03a：consent → 既有 revalidatePreClearContinue 的薄適配器。四道關卡完全復用，
@@ -8619,6 +9044,7 @@ internal suspend fun buildFastPathConsent(
     resolveLiveTarget: () -> PreClearDualTarget?,
     reprobe: suspend (Set<String>, Int?) -> DualProbeResult,
     noRemovalKnown: Boolean = false,
+    actionId: Long? = null,
 ): PolicyWriteConsent {
     val target: PreClearDualTarget? = try {
         resolveLiveTarget()
@@ -8650,6 +9076,7 @@ internal suspend fun buildFastPathConsent(
         fromFailedProbe = probe is DualProbeResult.Failed && !noTargetAdditive,
         rootVerifiedEmpty = false,
         additiveNoRemoval = noTargetAdditive,
+        actionId = actionId,
     )
 }
 
@@ -8700,10 +9127,11 @@ internal suspend fun dispatchConsentGatedConfirm(
     }
 }
 
-// D03b fixer M3/M5：兩個 one-shot guard（framework-free、JVM 可測）。
-// - InFlightGuard：confirm 重入防護——第一段 enter 成功者才 launch，其餘直接丟棄。
-// - OneShotRestartGuard：abort 後的重啟警告排程去抖＋打破同步遞迴
-//   （Activities 用 main Handler.post 實際延後；guard 只鎖「是否已排程」語義）。
+// D03b fixer M3/M5：framework-free、JVM 可測的 guard helpers。
+// - InFlightGuard：confirm 重入防護——第一段 enter 成功者才 launch，其餘直接丟棄（仍 live）。
+// - OneShotRestartGuard：LEGACY / test-only helper，不再是實際的排程 guard。
+//   auto-restart 的 dedup 與 budget 現在由 WarningRestartController 統一管理
+//   （Activities 用 main Handler.post 實際延後）；此 guard 只保留給舊 JVM 測試。
 internal class InFlightGuard {
     private val inFlight = AtomicBoolean(false)
     fun tryEnter(): Boolean = inFlight.compareAndSet(false, true)
@@ -8717,10 +9145,12 @@ internal class OneShotRestartGuard {
 }
 
 // D03b fixer (availability)：自動重啟警告的次數上限（每次「使用者真正點入口」重置）。
-// OneShotRestartGuard 只擋同一次 post 內的 re-entrant scheduling；此上限擋的是
-// 「連續多次 post」。結構性 fail-closed 原因（空草稿 + 目標不存在／probe 持續失敗）
-// 否則會跨 post 無限重警。用罷即不再排程，使用者必須重新點入口；不影響 fail-closed
-// 寫入（abort 依然零寫入）。pure function 故 JVM 可測。
+// MAX_AUTO_WARNING_RESTARTS 仍 live：它是兩邊 Activity 傳給 WarningRestartController
+// 的 maxRestarts；實際 auto-restart 的 dedup / budget 已搬到該 controller。
+// canAutoRestart 與 OneShotRestartGuard 一樣只保留為 test-only / legacy helper，
+// 不再是線上排程路徑的一部分（此 pure function 僅作為上限規格的 JVM 文件）。
+// 上限擋的是結構性 fail-closed 原因（空草稿 + 目標不存在／probe 持續失敗）跨 post
+// 無限重警；不影響 fail-closed 寫入（abort 依然零寫入）。
 internal const val MAX_AUTO_WARNING_RESTARTS = 1
 internal fun canAutoRestart(previousCount: Int): Boolean = previousCount < MAX_AUTO_WARNING_RESTARTS
 
@@ -8802,8 +9232,11 @@ internal fun <T> dismissDialogHandle(handle: T?, dismiss: (T) -> Unit): T? {
 // 兩者在二次確認 OK 點擊當下經 rootUninstallIfTargetStillValid 做 serial-bound fence；
 // 只有 preClearTargetStillValid 對 live 與 fresh 皆成立才執行 uninstall／re-probe，
 // 否則完全不執行、發出 fail-closed 訊息並 onCancel 還原 UI 狀態。
-// 三個新參數皆無預設值：任何新呼叫端都必須明確提供 fence 來源與 dialog holder
-// （fail-closed 編譯期約束）。
+// G2: actionAlive 的 identity gate 由呼叫端提供（{ true } 預設僅供舊測試／legacy
+// 呼叫端）；三個生產呼叫端皆明確傳入
+// `actionAlive = { warningRestartController.isLive(actionId) }`：
+// MainActivity.requestPreClearWarning、MainActivity.requestPreWriteWarning 與
+// PolicyActivity.requestEditorWriteWarning。
 // R2-5 (N10)：非 ROOT Positive「繼續清除」也必須通過 revalidatePreClearContinue 的
 // serial-bound + membership fence；capturedInstalled（警告時凍結的 installed 快照）與
 // reprobe（同一 verified uid／同一 delta 的重探 seam）皆無預設值，缺少任一即編譯失敗。
@@ -8823,13 +9256,16 @@ internal fun showPreClearWarning(
     rootUninstallAllowed: Boolean = false,
     // D03b fixer M2：ONLY 由 ROOT 驗證對話框兩個繼續回呼觸發（非 ROOT Positive 不帶此 callback）。
     onRootVerified: () -> Unit = {},
+    // G2: identity gate supplied by the Activity. Every deferred callback checks
+    // it so a late settle from a superseded request cannot cancel/proceed here.
+    actionAlive: () -> Boolean = { true },
 ) {
     if (installed.isEmpty()) {
         preClearLog("pre-clear warning called with empty list; treating as cancelled")
-        onCancel()
+        if (actionAlive()) onCancel()
         return
     }
-    if (host.isFinishing || host.isDestroyed) { onCancel(); return }
+    if (host.isFinishing || host.isDestroyed) { if (actionAlive()) onCancel(); return }
     val canRootUninstall = rootUninstallAllowed && capturedTarget != null &&
         capturedTarget.serial != null && preClearRootUninstallAllowed(capturedTarget.userId)
     val sorted = installed.sorted()
@@ -8839,7 +9275,7 @@ internal fun showPreClearWarning(
         host.getString(R.string.pre_clear_message, list)
     } catch (e: RuntimeException) {
         preClearLog("pre-clear message build failed", e)
-        onCancel()
+        if (actionAlive()) onCancel()
         return
     }
     try {
@@ -8852,6 +9288,10 @@ internal fun showPreClearWarning(
                 // 身份放行。fresh fetch + re-probe 是 suspend/IPC，故在既有 lifecycleScope
                 // launch 內執行，Main 不阻塞；只有 ProceedOk 才 onProceed（寫政策）。
                 host.lifecycleScope.launch {
+                    if (!actionAlive()) {
+                        preClearLog("pre-clear continue aborted: request no longer live")
+                        return@launch
+                    }
                     val outcome: PreClearContinueOutcome = try {
                         revalidatePreClearContinue(
                             captured = capturedTarget,
@@ -8868,16 +9308,22 @@ internal fun showPreClearWarning(
                     }
                     if (host.isFinishing || host.isDestroyed) {
                         preClearLog("pre-clear continue aborted: host gone status=finishing-or-destroyed")
-                        try { onCancel() } catch (_: Exception) { }
+                        if (actionAlive()) { try { onCancel() } catch (_: Exception) { } }
+                        return@launch
+                    }
+                    if (!actionAlive()) {
+                        preClearLog("pre-clear continue aborted: request no longer live after revalidation")
                         return@launch
                     }
                     when (outcome) {
                         is PreClearContinueOutcome.ProceedOk -> {
-                            try {
-                                onProceed()
-                            } catch (_: Exception) {
-                                preClearLog("pre-clear continue onProceed failed status=exception")
-                                try { onCancel() } catch (_: Exception) { }
+                            if (actionAlive()) {
+                                try {
+                                    onProceed()
+                                } catch (_: Exception) {
+                                    preClearLog("pre-clear continue onProceed failed status=exception")
+                                    if (actionAlive()) { try { onCancel() } catch (_: Exception) { } }
+                                }
                             }
                         }
                         else -> {
@@ -8890,19 +9336,21 @@ internal fun showPreClearWarning(
                                     is PreClearContinueOutcome.ProceedOk -> "proceed-ok"
                                 },
                             )
-                            try {
-                                Toast.makeText(
-                                    host,
-                                    R.string.pre_clear_continue_recheck_failed,
-                                    Toast.LENGTH_LONG,
-                                ).show()
-                            } catch (_: Exception) { }
-                            try { onCancel() } catch (_: Exception) { }
+                            if (actionAlive()) {
+                                try {
+                                    Toast.makeText(
+                                        host,
+                                        R.string.pre_clear_continue_recheck_failed,
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                } catch (_: Exception) { }
+                                try { onCancel() } catch (_: Exception) { }
+                            }
                         }
                     }
                 }
             }
-            .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> onCancel() }
+            .setNegativeButton(R.string.pre_clear_cancel) { _, _ -> if (actionAlive()) onCancel() }
         // R05/NEW-1：unverified target 完全不顯示 ROOT 代關 Neutral。
         if (canRootUninstall) {
             builder.setNeutralButton(R.string.pre_clear_root_uninstall) { _, _ ->
@@ -8944,6 +9392,10 @@ internal fun showPreClearWarning(
                             // delete+recreate 同 id 換 serial（continuityBreach）與
                             // known→null 皆攔截；任一失敗不 uninstall／re-probe／proceed。
                             host.lifecycleScope.launch {
+                                if (!actionAlive()) {
+                                    preClearLog("root-uninstall aborted: request no longer live")
+                                    return@launch
+                                }
                                 val effectiveUid: Int? = try {
                                     rootUninstallIfTargetStillValid(
                                         installed = installed,
@@ -8951,6 +9403,7 @@ internal fun showPreClearWarning(
                                         resolveLiveTarget = resolveLiveTarget,
                                         fetchFreshVerifiedTarget = fetchFreshVerifiedTarget,
                                         uninstall = { pkgs, uid -> uninstallDualApps(pkgs, uid) },
+                                        actionAlive = actionAlive,
                                     )
                                 } catch (e: CancellationException) {
                                     throw e
@@ -8961,10 +9414,12 @@ internal fun showPreClearWarning(
                                 if (effectiveUid == null) {
                                     // fail-closed：uninstall／re-probe／proceed 全不做。
                                     preClearLog("root-uninstall aborted: verified target no longer valid")
-                                    try {
-                                        Toast.makeText(host, R.string.pre_clear_target_changed, Toast.LENGTH_LONG).show()
-                                    } catch (_: Exception) { }
-                                    try { onCancel() } catch (_: Exception) { }
+                                    if (actionAlive()) {
+                                        try {
+                                            Toast.makeText(host, R.string.pre_clear_target_changed, Toast.LENGTH_LONG).show()
+                                        } catch (_: Exception) { }
+                                        try { onCancel() } catch (_: Exception) { }
+                                    }
                                     return@launch
                                 }
                                 // Phase D post-verify: re-probe the same warned set.
@@ -8979,7 +9434,11 @@ internal fun showPreClearWarning(
                                     DualProbeResult.Failed("exec-failed: ${(e.message ?: e.javaClass.simpleName).take(200)}")
                                 }
                                 if (host.isFinishing || host.isDestroyed) {
-                                    try { onCancel() } catch (_: Exception) { }
+                                    if (actionAlive()) { try { onCancel() } catch (_: Exception) { } }
+                                    return@launch
+                                }
+                                if (!actionAlive()) {
+                                    preClearLog("root-uninstall aborted: request no longer live after re-probe")
                                     return@launch
                                 }
                                 val outcome = decideUninstallVerifyResult(postProbe)
@@ -8998,36 +9457,40 @@ internal fun showPreClearWarning(
                                         outcome = outcome,
                                         // D03b fixer M2：ONLY 這兩個 ROOT 對話框繼續回呼
                                         // 標記 rootVerifiedEmpty（後者非驗證成功）；非 ROOT Positive 不走此處。
-                                        onClearVerified = { onRootVerified(); onProceed() },
-                                        onForceClear = { onRootVerified(); onProceed() },
-                                        onCancel = { onCancel() },
+                                        onClearVerified = {
+                                            if (actionAlive()) { onRootVerified(); onProceed() }
+                                        },
+                                        onForceClear = {
+                                            if (actionAlive()) { onRootVerified(); onProceed() }
+                                        },
+                                        onCancel = { if (actionAlive()) onCancel() },
                                         dialogHandles = dialogHandles,
                                     )
                                 } catch (e: CancellationException) {
                                     throw e
                                 } catch (e: Exception) {
                                     preClearLog("uninstall verify dialog failed", e)
-                                    try { onCancel() } catch (_: Exception) { }
+                                    if (actionAlive()) { try { onCancel() } catch (_: Exception) { } }
                                 }
                             }
                         }
-                        .setNegativeButton(R.string.dialog_cancel) { _, _ -> onCancel() }
-                        .setOnCancelListener { onCancel() }
+                        .setNegativeButton(R.string.dialog_cancel) { _, _ -> if (actionAlive()) onCancel() }
+                        .setOnCancelListener { if (actionAlive()) onCancel() }
                         .show()
                 } catch (e: RuntimeException) {
                     preClearLog("pre-clear root-uninstall confirm failed to show", e)
-                    onCancel()
+                    if (actionAlive()) onCancel()
                     null
                 }
             }
         }
-        builder.setOnCancelListener { onCancel() }
+        builder.setOnCancelListener { if (actionAlive()) onCancel() }
         // PR-74 A3：保存警告對話框 handle 供 onDestroy 釋放。
         dialogHandles.preClearWarning = builder.show()
     } catch (e: RuntimeException) {
         // BadToken / OOM 等 → 視同取消（不默默放行，由呼叫端重置旗標）。
         preClearLog("pre-clear warning failed to show", e)
-        onCancel()
+        if (actionAlive()) onCancel()
     }
 }
 

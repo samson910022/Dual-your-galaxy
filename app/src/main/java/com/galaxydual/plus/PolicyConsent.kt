@@ -58,6 +58,10 @@ package com.galaxydual.plus
  *   four gates. It is NEVER set for an Unknown snapshot (noRemovalKnown=false),
  *   which always falls back to fail-closed. Default false keeps every legacy /
  *   positional constructor source-compatible.
+ * - [actionId] (PR #89 R2 G2): id of the WarningRestartRequest that accepted the
+ *   action this consent belongs to. It lets every deferred side effect (confirm,
+ *   ROOT callback, retry, abort restart) prove it still owns the live request.
+ *   Default null keeps legacy/positional constructor callers source-compatible.
  */
 data class PolicyWriteConsent(
     val generation: Long,
@@ -68,4 +72,5 @@ data class PolicyWriteConsent(
     val fromFailedProbe: Boolean = false,
     val rootVerifiedEmpty: Boolean = false,
     val additiveNoRemoval: Boolean = false,
+    val actionId: Long? = null,
 )

@@ -249,6 +249,15 @@ data class PendingPolicyWrite(
     val consent: PolicyWriteConsent? = null,
 )
 
+// PR #89 Round-3 R3-2: outcome of confirmPolicyWrite for callers that must decide
+// whether an accepted warning action may be revoked (Activity wiring lands later).
+// Only admission is reported — guard/message/state/coroutine behavior is unchanged.
+public enum class PolicyWriteConfirmAdmission {
+    ACCEPTED,            // write dispatched on viewModelScope
+    RETRYABLE_RETAINED,  // pending kept: ack missing/mismatch, pending!=expected, RECONCILING
+    TERMINAL,            // pending cleared / no write (NO_PENDING, owner-write, stale revision)
+}
+
 data class PendingRemove(
     val pkg: String,
     val dualId: Int,
@@ -9419,22 +9428,30 @@ class DualViewModel(
     // P1 #1 queued-vs-committing:僅當此 expected 的 save 已實際開始
     // (policyWriteSaving 持有 key) 才 no-op；僅排隊等 mutex 的 confirm 仍可
     // 取消 (清 pending 後，排隊的 confirm 在取到 mutex 時 abort，不寫入)。
-    fun cancelPolicyWrite(expected: PendingPolicyWrite) {
+    // PR #89 Round-3 R3-1: returns true only when THIS expected pending was
+    // actually cleared (QUEUED); every refusal returns false (SAVING/RECONCILING/
+    // in-flight/stale). Cancel semantics/fences are unchanged.
+    fun cancelPolicyWrite(expected: PendingPolicyWrite): Boolean {
         synchronized(policySettleLock) {
-            if (policyWriteSaving.contains(policyWriteKey(expected))) return
+            if (policyWriteSaving.contains(policyWriteKey(expected))) return false
             if (_state.value.policyWritePhase == PolicyWritePhase.SAVING &&
                 _state.value.pendingPolicyWrite == expected
-            ) return
+            ) return false
             if (_state.value.policyWritePhase == PolicyWritePhase.RECONCILING &&
                 _state.value.pendingPolicyWrite == expected
-            ) return
-            if (policyReconciling.contains(policyWriteKey(expected))) return
-            if (activePolicyTx.get()?.key == policyWriteKey(expected)) return
+            ) return false
+            if (policyReconciling.contains(policyWriteKey(expected))) return false
+            if (activePolicyTx.get()?.key == policyWriteKey(expected)) return false
             // Stage G2：跨 VM（新 VM 認領前本地仍空，coordinator 仍為舊 B 的 key）。
-            if (policyTxCoordinator?.activeTx?.get()?.key == policyWriteKey(expected)) return
+            if (policyTxCoordinator?.activeTx?.get()?.key == policyWriteKey(expected)) return false
+            // StateFlow.update may re-invoke the lambda on CAS contention; reset
+            // on every invocation so a retried/mismatched pass cannot report true.
+            var cleared = false
             _state.update { cur ->
+                cleared = false
                 val pending = cur.pendingPolicyWrite ?: return@update cur
                 if (pending != expected) return@update cur
+                cleared = true
                 cur.copy(
                     pendingPolicyWrite = null,
                     policyWritePhase = PolicyWritePhase.IDLE,
@@ -9443,6 +9460,7 @@ class DualViewModel(
                     msgKind = MsgKind.INFO,
                 )
             }
+            return cleared
         }
     }
 
@@ -9554,7 +9572,19 @@ class DualViewModel(
     // MainActivity passes `if (policyAcknowledged) pending.generation else null`;
     // no default argument, no blanket boolean. The previously-added
     // POLICY_NOT_ACKNOWLEDGED message stays for the unauthorized case.
-    fun confirmPolicyWrite(expected: PendingPolicyWrite, acknowledgedGeneration: Long?) {
+    // PR #89 Round-3 R3-2: reports whether the write was dispatched (ACCEPTED),
+    // refused but retryable with the pending retained (RETRYABLE_RETAINED), or
+    // terminal (TERMINAL). All guards/messages/state updates/launches unchanged.
+    // PR #89 Round-4 R4-1: [onAttemptComplete] reports the ACTUAL async outcome
+    // of a dispatched write. It is emitted EXACTLY ONCE when the launched
+    // coroutine ends (including early `return@launch`/`return@withLock` and
+    // cancellation), NEVER for a synchronous pre-launch refusal. The verdict is
+    // derived from OBSERVED end state, not from this dispatch return value.
+    fun confirmPolicyWrite(
+        expected: PendingPolicyWrite,
+        acknowledgedGeneration: Long?,
+        onAttemptComplete: ((attemptGeneration: Long, outcome: PolicyWriteConfirmAttemptOutcome) -> Unit)? = null,
+    ): PolicyWriteConfirmAdmission {
         // N1: pending==null 必須優先報 NO_PENDING（INVALID），不得被 acknowledgement
         // 訊息掩蓋（acknowledgement 檢查置於其後）。
         if (_state.value.pendingPolicyWrite == null) {
@@ -9563,7 +9593,7 @@ class DualViewModel(
                 if (cur.pendingPolicyWrite != null) cur
                 else cur.copy(msg = policyText(PolicyText(PolicyTextKind.NO_PENDING)), msgKind = MsgKind.INVALID)
             }
-            return
+            return PolicyWriteConfirmAdmission.TERMINAL
         }
         // S1: acknowledgement fence。pending 保留（使用者仍可在對話框勾選後
         // 再按確認）；世代不符／未確認一律不寫 store（POLICY_NOT_ACKNOWLEDGED）；
@@ -9579,9 +9609,11 @@ class DualViewModel(
                     cur
                 }
             }
-            return
+            return PolicyWriteConfirmAdmission.RETRYABLE_RETAINED
         }
-        if (_state.value.pendingPolicyWrite != expected) return
+        if (_state.value.pendingPolicyWrite != expected) {
+            return PolicyWriteConfirmAdmission.RETRYABLE_RETAINED
+        }
         // Stage A：核對中拒絕新確認（IN_PROGRESS；pending 保留，請勿重試）。
         // 置於 owner 門控之前：核對中不得清 pending（owner 拒絕會清 pending，
         // 此處必須先擋）。
@@ -9593,7 +9625,7 @@ class DualViewModel(
                     msgKind = MsgKind.INFO,
                 )
             }
-            return
+            return PolicyWriteConfirmAdmission.RETRYABLE_RETAINED
         }
         // owner-user 門控 (defense-in-depth)：hook 只讀 user 0；非 owner 的
         // 寫入不會被 hook 看到，故直接拒絕、清 pending 且不寫 store。
@@ -9607,7 +9639,7 @@ class DualViewModel(
                     msgKind = MsgKind.CHANNEL,
                 )
             }
-            return
+            return PolicyWriteConfirmAdmission.TERMINAL
         }
         // Stage I2：陳舊修訂 stale 即強制重讀（同 unknown 門控：清 pending、不碰
         // store、重申 Unknown＋fence，晚到舊 Known 不得蓋回）。
@@ -9625,10 +9657,17 @@ class DualViewModel(
                     msgKind = MsgKind.CHANNEL,
                 )
             }
-            return
+            return PolicyWriteConfirmAdmission.TERMINAL
         }
         viewModelScope.launch {
             val pendingAtCall = expected
+            // R4-1: identity anchor for a REAL Tx claim. Never cleared — a
+            // stale rollback must not turn a proven handover into retryable QUEUED.
+            var attemptTx: PolicyTx? = null
+            // R4-1: outermost wrapper also covers the `return@launch` exits above
+            // and every `return@withLock` below, so the settlement callback fires
+            // exactly once even when the coroutine bails before the inner try.
+            try {
             if (_state.value.pendingPolicyWrite != pendingAtCall) return@launch
             val key = policyWriteKey(pendingAtCall)
             if (!inFlightWrites.add(key)) {
@@ -10021,6 +10060,7 @@ class DualViewModel(
                         }
                         h1Deferred = lazy
                         preClaimTx = tx
+                        attemptTx = tx
                         var preIoAbort = false
                         policyRevisionMutex.withLock {
                             try {
@@ -10335,6 +10375,7 @@ class DualViewModel(
                                 }
                             }
                             handoverTx = htx
+                            attemptTx = htx
                             preClaimTx = null
                             return@withLock
                         }
@@ -10350,6 +10391,7 @@ class DualViewModel(
                                 val pc = preClaimTx
                                 if (pc != null) {
                                     handoverTx = pc
+                                    attemptTx = pc
                                     preClaimTx = null
                                     if (writeLocked) {
                                         try { policyTxCoordinator?.writeMutex?.unlock() } catch (_: Exception) { }
@@ -10398,6 +10440,7 @@ class DualViewModel(
                                     }
                                 }
                                 handoverTx = htx
+                                attemptTx = htx
                                 preClaimTx = null
                                 return@withLock
                             }
@@ -10650,6 +10693,53 @@ class DualViewModel(
                     }
                 } catch (_: Exception) { }
             }
+            } finally {
+                // R4-1: exactly-once settlement for the launched attempt. The
+                // verdict is read from OBSERVED end state AFTER the F3 repair
+                // above, and the callback runs OUTSIDE policySettleLock.
+                if (onAttemptComplete != null) {
+                    // Fail CLOSED: any failure to read end state keeps the
+                    // action live (RETRYABLE_RETAINED) instead of suppressing
+                    // the settlement callback that releases the caller's guard.
+                    val outcome = try {
+                        resolveConfirmAttemptOutcome(pendingAtCall, attemptTx)
+                    } catch (_: Exception) {
+                        PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED
+                    }
+                    try { onAttemptComplete(pendingAtCall.generation, outcome) }
+                    catch (_: Exception) { } // foreign callback never changes VM outcome
+                }
+            }
+        }
+        return PolicyWriteConfirmAdmission.ACCEPTED
+    }
+
+    // R4-1: derive the ACTUAL async outcome from observed state, not from the
+    // dispatch return. Same-generation + QUEUED WINS over any Tx evidence: the
+    // local-set loser and foreign BUSY arms can leave coordinator residue while
+    // the pending is still retryable QUEUED. A proven handover is the only case
+    // where a pending may be retained yet cannot return to retryable QUEUED.
+    private fun resolveConfirmAttemptOutcome(
+        expected: PendingPolicyWrite,
+        attemptTx: PolicyTx?,
+    ): PolicyWriteConfirmAttemptOutcome = synchronized(policySettleLock) {
+        val s = _state.value
+        val key = policyWriteKey(expected)
+        val same = s.pendingPolicyWrite?.generation == expected.generation
+        val txHeld = attemptTx != null && (
+            activePolicyTx.get() === attemptTx ||
+            policyTxCoordinator?.activeTx?.get() === attemptTx
+        )
+        val joinable = attemptTx != null && canJoinTx(attemptTx)
+        val reconOurs = s.policyWritePhase == PolicyWritePhase.RECONCILING &&
+            policyReconciling.contains(key)
+        when {
+            s.pendingPolicyWrite == null -> PolicyWriteConfirmAttemptOutcome.CONSUMED
+            !same -> PolicyWriteConfirmAttemptOutcome.SUPERSEDED
+            s.policyWritePhase == PolicyWritePhase.QUEUED ->
+                PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED
+            txHeld || joinable || reconOurs -> PolicyWriteConfirmAttemptOutcome.HANDED_OFF
+            else -> PolicyWriteConfirmAttemptOutcome.RETRYABLE_RETAINED
         }
     }
 
