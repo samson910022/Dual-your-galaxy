@@ -429,13 +429,15 @@ private val LEGACY_CLASSIFICATIONS = setOf(
  *  - [abandonIntent] advances the outcome fence (cancel / OFF / show failure)
  *    and invalidates the pending enable for that intent: zero writes, zero
  *    state claims, and a late commit result can no longer land.
- *  - An ENABLE was recorded app-scoped at accept time and the consume seams
- *    ([notePendingEnable], [consumePendingEnable],
- *    [consumePendingEnableForReplay], [isEnableHandledBy]) are TEST-ONLY: no
- *    production code consumes that record. Phase 2: the app IO consumer that
- *    confirms the opt-in owns the actual effect write; UI callbacks and state
- *    replay are presentation-only and can never toggle it a second time. A
- *    grant alone is never treated as effect proof.
+ *  - An ENABLE is recorded app-scoped at accept time. [notePendingEnable] is
+ *    PRODUCTION: Main calls it to record the app-scoped GRANT ATTEMPT sequence
+ *    (sequence bookkeeping only — it never writes the effect preference or
+ *    acknowledges a consent commit). The consume seams ([consumePendingEnable],
+ *    [consumePendingEnableForReplay], [isEnableHandledBy]) remain TEST-ONLY: no
+ *    production code consumes that handoff record. Phase 2: the app IO consumer
+ *    that confirms the opt-in owns the actual effect write; UI callbacks and
+ *    state replay are presentation-only and can never toggle it a second time.
+ *    A grant alone is never treated as effect proof.
  *  - Cold-start convergence ALSO requires the app-only durable enable-pending
  *    marker from the SAME coherent read as optin=true. The marker is cleared
  *    in the same commit as a user OFF, so an authoritative resync can never
@@ -444,6 +446,13 @@ private val LEGACY_CLASSIFICATIONS = setOf(
  *    consumer and the resync. A newer claim is never regressed by a later
  *    Confirmed intent on the same generation, but a rebind may claim the same
  *    still-owed enable once on a NEW generation.
+ *  - R5-04: a grant ATTEMPT is recorded at accept time in the app-scoped intent
+ *    domain even when its reply is Unknown/lost. It is promoted to an EFFECTIVE
+ *    resync reason ONLY by a fresh authoritative read that verifies durable
+ *    optin=true AND the enable-pending marker. No Confirmed consent/effect
+ *    state is fabricated from an unverified local mMap. An OFF OLDER than such
+ *    a verified grant is the prior setting and cannot block resync; a NEWER
+ *    OFF still does.
  */
 internal class BbcActivationConsentHolder(
     /**
@@ -531,13 +540,34 @@ internal class BbcActivationConsentHolder(
     private var enableOwner: EnableOwner? = null
 
     /**
-     * Sequence of the last CONFIRMED consent grant. A resync-driven enable
-     * compares OFF/cancel evidence against THIS sequence (the grant's own
-     * intent), never against a freshly minted sequence that would be newer
-     * than every recorded abandon and make the OFF guard inert.
+     * Sequence of the last CONFIRMED consent grant (a Confirmed reply only; a
+     * verified accept-time attempt lives in [verifiedGrantSequence]). The
+     * AUTHORITATIVE grant reason a resync compares OFF/cancel evidence against
+     * is [effectiveGrantSequence] — the max of this and [verifiedGrantSequence]
+     * — never a freshly minted sequence that would be newer than every recorded
+     * abandon and make the OFF guard inert.
      */
     @Volatile
     private var confirmedGrantSequence: Long = 0L
+
+    /**
+     * R5-04: highest consent-grant ATTEMPT recorded at accept time in the SAME
+     * app-scoped intent domain (via [notePendingEnable], which Main calls). It
+     * is kept even when the commit's reply is Unknown or never returns, because
+     * the commit may still have landed durably before a rebind. It becomes an
+     * effective resync reason ONLY after [resolve] verifies durable optin=true
+     * AND the enable-pending marker from a FRESH session's coherent read.
+     */
+    @Volatile
+    private var pendingGrantAttemptSequence: Long = 0L
+
+    /**
+     * R5-04: the grant attempt promoted by such a verified read. Deliberately
+     * separate from [confirmedGrantSequence] so an unverified reply can never
+     * masquerade as a Confirmed consent grant.
+     */
+    @Volatile
+    private var verifiedGrantSequence: Long = 0L
 
     /** The single generation whose resync is allowed to drive a runtime enable. */
     @Volatile
@@ -546,6 +576,14 @@ internal class BbcActivationConsentHolder(
     /** Generation in which the user (or cancel) said OFF: resync may not re-enable it. */
     @Volatile
     private var resyncEnableBlockedGeneration: Long = -1L
+
+    /**
+     * R5-04: sequence of the OFF/cancel that installed
+     * [resyncEnableBlockedGeneration]. A NEWER verified grant clears the
+     * generation block; an OFF that is truly newer than the grant keeps it.
+     */
+    @Volatile
+    private var resyncEnableBlockedSequence: Long = -1L
 
     /**
      * PR #90 Phase C (P2): an ENABLE that was enqueued with a Confirmed consent
@@ -682,8 +720,25 @@ internal class BbcActivationConsentHolder(
         }
     }
 
-    /** The grant sequence that a cold-start resync must compare OFFs against. */
+    /**
+     * Test/telemetry seam: the CONFIRMED grant sequence only. The authoritative
+     * grant reason a cold-start resync actually compares OFFs against is
+     * [effectiveGrantSequence], which also includes verified accept-time
+     * attempts promoted from a coherent durable snapshot.
+     */
     internal fun confirmedGrantSequence(): Long = confirmedGrantSequence
+
+    /**
+     * R5-04: the effective grant reason for sequence-aware resync comparison.
+     * A Confirmed grant wins; otherwise a grant attempt promoted by a verified
+     * durable optin+marker read is used. The promoted reason is the HIGHEST
+     * recorded attempt, not necessarily the exact attempt that wrote the marker;
+     * the OFF guards ([latestAbandonSequence] and
+     * [resyncEnableBlockedSequence]) still bound it. An unverified local read
+     * contributes nothing (both fields stay at `0` for a fresh process).
+     */
+    internal fun effectiveGrantSequence(): Long =
+        maxOf(confirmedGrantSequence, verifiedGrantSequence)
 
     /** Test/telemetry seam: the generation owning the current (Unknown) fence. */
     internal fun currentFenceGeneration(): Long = fenced.get().fenceGeneration
@@ -702,7 +757,8 @@ internal class BbcActivationConsentHolder(
      * still owed; an OFF that survived the daemon cleared it. The marker is
      * NOT a Hook authorization key.
      *
-     * [reasonSequence] is the CONFIRMED grant's intent sequence — OFF/cancel
+     * [reasonSequence] is the AUTHORITATIVE grant reason (a Confirmed reply OR a
+     * verified accept-time attempt from [effectiveGrantSequence]) — OFF/cancel
      * evidence is compared against it, not against a freshly minted sequence
      * that would outrank every recorded abandon. [claimSequence] is a fresh
      * monotonic ownership token so a later Confirmed S cannot regress it into
@@ -740,16 +796,18 @@ internal class BbcActivationConsentHolder(
     }
 
     /**
-     * TEST-ONLY handoff bookkeeping (no production consumer). Production still
-     * records the intent at accept time, but the phase-2 effect write is owned
-     * and driven by the app IO consumer in [BbcToggleCoordinator], never by this
-     * record; new production code must not rely on it. Kept for the
-     * framework-free exactly-once handoff tests. The grant alone is only
-     * AUTHORIZATION — it is not proof that the runtime preference was written.
+     * Handoff bookkeeping from accept(). The phase-2 effect write is owned and
+     * driven by the app IO consumer in [BbcToggleCoordinator], never by this
+     * record; the grant alone is only AUTHORIZATION, not proof that the runtime
+     * preference was written. R5-04: the same call ALSO records the app-scoped
+     * GRANT ATTEMPT sequence, so a rebind that loses the commit reply can still
+     * recognise a newer verified grant in the fresh session's resync. That is
+     * sequence bookkeeping only — it never grants or acknowledges a write.
      */
     @Synchronized
     fun notePendingEnable(sequence: Long, generation: Long) {
         pendingEnable = PendingEnable(sequence, generation)
+        if (sequence > pendingGrantAttemptSequence) pendingGrantAttemptSequence = sequence
     }
 
     /**
@@ -877,6 +935,33 @@ internal class BbcActivationConsentHolder(
             read.classification == PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED ->
                 BbcActivationConsentState.NotGranted
             else -> cur.state // unresolved: stay neutral rather than invent a state
+        }
+        // R5-04 review: `next is Granted` ALONE is not proof of a fresh grant.
+        // Granted is a singleton, so the `fenceIsCurrent -> cur.state`,
+        // `!coherent || UNAVAILABLE -> cur.state` and unresolved `else` branches
+        // all yield the SAME object when the holder was already Granted. This
+        // boolean mirrors ONLY the `optin == TRUE` branch of a COHERENT,
+        // unfenced read: promotion must be derived from THIS read, never
+        // inherited from cur.state or an optimistic local mMap.
+        val grantedFromThisRead = !fenceIsCurrent && read.coherent &&
+            read.optIn == BbcOptInValue.TRUE
+        // R5-04: promote the app-scoped GRANT ATTEMPT only when this FRESH,
+        // coherent read verifies BOTH durable optin=true and the enable-pending
+        // marker, and the resolution actually authorizes. This is the case the
+        // old Confirmed grant reply was lost to a rebind but the commit landed.
+        // No Confirmed grant/effect is fabricated from an optimistic local map:
+        // only the effective resync sequence moves. An OFF OLDER than the
+        // verified grant was the prior setting and must stop blocking; a NEWER
+        // OFF is also fenced by latestAbandonSequence and keeps the block.
+        if (grantedFromThisRead &&
+            read.enablePending == true &&
+            pendingGrantAttemptSequence > verifiedGrantSequence
+        ) {
+            verifiedGrantSequence = pendingGrantAttemptSequence
+            if (resyncEnableBlockedSequence < verifiedGrantSequence) {
+                resyncEnableBlockedGeneration = -1L
+                resyncEnableBlockedSequence = -1L
+            }
         }
         if (next === cur.state) return
         val becomesUnknown = next is BbcActivationConsentState.Unknown
@@ -1047,7 +1132,14 @@ internal class BbcActivationConsentHolder(
         val next = if (grants) BbcActivationConsentState.Granted else BbcActivationConsentState.Unknown
         val fenceGeneration = if (grants) -1L else fenceForTouchedGeneration(cur, touchedGeneration)
         val fenceSession = if (grants) null else fenceSessionFor(cur, touchedGeneration, session)
-        if (grants) confirmedGrantSequence = intentSequence
+        if (grants) {
+            confirmedGrantSequence = intentSequence
+            // A direct holder caller need not go through notePendingEnable; keep
+            // the attempt domain in sync so a later verified resync can use it.
+            if (intentSequence > pendingGrantAttemptSequence) {
+                pendingGrantAttemptSequence = intentSequence
+            }
+        }
         if (grants && consumerOwnsEnable) {
             // Record app-consumer ownership before publishing Granted: a rebuilt
             // UI's collector must not dispatch a second effect toggle. NEVER
@@ -1115,7 +1207,10 @@ internal class BbcActivationConsentHolder(
         latestAbandonSequence = maxOf(latestAbandonSequence, intentSequence)
         // OFF/cancel in this generation blocks resync-driven enabling: a later
         // authoritative read must not resurrect the effect the user turned off.
-        resyncEnableBlockedGeneration = fenced.get().generation
+        // R5-04: remember the OFF's sequence too, so a NEWER verified grant can
+        // clear this block while an older grant cannot.
+        resyncEnableBlockedGeneration = cur.generation
+        resyncEnableBlockedSequence = maxOf(resyncEnableBlockedSequence, intentSequence)
         val pending = pendingEnable
         if (pending != null && pending.sequence <= intentSequence) pendingEnable = null
         if (intentSequence <= cur.appliedIntentSequence) return

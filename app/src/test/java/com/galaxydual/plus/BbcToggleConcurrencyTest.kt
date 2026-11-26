@@ -827,6 +827,40 @@ class BbcToggleConcurrencyTest {
         }
     }
 
+    /**
+     * R5-04: expose the APPLIED mark sequence for the coordinator's sequence-
+     * aware Confirmed veto. Reading it is side-effect free: mark()/applyOutcome
+     * keep their fence semantics (stale outcomes ignored, legacy overload does
+     * not advance the fence, a persisted read is never Confirmed).
+     */
+    @Test
+    fun appliedSequenceTracksOnlyAppliedMarks_notReadsOrStaleOutcomes() {
+        val state = BbcToggleRuntimeState(initialConfirmed = false)
+        assertEquals(0L, state.appliedSequence())
+
+        assertTrue(state.mark(BbcWriteOutcome.Unknown, 5L))
+        assertEquals(5L, state.appliedSequence())
+        assertNull(state.confirmedOrUnknown)
+
+        assertFalse("a stale success may not advance the applied fence",
+            state.mark(BbcWriteOutcome.Confirmed(false), 3L))
+        assertEquals(5L, state.appliedSequence())
+
+        assertTrue(state.mark(BbcWriteOutcome.Confirmed(true), 6L))
+        assertEquals(6L, state.appliedSequence())
+
+        assertTrue("the legacy overload must still apply",
+            state.mark(BbcWriteOutcome.Confirmed(false)))
+        assertEquals("but must not advance the sequence fence",
+            6L, state.appliedSequence())
+        assertEquals(false, state.confirmedOrUnknown)
+
+        state.seedEffectFromPersistedRead(BbcRuntimePrefValue.TRUE)
+        assertEquals("a persisted read is never a Confirmed mark",
+            BbcEffectStatus.Confirmed(false), state.effectStatus.value)
+        assertEquals(6L, state.appliedSequence())
+    }
+
     // --- PR #90 Phase 2: split lanes, explicit same-axis supersession --------
 
     private fun TestScope.splitLaneCoordinator(

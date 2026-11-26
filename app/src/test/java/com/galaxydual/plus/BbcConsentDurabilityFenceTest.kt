@@ -8,6 +8,7 @@
 package com.galaxydual.plus
 
 import com.galaxydual.hook.PolicySource
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -927,5 +928,103 @@ class BbcConsentDurabilityFenceTest {
             BbcActivationConsentState.Granted, holder.currentState())
         assertNull(holder.currentFenceSession())
         appScope.cancel()
+    }
+
+    /**
+     * R5-04 (P1), durable-fence level: an old Confirmed(false) plus a grant
+     * whose optin/marker exist ONLY in a FAILED commit's optimistic local mMap
+     * must NEVER drive an enable. Only a later authoritative read that VERIFIES
+     * the durable optin+marker on a fresh prefs instance may promote the grant
+     * attempt and converge the owed enable exactly once.
+     */
+    @Test
+    fun unverifiedLocalMarkerNeverEnables_verifiedDurableMarkerEnablesOnceAfterRebind() = runTest {
+        val pendingKey = "app_enable_pending_test_only"
+        val durable = mutableMapOf<String, Any>(
+            classKey to PolicySource.INSTALL_CLASSIFICATION_NEW_GENERATION_NOT_CONSENTED,
+            runtimeKey to false,
+        )
+        val service = FakePrefs(durable)
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(service.authoritativeRead(1L))
+        assertEquals(BbcActivationConsentState.NotGranted, holder.currentState())
+
+        val s1 = BbcConsentSessionIdentity(1L, Any(), Any())
+        var fresh = BbcConsentSessionIdentity(2L, Any(), Any())
+        val commits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value ->
+                commits.add(value)
+                // One atomic runtime+marker commit, as in production.
+                service.commitBoolean(runtimeKey, value)
+                service.commitBoolean(pendingKey, false)
+                BbcWriteOutcome.Confirmed(value)
+            },
+            io = dispatcher,
+            consentCommitAt = { gen ->
+                // The daemon rejects the write: only the optimistic mMap is
+                // polluted. The commit reply is lost to the rebind.
+                service.commitOk = false
+                service.commitBoolean(optinKey, true)
+                service.commitBoolean(pendingKey, true)
+                BbcConsentWriteResult(Unknown(), gen, s1)
+            },
+            consentRead = { gen ->
+                service.freshInstance().authoritativeRead(gen).copy(
+                    enablePending = durable[pendingKey] as? Boolean ?: false,
+                    session = fresh,
+                )
+            },
+            currentSession = { fresh },
+            consentHolder = holder,
+        )
+        val h = harness(holder, coordinator)
+
+        h.userToggle(false) // the older, real Confirmed(false)
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false), commits)
+        h.userToggle(true)
+        h.accept()
+        testScheduler.advanceUntilIdle()
+        assertEquals("only the optimistic mMap carries the grant marker",
+            true, service.local[pendingKey])
+        assertFalse("the daemon never persisted opt-in", durable.containsKey(optinKey))
+        assertEquals("an Unknown reply may not drive phase 2", listOf(false), commits)
+
+        holder.onServiceGenerationChanged(2L)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertFalse("a local-only grant must never authorize",
+            holder.currentState() is BbcActivationConsentState.Granted)
+        assertEquals("no enable from unverified local evidence", listOf(false), commits)
+        h.dispose()
+
+        // Now the daemon REALLY persists both keys. A genuinely fresh session
+        // verifies them and converges the still-owed enable exactly once.
+        service.commitOk = true
+        durable[optinKey] = true
+        durable[pendingKey] = true
+        fresh = BbcConsentSessionIdentity(3L, Any(), Any())
+        holder.onServiceGenerationChanged(3L)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertTrue("a verified durable read resolves Granted",
+            holder.currentState() is BbcActivationConsentState.Granted)
+        assertEquals(
+            "a verified durable marker converges exactly one enable",
+            listOf(false, true), commits,
+        )
+        assertEquals("the enable cleared the durable marker",
+            false, durable[pendingKey] as? Boolean)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false, true), commits)
     }
 }

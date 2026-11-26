@@ -111,6 +111,16 @@ internal class BbcToggleRuntimeState(
         get() = state.get().value
 
     /**
+     * R5-04: the sequence of the last APPLIED [mark] outcome (`0` before any
+     * sequence-aware mark). Read-only: it does not change [mark]/[applyOutcome]
+     * semantics or advance the fence. The coordinator compares it with the
+     * verified grant-attempt sequence so an OLD Confirmed(false) from a prior
+     * setting cannot veto a NEWER grant whose enable is still owed after a
+     * rebind. A Confirmed(false) APPLIED after that grant still wins.
+     */
+    fun appliedSequence(): Long = state.get().sequence
+
+    /**
      * PR #90 Phase 3 (R3-06a/E2): fold an authoritative persisted value that was
      * read on the app IO lane into the UI projection as a NEUTRAL seed.
      *

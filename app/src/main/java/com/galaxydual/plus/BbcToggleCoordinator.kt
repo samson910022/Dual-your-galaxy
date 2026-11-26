@@ -567,16 +567,28 @@ internal class BbcToggleCoordinator(
         // this marker in the same commit. Without the marker a cold-start
         // resync would silently flip the user's OFF back ON.
         if (!enablePending) return
-        // A confirmed effect is already authoritative: Confirmed(true) needs no
-        // second enable, Confirmed(false) is a user OFF that must never be
-        // overridden by a background resync.
-        if (state.effectStatus.value is BbcEffectStatus.Confirmed) return
+        // R5-04: the grant reason must come from the VERIFIED grant attempt,
+        // not only from a Confirmed consent reply. A rebind can lose that reply
+        // after the durable optin+marker commit landed; the fresh authoritative
+        // read verified it and the holder promoted the attempt.
+        // The OFF/cancel comparison uses this GRANT sequence, not the freshly
+        // minted one (which would outrank every recorded abandon). The claim
+        // token is fresh so a later Confirmed S cannot regress a resync-owned R.
+        val reason = consentHolder.effectiveGrantSequence()
+        // SEQUENCE-AWARE effect veto (replaces the old blanket `is Confirmed`):
+        //  * Confirmed(true) is already ON — no second enable, ever.
+        //  * Confirmed(false) APPLIED after the grant is a real newer OFF and
+        //    must veto. Applied BEFORE the grant it is only the prior setting
+        //    and must NOT permanently veto the still-owed enable (that was the
+        //    R5-04 bug: ON never converged until a process restart).
+        //  * A newer projected user intent or abandon is checked below / in the
+        //    holder's claim, so OFF remains highest priority.
+        val effect = state.effectStatus.value
+        if (effect is BbcEffectStatus.Confirmed) {
+            if (effect.value) return
+            if (state.appliedSequence() >= reason) return
+        }
         if (state.latestIntentProjectedValue() == false) return
-        // The OFF/cancel comparison uses the GRANT's intent sequence, not a
-        // freshly minted one (which would outrank every recorded abandon).
-        // The claim token is fresh and monotonic so a later Confirmed S cannot
-        // regress a resync-owned enable R into a second write.
-        val reason = consentHolder.confirmedGrantSequence()
         val claim = consentHolder.nextIntentSequence()
         if (!consentHolder.tryClaimResyncEnable(generation, reason, enablePending, claim)) return
         enqueueToggle(effectSequence, true, {}, {}, session)

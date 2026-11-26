@@ -942,11 +942,17 @@ class BbcActivationConsentStateMachineTest {
             scope = appScope, state = runtime,
             commit = { value ->
                 commits.add(value)
-                // The enable commit fails: the daemon never clears the marker.
-                if (firstEnable) {
+                // The FIRST ENABLE fails (not the older OFF): that commit never
+                // landed, so the daemon never clears the enable-pending marker.
+                val outcome = if (value && firstEnable) {
                     firstEnable = false
                     BbcWriteOutcome.Unknown
                 } else BbcWriteOutcome.Confirmed(value)
+                if (outcome is BbcWriteOutcome.Confirmed) {
+                    durable.runtimeEnabled = value
+                    durable.pending = false // one atomic runtime+marker commit
+                }
+                outcome
             },
             io = dispatcher,
             consentCommitAt = { gen ->
@@ -961,10 +967,16 @@ class BbcActivationConsentStateMachineTest {
             consentHolder = holder,
         )
         val h = harness(holder, coordinator)
+        // R5-04: a REAL older Confirmed(false) must be present; the old setup
+        // started with no effect mark and accidentally dodged the veto branch.
+        h.userToggle(false)
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false), commits)
+        assertEquals(BbcEffectStatus.Confirmed(false), runtime.effectStatus.value)
         h.userToggle(true)
         h.accept()
         testScheduler.advanceUntilIdle()
-        assertEquals("the gen1 enable was attempted", listOf(true), commits)
+        assertEquals("the gen1 enable was attempted", listOf(false, true), commits)
         assertTrue("an Unknown enable is not an acknowledgement",
             runtime.effectStatus.value is BbcEffectStatus.Unknown)
         assertTrue(durable.pending)
@@ -975,14 +987,378 @@ class BbcActivationConsentStateMachineTest {
         coordinator.submitConsentRead {}
         testScheduler.advanceUntilIdle()
         assertEquals("the owed enable must be claimed once on the NEW generation",
-            listOf(true, true), commits)
+            listOf(false, true, true), commits)
 
         repeat(2) {
             coordinator.submitConsentRead {}
             testScheduler.advanceUntilIdle()
         }
         assertEquals("repeated resyncs at gen2 must not enable twice",
-            listOf(true, true), commits)
+            listOf(false, true, true), commits)
+    }
+
+    /**
+     * R5-04 (P1): an OLD Confirmed(false) must not permanently veto a NEWER
+     * accepted grant whose consent commit landed durably but whose reply was
+     * lost to a rebind. The fresh session's authoritative read VERIFIES
+     * optin=true + enablePending=true, so the owed phase-2 enable must be
+     * driven ONCE by the app consumer — no UI/Settings reopen, no restart.
+     */
+    @Test
+    fun oldConfirmedFalseNeverVetoesNewerVerifiedGrantAfterRebind() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        val durable = ColdStartDurable()
+        holder.resolve(durable.read(1L))
+        assertEquals(BbcActivationConsentState.NotGranted, holder.currentState())
+
+        val s1 = BbcConsentSessionIdentity(1L, Any(), Any())
+        val s2 = BbcConsentSessionIdentity(2L, Any(), Any())
+        var current: BbcConsentSessionIdentity = s1
+        val commits = Collections.synchronizedList(mutableListOf<Boolean>())
+        val sessions = Collections.synchronizedList(
+            mutableListOf<BbcConsentSessionIdentity?>(),
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            commitWithSession = { value, session ->
+                sessions.add(session)
+                commits.add(value)
+                durable.runtimeEnabled = value
+                durable.pending = false // every runtime commit clears the marker atomically
+                BbcWriteOutcome.Confirmed(value)
+            },
+            io = dispatcher,
+            consentCommitAt = { gen ->
+                // The grant REALLY lands, but the reply is lost (rebind gen1->gen2).
+                durable.optIn = true
+                durable.pending = true
+                BbcConsentWriteResult(BbcWriteOutcome.Unknown, gen, s1)
+            },
+            consentRead = { gen ->
+                durable.read(gen).copy(session = if (gen == 1L) s1 else s2)
+            },
+            currentSession = { current },
+            consentHolder = holder,
+        )
+        val h = harness(holder, coordinator)
+
+        // gen1: the user's OFF succeeds -> a REAL, older Confirmed(false) mark.
+        h.userToggle(false)
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false), commits)
+        assertEquals(BbcEffectStatus.Confirmed(false), runtime.effectStatus.value)
+
+        // Later: a NEW, explicit ON/consent. The optin+marker commit lands, but
+        // the Unknown reply must NOT fabricate a grant or drive phase 2 yet.
+        h.userToggle(true)
+        val grant = h.dialogsShown.single()
+        h.accept(grant)
+        testScheduler.advanceUntilIdle()
+        assertEquals("an Unknown grant reply must not drive phase 2",
+            listOf(false), commits)
+        assertTrue(durable.optIn)
+        assertTrue(durable.pending)
+        assertFalse(holder.currentState() is BbcActivationConsentState.Granted)
+
+        // Rebind before the grant reply is processed; fresh stamped snapshot.
+        current = s2
+        holder.onServiceGenerationChanged(2L)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+
+        assertTrue("a fresh authoritative read must resolve Granted",
+            holder.currentState() is BbcActivationConsentState.Granted)
+        assertEquals("exactly ONE phase-2 ON, despite the old Confirmed(false)",
+            listOf(false, true), commits)
+        assertEquals("no UI/Settings reopen was needed", 1, h.dialogsShown.size)
+        assertEquals(listOf<BbcConsentSessionIdentity?>(null, s2), sessions)
+        assertFalse("the enable cleared the durable marker", durable.pending)
+        assertEquals(BbcEffectStatus.Confirmed(true), runtime.effectStatus.value)
+
+        repeat(2) {
+            coordinator.submitConsentRead {}
+            testScheduler.advanceUntilIdle()
+        }
+        assertEquals("repeated resyncs must never enable twice",
+            listOf(false, true), commits)
+        h.dispose()
+    }
+
+    /**
+     * R5-04: the SAME flow, but a genuinely NEWER OFF lands before the resync.
+     * The old grant must not be replayed and the durable OFF must stay final.
+     */
+    @Test
+    fun newerOffAfterVerifiedGrant_rebindResyncNeverReenables() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        val durable = ColdStartDurable()
+        holder.resolve(durable.read(1L))
+        val s1 = BbcConsentSessionIdentity(1L, Any(), Any())
+        val s2 = BbcConsentSessionIdentity(2L, Any(), Any())
+        var current: BbcConsentSessionIdentity = s1
+        val commits = Collections.synchronizedList(mutableListOf<Boolean>())
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            commitWithSession = { value, _ ->
+                commits.add(value)
+                durable.runtimeEnabled = value
+                durable.pending = false // every runtime commit clears the marker
+                BbcWriteOutcome.Confirmed(value)
+            },
+            io = dispatcher,
+            consentCommitAt = { gen ->
+                durable.optIn = true
+                durable.pending = true
+                BbcConsentWriteResult(BbcWriteOutcome.Unknown, gen, s1)
+            },
+            consentRead = { gen -> durable.read(gen).copy(session = s2) },
+            currentSession = { current },
+            consentHolder = holder,
+        )
+        val h = harness(holder, coordinator)
+
+        h.userToggle(false) // old Confirmed(false), then a newer accepted ON
+        testScheduler.advanceUntilIdle()
+        h.userToggle(true)
+        h.accept()
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false), commits)
+        assertTrue(durable.pending)
+
+        current = s2
+        holder.onServiceGenerationChanged(2L)
+        // The user turns OFF AGAIN in the new generation: newer than the grant,
+        // and it clears the marker in the same atomic runtime commit.
+        h.userToggle(false)
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false, false), commits)
+        assertFalse(durable.pending)
+        assertFalse(durable.runtimeEnabled)
+
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("a newer OFF must never be replayed into an enable",
+            listOf(false, false), commits)
+        assertEquals(false, runtime.confirmedOrUnknown)
+        h.dispose()
+    }
+
+    /**
+     * R5-04: Confirmed(true) is already authoritative. Even with durable
+     * optin=true + marker=true on a fresh session, the resync must not write a
+     * SECOND enable (monotonic, generation-scoped ownership).
+     */
+    @Test
+    fun priorConfirmedTrue_resyncNeverWritesSecondEnable() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false))
+        val grant = holder.startConsentIntent()
+        assertTrue(holder.markConsentWriteOutcome(
+            BbcWriteOutcome.Confirmed(true), grant, 1L, consumerOwnsEnable = true,
+        ))
+        assertTrue(runtime.mark(BbcWriteOutcome.Confirmed(true), runtime.nextSequence()))
+
+        val commits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentRead = { gen ->
+                read(gen, optIn = BbcOptInValue.TRUE, runtime = false, enablePending = true)
+            },
+            consentHolder = holder,
+        )
+
+        holder.onServiceGenerationChanged(2L)
+        repeat(2) {
+            coordinator.submitConsentRead {}
+            testScheduler.advanceUntilIdle()
+        }
+        assertEquals("no second enable after Confirmed(true)", 0, commits.size)
+        assertEquals(BbcEffectStatus.Confirmed(true), runtime.effectStatus.value)
+    }
+
+    /**
+     * R5-04: a failed/incoherent rebind read must not consume the owed enable;
+     * the NEXT fresh authoritative read converges it exactly once. No sleeps,
+     * no polling — the read seam count is deterministic on the TestScheduler.
+     */
+    @Test
+    fun failedResyncReadThenFreshRead_convergesOwedEnableExactlyOnce() = runTest {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        holder.onServiceGenerationChanged(1L)
+        val durable = ColdStartDurable()
+        holder.resolve(durable.read(1L))
+        val commits = mutableListOf<Boolean>()
+        var reads = 0
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentCommitAt = { gen ->
+                durable.optIn = true
+                durable.pending = true
+                BbcConsentWriteResult(BbcWriteOutcome.Unknown, gen)
+            },
+            consentRead = { gen ->
+                reads++
+                // First rebind read is an authoritative READ FAILURE: no value,
+                // no marker, no authorization may be produced from it.
+                if (reads == 1) BbcConsentDurableSnapshot.failClosed().forGeneration(gen)
+                else durable.read(gen)
+            },
+            consentHolder = holder,
+        )
+        val h = harness(holder, coordinator)
+
+        h.userToggle(false) // old Confirmed(false)
+        testScheduler.advanceUntilIdle()
+        h.userToggle(true)
+        h.accept()
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false), commits)
+        h.dispose()
+
+        holder.onServiceGenerationChanged(2L)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("a failed read may not claim the owed enable", listOf(false), commits)
+        assertFalse(holder.currentState() is BbcActivationConsentState.Granted)
+
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("the next authoritative read converges exactly once",
+            listOf(false, true), commits)
+        assertTrue(holder.currentState() is BbcActivationConsentState.Granted)
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals(listOf(false, true), commits)
+    }
+
+    /**
+     * R5-04: process death simulation. A brand-new holder has NO grant-attempt
+     * record; with no marker it must never enable, and with a verified marker
+     * it must converge exactly once even though no UI ever reopens.
+     */
+    @Test
+    fun processDeathFreshHolder_markerAbsentNeverEnables_markerTrueEnablesOnce() = runTest {
+        val sequence = AtomicLong(0L)
+        val durable = ColdStartDurable()
+        durable.optIn = true // durable opt-in survived the process death
+        val holder = BbcActivationConsentHolder(sequence)
+        val runtime = BbcToggleRuntimeState(initialConfirmed = false, sequence = sequence)
+        assertEquals(BbcEffectStatus.Provisional, runtime.effectStatus.value)
+        holder.onServiceGenerationChanged(7L)
+        val commits = mutableListOf<Boolean>()
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val appScope = CoroutineScope(SupervisorJob() + dispatcher)
+        coroutineContext[Job]?.invokeOnCompletion { appScope.cancel() }
+        val coordinator = BbcToggleCoordinator(
+            scope = appScope, state = runtime,
+            commit = { value -> commits.add(value); BbcWriteOutcome.Confirmed(value) },
+            io = dispatcher,
+            consentRead = { gen -> durable.read(gen) },
+            consentHolder = holder,
+        )
+
+        // Marker absent: optin=true alone is NOT an owed enable.
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals(BbcActivationConsentState.Granted, holder.currentState())
+        assertTrue(commits.isEmpty())
+        assertEquals(0L, holder.effectiveGrantSequence())
+
+        // The daemon's marker appears on a genuinely fresh session: owed enable.
+        durable.pending = true
+        coordinator.submitConsentRead {}
+        testScheduler.advanceUntilIdle()
+        assertEquals("a verified marker drives exactly one enable", listOf(true), commits)
+        repeat(2) {
+            coordinator.submitConsentRead {}
+            testScheduler.advanceUntilIdle()
+        }
+        assertEquals(listOf(true), commits)
+    }
+
+    /**
+     * R5-04, holder level: an OFF recorded BEFORE the grant is the prior setting
+     * and must not block a verified grant at the SAME generation; a NEWER OFF
+     * must keep blocking after a rebind, and an unverified attempt promotes to
+     * no reason at all.
+     */
+    @Test
+    fun verifiedGrantAttempt_promotesReasonAndClearsOnlyOlderOffBlock() {
+        val sequence = AtomicLong(0L)
+        val holder = BbcActivationConsentHolder(sequence)
+        holder.onServiceGenerationChanged(1L)
+        holder.resolve(read(1L, optIn = false))
+
+        val oldOff = holder.supersedeActiveIntent()
+        val grant = holder.startConsentIntent()
+        holder.notePendingEnable(grant, 1L)
+        assertEquals("an unverified attempt is not a grant reason",
+            0L, holder.effectiveGrantSequence())
+        assertEquals("the OFF is OLDER than the later grant", true, oldOff < grant)
+
+        // Fresh read verifies durable optin=true + marker: promote and unblock.
+        holder.resolve(read(1L, optIn = BbcOptInValue.TRUE, enablePending = true))
+        assertEquals(grant, holder.effectiveGrantSequence())
+        assertTrue("an OFF OLDER than the verified grant may not block resync",
+            holder.tryClaimResyncEnable(1L, grant, true, holder.nextIntentSequence()))
+        assertTrue("the old OFF stayed older", oldOff < grant)
+
+        // A genuinely newer OFF keeps winning after a rebind.
+        val newerOff = holder.supersedeActiveIntent()
+        assertTrue(newerOff > grant)
+        holder.onServiceGenerationChanged(2L)
+        holder.resolve(read(2L, optIn = BbcOptInValue.TRUE, enablePending = true))
+        assertFalse("a newer OFF must still block the owed enable",
+            holder.tryClaimResyncEnable(2L, grant, true, holder.nextIntentSequence()))
+        assertEquals("promotion never fabricates a Confirmed grant",
+            0L, holder.confirmedGrantSequence())
+
+        // R5 review: a holder ALREADY Granted plus an INCOHERENT read that
+        // optimistically reports optin=true + marker=true must NOT promote a
+        // newer attempt or clear the OFF block. All-or-nothing: an incoherent
+        // snapshot verifies nothing, so no "verified" grant may be derived from
+        // it — the Granted state was inherited from cur.state, not this read.
+        val beforeIncoherent = holder.effectiveGrantSequence()
+        val olderOff = holder.supersedeActiveIntent() // fresh OFF block at gen 2
+        val attemptAfterOff = holder.startConsentIntent()
+        holder.notePendingEnable(attemptAfterOff, 2L)
+        assertTrue(olderOff < attemptAfterOff)
+        holder.resolve(
+            read(2L, optIn = BbcOptInValue.TRUE, coherent = false, enablePending = true),
+        )
+        assertEquals("an incoherent read fabricates no verified grant",
+            beforeIncoherent, holder.effectiveGrantSequence())
+        assertFalse("an incoherent read may not clear the OFF block",
+            holder.tryClaimResyncEnable(2L, attemptAfterOff, true, holder.nextIntentSequence()))
     }
 
     /**
